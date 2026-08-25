@@ -124,52 +124,80 @@ class _Base(unittest.TestCase):
             )
 
 
-class TestPreflightGuard(_Base):
-    def test_oversized_request_is_rejected_before_going_upstream(self):
+class TestAdaptiveFitting(_Base):
+    """The bridge must not refuse a request on its own arithmetic.
+
+    Our token count is an estimate, so refusing a request the model would have
+    accepted is a brittle way to fail. Agentaus states its real limit when it rejects
+    something, which is better evidence than anything computed here - so the estimate
+    decides only *when to compact*, a recoverable choice, and an actual rejection
+    drives a tighter retry rather than ending the turn.
+    """
+
+    def test_oversized_request_is_attempted_not_refused(self):
         from agentaus_bridge.config import settings
 
         settings.agentaus_max_input_tokens = 1000
-        response = self._post("x" * 40_000, stream=False)  # ~10k estimated tokens
+        response = self._post("x" * 40_000, stream=False)
 
-        self.assertEqual(response.status_code, 400)
-        message = response.json()["error"]["message"]
-        self.assertIn("prompt is too long", message)
-        self.assertIn("/model opus", message, "must name the recovery that actually works")
-        self.assertIn("/compact on Agentaus will fail", message,
+        # The stub always rejects as over-length, so an error is expected - but it must
+        # be Agentaus' verdict, quoted, not the bridge refusing on its own arithmetic.
+        self.assertIn("Agentaus said:", response.text,
+                      "the bridge refused without ever asking Agentaus")
+
+    def test_upstream_rejection_carries_recovery_guidance(self):
+        from agentaus_bridge.config import settings
+
+        settings.agentaus_max_input_tokens = 1000
+        message = self._post("x" * 40_000, stream=False).json()["error"]["message"]
+
+        self.assertIn("prompt is too long", message,
+                      "must use the wording Claude Code can auto-recover from")
+        self.assertIn("/model opus", message, "must name a recovery that works")
+        self.assertIn("/compact on Agentaus fails", message,
                       "must warn that /compact deadlocks when already over the window")
 
-    def test_reply_allowance_counts_toward_the_window(self):
-        """Agentaus counts prompt + reply against one window."""
+    def test_rejection_teaches_the_bridge_the_real_window(self):
+        """The rejection states max_model_len; that is better than our default."""
+        from agentaus_bridge import server as srv
         from agentaus_bridge.config import settings
 
-        settings.agentaus_max_input_tokens = 1000
-        # ~500 prompt tokens is under the limit on its own, but not with 800 reserved.
-        response = self._post("x" * 2_000, stream=False, max_tokens=800)
+        srv._reset_learned_limit()
+        settings.max_input_tokens_is_explicit = False
+        try:
+            self._post("x" * 40_000, stream=False)
+            self.assertEqual(srv._context_limit(), 131072,
+                             "the limit stated by Agentaus was not adopted")
+        finally:
+            settings.max_input_tokens_is_explicit = True
+            srv._reset_learned_limit()
 
-        self.assertEqual(response.status_code, 400)
-
-    def test_normal_request_is_not_blocked(self):
+    def test_small_request_reaches_upstream_untouched(self):
         from agentaus_bridge.config import settings
 
         settings.agentaus_max_input_tokens = 131072
         response = self._post("hello", stream=False)
 
-        # The stub always answers with an over-length error, so "prompt is too long"
-        # appears either way. What distinguishes the guard is that it names the env
-        # var; the upstream path instead quotes Agentaus verbatim.
-        self.assertNotIn("AGENTAUS_MAX_INPUT_TOKENS", response.text,
-                         "guard fired on a request well under the limit")
-        self.assertIn("Agentaus said:", response.text, "should have reached upstream")
+        self.assertIn("Agentaus said:", response.text,
+                      "a small request should have gone straight upstream")
 
-    def test_guard_can_be_disabled(self):
+    def test_request_is_still_attempted_with_compaction_disabled(self):
         from agentaus_bridge.config import settings
 
-        settings.agentaus_max_input_tokens = 0
-        response = self._post("x" * 40_000, stream=False)
+        settings.agentaus_auto_trim = False
+        try:
+            response = self._post("x" * 40_000, stream=False)
+        finally:
+            settings.agentaus_auto_trim = True
 
-        self.assertNotIn("AGENTAUS_MAX_INPUT_TOKENS", response.text,
-                         "guard fired despite being disabled")
-        self.assertIn("Agentaus said:", response.text, "should have reached upstream")
+        self.assertIn("Agentaus said:", response.text)
+
+    def test_fit_shrinks_the_target_on_each_retry(self):
+        """Each retry must aim lower - repeating the same arithmetic would just fail again."""
+        from agentaus_bridge.config import settings
+
+        self.assertLess(settings.agentaus_fit_shrink, 1.0)
+        self.assertGreater(settings.agentaus_fit_attempts, 0)
 
 
 class TestInBandErrorSurfacing(_Base):

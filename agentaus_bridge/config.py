@@ -198,6 +198,18 @@ class Settings:
         default_factory=lambda: _int("AGENTAUS_REVIEW_MIN_CHARS", 200)
     )
 
+    # How many times to recompact and retry when Agentaus itself rejects the prompt
+    # as too long. Preferred over refusing on our own estimate: the API states its real
+    # limit in the rejection, which is better evidence than anything computed here.
+    agentaus_fit_attempts: int = field(
+        default_factory=lambda: _int("AGENTAUS_FIT_ATTEMPTS", 3)
+    )
+    # How much tighter each retry aims. 0.6 shrinks fast enough to converge in a few
+    # attempts without discarding far more of the conversation than necessary.
+    agentaus_fit_shrink: float = field(
+        default_factory=lambda: _float("AGENTAUS_FIT_SHRINK", 0.6)
+    )
+
     # --- misc ---------------------------------------------------------------------
     log_level: str = field(default_factory=lambda: os.environ.get("BRIDGE_LOG_LEVEL", "info"))
     log_bodies: bool = field(default_factory=lambda: _bool("BRIDGE_LOG_BODIES", False))

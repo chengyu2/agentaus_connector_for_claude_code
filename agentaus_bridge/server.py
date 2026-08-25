@@ -483,6 +483,64 @@ def _agentaus_error_text(err: dict) -> str:
     return f"Agentaus error: {message}"
 
 
+async def _fit_to_window(
+    request: Request, body: dict, *, limit: int, reserve: int, scale: float
+) -> dict:
+    """Compact `body` until it should fit `limit * scale`, and return it.
+
+    `scale` tightens the target on a retry: if Agentaus rejected the request as too
+    long, our estimate was optimistic, so the next attempt aims lower rather than
+    trusting the same arithmetic twice.
+
+    Never raises and never refuses - the worst case returns the body compacted as far
+    as it can be, and lets the API decide.
+    """
+    if limit <= 0 or not settings.agentaus_auto_trim:
+        return body
+
+    target = max(int(limit * scale), 1000)
+    threshold = settings.agentaus_compact_threshold
+    estimated = estimate_request_tokens(body)
+    if estimated + reserve <= int(target * threshold):
+        return body
+
+    plan = await _get_compactor(request).compact(
+        body,
+        limit=target,
+        reserve=reserve,
+        keep_fraction=settings.agentaus_keep_fraction,
+        threshold=threshold,
+        chunk_tokens=settings.agentaus_summary_chunk_tokens,
+    )
+    if plan["method"] == "summarised":
+        fitted = {**body, "messages": plan["messages"]}
+        fitted["system"] = _with_summary(
+            body.get("system"), plan["summary"], plan["summarised"]
+        )
+        log.warning(
+            "compacted %d oldest message(s) into a summary for a %d-token target "
+            "(~%d -> ~%d tokens)",
+            plan["summarised"], target, estimated, estimate_request_tokens(fitted),
+        )
+        return fitted
+    if plan["method"] == "trimmed":
+        fitted = {**body, "messages": plan["messages"]}
+        fitted["system"] = _with_trim_notice(body.get("system"), plan["dropped"])
+        log.warning(
+            "summarisation could not reach the %d-token target; dropped %d oldest "
+            "message(s) instead (~%d -> ~%d tokens)",
+            target, plan["dropped"], estimated, estimate_request_tokens(fitted),
+        )
+        return fitted
+    return body
+
+
+def _is_over_length(text: str) -> bool:
+    """Whether an upstream error is Agentaus reporting the prompt as too long."""
+    lowered = (text or "").lower()
+    return "max_model_len" in lowered or "exceeds" in lowered and "prompt" in lowered
+
+
 def _agentaus_headers() -> dict:
     return {
         "Authorization": f"Bearer {settings.agentaus_api_key}",
@@ -500,76 +558,17 @@ async def _handle_agentaus(
     started = time.monotonic()
     display_model = model or "agentaus"
 
-    # Pre-flight context check. Agentaus counts the prompt and the reply against one
-    # window, so reserve the requested output before comparing. Catching it here turns
-    # a confusing upstream failure into an actionable message and saves sending a
-    # payload that can be hundreds of kilobytes.
+    # Fit the conversation to the window, then send it. Deliberately NOT a hard
+    # pre-flight rejection on our own arithmetic: our token count is an estimate, and
+    # refusing a request the model would have accepted is a brittle way to fail. The
+    # API is the authority - if Agentaus says a prompt is too long it also states its
+    # real limit, which is better evidence than anything computed here. So the estimate
+    # only decides *when to compact*, a recoverable choice, and an actual rejection
+    # drives a tighter retry rather than ending the turn.
     limit = _context_limit()
-    if limit > 0:
-        estimated = estimate_request_tokens(body)
-        original_estimate = estimated
-        reserved = int(body.get("max_tokens") or 0)
-        threshold = settings.agentaus_compact_threshold
-        needs_compaction = estimated + reserved > int(limit * threshold)
-        if needs_compaction and settings.agentaus_auto_trim:
-            plan = await _get_compactor(request).compact(
-                body,
-                limit=limit,
-                reserve=reserved,
-                keep_fraction=settings.agentaus_keep_fraction,
-                threshold=threshold,
-                chunk_tokens=settings.agentaus_summary_chunk_tokens,
-            )
-            if plan["method"] == "summarised":
-                body = {**body, "messages": plan["messages"]}
-                body["system"] = _with_summary(
-                    body.get("system"), plan["summary"], plan["summarised"]
-                )
-                estimated = estimate_request_tokens(body)
-                log.warning(
-                    "compacted %d oldest message(s) into a summary to fit the %d-token "
-                    "window (~%d -> ~%d tokens)",
-                    plan["summarised"], limit, original_estimate, estimated,
-                )
-            elif plan["method"] == "trimmed":
-                body = {**body, "messages": plan["messages"]}
-                body["system"] = _with_trim_notice(body.get("system"), plan["dropped"])
-                estimated = estimate_request_tokens(body)
-                log.warning(
-                    "summarisation could not fit the window; dropped %d oldest "
-                    "message(s) instead (~%d -> ~%d tokens)",
-                    plan["dropped"], original_estimate, estimated,
-                )
-
-        if estimated + reserved > limit:
-            log.warning(
-                "rejected oversized request: ~%d prompt + %d reserved > %d limit",
-                estimated, reserved, limit,
-            )
-            return _error_response(
-                400,
-                "invalid_request_error",
-                # Lead with Anthropic's canonical wording. Claude Code matches on
-                # "prompt is too long" to trigger auto-compact and retry, so phrasing
-                # it this way turns a dead turn into automatic recovery. The
-                # Agentaus-specific detail follows for anyone reading the log.
-                # Recovery advice is ordered deliberately. /compact is NOT first:
-                # compaction works by sending the conversation to the model to be
-                # summarised, so once the conversation is already over the window the
-                # compaction call is over it too and fails identically - a deadlock
-                # (anthropics/claude-code#25867). Switching to a Claude model is the
-                # reliable escape, and it exists only because this bridge keeps both
-                # providers live in the same session.
-                f"prompt is too long: {estimated + reserved} tokens > {limit} maximum. "
-                f"Agentaus has a {limit:,}-token context window (roughly "
-                f"{estimated:,} prompt + {reserved:,} reserved for the reply). "
-                f"To recover: switch to a Claude model with /model opus - it has a much "
-                f"larger window, so /compact will succeed there, and you can switch back "
-                f"to Agentaus afterwards. Otherwise /clear starts fresh. Note /compact "
-                f"on Agentaus will fail the same way while you are this far over, "
-                f"because compaction must itself fit in the window. "
-                f"(Set AGENTAUS_MAX_INPUT_TOKENS to change this limit.)",
-            )
+    reserved = int(body.get("max_tokens") or 0)
+    original_estimate = estimate_request_tokens(body)
+    body = await _fit_to_window(request, body, limit=limit, reserve=reserved, scale=1.0)
 
     # Supplement the system prompt for Agentaus only. Claude turns never reach here -
     # they are forwarded untouched by _passthrough.
@@ -588,15 +587,41 @@ async def _handle_agentaus(
         log.info("-> agentaus payload: %s", json.dumps(payload)[:4000])
 
     if not wants_stream:
-        try:
-            upstream = await _post_with_retry(
-                client,
-                settings.agentaus_url,
-                json_body={**payload, "stream": False},
-                headers=_agentaus_headers(),
+        # Agentaus is the authority on whether a prompt fits. If it says no, it also
+        # says what its real limit is, so the next attempt compacts against that
+        # instead of against our estimate.
+        scale = 1.0
+        for fit_attempt in range(settings.agentaus_fit_attempts + 1):
+            try:
+                upstream = await _post_with_retry(
+                    client,
+                    settings.agentaus_url,
+                    json_body={**payload, "stream": False},
+                    headers=_agentaus_headers(),
+                )
+            except httpx.HTTPError as exc:
+                return _error_response(502, "api_error", f"Agentaus request failed: {exc}")
+
+            over_length = (
+                upstream.status_code >= 400 and _is_over_length(upstream.text)
             )
-        except httpx.HTTPError as exc:
-            return _error_response(502, "api_error", f"Agentaus request failed: {exc}")
+            if not over_length or fit_attempt == settings.agentaus_fit_attempts:
+                break
+
+            _learn_limit_from(upstream.text)
+            scale *= settings.agentaus_fit_shrink
+            log.warning(
+                "Agentaus rejected the prompt as too long; recompacting to %.0f%% "
+                "of the window and retrying", scale * 100,
+            )
+            body = await _fit_to_window(
+                request, body, limit=_context_limit(), reserve=reserved, scale=scale
+            )
+            payload = anthropic_request_to_agentaus(
+                body,
+                system_prompt_overwrite=settings.system_prompt_overwrite,
+                stream=False,
+            )
 
         if upstream.status_code >= 400:
             return _upstream_error_response(upstream.status_code, upstream.text)
@@ -643,8 +668,20 @@ async def _handle_agentaus(
         )
         return JSONResponse(message)
 
+    async def _refit(scale: float) -> dict:
+        """Recompact against a tighter target and rebuild the upstream payload."""
+        nonlocal body
+        body = await _fit_to_window(
+            request, body, limit=_context_limit(), reserve=reserved, scale=scale
+        )
+        return anthropic_request_to_agentaus(
+            body,
+            system_prompt_overwrite=settings.system_prompt_overwrite,
+            stream=settings.upstream_stream,
+        )
+
     generator = _keepalive(
-        _agentaus_event_stream(client, payload, body, display_model, started),
+        _agentaus_event_stream(client, payload, body, display_model, started, _refit),
         settings.ping_interval_seconds,
         AnthropicStreamBuilder.ping,
     )
@@ -661,6 +698,7 @@ async def _agentaus_event_stream(
     original: dict,
     model: str,
     started: float,
+    refit=None,
 ) -> AsyncIterator[bytes]:
     """Produce a valid Anthropic SSE stream from an Agentaus response."""
     builder = AnthropicStreamBuilder(
@@ -683,6 +721,10 @@ async def _agentaus_event_stream(
     buffering = settings.agentaus_self_review
     pending: list[str] = []
 
+    # Tracks recompaction attempts driven by Agentaus rejecting the prompt as too long.
+    fit_attempt = 0
+    fit_scale = 1.0
+
     attempt = 0
     while True:
         emitted = False
@@ -700,6 +742,18 @@ async def _agentaus_event_stream(
                     if upstream.status_code >= 400:
                         detail = (await upstream.aread()).decode("utf-8", "replace")[:500]
                         if (
+                            _is_over_length(detail)
+                            and refit is not None
+                            and fit_attempt < settings.agentaus_fit_attempts
+                        ):
+                            # Nothing has been emitted yet, so the request can be
+                            # recompacted and replayed invisibly.
+                            _learn_limit_from(detail)
+                            fit_attempt += 1
+                            fit_scale *= settings.agentaus_fit_shrink
+                            payload = await refit(fit_scale)
+                            retry_reason = f"prompt too long, refitting to {fit_scale:.0%}"
+                        elif (
                             upstream.status_code in _RETRYABLE_STATUS
                             and attempt < settings.max_retries
                         ):
