@@ -125,7 +125,9 @@ class TestPreflightGuard(_Base):
         self.assertEqual(response.status_code, 400)
         message = response.json()["error"]["message"]
         self.assertIn("prompt is too long", message)
-        self.assertIn("/compact", message, "the error must say what to do about it")
+        self.assertIn("/model opus", message, "must name the recovery that actually works")
+        self.assertIn("/compact on Agentaus will fail", message,
+                      "must warn that /compact deadlocks when already over the window")
 
     def test_reply_allowance_counts_toward_the_window(self):
         """Agentaus counts prompt + reply against one window."""
@@ -192,7 +194,7 @@ class TestInBandErrorSurfacing(_Base):
     def test_context_error_includes_guidance(self):
         body = self._post("hi", stream=True).text
 
-        self.assertIn("/compact", body, "an over-length error must say how to recover")
+        self.assertIn("/model opus", body, "an over-length error must name a working recovery")
 
 
 class TestCanonicalOverLengthWording(_Base):

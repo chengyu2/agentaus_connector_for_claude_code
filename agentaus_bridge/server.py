@@ -268,7 +268,9 @@ def _agentaus_error_text(err: dict) -> str:
         # auto-compact-and-retry path recognises it, then keep the upstream text.
         return (
             "prompt is too long: this conversation exceeds Agentaus' context window. "
-            "Run /compact or /clear, or switch to a Claude model for this turn. "
+            "To recover, switch to a Claude model with /model opus and run /compact "
+            "there, then switch back; /compact on Agentaus fails the same way while "
+            "the conversation is over the window. /clear also works but loses history. "
             f"(Agentaus said: {message})"
         )
     return f"Agentaus error: {message}"
@@ -316,10 +318,21 @@ async def _handle_agentaus(
                 # "prompt is too long" to trigger auto-compact and retry, so phrasing
                 # it this way turns a dead turn into automatic recovery. The
                 # Agentaus-specific detail follows for anyone reading the log.
+                # Recovery advice is ordered deliberately. /compact is NOT first:
+                # compaction works by sending the conversation to the model to be
+                # summarised, so once the conversation is already over the window the
+                # compaction call is over it too and fails identically - a deadlock
+                # (anthropics/claude-code#25867). Switching to a Claude model is the
+                # reliable escape, and it exists only because this bridge keeps both
+                # providers live in the same session.
                 f"prompt is too long: {estimated + reserved} tokens > {limit} maximum. "
                 f"Agentaus has a {limit:,}-token context window (roughly "
                 f"{estimated:,} prompt + {reserved:,} reserved for the reply). "
-                f"Run /compact or /clear, or switch to a Claude model for this turn. "
+                f"To recover: switch to a Claude model with /model opus - it has a much "
+                f"larger window, so /compact will succeed there, and you can switch back "
+                f"to Agentaus afterwards. Otherwise /clear starts fresh. Note /compact "
+                f"on Agentaus will fail the same way while you are this far over, "
+                f"because compaction must itself fit in the window. "
                 f"(Set AGENTAUS_MAX_INPUT_TOKENS to change this limit.)",
             )
 
