@@ -135,6 +135,8 @@ class _RetryTestBase(unittest.TestCase):
         settings.agentaus_base_url = f"http://127.0.0.1:{PORT}"
         settings.agentaus_api_key = "test-key"
         settings.retry_backoff_seconds = 0.01  # keep the suite fast
+        from agentaus_bridge import server as _srv
+        _srv._reset_learned_limit()
         settings.max_retries = 2
 
     def tearDown(self) -> None:

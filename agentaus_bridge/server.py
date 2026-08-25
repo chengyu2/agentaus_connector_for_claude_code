@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import time
 import uuid
 from typing import AsyncIterator, Callable
@@ -22,6 +23,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .compact import ConversationCompactor
 from .config import settings
 from .translate import (
     AnthropicStreamBuilder,
@@ -257,6 +259,104 @@ async def _post_with_retry(
 # Agentaus path
 # --------------------------------------------------------------------------------------
 
+
+# --------------------------------------------------------------------------------------
+# Context window
+# --------------------------------------------------------------------------------------
+
+# Agentaus states its own limit when a prompt overflows:
+#   "The engine prompt length 224662 exceeds the max_model_len 131072"
+# so the bridge learns the number from the API instead of trusting a constant that
+# goes stale the moment Trellis Data changes the model.
+_MAX_MODEL_LEN = re.compile(r"max_model_len\s+(\d+)")
+_learned_limit: int | None = None
+
+
+def _reset_learned_limit() -> None:
+    """Clear the learned window. Used by tests: it is module state that would
+    otherwise leak between cases and make results depend on ordering."""
+    global _learned_limit
+    _learned_limit = None
+
+
+def _learn_limit_from(message: str) -> None:
+    global _learned_limit
+    match = _MAX_MODEL_LEN.search(message or "")
+    if not match:
+        return
+    value = int(match.group(1))
+    if value > 0 and value != _learned_limit:
+        _learned_limit = value
+        log.info("learned Agentaus context window from the API: %d tokens", value)
+
+
+def _context_limit() -> int:
+    """The window to enforce.
+
+    An explicitly configured AGENTAUS_MAX_INPUT_TOKENS always wins - learning a value
+    from an error must never quietly override what the operator asked for. Otherwise
+    prefer what Agentaus itself reported over the compiled-in default.
+    """
+    if settings.max_input_tokens_is_explicit:
+        return settings.agentaus_max_input_tokens
+    return _learned_limit or settings.agentaus_max_input_tokens
+
+
+async def _agentaus_summarise(client: httpx.AsyncClient, text: str) -> str:
+    """Ask Agentaus to compact a slice of the conversation.
+
+    Deliberately delegated to the model rather than to heuristics here: what is worth
+    keeping out of an engineering conversation is a judgement call, and the model is
+    better placed to make it than any rule the bridge could hard-code.
+    """
+    payload = {
+        "messages": [{"role": "user", "content": text}],
+        "stream": False,
+        "system_prompt_overwrite": True,
+    }
+    response = await _post_with_retry(
+        client, settings.agentaus_url, json_body=payload, headers=_agentaus_headers()
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"summariser returned HTTP {response.status_code}")
+    data = response.json()
+    if isinstance(data.get("error"), dict):
+        _learn_limit_from(str(data["error"].get("message") or ""))
+        raise RuntimeError(str(data["error"].get("message"))[:200])
+    return ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+
+
+def _get_compactor(request: Request) -> ConversationCompactor:
+    """One compactor per process, so its summary cache survives between turns.
+
+    Without the cache the same conversation prefix would be re-summarised on every
+    turn, since Claude Code re-sends the whole history each time.
+    """
+    existing = getattr(request.app.state, "compactor", None)
+    if existing is None:
+        client = request.app.state.client
+        existing = ConversationCompactor(lambda text: _agentaus_summarise(client, text))
+        request.app.state.compactor = existing
+    return existing
+
+
+def _with_summary(system, summary: str, replaced: int):
+    """Fold the summary into the system prompt, replacing the messages it stands for."""
+    notice = (
+        f"\n\n[Earlier conversation summary - the {replaced} oldest messages were "
+        f"replaced by this compacted record to fit the context window. Treat it as an "
+        f"accurate account of what happened before; if the user refers to something "
+        f"not covered here, say so rather than guessing.]\n{summary}"
+    )
+    if system is None:
+        return notice.strip()
+    if isinstance(system, str):
+        return system + notice
+    if isinstance(system, list):
+        return list(system) + [{"type": "text", "text": notice.strip()}]
+    return system
+
+
 def _with_trim_notice(system, dropped: int):
     """Append a note to the system prompt saying history was trimmed.
 
@@ -284,6 +384,7 @@ def _agentaus_error_text(err: dict) -> str:
     max_model_len M", which is actionable once it actually reaches the client.
     """
     message = str(err.get("message") or err) if err else "unknown Agentaus error"
+    _learn_limit_from(message)
     if "max_model_len" in message or "exceeds" in message:
         # Prefix Anthropic's canonical over-length wording so Claude Code's
         # auto-compact-and-retry path recognises it, then keep the upstream text.
@@ -318,27 +419,35 @@ async def _handle_agentaus(
     # window, so reserve the requested output before comparing. Catching it here turns
     # a confusing upstream failure into an actionable message and saves sending a
     # payload that can be hundreds of kilobytes.
-    limit = settings.agentaus_max_input_tokens
+    limit = _context_limit()
     if limit > 0:
         estimated = estimate_request_tokens(body)
+        original_estimate = estimated
         reserved = int(body.get("max_tokens") or 0)
         if estimated + reserved > limit and settings.agentaus_auto_trim:
-            kept, dropped = trim_messages_to_fit(body, limit, reserve=reserved)
-            if dropped and len(kept) >= 1:
-                retry_estimate = estimate_request_tokens(
-                    {"system": body.get("system"), "messages": kept, "tools": body.get("tools")}
+            plan = await _get_compactor(request).compact(
+                body, limit=limit, reserve=reserved
+            )
+            if plan["method"] == "summarised":
+                body = {**body, "messages": plan["messages"]}
+                body["system"] = _with_summary(
+                    body.get("system"), plan["summary"], plan["summarised"]
                 )
-                if retry_estimate + reserved <= limit:
-                    log.warning(
-                        "auto-trimmed %d oldest message(s) to fit Agentaus' %d-token "
-                        "window (~%d -> ~%d tokens)",
-                        dropped, limit, estimated, retry_estimate,
-                    )
-                    body = {**body, "messages": kept}
-                    # Tell Agentaus its view of the conversation is partial, so it can
-                    # say so rather than confidently answering from missing context.
-                    body["system"] = _with_trim_notice(body.get("system"), dropped)
-                    estimated = retry_estimate
+                estimated = estimate_request_tokens(body)
+                log.warning(
+                    "compacted %d oldest message(s) into a summary to fit the %d-token "
+                    "window (~%d -> ~%d tokens)",
+                    plan["summarised"], limit, original_estimate, estimated,
+                )
+            elif plan["method"] == "trimmed":
+                body = {**body, "messages": plan["messages"]}
+                body["system"] = _with_trim_notice(body.get("system"), plan["dropped"])
+                estimated = estimate_request_tokens(body)
+                log.warning(
+                    "summarisation could not fit the window; dropped %d oldest "
+                    "message(s) instead (~%d -> ~%d tokens)",
+                    plan["dropped"], original_estimate, estimated,
+                )
 
         if estimated + reserved > limit:
             log.warning(

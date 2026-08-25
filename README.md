@@ -278,41 +278,77 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL="agentaus"
 ## What happens when a conversation outgrows Agentaus
 
 Agentaus' window is **131,072 tokens** — prompt and reply together — against Claude's
-much larger one. Two things make this bite sooner than you would expect: there is no
+much larger one. Two things make it bite sooner than you would expect: there is no
 prompt caching, so every turn resends the whole conversation, and Claude Code sizes its
 auto-compact against the window it *assumes* for a model, which it has no way to learn
 for Agentaus.
 
-Left alone the turn simply dies, and `/compact` cannot rescue it either — compaction
-summarises by sending the conversation to the model, so once you are over the window
-the compaction call is over it too
+Left alone the turn dies, and `/compact` cannot rescue it either — compaction summarises
+by sending the conversation to the model, so once you are over the window the compaction
+call is over it too
 ([claude-code#25867](https://github.com/anthropics/claude-code/issues/25867)).
 
-So the bridge recovers by itself. When a request would overflow, it drops the oldest
-messages until it fits and sends the rest:
+So the bridge compacts by itself, **asking Agentaus to summarise** the older part of the
+conversation and sending that summary in its place:
 
 ```
-WARNING agentaus-bridge: auto-trimmed 42 oldest message(s) to fit Agentaus'
-        131072-token window (~405767 -> ~121753 tokens)
+system prompt + "[earlier conversation summary] ..."   <- the compacted head
+<most recent messages, verbatim>                       <- untouched tail
 ```
 
-This is what `/compact` does in effect, minus the summarising — which the bridge cannot
-do cheaply, being stateless: it would have to re-summarise the whole history on every
-single turn. Two properties make the trimming safe:
+```
+WARNING agentaus-bridge: compacted 46 oldest message(s) into a summary to fit
+        the 131072-token window (~294955 -> ~54790 tokens)
+```
 
+### Why summarise rather than truncate
+
+Dropping the oldest messages is cheap but loses exactly what later turns depend on — a
+port number agreed an hour ago, why a approach was rejected, a constraint stated once.
+The summariser is prompted to extract rather than paraphrase: file paths, identifiers,
+commands, decisions *and their reasons*, bugs and their root causes, what is done versus
+outstanding, and explicitly never to invent detail it cannot see.
+
+In a live test, a 295,000-token conversation compacted to 54,790 tokens still answered
+correctly about a port, a config path, a rate limit and the reasoning behind a backoff
+ceiling — all of which lived in the very first message, long since compacted away.
+
+### What it costs
+
+The bridge is stateless: Claude Code resends the whole conversation every turn, so a
+naive version would re-summarise the entire history on *every request*. The compacted
+region is a stable prefix, so summaries are cached by content hash and paid for once —
+the first overflowing turn takes an extra call (tens of seconds on a long history), and
+following turns reuse it until the boundary moves.
+
+A head too large for one summarisation call is summarised in pieces, and those summaries
+summarised again, so any length reduces in bounded steps.
+
+### The guarantees
+
+- **The question being answered is never touched.** Only the older head is compacted.
 - **Tool pairs are never split.** A `tool_result` refers back to a `tool_use` in the
-  previous assistant turn, so trimming keeps going until the surviving conversation
-  starts on a clean user turn. Cutting between them produces a request Agentaus rejects.
-- **Agentaus is told.** A note is appended to the system prompt saying how many messages
-  were removed, so the model says it cannot see earlier context instead of inventing it.
+  preceding assistant turn, so the kept tail always begins on a clean user turn —
+  cutting between them produces a request Agentaus rejects.
+- **The model is told.** The summary is introduced as a compacted record with the
+  number of messages it replaces, so it reports missing context instead of inventing it.
+- **Failure degrades, it does not cascade.** If summarising fails, the bridge falls back
+  to dropping the head; only if that cannot fit either is the turn refused, using the
+  `prompt is too long` wording Claude Code can act on.
 
-The message being answered is always kept. If a *single* message is itself too large to
-fit, nothing can be trimmed and the request is refused with `prompt is too long: N
-tokens > M maximum` — the wording Claude Code matches on to compact and retry.
+### The window is learned, not assumed
 
-Set `AGENTAUS_AUTO_TRIM=false` to get the hard error instead. Trimming is lossy, and on
-work where losing the early conversation would be worse than failing outright, failing
-is the better outcome.
+Agentaus states its own limit when a prompt overflows:
+
+```
+The engine prompt length 224662 exceeds the max_model_len 131072
+```
+
+The bridge parses that and uses it from then on, so the number stays right if Trellis
+Data changes the model. `AGENTAUS_MAX_INPUT_TOKENS` still wins when set explicitly —
+learning must never quietly override what you configured. `AGENTAUS_AUTO_TRIM=false`
+turns the whole mechanism off and restores the hard error, which is the better outcome
+on work where losing early context would be worse than failing.
 
 ---
 
@@ -398,8 +434,8 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_UPSTREAM_STREAM` | `true` | Request SSE from Agentaus rather than polling for a whole reply |
 | `AGENTAUS_MODEL_MARKERS` | `agentaus` | Comma-separated substrings that route to Agentaus |
 | `AGENTAUS_FORCE_ALL` | `false` | Ignore the model id; send everything to Agentaus |
-| `AGENTAUS_MAX_INPUT_TOKENS` | `131072` | Agentaus' context window. Defaults in code, not `.env`, so a fresh clone is still protected; `0` disables the check |
-| `AGENTAUS_AUTO_TRIM` | `true` | Drop oldest messages to fit the window rather than failing the turn |
+| `AGENTAUS_MAX_INPUT_TOKENS` | `131072` | Agentaus' context window. Defaults in code and self-corrects from Agentaus' own error messages; setting it explicitly overrides both. `0` disables the check |
+| `AGENTAUS_AUTO_TRIM` | `true` | Compact the older conversation into a summary rather than failing the turn |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | `127.0.0.1` / `8787` | Listen address |
 | `BRIDGE_PASSTHROUGH` | `true` | Forward non-Agentaus models to Anthropic; `false` answers them with Agentaus instead |
 | `ANTHROPIC_UPSTREAM_BASE_URL` | `https://api.anthropic.com` | Passthrough target |

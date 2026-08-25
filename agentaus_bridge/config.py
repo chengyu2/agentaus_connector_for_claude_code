@@ -132,6 +132,11 @@ class Settings:
     agentaus_max_input_tokens: int = field(
         default_factory=lambda: _int("AGENTAUS_MAX_INPUT_TOKENS", 131072)
     )
+    # Whether the operator set the window explicitly. If they did, a value the bridge
+    # later learns from an Agentaus error must not silently override their choice.
+    max_input_tokens_is_explicit: bool = field(
+        default_factory=lambda: bool(os.environ.get("AGENTAUS_MAX_INPUT_TOKENS", "").strip())
+    )
     # When a conversation exceeds the window, drop the oldest messages so the turn
     # still succeeds instead of dying. This is what /compact does in effect, and it
     # is the only automatic recovery available to the bridge: Claude Code's model

@@ -29,6 +29,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from agentaus_bridge import server as server_mod  # noqa: E402
+
 PORT = 9941
 OVERSIZE_ERROR = {
     "error": {
@@ -90,6 +92,11 @@ class _Base(unittest.TestCase):
         )
         settings.agentaus_base_url = f"http://127.0.0.1:{PORT}"
         settings.agentaus_api_key = "test-key"
+        # The learned window is module state; without clearing it a limit picked up
+        # by an earlier test silently overrides the one set here.
+        server_mod._reset_learned_limit()
+        self._saved_explicit = settings.max_input_tokens_is_explicit
+        settings.max_input_tokens_is_explicit = True
 
     def tearDown(self) -> None:
         from agentaus_bridge.config import settings
@@ -99,6 +106,8 @@ class _Base(unittest.TestCase):
             settings.agentaus_api_key,
             settings.agentaus_max_input_tokens,
         ) = self._saved
+        settings.max_input_tokens_is_explicit = self._saved_explicit
+        server_mod._reset_learned_limit()
 
     def _post(self, text: str, stream: bool, max_tokens: int = 64):
         from agentaus_bridge import server
@@ -276,6 +285,8 @@ class TestTrimReachesUpstream(unittest.TestCase):
         settings.agentaus_api_key = "k"
         settings.agentaus_max_input_tokens = 2000
         settings.agentaus_auto_trim = True
+        settings.max_input_tokens_is_explicit = True
+        server_mod._reset_learned_limit()
         try:
             messages = []
             for i in range(20):
@@ -291,8 +302,9 @@ class TestTrimReachesUpstream(unittest.TestCase):
             (settings.agentaus_base_url, settings.agentaus_api_key,
              settings.agentaus_max_input_tokens, settings.agentaus_auto_trim) = saved
 
-        self.assertEqual(len(self.received), 1, "upstream was not called")
-        sent = self.received[0]["messages"]
+        self.assertGreaterEqual(len(self.received), 1, "upstream was not called")
+        # Compaction summarises first, so the actual turn is the final request.
+        sent = self.received[-1]["messages"]
         self.assertLess(len(sent), len(messages),
                         "upstream got the full conversation - the trim was discarded")
         blob = json.dumps(sent)

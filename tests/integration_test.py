@@ -156,6 +156,29 @@ def main() -> int:
     check("oversized stream answers the final question",
           "STREAM_TRIMMED" in body_text.upper(), repr(body_text[:40]))
 
+    # --- 6b. the point of summarising rather than truncating ------------------
+    print("\n6b. Detail survives compaction")
+    facts = [
+        {"role": "user", "content":
+            "Remember these project facts: the bridge listens on port 9473, the config "
+            "lives at /etc/agentaus/bridge.toml, and we chose exponential backoff with a "
+            "12 second ceiling because the upstream rate-limits at 40 req/min."},
+        {"role": "assistant", "content":
+            "Noted: port 9473, /etc/agentaus/bridge.toml, 12s ceiling, 40 req/min."},
+    ]
+    msgs = facts + long_conversation(28, 3000)
+    msgs.append({"role": "user", "content":
+        "What port does the bridge listen on, where is its config file, and why did we "
+        "pick that backoff ceiling?"})
+    code, raw = call(url, {"model": "agentaus", "max_tokens": 300, "messages": msgs}, timeout=300)
+    reply = text_of(raw)
+    check("compacted conversation answers", code == 200, f"HTTP {code}")
+    # These facts live in the first message, which is always inside the compacted head.
+    # Truncation loses them; summarising is supposed to carry them through.
+    for fact, label in (("9473", "port"), ("bridge.toml", "config path"),
+                        ("40", "rate limit"), ("12", "backoff reason")):
+        check(f"detail preserved: {label}", fact in reply, fact)
+
     # --- 7. untrimmable input must fail loudly, not silently ------------------
     print("\n7. Single message too large to trim")
     code, raw = call(url, {"model": "agentaus", "max_tokens": 32,
