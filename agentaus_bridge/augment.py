@@ -34,6 +34,12 @@ CORE_GUIDANCE = """\
 
 Before writing any code, work out what the problem actually requires:
 
+0. Find out rather than assume. If a fact is knowable - what a file contains, what a
+function signature is, what a command returns, what a document says - get it and read
+it. Every assumption you make instead is a place the answer can be confidently wrong.
+When you genuinely cannot check something, say so explicitly rather than filling the
+gap with a plausible guess.
+
 1. Restate the requirement to yourself in one line, including anything implied but not
 spelled out - what should happen on empty input, zero, negatives, duplicates, a single
 element, the smallest and largest allowed values, and invalid input that should raise.
@@ -63,6 +69,11 @@ TOOL_GUIDANCE = """\
 7. Read before you edit. Never guess at an API, file path, function signature or flag -
 open it and look. If you have not read it, say so rather than assuming.
 
+7a. When you need information out of a document, a log, a config file or command
+output, read it and interpret it properly. Do not pattern-match a fragment and assume
+the rest - a regex over something you have not understood will look right on the case
+you tried and be wrong on the next one.
+
 8. Track what you have already done. Do not re-run a tool you have already run in this
 conversation unless the inputs genuinely changed; re-read the earlier result instead.
 Repeating a call you have already made wastes the turn and loses context.
@@ -90,9 +101,13 @@ missing, duplicate, unicode, very large input)
 Do not comment on style, naming or formatting. Do not suggest improvements to code \
 that is already correct.
 
-If the answer is sound, reply with exactly: OK
+Begin your reply with one of these two lines exactly:
 
-Otherwise list the defects, one per line, each with the specific fix.
+VERDICT: OK
+VERDICT: DEFECTS
+
+If DEFECTS, list them below that line, one per line, each with the specific fix.
+Say OK when the answer is sound - do not invent a defect to seem thorough.
 
 REQUEST:
 {request}
@@ -143,13 +158,48 @@ def with_guidance(system, body: dict | None = None) -> object:
     return system
 
 
-def review_says_ok(review: str) -> bool:
-    """Whether the reviewer found nothing worth changing.
+VERDICT_LINE = "VERDICT:"
 
-    Deliberately generous about what counts as approval: a model asked to reply "OK"
-    will pad it. Treating a padded approval as a defect list would trigger a pointless
-    rewrite of a correct answer, which is worse than skipping a marginal fix.
+ADJUDICATE_INSTRUCTION = """\
+Does the review below report any actual defect that needs fixing?
+
+Answer with exactly one word: YES or NO.
+
+REVIEW:
+{review}
+"""
+
+
+def declared_verdict(review: str) -> bool | None:
+    """Read the verdict the reviewer was asked to state.
+
+    Returns True for "sound", False for "has defects", or None when the reviewer did
+    not follow the format - in which case the caller asks the model rather than
+    guessing from the prose, because sniffing for the word "OK" misreads both
+    "OK, but the empty case is broken" and a bare approval wrapped in markdown.
     """
+    if not review:
+        return True
+    for line in review.strip().splitlines()[:3]:
+        stripped = line.strip().strip("`*_ \t")
+        if stripped.upper().startswith(VERDICT_LINE):
+            value = stripped[len(VERDICT_LINE):].strip().strip("`*_ .").upper()
+            if value.startswith("OK"):
+                return True
+            if value.startswith("DEFECT"):
+                return False
+    return None
+
+
+def review_says_ok(review: str) -> bool:
+    """Deterministic reading of a review verdict.
+
+    Kept for the case where no model call is available. `declared_verdict` is the
+    primary path; this is the last-resort fallback.
+    """
+    verdict = declared_verdict(review)
+    if verdict is not None:
+        return verdict
     if not review:
         return True
     cleaned = review.strip().strip("`*_ \t\n.").upper()

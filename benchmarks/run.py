@@ -96,12 +96,43 @@ def ask(prompt: str, *, max_tokens: int = 900, timeout: int = 300) -> str:
         return f"__ERROR__ {type(e).__name__}: {e}"
 
 
-def extract_code(answer: str) -> str:
-    """Pull the Python out of a reply that may be fenced or bare."""
+EXTRACT_PROMPT = """\
+Below is a reply containing a Python solution, possibly with commentary, fenced code \
+blocks, or a usage example alongside the real answer.
+
+Output the complete Python source needed to define `{entry}` and nothing else: no \
+fences, no commentary, no example calls. If several definitions are present, output \
+all of them. Do not modify the code in any way.
+
+REPLY:
+{answer}
+"""
+
+
+def extract_code_regex(answer: str) -> str:
+    """Deterministic fallback: take the longest fenced block, else the whole reply."""
     fenced = re.findall(r"```(?:python)?\s*\n(.*?)```", answer, re.S)
     if fenced:
         return max(fenced, key=len)
     return answer
+
+
+def extract_code(answer: str, entry: str = "", *, use_model: bool = True) -> str:
+    """Pull the runnable Python out of a reply.
+
+    Asks the model first. A regex over a reply whose shape you have not actually
+    checked works on the case you tried and silently mangles the next one - a reply
+    that fences a usage example after the real answer, or explains in prose containing
+    triple backticks. The regex remains as a fallback so extraction never fails.
+    """
+    if use_model and entry:
+        got = ask(EXTRACT_PROMPT.format(entry=entry, answer=answer[:12000]),
+                  max_tokens=1200, timeout=180)
+        if not got.startswith("__ERROR__"):
+            cleaned = re.sub(r"^```(?:python)?\s*\n|```\s*$", "", got.strip(), flags=re.M)
+            if entry in cleaned:
+                return cleaned
+    return extract_code_regex(answer)
 
 
 def run_tests(code: str, tests: str, entry: str) -> tuple[bool, str]:
@@ -238,7 +269,8 @@ def main() -> int:
                     results[name].append({"id": task["id"], "passed": False,
                                           "judge": None, "answer": "", "run": run_i})
                     continue
-                passed, detail = run_tests(extract_code(answer), task["tests"], task["entry"])
+                passed, detail = run_tests(extract_code(answer, task["entry"]),
+                                           task["tests"], task["entry"])
                 scores = None if args.no_judge else judge(task["prompt"], answer)
                 mark = "PASS" if passed else "FAIL"
                 extra = ""

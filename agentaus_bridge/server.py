@@ -24,9 +24,10 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .augment import (
+    ADJUDICATE_INSTRUCTION,
     REVIEW_INSTRUCTION,
     REVISE_INSTRUCTION,
-    review_says_ok,
+    declared_verdict,
     with_guidance,
     worth_reviewing,
 )
@@ -354,7 +355,19 @@ async def _self_review(client: httpx.AsyncClient, request_text: str, answer: str
         review = await _agentaus_summarise(
             client, REVIEW_INSTRUCTION.format(request=request_text[:12000], answer=answer[:12000])
         )
-        if review_says_ok(review):
+        verdict = declared_verdict(review)
+        if verdict is None:
+            # The reviewer did not follow the format. Ask it rather than guessing from
+            # the prose: sniffing for "OK" misreads both "OK, but the empty case is
+            # broken" and a bare approval wrapped in markdown, and the two mistakes
+            # fail in opposite directions.
+            adjudication = await _agentaus_summarise(
+                client, ADJUDICATE_INSTRUCTION.format(review=review[:6000])
+            )
+            verdict = not adjudication.strip().upper().startswith("YES")
+            log.info("review verdict was unstated; adjudicated as %s",
+                     "sound" if verdict else "defective")
+        if verdict:
             return answer
         revised = await _agentaus_summarise(
             client,

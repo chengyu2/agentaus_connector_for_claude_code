@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agentaus_bridge.augment import (  # noqa: E402
     CORE_GUIDANCE,
     TOOL_GUIDANCE,
+    declared_verdict,
     guidance_for,
     review_says_ok,
     with_guidance,
@@ -107,6 +108,63 @@ class TestReviewThreshold(unittest.TestCase):
     def test_threshold_is_configurable(self):
         self.assertTrue(worth_reviewing("x" * 50, min_chars=10))
         self.assertFalse(worth_reviewing("x" * 50, min_chars=100))
+
+
+class TestVerifyDontAssume(unittest.TestCase):
+    """The guidance must tell the model to find out rather than guess.
+
+    Assuming is the failure that produces confidently wrong answers, which are worse
+    than an admitted gap - the user acts on them.
+    """
+
+    def test_core_guidance_says_to_verify(self):
+        notes = guidance_for({})
+
+        self.assertIn("Find out rather than assume", notes)
+        self.assertIn("say so", notes, "must tell the model to admit what it cannot check")
+
+    def test_tool_guidance_warns_against_pattern_matching_documents(self):
+        notes = guidance_for({"tools": [{"name": "Read"}]})
+
+        self.assertIn("read it and interpret it properly", notes)
+
+
+class TestDeclaredVerdict(unittest.TestCase):
+    """Reading a stated verdict beats sniffing prose.
+
+    "OK, but the empty case is broken" and a bare "**OK**" both defeat a substring
+    check, and they fail in opposite directions - one discards a good answer, the other
+    ships a broken one.
+    """
+
+    def test_stated_verdicts_are_read(self):
+        self.assertIs(declared_verdict("VERDICT: OK"), True)
+        self.assertIs(declared_verdict("VERDICT: DEFECTS\n- empty case unhandled"), False)
+
+    def test_markdown_around_the_verdict_is_tolerated(self):
+        self.assertIs(declared_verdict("**VERDICT: OK**"), True)
+        self.assertIs(declared_verdict("`VERDICT: DEFECTS`\n- x"), False)
+
+    def test_a_verdict_later_in_the_reply_is_found(self):
+        self.assertIs(declared_verdict("Here is my review.\nVERDICT: OK"), True)
+
+    def test_missing_verdict_returns_none_so_the_caller_can_ask(self):
+        """None is the signal to adjudicate with a model call, not to guess."""
+        self.assertIsNone(declared_verdict("The code looks broadly fine to me."))
+
+    def test_the_ambiguous_case_that_motivated_this(self):
+        """A substring check reads this as approval; it is the opposite."""
+        review = "OK, but there is a real problem: median([]) raises IndexError."
+
+        self.assertIsNone(declared_verdict(review),
+                          "must defer rather than guess at an unformatted review")
+
+    def test_empty_review_is_treated_as_sound(self):
+        self.assertIs(declared_verdict(""), True)
+
+    def test_fallback_still_works_without_a_model(self):
+        self.assertTrue(review_says_ok("VERDICT: OK"))
+        self.assertFalse(review_says_ok("VERDICT: DEFECTS\n- broken"))
 
 
 if __name__ == "__main__":
