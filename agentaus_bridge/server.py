@@ -23,7 +23,15 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .augment import (
+    REVIEW_INSTRUCTION,
+    REVISE_INSTRUCTION,
+    review_says_ok,
+    with_guidance,
+    worth_reviewing,
+)
 from .compact import ConversationCompactor
+from .tokens import calibrator, has_tokeniser as _has_tokeniser
 from .config import settings
 from .translate import (
     AnthropicStreamBuilder,
@@ -31,6 +39,7 @@ from .translate import (
     agentaus_response_to_anthropic,
     anthropic_request_to_agentaus,
     estimate_request_tokens,
+    raw_token_count,
     sse,
     trim_messages_to_fit,
 )
@@ -96,6 +105,12 @@ async def healthz() -> JSONResponse:
             "passthrough": settings.passthrough_enabled,
             "anthropic_upstream": settings.anthropic_base_url,
             "model_markers": settings.agentaus_model_markers,
+            "context_limit": _context_limit(),
+            "tokeniser": "tiktoken" if _has_tokeniser() else "chars/4 fallback",
+            "token_calibration": {
+                "ratio": round(calibrator.ratio, 3),
+                "samples": calibrator.samples,
+            },
         }
     )
 
@@ -182,7 +197,10 @@ async def count_tokens(request: Request) -> Response:
 
 # Status codes worth a second attempt. These are gateway/capacity signals rather than
 # anything about the request itself, so replaying the identical body is safe.
-_RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
+# 520-527 are Cloudflare's own errors; Agentaus sits behind it and 524 (origin
+# timed out) is common on a long summarisation request.
+_RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504,
+                     520, 521, 522, 523, 524, 525, 526, 527}
 
 # Connection-level faults that never reached the application upstream. A DNS blip
 # ("nodename nor servname provided") arrives as ConnectError; a dropped keep-alive
@@ -326,6 +344,48 @@ async def _agentaus_summarise(client: httpx.AsyncClient, text: str) -> str:
     return ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
 
 
+async def _self_review(client: httpx.AsyncClient, request_text: str, answer: str) -> str:
+    """Have Agentaus critique its own answer and revise it if defects are found.
+
+    Returns the answer to use - the original when the review is clean, or a revision.
+    Any failure returns the original: a broken review must never lose a good answer.
+    """
+    try:
+        review = await _agentaus_summarise(
+            client, REVIEW_INSTRUCTION.format(request=request_text[:12000], answer=answer[:12000])
+        )
+        if review_says_ok(review):
+            return answer
+        revised = await _agentaus_summarise(
+            client,
+            REVISE_INSTRUCTION.format(
+                request=request_text[:12000], answer=answer[:12000], defects=review[:6000]
+            ),
+        )
+        if revised and revised.strip():
+            log.info("self-review revised the answer (%d -> %d chars)", len(answer), len(revised))
+            return revised.strip()
+    except Exception as exc:
+        log.warning("self-review failed (%s); keeping the original answer", exc)
+    return answer
+
+
+def _last_user_text(body: dict) -> str:
+    """The most recent user message, as the request the review judges against."""
+    for message in reversed(body.get("messages") or []):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [b.get("text", "") for b in content
+                     if isinstance(b, dict) and b.get("type") == "text"]
+            if parts:
+                return "\n".join(parts)
+    return ""
+
+
 def _get_compactor(request: Request) -> ConversationCompactor:
     """One compactor per process, so its summary cache survives between turns.
 
@@ -335,9 +395,34 @@ def _get_compactor(request: Request) -> ConversationCompactor:
     existing = getattr(request.app.state, "compactor", None)
     if existing is None:
         client = request.app.state.client
-        existing = ConversationCompactor(lambda text: _agentaus_summarise(client, text))
+        existing = ConversationCompactor(
+            lambda text: _agentaus_summarise(client, text),
+            max_concurrency=settings.agentaus_summary_concurrency,
+            verify=settings.agentaus_verify_summary,
+        )
         request.app.state.compactor = existing
     return existing
+
+
+def _calibrate_from_usage(body: dict, usage: dict | None) -> None:
+    """Compare our count of a request against the count Agentaus charged for it.
+
+    This is the only ground truth available: Agentaus does not publish its tokeniser,
+    so the ratio between our count and its reported `input_tokens` is what makes the
+    context arithmetic converge on reality.
+    """
+    if not isinstance(usage, dict):
+        return
+    reported = usage.get("input_tokens")
+    if not isinstance(reported, int) or reported <= 0:
+        return
+    counted = raw_token_count(
+        json.dumps(
+            {"s": body.get("system"), "m": body.get("messages"), "t": body.get("tools")},
+            default=str,
+        )
+    )
+    calibrator.observe(counted, reported)
 
 
 def _with_summary(system, summary: str, replaced: int):
@@ -424,9 +509,16 @@ async def _handle_agentaus(
         estimated = estimate_request_tokens(body)
         original_estimate = estimated
         reserved = int(body.get("max_tokens") or 0)
-        if estimated + reserved > limit and settings.agentaus_auto_trim:
+        threshold = settings.agentaus_compact_threshold
+        needs_compaction = estimated + reserved > int(limit * threshold)
+        if needs_compaction and settings.agentaus_auto_trim:
             plan = await _get_compactor(request).compact(
-                body, limit=limit, reserve=reserved
+                body,
+                limit=limit,
+                reserve=reserved,
+                keep_fraction=settings.agentaus_keep_fraction,
+                threshold=threshold,
+                chunk_tokens=settings.agentaus_summary_chunk_tokens,
             )
             if plan["method"] == "summarised":
                 body = {**body, "messages": plan["messages"]}
@@ -479,6 +571,11 @@ async def _handle_agentaus(
                 f"(Set AGENTAUS_MAX_INPUT_TOKENS to change this limit.)",
             )
 
+    # Supplement the system prompt for Agentaus only. Claude turns never reach here -
+    # they are forwarded untouched by _passthrough.
+    if settings.agentaus_guidance:
+        body = {**body, "system": with_guidance(body.get("system"))}
+
     # Built only after the context guard, so any trimming above is reflected in what
     # actually gets sent. Building it earlier silently discarded the trim.
     payload = anthropic_request_to_agentaus(
@@ -517,6 +614,24 @@ async def _handle_agentaus(
                 data["error"].get("type") or "api_error",
                 _agentaus_error_text(data["error"]),
             )
+
+        _calibrate_from_usage(body, data.get("usage"))
+
+        # Review only a plain text answer. A turn that calls tools is mid-task, and
+        # rewriting it would break the tool_use the client is waiting on.
+        choice0 = (data.get("choices") or [{}])[0]
+        msg0 = choice0.get("message") or {}
+        if (
+            settings.agentaus_self_review
+            and not msg0.get("tool_calls")
+            and worth_reviewing(msg0.get("content") or "",
+                                min_chars=settings.agentaus_review_min_chars)
+        ):
+            reviewed = await _self_review(client, _last_user_text(body), msg0["content"])
+            if reviewed != msg0["content"]:
+                msg0 = {**msg0, "content": reviewed}
+                data = {**data, "choices": [{**choice0, "message": msg0}]
+                        + list((data.get("choices") or [])[1:])}
 
         message = agentaus_response_to_anthropic(data, model=display_model)
         log.info(
@@ -563,9 +678,15 @@ async def _agentaus_event_stream(
     # client has only seen `message_start`, which carries no content. Once any text or
     # tool call has been emitted a retry would duplicate it, so `emitted` latches the
     # stream to fail-fast from that point on.
+    # Buffer the answer when it may need revising. Tool turns are never buffered:
+    # they carry no prose to review and the client is waiting on the tool_use.
+    buffering = settings.agentaus_self_review
+    pending: list[str] = []
+
     attempt = 0
     while True:
         emitted = False
+        pending = []
         finish_reason = None
         usage = None
         accumulator = ToolCallAccumulator()
@@ -624,8 +745,15 @@ async def _agentaus_event_stream(
                                 delta = choice.get("delta") or {}
                                 text = delta.get("content")
                                 if text:
-                                    emitted = True
-                                    yield builder.text(text)
+                                    if buffering:
+                                        # Held back rather than streamed: an answer
+                                        # already on screen cannot be revised. Agentaus
+                                        # sends its reply in one piece anyway, so this
+                                        # costs little in practice.
+                                        pending.append(text)
+                                    else:
+                                        emitted = True
+                                        yield builder.text(text)
                                 if delta.get("tool_calls"):
                                     emitted = True
                                     accumulator.add(delta["tool_calls"])
@@ -658,8 +786,11 @@ async def _agentaus_event_stream(
                 choice = (data.get("choices") or [{}])[0]
                 message = choice.get("message") or {}
                 if message.get("content"):
-                    emitted = True
-                    yield builder.text(message["content"])
+                    if buffering:
+                        pending.append(message["content"])
+                    else:
+                        emitted = True
+                        yield builder.text(message["content"])
                 accumulator.add(
                     [{"index": i, **call} for i, call in enumerate(message.get("tool_calls") or [])]
                 )
@@ -680,9 +811,18 @@ async def _agentaus_event_stream(
             continue
         break
 
+    answer = "".join(pending)
+    if buffering and answer:
+        if not accumulator.pending() and worth_reviewing(
+            answer, min_chars=settings.agentaus_review_min_chars
+        ):
+            answer = await _self_review(client, _last_user_text(original), answer)
+        yield builder.text(answer)
+
     for call in accumulator.drain():
         yield builder.tool_use(call["id"], call["name"], call["arguments"])
 
+    _calibrate_from_usage(original, usage)
     yield builder.finish(finish_reason, usage)
     log.info(
         "POST /v1/messages model=%s route=agentaus stream=true -> 200 in %.1fs finish=%s usage=%s",

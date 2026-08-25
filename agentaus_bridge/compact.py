@@ -23,8 +23,11 @@ detaches tool_result blocks from the tool_use they answer.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import re
+import unicodedata
 import logging
 from collections import OrderedDict
 from typing import Awaitable, Callable
@@ -50,7 +53,7 @@ Preserve, exactly as written wherever they appear:
 - Any values that later steps depend on: ports, URLs, identifiers, limits
 
 Rules:
-- Never invent detail that is not present. Omission is fine; fabrication is not.
+- Never invent detail that is not present. Omission is fine; fabrication is not.\n- Reproduce every identifier EXACTLY: file paths, names, flags, versions, region\n  codes. Use plain ASCII hyphens and quotes, never typographic ones, and never\n  wrap an identifier in $$. Put identifiers in backticks.
 - Keep specifics over generalities: "set BRIDGE_PORT=9100 in .env" beats "changed config".
 - Use terse bullet points grouped under short headings.
 - Do not add commentary, preamble, or a closing summary.
@@ -58,7 +61,71 @@ Rules:
 Conversation to compact:
 """
 
+
+# A single summarising pass reliably drops specifics. This second pass shows the model
+# the source again alongside the summary and asks only "what is missing" - a much
+# easier question to answer well than "summarise this", and it recovers detail the
+# first pass elided.
+GAP_INSTRUCTION = """\
+Below is a SUMMARY of part of a software engineering conversation, followed by the \
+ORIGINAL text it was made from.
+
+List any concrete facts present in the ORIGINAL but missing from the SUMMARY. Focus on:
+file paths, function and variable names, commands, flags, version numbers, ports, URLs, \
+numeric limits, decisions and the reasons for them, bugs and their root causes, and \
+anything stated as a requirement or constraint.
+
+Output only the missing facts as terse bullet points. If nothing of substance is \
+missing, output exactly: NONE
+
+"""
+
+# Merging concatenated per-chunk summaries produces repetition and loses ordering.
+# Asking the model to reorganise them keeps the record readable as one account.
+MERGE_INSTRUCTION = """\
+The following are summaries of consecutive parts of one software engineering \
+conversation. Merge them into a single coherent record.
+
+- Keep every specific fact: paths, identifiers, commands, numbers, decisions and reasons.
+- Remove duplication, but never drop a detail that appears only once.
+- Preserve chronological order where it matters, and group related points under headings.
+- Do not add anything that is not present below.
+
+"""
+
+
 Summariser = Callable[[str], Awaitable[str]]
+
+
+
+# Models reformat punctuation when they write prose: ASCII hyphens become U+2011
+# NON-BREAKING HYPHEN, quotes become curly, and identifiers sometimes arrive wrapped
+# in $$...$$ as though they were mathematics. Observed from Agentaus:
+#
+#     EU-WEST-2        -> EU\u2011WEST\u20112
+#     retry_budget_ms  -> $$retry_budget_ms$$
+#
+# In prose that is cosmetic. In a summary that a coding agent will read back and act
+# on, it is corruption: a region code or file path carrying a typographic hyphen looks
+# correct and is not, which is worse than it being missing. Normalising deterministically
+# is more reliable than asking the model not to do it.
+_TYPOGRAPHIC = {
+    "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-",
+    "\u2212": "-", "\u00a0": " ", "\u202f": " ",
+    "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
+}
+
+_MATH_WRAPPED = re.compile(r"\$\$\s*([^$\n]{1,120}?)\s*\$\$")
+
+
+def normalise_identifiers(text: str) -> str:
+    """Undo typographic substitutions so identifiers survive verbatim."""
+    if not text:
+        return text
+    text = unicodedata.normalize("NFKC", text)
+    for fancy, plain in _TYPOGRAPHIC.items():
+        text = text.replace(fancy, plain)
+    return _MATH_WRAPPED.sub(r"`\1`", text)
 
 
 def _clean_turn_start(message: dict) -> bool:
@@ -134,31 +201,79 @@ def render_for_summary(messages: list) -> str:
     return "\n".join(lines)
 
 
-def _chunk(text: str, budget_tokens: int) -> list[str]:
-    """Split text into pieces that each fit a summarisation call, on line boundaries."""
+def _chunk(text: str, budget_tokens: int, *, overlap_ratio: float = 0.08) -> list[str]:
+    """Split text into pieces that each fit one summarisation call.
+
+    Sizing is by characters throughout, never by line count. `render_for_summary`
+    emits one line per message, and a single message can be tens of thousands of
+    characters, so a line-counted overlap carries far more than intended: an earlier
+    version overlapped 30 lines and produced chunks six times larger than the model's
+    entire context window, which the API rejected outright.
+
+    A line longer than the budget on its own is hard-split rather than emitted whole,
+    for the same reason.
+    """
     budget_chars = max(budget_tokens * 4, 2000)
-    chunks, current, size = [], [], 0
+    overlap_chars = int(budget_chars * overlap_ratio)
+
+    units: list[str] = []
     for line in text.splitlines():
-        line_size = len(line) + 1
-        if current and size + line_size > budget_chars:
+        if len(line) <= budget_chars:
+            units.append(line)
+        else:
+            for i in range(0, len(line), budget_chars):
+                units.append(line[i:i + budget_chars])
+
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    for unit in units:
+        cost = len(unit) + 1
+        if current and size + cost > budget_chars:
             chunks.append("\n".join(current))
-            current, size = [], 0
-        current.append(line)
-        size += line_size
+            # Carry back a bounded tail so a point made either side of the boundary
+            # reaches one summariser whole.
+            carry: list[str] = []
+            carried = 0
+            for previous in reversed(current):
+                if carried + len(previous) + 1 > overlap_chars:
+                    break
+                carry.insert(0, previous)
+                carried += len(previous) + 1
+            current, size = carry, carried
+        current.append(unit)
+        size += cost
     if current:
         chunks.append("\n".join(current))
     return chunks
 
 
 class ConversationCompactor:
-    """Summarises the head of a conversation, caching by content hash."""
+    """Replaces the head of a conversation with a summary produced by the model.
 
-    def __init__(self, summarise: Summariser, *, cache_size: int = 32) -> None:
+    Quality is chosen over economy throughout: chunks are summarised concurrently, a
+    second pass re-reads the source to recover specifics the first pass dropped, and
+    partial summaries are merged by the model rather than concatenated. The expensive
+    result is cached by content hash, so the cost lands once per boundary move rather
+    than once per turn.
+    """
+
+    def __init__(
+        self,
+        summarise: Summariser,
+        *,
+        cache_size: int = 64,
+        max_concurrency: int = 8,
+        verify: bool = True,
+    ) -> None:
         self._summarise = summarise
         self._cache: OrderedDict[str, str] = OrderedDict()
         self._cache_size = cache_size
+        self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._verify = verify
         self.hits = 0
         self.misses = 0
+        self.calls = 0
 
     @staticmethod
     def _key(messages: list) -> str:
@@ -172,12 +287,48 @@ class ConversationCompactor:
         while len(self._cache) > self._cache_size:
             self._cache.popitem(last=False)
 
-    async def summarise_head(self, head: list, *, chunk_budget: int) -> str:
-        """Summarise `head`, reusing a cached result when the same prefix recurs.
+    async def _call(self, prompt: str) -> str:
+        """One summariser call, bounded by the concurrency limit."""
+        async with self._semaphore:
+            self.calls += 1
+            return (await self._summarise(prompt)) or ""
 
-        A head larger than one call can hold is summarised in pieces and the pieces
-        summarised again, so arbitrarily long histories reduce in bounded steps.
+    @staticmethod
+    def _raw_fallback(chunk: str, limit: int = 6000) -> str:
+        """Last resort when a chunk cannot be summarised at all.
+
+        Passing the raw head through, truncated, keeps its facts in play. Returning
+        nothing would silently delete that slice of the conversation, which is the
+        failure this whole module exists to prevent.
         """
+        if len(chunk) <= limit:
+            body = chunk
+        else:
+            # Keep both ends: openings carry decisions, closings carry outcomes.
+            half = limit // 2
+            body = chunk[:half] + "\n[...]\n" + chunk[-half:]
+        return "[Unsummarised excerpt - the summariser failed on this section]\n" + body
+
+    async def _summarise_chunk(self, chunk: str, index: int, total: int) -> str:
+        label = f" (part {index} of {total})" if total > 1 else ""
+        summary = normalise_identifiers(
+            (await self._call(SUMMARY_INSTRUCTION + label + "\n" + chunk)).strip()
+        )
+        if not self._verify:
+            return summary
+
+        # Second pass: ask what the first pass missed, and fold it back in. This is
+        # the single biggest fidelity win - "what is missing" is a far easier question
+        # for the model than "summarise well".
+        gaps = normalise_identifiers((await self._call(
+            GAP_INSTRUCTION + "SUMMARY:\n" + summary + "\n\nORIGINAL:\n" + chunk
+        )).strip())
+        if gaps and gaps.upper().strip().rstrip(".") != "NONE":
+            summary = summary + "\nAdditional details:\n" + gaps
+        return summary
+
+    async def summarise_head(self, head: list, *, chunk_budget: int) -> str:
+        """Summarise `head`, reusing a cached result when the same prefix recurs."""
         key = self._key(head)
         cached = self._cache.get(key)
         if cached is not None:
@@ -189,30 +340,75 @@ class ConversationCompactor:
         text = render_for_summary(head)
         pieces = _chunk(text, chunk_budget)
 
-        summaries = []
-        for i, piece in enumerate(pieces, 1):
-            label = f" (part {i} of {len(pieces)})" if len(pieces) > 1 else ""
-            summaries.append(await self._summarise(SUMMARY_INSTRUCTION + label + "\n" + piece))
+        # Concurrent: a long history is many independent calls, and doing them in
+        # sequence is the difference between seconds and minutes of visible latency.
+        #
+        # return_exceptions is essential. Without it a single failed chunk - one
+        # Cloudflare 524 out of nineteen calls - propagates and discards every other
+        # summary that succeeded, and the whole conversation is lost to the fallback.
+        raw = await asyncio.gather(*[
+            self._summarise_chunk(piece, i, len(pieces))
+            for i, piece in enumerate(pieces, 1)
+        ], return_exceptions=True)
 
-        summary = "\n".join(s.strip() for s in summaries if s and s.strip())
+        summaries: list[str] = []
+        failures = 0
+        for piece, result in zip(pieces, raw):
+            if isinstance(result, BaseException) or not str(result).strip():
+                failures += 1
+                log.warning("chunk summarisation failed (%s); keeping a raw excerpt",
+                            type(result).__name__ if isinstance(result, BaseException)
+                            else "empty reply")
+                summaries.append(self._raw_fallback(piece))
+            else:
+                summaries.append(str(result))
 
-        # Collapse again if summarising in pieces produced more than will fit.
+        if failures:
+            log.warning("%d of %d chunks fell back to raw excerpts", failures, len(pieces))
+        if failures == len(pieces):
+            raise RuntimeError("every chunk failed to summarise")
+
+        if len(summaries) == 1:
+            summary = summaries[0]
+        else:
+            joined = "\n\n---\n\n".join(summaries)
+            # Merged by the model rather than concatenated: consecutive chunks overlap,
+            # so raw concatenation repeats itself and reads as several disjoint records.
+            summary = normalise_identifiers(
+                (await self._call(MERGE_INSTRUCTION + joined)).strip()
+            ) or joined
+
+        # Condense only if the summary itself will not fit a call. Condensing merely
+        # because it exceeds one chunk's budget would throw away detail that had room
+        # to survive - each pass loses something.
         rounds = 0
-        while estimate_tokens(summary) > chunk_budget and len(summaries) > 1 and rounds < 2:
-            summary = (await self._summarise(SUMMARY_INSTRUCTION + "\n" + summary)).strip()
+        ceiling = max(chunk_budget * 3, 12000)
+        while estimate_tokens(summary) > ceiling and rounds < 3:
+            summary = normalise_identifiers((await self._call(MERGE_INSTRUCTION + summary)).strip())
             rounds += 1
 
         self._remember(key, summary)
         return summary
 
     async def compact(
-        self, body: dict, *, limit: int, reserve: int, keep_fraction: float = 0.5
+        self,
+        body: dict,
+        *,
+        limit: int,
+        reserve: int,
+        keep_fraction: float = 0.5,
+        threshold: float = 1.0,
+        chunk_tokens: int | None = None,
     ) -> dict:
         """Return a plan describing how to fit `body` into `limit`.
 
-        Keys: `messages`, `summary` (or None), `summarised` (count), `method`.
-        `method` is "none", "summarised", or "trimmed" when summarising could not
-        make it fit and the head had to be dropped instead.
+        `threshold` compacts before the window is actually full - at 0.8, compaction
+        happens at 80% occupancy. Waiting for the hard limit means every turn near the
+        boundary runs with almost no headroom for the reply, and one large tool result
+        tips it over into a failure the user sees.
+
+        Keys: `messages`, `summary` (or None), `summarised`, `method`
+        ("none" | "summarised" | "trimmed").
         """
         messages = list(body.get("messages") or [])
         overhead = estimate_request_tokens(
@@ -225,7 +421,8 @@ class ConversationCompactor:
                 {"system": body.get("system"), "messages": msgs, "tools": body.get("tools")}
             ) + estimate_tokens(summary) + reserve
 
-        if total(messages) <= limit:
+        trigger = int(limit * threshold)
+        if total(messages) <= trigger:
             return {"messages": messages, "summary": None, "summarised": 0, "method": "none"}
 
         keep_tokens = max(int(budget * keep_fraction), 512)
@@ -236,7 +433,9 @@ class ConversationCompactor:
 
         summary = ""
         try:
-            summary = await self.summarise_head(head, chunk_budget=max(budget // 4, 1000))
+            summary = await self.summarise_head(
+                head, chunk_budget=chunk_tokens or max(budget // 4, 1000)
+            )
         except Exception as exc:  # fall back rather than fail the turn
             log.warning("summarisation failed (%s); falling back to trimming", exc)
 

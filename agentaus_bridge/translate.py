@@ -10,6 +10,8 @@ Direction B  Agentaus -> Claude Code:  agentaus_response_to_anthropic()  (non-st
 from __future__ import annotations
 
 import json
+
+from .tokens import calibrator, count_tokens
 import uuid
 from typing import Any, Iterable
 
@@ -216,8 +218,19 @@ def _parse_arguments(raw: Any) -> dict:
 
 
 def estimate_tokens(text: str) -> int:
-    """Rough char/4 heuristic; Agentaus exposes no tokenizer endpoint."""
-    return max(1, len(text) // 4)
+    """Token count for `text`.
+
+    Uses a real BPE tokeniser where available, corrected by what Agentaus reports for
+    requests we have already counted. Characters-over-four under-counts dense code and
+    JSON by roughly half, which is the difference between a request that fits and one
+    the API rejects.
+    """
+    return calibrator.adjust(count_tokens(text))
+
+
+def raw_token_count(text: str) -> int:
+    """Uncalibrated count, for comparing against what Agentaus reports."""
+    return count_tokens(text)
 
 
 def estimate_request_tokens(body: dict) -> int:
@@ -498,6 +511,14 @@ class ToolCallAccumulator:
                 slot["name"] = fn["name"]
             if fn.get("arguments"):
                 slot["arguments"] += fn["arguments"]
+
+    def pending(self) -> bool:
+        """Whether any tool call has been accumulated.
+
+        Used to decide whether a turn is prose that may be revised, or a tool call the
+        client is waiting on and which must be passed through untouched.
+        """
+        return bool(self._calls)
 
     def drain(self) -> list[dict]:
         ordered = [self._calls[key] for key in sorted(self._calls)]

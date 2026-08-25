@@ -101,22 +101,22 @@ class Settings:
     chunk_chars: int = field(default_factory=lambda: _int("BRIDGE_CHUNK_CHARS", 60))
 
     # --- timeouts -----------------------------------------------------------------
-    connect_timeout: float = field(default_factory=lambda: float(_int("BRIDGE_CONNECT_TIMEOUT", 15)))
-    read_timeout: float = field(default_factory=lambda: float(_int("BRIDGE_READ_TIMEOUT", 600)))
+    connect_timeout: float = field(default_factory=lambda: float(_int("BRIDGE_CONNECT_TIMEOUT", 30)))
+    read_timeout: float = field(default_factory=lambda: float(_int("BRIDGE_READ_TIMEOUT", 1800)))
 
     # --- retries ------------------------------------------------------------------
     # Transient upstream failures (DNS blips, connection resets, 502/503/504 from a
     # gateway) otherwise surface in Claude Code as a hard "API Error 502" that kills
     # the turn. Retrying is only safe before any content has been emitted, which the
     # streaming path enforces.
-    max_retries: int = field(default_factory=lambda: _int("BRIDGE_MAX_RETRIES", 2))
+    max_retries: int = field(default_factory=lambda: _int("BRIDGE_MAX_RETRIES", 4))
     retry_backoff_seconds: float = field(
         default_factory=lambda: _float("BRIDGE_RETRY_BACKOFF", 0.5)
     )
     # Ceiling on a single backoff wait. Claude Code gives up on a silent stream at
     # 300s, so unbounded doubling would trade a fast error for a hung turn.
     retry_max_delay_seconds: float = field(
-        default_factory=lambda: _float("BRIDGE_RETRY_MAX_DELAY", 8.0)
+        default_factory=lambda: _float("BRIDGE_RETRY_MAX_DELAY", 30.0)
     )
 
     # --- Agentaus context window ---------------------------------------------------
@@ -147,6 +147,55 @@ class Settings:
     # in the window. Set false to get the error instead of silent trimming.
     agentaus_auto_trim: bool = field(
         default_factory=lambda: _bool("AGENTAUS_AUTO_TRIM", True)
+    )
+    # Compact at this fraction of the window rather than waiting for it to be full.
+    # Running a turn at 99% leaves no headroom: one large tool result tips it over and
+    # the user sees a failure. Compacting at 80% keeps a working margin.
+    agentaus_compact_threshold: float = field(
+        default_factory=lambda: _float("AGENTAUS_COMPACT_THRESHOLD", 0.8)
+    )
+    # How much of the budget stays verbatim. The rest becomes the summarised head.
+    agentaus_keep_fraction: float = field(
+        default_factory=lambda: _float("AGENTAUS_KEEP_FRACTION", 0.5)
+    )
+    # Re-read the source after summarising to recover specifics the first pass missed.
+    # Costs an extra call per chunk and is the largest single fidelity gain.
+    agentaus_verify_summary: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_VERIFY_SUMMARY", True)
+    )
+    # Concurrent summarisation calls. Higher is faster on long histories.
+    agentaus_summary_concurrency: int = field(
+        default_factory=lambda: _int("AGENTAUS_SUMMARY_CONCURRENCY", 8)
+    )
+    # Tokens of conversation per summarisation call. Smaller means more calls, but
+    # each returns faster and is far less likely to hit an origin timeout - a 32k
+    # chunk took long enough that Cloudflare answered 524. Smaller chunks also raise
+    # fidelity: a fact is a larger share of its chunk, so it is less likely to be
+    # judged unimportant and dropped.
+    agentaus_summary_chunk_tokens: int = field(
+        default_factory=lambda: _int("AGENTAUS_SUMMARY_CHUNK_TOKENS", 6000)
+    )
+
+    # --- Agentaus compensation ------------------------------------------------------
+    # Applied ONLY to Agentaus turns. Claude models keep default Claude Code behaviour:
+    # the compensation exists for a specific capability gap, and adding it where there
+    # is no gap would only cost latency.
+    #
+    # Supplement Claude Code's system prompt with operating notes aimed at the failure
+    # modes actually observed from Agentaus - repeated tool calls, guessing at APIs,
+    # happy-path-only code, editing before planning.
+    agentaus_guidance: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_GUIDANCE", True)
+    )
+    # Have the model review its own answer and revise it when defects are found.
+    # "What is wrong with this?" is a much easier question for a smaller model than
+    # getting it right first time, which is what makes the extra round trip pay.
+    agentaus_self_review: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_SELF_REVIEW", True)
+    )
+    # Answers shorter than this skip the review: they are usually acknowledgements.
+    agentaus_review_min_chars: int = field(
+        default_factory=lambda: _int("AGENTAUS_REVIEW_MIN_CHARS", 200)
     )
 
     # --- misc ---------------------------------------------------------------------

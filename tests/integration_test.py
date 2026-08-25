@@ -16,10 +16,25 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import unicodedata
 import urllib.error
 import urllib.request
 
 PASS, FAIL = "  PASS", "  FAIL"
+
+
+def normalise(text: str) -> str:
+    """Fold typographic punctuation to ASCII before matching.
+
+    Models write EU-WEST-2 as EU\u2011WEST\u20112. A naive substring check reports the
+    fact as lost when it is present, which sent an earlier investigation chasing a
+    summarisation bug that did not exist.
+    """
+    text = unicodedata.normalize("NFKC", text)
+    for dash in "\u2010\u2011\u2012\u2013\u2014\u2212":
+        text = text.replace(dash, "-")
+    return text.lower()
+
 results: list[bool] = []
 
 
@@ -160,24 +175,30 @@ def main() -> int:
     print("\n6b. Detail survives compaction")
     facts = [
         {"role": "user", "content":
-            "Remember these project facts: the bridge listens on port 9473, the config "
-            "lives at /etc/agentaus/bridge.toml, and we chose exponential backoff with a "
-            "12 second ceiling because the upstream rate-limits at 40 req/min."},
-        {"role": "assistant", "content":
-            "Noted: port 9473, /etc/agentaus/bridge.toml, 12s ceiling, 40 req/min."},
+            "Remember these project facts: the bridge listens on port 9473; config at "
+            "/etc/agentaus/bridge.toml; upstream rate-limits at 40 req/min so we chose "
+            "exponential backoff with a 12 second ceiling; the database is PostgreSQL "
+            "16.3; the tuning knob is retry_budget_ms; Kowalski owns the deployment "
+            "runbook; we deploy to EU-WEST-2 for data residency."},
+        {"role": "assistant", "content": "All noted."},
     ]
     msgs = facts + long_conversation(28, 3000)
     msgs.append({"role": "user", "content":
-        "What port does the bridge listen on, where is its config file, and why did we "
-        "pick that backoff ceiling?"})
-    code, raw = call(url, {"model": "agentaus", "max_tokens": 300, "messages": msgs}, timeout=300)
+        "From the earlier project facts, answer concisely: what port does the bridge "
+        "listen on; where is its config file; what is the upstream rate limit; what is "
+        "the backoff ceiling; which database version; what is the tuning knob called; "
+        "who owns the deployment runbook; which region do we deploy to?"})
+    code, raw = call(url, {"model": "agentaus", "max_tokens": 600, "messages": msgs}, timeout=900)
     reply = text_of(raw)
     check("compacted conversation answers", code == 200, f"HTTP {code}")
     # These facts live in the first message, which is always inside the compacted head.
     # Truncation loses them; summarising is supposed to carry them through.
+    reply_n = normalise(reply)
     for fact, label in (("9473", "port"), ("bridge.toml", "config path"),
-                        ("40", "rate limit"), ("12", "backoff reason")):
-        check(f"detail preserved: {label}", fact in reply, fact)
+                        ("40", "rate limit"), ("12", "backoff ceiling"),
+                        ("16.3", "db version"), ("retry_budget_ms", "tuning knob"),
+                        ("Kowalski", "owner"), ("EU-WEST-2", "region")):
+        check(f"detail preserved: {label}", normalise(fact) in reply_n, fact)
 
     # --- 7. untrimmable input must fail loudly, not silently ------------------
     print("\n7. Single message too large to trim")

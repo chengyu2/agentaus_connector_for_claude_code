@@ -185,3 +185,176 @@ class TestCompaction(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestQualityDesign(unittest.TestCase):
+    """Behaviours chosen for fidelity and latency rather than economy."""
+
+    def test_chunks_are_summarised_concurrently(self):
+        """Sequential calls on a long history are minutes of visible latency."""
+        import asyncio as aio
+
+        in_flight = {"now": 0, "peak": 0}
+
+        async def slow(_: str) -> str:
+            in_flight["now"] += 1
+            in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+            await aio.sleep(0.02)
+            in_flight["now"] -= 1
+            return "s"
+
+        c = ConversationCompactor(slow, verify=False)
+        run(c.compact({"messages": convo(300), "system": "s"}, limit=4000, reserve=100))
+
+        self.assertGreater(in_flight["peak"], 1, "summarisation ran one chunk at a time")
+
+    def test_concurrency_is_bounded(self):
+        """Unbounded fan-out on a very long history would hammer the API."""
+        import asyncio as aio
+
+        in_flight = {"now": 0, "peak": 0}
+
+        async def slow(_: str) -> str:
+            in_flight["now"] += 1
+            in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+            await aio.sleep(0.01)
+            in_flight["now"] -= 1
+            return "s"
+
+        c = ConversationCompactor(slow, max_concurrency=3, verify=False)
+        run(c.compact({"messages": convo(400), "system": "s"}, limit=4000, reserve=100))
+
+        self.assertLessEqual(in_flight["peak"], 3)
+
+    def test_verification_pass_recovers_missed_detail(self):
+        """The gap pass exists to catch what a single summarising pass drops."""
+        seen_prompts = []
+
+        async def summariser(text: str) -> str:
+            seen_prompts.append(text)
+            if text.startswith("Below is a SUMMARY"):
+                return "- the port is 9473"      # the gap pass finds a missed fact
+            if text.startswith("The following are summaries"):
+                # Merge must carry its input through, or it would mask what the
+                # earlier passes produced and this test would prove nothing.
+                return text.split("\n\n", 1)[-1]
+            return "generic summary with no specifics"
+
+        c = ConversationCompactor(summariser, verify=True)
+        plan = run(c.compact({"messages": convo(40), "system": "s"}, limit=3000, reserve=100))
+
+        self.assertIn("9473", plan["summary"], "recovered detail was not folded back in")
+        self.assertTrue(any(p.startswith("Below is a SUMMARY") for p in seen_prompts),
+                        "no verification pass was made")
+
+    def test_verification_ignores_an_explicit_nothing_missing(self):
+        async def summariser(text: str) -> str:
+            if text.startswith("Below is a SUMMARY"):
+                return "NONE"
+            if text.startswith("The following are summaries"):
+                return text.split("\n\n", 1)[-1]
+            return "real summary"
+
+        c = ConversationCompactor(summariser, verify=True)
+        plan = run(c.compact({"messages": convo(40), "system": "s"}, limit=3000, reserve=100))
+
+        self.assertNotIn("NONE", plan["summary"], "the sentinel leaked into the summary")
+
+    def test_compaction_happens_before_the_window_is_full(self):
+        """At 100% occupancy a single large tool result tips the next turn over."""
+        from agentaus_bridge.translate import estimate_request_tokens
+
+        counter = _Counter()
+        c = ConversationCompactor(counter, verify=False)
+        body = {"messages": convo(40), "system": "s"}
+        size = estimate_request_tokens(body)
+
+        # A window the conversation fits inside with room to spare: at threshold 1.0
+        # nothing should happen, but at 0.5 the trigger is below the current size and
+        # the keep-budget is smaller than the conversation, so it must compact.
+        limit = int(size * 1.6)
+        under = run(c.compact(body, limit=limit, reserve=100, threshold=1.0))
+        early = run(c.compact(body, limit=limit, reserve=100, threshold=0.5))
+
+        self.assertEqual(under["method"], "none", "fits comfortably, should not compact")
+        self.assertEqual(early["method"], "summarised", "threshold did not trigger early")
+
+    def test_chunks_overlap_so_boundaries_are_not_lost(self):
+        """A decision explained across a chunk boundary must reach one summariser whole."""
+        from agentaus_bridge.compact import _chunk
+
+        text = "\n".join(f"line {i}" for i in range(400))
+        pieces = _chunk(text, 200, overlap_ratio=0.25)
+
+        self.assertGreater(len(pieces), 1)
+        tail_of_first = pieces[0].splitlines()[-5:]
+        self.assertTrue(any(line in pieces[1] for line in tail_of_first),
+                        "consecutive chunks share no context")
+
+    def test_partial_summaries_are_merged_by_the_model(self):
+        """Concatenating overlapping chunk summaries repeats itself."""
+        prompts = []
+
+        async def summariser(text: str) -> str:
+            prompts.append(text)
+            return "chunk summary"
+
+        c = ConversationCompactor(summariser, verify=False)
+        run(c.compact({"messages": convo(300), "system": "s"}, limit=4000, reserve=100))
+
+        self.assertTrue(any("Merge them into a single coherent record" in p for p in prompts),
+                        "partial summaries were concatenated rather than merged")
+
+
+class TestChunkSizing(unittest.TestCase):
+    """Chunks must fit the summariser's own context window.
+
+    Regression: `render_for_summary` emits one line per message and a message can be
+    tens of thousands of characters, so overlapping by a *line count* carried far more
+    than intended. Chunks grew past the model's entire window, every summarisation call
+    came back HTTP 400, and compaction silently degraded to dropping the history - the
+    exact detail loss the summarising was added to prevent.
+    """
+
+    def test_no_chunk_exceeds_the_budget(self):
+        from agentaus_bridge.compact import _chunk, render_for_summary
+
+        msgs = [{"role": "user", "content": f"item {i}: " + "padding detail. " * 3000}
+                for i in range(30)]
+        budget = 32_000
+        pieces = _chunk(render_for_summary(msgs), budget)
+
+        oversized = [len(p) for p in pieces if len(p) > budget * 4 * 1.1]
+        self.assertEqual(oversized, [], f"chunks exceed the budget: {oversized}")
+
+    def test_chunk_count_does_not_explode(self):
+        """The broken overlap also produced far more chunks than the text warranted."""
+        from agentaus_bridge.compact import _chunk, render_for_summary
+
+        msgs = [{"role": "user", "content": f"item {i}: " + "padding detail. " * 3000}
+                for i in range(30)]
+        text = render_for_summary(msgs)
+        budget = 32_000
+        pieces = _chunk(text, budget)
+
+        # Generous ceiling: overlap means some redundancy, but not multiples.
+        self.assertLess(len(pieces), (len(text) / (budget * 4)) * 2 + 2,
+                        f"{len(pieces)} chunks for {len(text)} chars")
+
+    def test_a_single_huge_message_is_split(self):
+        from agentaus_bridge.compact import _chunk
+
+        pieces = _chunk("x" * 500_000, 10_000)
+
+        self.assertGreater(len(pieces), 1, "an oversized single line was emitted whole")
+        self.assertTrue(all(len(p) <= 10_000 * 4 * 1.1 for p in pieces))
+
+    def test_chunks_still_overlap(self):
+        from agentaus_bridge.compact import _chunk
+
+        text = "\n".join(f"line {i} " + "z" * 200 for i in range(400))
+        pieces = _chunk(text, 2000, overlap_ratio=0.2)
+
+        self.assertGreater(len(pieces), 1)
+        tail = pieces[0].splitlines()[-3:]
+        self.assertTrue(any(t in pieces[1] for t in tail), "overlap was lost in the fix")
