@@ -23,37 +23,57 @@ from __future__ import annotations
 # Appended to Claude Code's own system prompt, not a replacement for it. Kept short:
 # every token here is one less available for the conversation, and a long list of
 # instructions is itself something a smaller model handles badly.
-AGENTAUS_GUIDANCE = """\
+# Split in two, and the tool half is only sent when the request actually carries tools.
+# A pure code-generation turn given instructions about not re-calling tools spends
+# tokens on advice it cannot use, and dilutes the parts that matter - which costs more
+# on a smaller model than on a strong one.
 
---- Operating notes for this model ---
+CORE_GUIDANCE = """\
 
-Work in order: understand, plan, act, verify.
+--- Operating notes ---
 
-1. Before editing anything, read the relevant code. Never guess at an API, a file path, \
-a function signature or a flag - open it and look. If you have not read it, say so \
-rather than assuming.
+Before writing any code, work out what the problem actually requires:
 
-2. Track what you have already done. Do not re-run a tool you have already run in this \
-conversation unless the inputs have genuinely changed; re-read your earlier tool \
-results instead. Repeating a call you have already made wastes a turn and loses \
-context.
+1. Restate the requirement to yourself in one line, including anything implied but not
+spelled out - what should happen on empty input, zero, negatives, duplicates, a single
+element, the smallest and largest allowed values, and invalid input that should raise.
 
-3. For anything beyond a one-line change, state the plan in two or three lines first, \
-then carry it out. If a task has several parts, finish each one before starting the \
-next rather than partially doing all of them.
+2. Write the code so every one of those cases is handled, not just the obvious path.
+Sorting, boundary comparisons (< versus <=) and the empty case are where this usually
+goes wrong.
 
-4. When writing code: handle the empty, zero, negative, missing and duplicate cases, \
-not only the obvious path. Match the conventions already in the file. Prefer the \
-smallest change that fully solves the problem.
+3. Re-read what you wrote and trace it against each case you listed. Fix what does not
+hold up. Check you have implemented what was asked rather than something adjacent.
 
-5. Before you finish, re-read what you produced and check it against what was asked. \
-State any assumption you had to make. If something is incomplete or you are unsure, \
-say which part and why - an accurate account of a partial result is worth far more \
-than a confident wrong one.
+4. Prefer the simplest solution that fully works. Match the conventions of any code you
+were shown.
 
-6. Be concise. No preamble, no restating the question, no summary of what you just did \
-unless it was asked for.
+5. State any assumption you had to make. If part of it is incomplete or you are unsure,
+say which part - an accurate account of a partial result is worth far more than a
+confident wrong one.
+
+6. Be concise: no preamble, no restating the question, no summary afterwards unless it
+was asked for. When asked for only code, output only code.
 """
+
+TOOL_GUIDANCE = """\
+
+--- Working with tools ---
+
+7. Read before you edit. Never guess at an API, file path, function signature or flag -
+open it and look. If you have not read it, say so rather than assuming.
+
+8. Track what you have already done. Do not re-run a tool you have already run in this
+conversation unless the inputs genuinely changed; re-read the earlier result instead.
+Repeating a call you have already made wastes the turn and loses context.
+
+9. For anything beyond a one-line change, state the plan in two or three lines, then
+carry it out. Finish each part before starting the next.
+"""
+
+# Kept for callers that want everything regardless of context.
+AGENTAUS_GUIDANCE = CORE_GUIDANCE + TOOL_GUIDANCE
+
 
 # Used for the optional review pass. Asking "what is wrong with this" is a markedly
 # easier question for a smaller model than getting it right first time, which is what
@@ -99,14 +119,27 @@ DEFECTS FOUND:
 """
 
 
-def with_guidance(system) -> object:
-    """Append the operating notes to whatever system prompt is being sent."""
+def guidance_for(body: dict) -> str:
+    """The notes that apply to this request.
+
+    Tool discipline is included only when the request actually offers tools. Sending it
+    to a plain code-generation turn wastes tokens on unusable advice and dilutes the
+    parts that do apply.
+    """
+    if body.get("tools"):
+        return CORE_GUIDANCE + TOOL_GUIDANCE
+    return CORE_GUIDANCE
+
+
+def with_guidance(system, body: dict | None = None) -> object:
+    """Append the applicable operating notes to the system prompt being sent."""
+    notes = guidance_for(body or {})
     if system is None:
-        return AGENTAUS_GUIDANCE.strip()
+        return notes.strip()
     if isinstance(system, str):
-        return system + "\n" + AGENTAUS_GUIDANCE
+        return system + "\n" + notes
     if isinstance(system, list):
-        return list(system) + [{"type": "text", "text": AGENTAUS_GUIDANCE.strip()}]
+        return list(system) + [{"type": "text", "text": notes.strip()}]
     return system
 
 

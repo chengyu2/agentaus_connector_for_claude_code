@@ -36,6 +36,30 @@ from benchmarks.tasks import TASKS  # noqa: E402
 
 BRIDGE = "http://127.0.0.1:8787"
 
+PAIRWISE_PROMPT = """\
+Two candidate solutions to the same programming task are shown below. Decide which is \
+better, judging only on:
+
+- correctness: does it do exactly what was asked?
+- edge cases: empty, zero, negative, duplicate, boundary and invalid input
+- simplicity: no unnecessary complexity
+
+Ignore length, formatting and comments unless they affect correctness. If the two are \
+equivalent in substance, say TIE - do not invent a preference.
+
+TASK:
+{task}
+
+SOLUTION A:
+{a}
+
+SOLUTION B:
+{b}
+
+Reply with ONLY a JSON object:
+{{"winner": "A" | "B" | "TIE", "reason": "one short sentence"}}
+"""
+
 JUDGE_PROMPT = """\
 You are grading a candidate solution to a programming task. Be strict and objective.
 
@@ -121,6 +145,29 @@ def judge(task_prompt: str, answer: str) -> dict:
         return {"correctness": 0, "edge_cases": 0, "clarity": 0, "reason": "unparseable"}
 
 
+def pairwise(task_prompt: str, answer_a: str, answer_b: str, flip: bool) -> str:
+    """Blind pairwise comparison, returning "compensated", "baseline" or "tie".
+
+    Absolute 1-5 scoring ceilings out - almost everything scores 5 and the arms become
+    indistinguishable. Asking which of two is better discriminates far more finely.
+
+    `flip` swaps the presentation order. Judges have a position bias, so which arm is
+    shown first is alternated across tasks and undone when reading the verdict.
+    """
+    first, second = (answer_b, answer_a) if flip else (answer_a, answer_b)
+    raw = ask(PAIRWISE_PROMPT.format(task=task_prompt, a=first[:5000], b=second[:5000]),
+              max_tokens=200)
+    match = re.search(r'"winner"\s*:\s*"(A|B|TIE)"', raw, re.I)
+    if not match:
+        return "tie"
+    winner = match.group(1).upper()
+    if winner == "TIE":
+        return "tie"
+    shown_first_is_compensated = not flip
+    picked_first = winner == "A"
+    return "compensated" if picked_first == shown_first_is_compensated else "baseline"
+
+
 def configure(guidance: bool, review: bool) -> bool:
     """Restart the bridge with the compensation layer on or off."""
     import os
@@ -188,7 +235,8 @@ def main() -> int:
                 answer = ask(task["prompt"])
                 if answer.startswith("__ERROR__"):
                     print(f"  {task['id']:<16} ERROR {answer[:60]}")
-                    results[name].append({"id": task["id"], "passed": False, "judge": None})
+                    results[name].append({"id": task["id"], "passed": False,
+                                          "judge": None, "answer": "", "run": run_i})
                     continue
                 passed, detail = run_tests(extract_code(answer), task["tests"], task["entry"])
                 scores = None if args.no_judge else judge(task["prompt"], answer)
@@ -199,7 +247,28 @@ def main() -> int:
                              f"e={scores['edge_cases']} cl={scores['clarity']}")
                 suffix = f"  ({detail})" if not passed else ""
                 print(f"  {task['id']:<16} {mark}{extra}{suffix}", flush=True)
-                results[name].append({"id": task["id"], "passed": passed, "judge": scores})
+                results[name].append({"id": task["id"], "passed": passed,
+                                      "judge": scores, "answer": answer,
+                                      "run": run_i})
+
+    # --- head to head -----------------------------------------------------------
+    votes = {"compensated": 0, "baseline": 0, "tie": 0}
+    if not args.no_judge and len(results) == 2:
+        print(f"\n{'=' * 66}\nHEAD TO HEAD (blind, order alternated)\n{'=' * 66}")
+        paired = {}
+        for name in results:
+            for row in results[name]:
+                paired.setdefault((row["id"], row["run"]), {})[name] = row["answer"]
+        for i, (key, pair) in enumerate(sorted(paired.items())):
+            a, b = pair.get("compensated", ""), pair.get("baseline", "")
+            if not a or not b:
+                continue
+            verdict = pairwise(next(t["prompt"] for t in tasks if t["id"] == key[0]),
+                               a, b, flip=bool(i % 2))
+            votes[verdict] += 1
+            print(f"  {key[0]:<16} run {key[1] + 1}  ->  {verdict}", flush=True)
+        print(f"\n  compensated {votes['compensated']}  |  baseline {votes['baseline']}"
+              f"  |  tie {votes['tie']}")
 
     print(f"\n{'=' * 66}\nSUMMARY\n{'=' * 66}")
     print(f"{'arm':<14} {'pass rate':>12} {'correctness':>12} {'edge cases':>12} {'clarity':>10}")
@@ -225,6 +294,9 @@ def main() -> int:
         delta = (c["pass"] - b["pass"]) * 100
         print(f"\ncompensation changes the pass rate by {delta:+.1f} points "
               f"and judged correctness by {c['correctness'] - b['correctness']:+.2f}")
+        if votes["compensated"] or votes["baseline"]:
+            print(f"head to head: compensated won {votes['compensated']}, "
+                  f"lost {votes['baseline']}, tied {votes['tie']}")
         if delta < 0:
             print("NOTE: compensation scored WORSE here. That is a real result, not a bug.")
 

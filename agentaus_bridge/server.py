@@ -574,7 +574,7 @@ async def _handle_agentaus(
     # Supplement the system prompt for Agentaus only. Claude turns never reach here -
     # they are forwarded untouched by _passthrough.
     if settings.agentaus_guidance:
-        body = {**body, "system": with_guidance(body.get("system"))}
+        body = {**body, "system": with_guidance(body.get("system"), body)}
 
     # Built only after the context guard, so any trimming above is reflected in what
     # actually gets sent. Building it earlier silently discarded the trim.
