@@ -397,7 +397,7 @@ and `--check` (verify the credential and exit).
 | --- | --- |
 | Images and PDFs | Agentaus is text-only, so attachments become a bracketed note rather than being silently dropped. Screenshot-based workflows will not work. |
 | Extended thinking | Agentaus exposes no reasoning channel. `thinking` blocks from earlier Claude turns are stripped before sending. |
-| Context window | Agentaus accepts **131,072 tokens** total, prompt plus reply - far less than Claude. Claude Code does not know this, so its auto-compact triggers too late; the bridge enforces the limit itself and tells you to `/compact`. |
+| Context window | Agentaus accepts **131,072 tokens** total, prompt plus reply — far less than Claude. Claude Code sizes auto-compact against the window it *assumes* for the model, and it has no way to learn Agentaus' real one, so it will not compact in time on its own. The bridge enforces the limit itself and phrases the refusal as `prompt is too long: N tokens > M maximum`, which is the wording Claude Code matches on to compact and retry. Recovery is usually automatic; if not, run `/compact`. |
 | Prompt caching | Not supported upstream, so `cache_control` markers do nothing. Every turn resends the whole conversation — the main cost driver in long sessions. |
 | Token counting | Agentaus has no tokenizer endpoint, so `/v1/messages/count_tokens` returns a chars÷4 estimate. It feeds the context meter and auto-compact trigger only, never billing. |
 | `max_tokens`, `temperature` | Accepted by Agentaus but ignored, so they are passed along without effect. |

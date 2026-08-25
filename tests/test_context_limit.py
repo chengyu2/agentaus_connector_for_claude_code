@@ -124,7 +124,7 @@ class TestPreflightGuard(_Base):
 
         self.assertEqual(response.status_code, 400)
         message = response.json()["error"]["message"]
-        self.assertIn("too long for Agentaus", message)
+        self.assertIn("prompt is too long", message)
         self.assertIn("/compact", message, "the error must say what to do about it")
 
     def test_reply_allowance_counts_toward_the_window(self):
@@ -143,8 +143,12 @@ class TestPreflightGuard(_Base):
         settings.agentaus_max_input_tokens = 131072
         response = self._post("hello", stream=False)
 
-        # Reaches the stub, which returns the in-band error - so not a 400 from the guard.
-        self.assertNotIn("too long for Agentaus", response.text)
+        # The stub always answers with an over-length error, so "prompt is too long"
+        # appears either way. What distinguishes the guard is that it names the env
+        # var; the upstream path instead quotes Agentaus verbatim.
+        self.assertNotIn("AGENTAUS_MAX_INPUT_TOKENS", response.text,
+                         "guard fired on a request well under the limit")
+        self.assertIn("Agentaus said:", response.text, "should have reached upstream")
 
     def test_guard_can_be_disabled(self):
         from agentaus_bridge.config import settings
@@ -152,7 +156,9 @@ class TestPreflightGuard(_Base):
         settings.agentaus_max_input_tokens = 0
         response = self._post("x" * 40_000, stream=False)
 
-        self.assertNotIn("too long for Agentaus", response.text)
+        self.assertNotIn("AGENTAUS_MAX_INPUT_TOKENS", response.text,
+                         "guard fired despite being disabled")
+        self.assertIn("Agentaus said:", response.text, "should have reached upstream")
 
 
 class TestInBandErrorSurfacing(_Base):
@@ -187,6 +193,30 @@ class TestInBandErrorSurfacing(_Base):
         body = self._post("hi", stream=True).text
 
         self.assertIn("/compact", body, "an over-length error must say how to recover")
+
+
+class TestCanonicalOverLengthWording(_Base):
+    """Claude Code matches on Anthropic's "prompt is too long" to auto-compact and
+    retry. If our wording drifts, an over-length turn dies instead of recovering."""
+
+    def test_preflight_error_uses_canonical_wording(self):
+        from agentaus_bridge.config import settings
+
+        settings.agentaus_max_input_tokens = 1000
+        message = self._post("x" * 40_000, stream=False).json()["error"]["message"]
+
+        self.assertTrue(
+            message.startswith("prompt is too long:"),
+            f"Claude Code will not recognise this as over-length: {message[:80]!r}",
+        )
+
+    def test_upstream_error_uses_canonical_wording(self):
+        from agentaus_bridge.config import settings
+
+        settings.agentaus_max_input_tokens = 0  # let the stub's error through
+        body = self._post("hi", stream=True).text
+
+        self.assertIn("prompt is too long", body)
 
 
 if __name__ == "__main__":

@@ -264,9 +264,12 @@ def _agentaus_error_text(err: dict) -> str:
     """
     message = str(err.get("message") or err) if err else "unknown Agentaus error"
     if "max_model_len" in message or "exceeds" in message:
-        message += (
-            "  ->  This conversation is longer than Agentaus can accept. "
-            "Run /compact or /clear, or switch to a Claude model for this turn."
+        # Prefix Anthropic's canonical over-length wording so Claude Code's
+        # auto-compact-and-retry path recognises it, then keep the upstream text.
+        return (
+            "prompt is too long: this conversation exceeds Agentaus' context window. "
+            "Run /compact or /clear, or switch to a Claude model for this turn. "
+            f"(Agentaus said: {message})"
         )
     return f"Agentaus error: {message}"
 
@@ -309,11 +312,15 @@ async def _handle_agentaus(
             return _error_response(
                 400,
                 "invalid_request_error",
-                f"This conversation is too long for Agentaus: roughly {estimated:,} "
-                f"prompt tokens plus {reserved:,} reserved for the reply exceeds its "
-                f"{limit:,}-token context window. Run /compact or /clear, or switch to "
-                f"a Claude model for this turn. (Set AGENTAUS_MAX_INPUT_TOKENS to change "
-                f"this limit.)",
+                # Lead with Anthropic's canonical wording. Claude Code matches on
+                # "prompt is too long" to trigger auto-compact and retry, so phrasing
+                # it this way turns a dead turn into automatic recovery. The
+                # Agentaus-specific detail follows for anyone reading the log.
+                f"prompt is too long: {estimated + reserved} tokens > {limit} maximum. "
+                f"Agentaus has a {limit:,}-token context window (roughly "
+                f"{estimated:,} prompt + {reserved:,} reserved for the reply). "
+                f"Run /compact or /clear, or switch to a Claude model for this turn. "
+                f"(Set AGENTAUS_MAX_INPUT_TOKENS to change this limit.)",
             )
 
     if settings.log_bodies:
