@@ -275,6 +275,74 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL="agentaus"
 
 ---
 
+## Changing the port
+
+The bridge listens on `127.0.0.1:8787` by default. If something else already owns that
+port — or you want to run two bridges side by side — the port appears in **two** places
+that must agree, and they are read by different processes:
+
+**1. Tell the bridge where to listen** (`.env`):
+
+```dotenv
+BRIDGE_PORT=9100
+```
+
+**2. Tell Claude Code where to find it** (`.claude/settings.json`):
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:9100",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION": "agentaus",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Agentaus (Trellis Data)",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Sovereign Australian model via the local Agentaus bridge"
+  }
+}
+```
+
+Then restart both:
+
+```bash
+./scripts/start-bridge.sh                  # or: launchctl kickstart -k gui/$(id -u)/com.trellisdata.agentaus-bridge
+```
+
+and restart Claude Code — `ANTHROPIC_BASE_URL` is read once at startup, so a running
+session keeps talking to the old port.
+
+Verify the two ends agree before anything else:
+
+```bash
+curl -s http://127.0.0.1:9100/healthz
+```
+
+A JSON reply means the bridge is listening. `Connection refused` means it is not on
+that port — check `.env` and that the bridge actually restarted.
+
+**If you miss step 2**, Claude Code keeps calling the old port and every request fails
+with a connection error, including Claude models, because all traffic flows through the
+bridge. That symptom looks like the model is down when it is really a port mismatch.
+
+### The other places a port can appear
+
+| Where | How to change it | When it matters |
+| --- | --- | --- |
+| `scripts/claude-agentaus.sh` | `export BRIDGE_URL="http://127.0.0.1:9100"` before running it | Only if you use the launcher; it reads `BRIDGE_URL` and needs no edit |
+| `tests/smoke_test.py` | `--url http://127.0.0.1:9100` | Running the end-to-end checks |
+| Command line | `python -m agentaus_bridge --port 9100` | Overrides `.env` for one run, handy for testing |
+| launchd plist | nothing — it reads `.env` | No edit needed |
+
+### Picking a free port
+
+```bash
+lsof -ti tcp:9100        # prints a pid if something already owns it, silence if free
+```
+
+Stay above 1024 (lower ports need root) and avoid anything already in use — the bridge
+exits with `Address already in use` rather than starting on a different port, which is
+deliberate: a silent fallback would leave Claude Code pointed at nothing.
+
+---
+
 ## Configuration reference
 
 All settings are environment variables, readable from `.env`. Shell exports win over
