@@ -256,6 +256,21 @@ async def _post_with_retry(
 # Agentaus path
 # --------------------------------------------------------------------------------------
 
+def _agentaus_error_text(err: dict) -> str:
+    """Flatten an Agentaus error object into a message worth showing a user.
+
+    The context-length failure reads "The engine prompt length N exceeds the
+    max_model_len M", which is actionable once it actually reaches the client.
+    """
+    message = str(err.get("message") or err) if err else "unknown Agentaus error"
+    if "max_model_len" in message or "exceeds" in message:
+        message += (
+            "  ->  This conversation is longer than Agentaus can accept. "
+            "Run /compact or /clear, or switch to a Claude model for this turn."
+        )
+    return f"Agentaus error: {message}"
+
+
 def _agentaus_headers() -> dict:
     return {
         "Authorization": f"Bearer {settings.agentaus_api_key}",
@@ -278,6 +293,29 @@ async def _handle_agentaus(
     started = time.monotonic()
     display_model = model or "agentaus"
 
+    # Pre-flight context check. Agentaus counts the prompt and the reply against one
+    # window, so reserve the requested output before comparing. Catching it here turns
+    # a confusing upstream failure into an actionable message and saves sending a
+    # payload that can be hundreds of kilobytes.
+    limit = settings.agentaus_max_input_tokens
+    if limit > 0:
+        estimated = estimate_request_tokens(body)
+        reserved = int(body.get("max_tokens") or 0)
+        if estimated + reserved > limit:
+            log.warning(
+                "rejected oversized request: ~%d prompt + %d reserved > %d limit",
+                estimated, reserved, limit,
+            )
+            return _error_response(
+                400,
+                "invalid_request_error",
+                f"This conversation is too long for Agentaus: roughly {estimated:,} "
+                f"prompt tokens plus {reserved:,} reserved for the reply exceeds its "
+                f"{limit:,}-token context window. Run /compact or /clear, or switch to "
+                f"a Claude model for this turn. (Set AGENTAUS_MAX_INPUT_TOKENS to change "
+                f"this limit.)",
+            )
+
     if settings.log_bodies:
         log.info("-> agentaus payload: %s", json.dumps(payload)[:4000])
 
@@ -299,6 +337,15 @@ async def _handle_agentaus(
             data = upstream.json()
         except ValueError:
             return _error_response(502, "api_error", "Agentaus returned a non-JSON response")
+
+        # Agentaus can answer HTTP 200 with an error object instead of choices.
+        if isinstance(data.get("error"), dict):
+            log.warning("agentaus in-band error: %s", _agentaus_error_text(data["error"]))
+            return _error_response(
+                400,
+                data["error"].get("type") or "api_error",
+                _agentaus_error_text(data["error"]),
+            )
 
         message = agentaus_response_to_anthropic(data, model=display_model)
         log.info(
@@ -385,6 +432,23 @@ async def _agentaus_event_stream(
                             except json.JSONDecodeError:
                                 continue
 
+                            # Agentaus reports some failures - an over-length
+                            # prompt among them - as HTTP 200 with an error object
+                            # inside the SSE body. Nothing here has "choices", so
+                            # without this branch the error is skipped and the turn
+                            # ends as an empty, successful-looking message.
+                            if isinstance(chunk.get("error"), dict):
+                                yield builder.error(
+                                    _agentaus_error_text(chunk["error"]),
+                                    chunk["error"].get("type") or "api_error",
+                                )
+                                yield builder.finish("stop", None)
+                                log.warning(
+                                    "agentaus in-band error: %s",
+                                    _agentaus_error_text(chunk["error"]),
+                                )
+                                return
+
                             for choice in chunk.get("choices") or []:
                                 delta = choice.get("delta") or {}
                                 text = delta.get("content")
@@ -413,6 +477,13 @@ async def _agentaus_event_stream(
                     yield builder.finish("stop", None)
                     return
                 data = upstream.json()
+                if isinstance(data.get("error"), dict):
+                    yield builder.error(
+                        _agentaus_error_text(data["error"]),
+                        data["error"].get("type") or "api_error",
+                    )
+                    yield builder.finish("stop", None)
+                    return
                 choice = (data.get("choices") or [{}])[0]
                 message = choice.get("message") or {}
                 if message.get("content"):

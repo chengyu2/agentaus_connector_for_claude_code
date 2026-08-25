@@ -357,6 +357,7 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_UPSTREAM_STREAM` | `true` | Request SSE from Agentaus rather than polling for a whole reply |
 | `AGENTAUS_MODEL_MARKERS` | `agentaus` | Comma-separated substrings that route to Agentaus |
 | `AGENTAUS_FORCE_ALL` | `false` | Ignore the model id; send everything to Agentaus |
+| `AGENTAUS_MAX_INPUT_TOKENS` | `131072` | Agentaus' context window. Defaults in code, not `.env`, so a fresh clone is still protected; `0` disables the check |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | `127.0.0.1` / `8787` | Listen address |
 | `BRIDGE_PASSTHROUGH` | `true` | Forward non-Agentaus models to Anthropic; `false` answers them with Agentaus instead |
 | `ANTHROPIC_UPSTREAM_BASE_URL` | `https://api.anthropic.com` | Passthrough target |
@@ -396,6 +397,7 @@ and `--check` (verify the credential and exit).
 | --- | --- |
 | Images and PDFs | Agentaus is text-only, so attachments become a bracketed note rather than being silently dropped. Screenshot-based workflows will not work. |
 | Extended thinking | Agentaus exposes no reasoning channel. `thinking` blocks from earlier Claude turns are stripped before sending. |
+| Context window | Agentaus accepts **131,072 tokens** total, prompt plus reply - far less than Claude. Claude Code does not know this, so its auto-compact triggers too late; the bridge enforces the limit itself and tells you to `/compact`. |
 | Prompt caching | Not supported upstream, so `cache_control` markers do nothing. Every turn resends the whole conversation — the main cost driver in long sessions. |
 | Token counting | Agentaus has no tokenizer endpoint, so `/v1/messages/count_tokens` returns a chars÷4 estimate. It feeds the context meter and auto-compact trigger only, never billing. |
 | `max_tokens`, `temperature` | Accepted by Agentaus but ignored, so they are passed along without effect. |
@@ -479,6 +481,8 @@ malformed tool arguments.
 | Both Agentaus **and** Claude models fail at once | Almost always DNS or the bridge being down, not either provider. Everything flows through the bridge, so one broken resolver takes out both. See the row below. |
 | `nodename nor servname provided, or not known` | The macOS system resolver (`mDNSResponder`) is wedged. Diagnose by comparing `dig agentaus.com.au` (queries the DNS server directly) with `python3 -c "import socket;socket.getaddrinfo('agentaus.com.au',443)"` (uses the system resolver). If `dig` works and `getaddrinfo` fails, every app on the machine is affected, not just the bridge. Fix: `sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder`, or reboot. |
 | Agentaus vanished from the `/model` list | `.claude/settings.json` is missing or lost `ANTHROPIC_CUSTOM_MODEL_OPTION`. That variable creates the row and is read **once at startup**, so restore the file and restart Claude Code. |
+| Agentaus replies with nothing, or the turn fails with no explanation | The conversation exceeded Agentaus' **131,072-token** window. Agentaus reports this as HTTP 200 with the error inside the SSE body, which older builds turned into a silent empty reply. The bridge now rejects it up front with an actionable message. Run `/compact` or `/clear`, or switch to a Claude model. |
+| `This conversation is too long for Agentaus` | Working as intended. Agentaus' window is much smaller than Claude's, and there is no prompt caching, so long sessions hit it quickly. `/compact` usually recovers the session. |
 | `Address already in use` on start | An older bridge is still bound: `lsof -ti tcp:8787 \| xargs kill`. |
 
 ---

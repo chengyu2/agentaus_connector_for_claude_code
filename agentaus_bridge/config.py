@@ -119,6 +119,20 @@ class Settings:
         default_factory=lambda: _float("BRIDGE_RETRY_MAX_DELAY", 8.0)
     )
 
+    # --- Agentaus context window ---------------------------------------------------
+    # Agentaus rejects anything over max_model_len with:
+    #   "The engine prompt length N exceeds the max_model_len 131072"
+    # and - when streaming - reports it as HTTP 200 with the error inside the SSE
+    # body, which is easy to mistake for an empty reply.
+    #
+    # This default lives in CODE, not .env, on purpose: it is a property of the
+    # Agentaus model rather than a user preference, so a fresh clone with no .env
+    # (or an .env someone trimmed) still gets the correct limit. The env var is an
+    # escape hatch for when Trellis Data changes the window.
+    agentaus_max_input_tokens: int = field(
+        default_factory=lambda: _int("AGENTAUS_MAX_INPUT_TOKENS", 131072)
+    )
+
     # --- misc ---------------------------------------------------------------------
     log_level: str = field(default_factory=lambda: os.environ.get("BRIDGE_LOG_LEVEL", "info"))
     log_bodies: bool = field(default_factory=lambda: _bool("BRIDGE_LOG_BODIES", False))
