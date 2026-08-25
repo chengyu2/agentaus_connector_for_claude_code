@@ -358,3 +358,111 @@ class TestChunkSizing(unittest.TestCase):
         self.assertGreater(len(pieces), 1)
         tail = pieces[0].splitlines()[-3:]
         self.assertTrue(any(t in pieces[1] for t in tail), "overlap was lost in the fix")
+
+
+class TestIncrementalCompaction(unittest.TestCase):
+    """Cost across a *session*, not a single request.
+
+    The regression this guards: the compaction boundary advanced by roughly one turn
+    every turn, so the summary was keyed on something that never repeated and the cache
+    never hit. Every turn re-summarised the entire history - measured at 173 seconds
+    per turn on a real session, which is what made a plain "hello" look like a hang.
+    """
+
+    @staticmethod
+    def session(turns: int) -> list:
+        msgs = []
+        for i in range(turns):
+            msgs.append({"role": "user", "content": f"turn {i}: " + "detail " * 400})
+            msgs.append({"role": "assistant", "content": f"reply {i}"})
+        msgs.append({"role": "user", "content": "the current question"})
+        return msgs
+
+    def test_a_session_costs_far_less_than_re_summarising_every_turn(self):
+        """What matters is total work across a session, not any single request.
+
+        Two mechanisms contribute and both are wins: a quantised boundary makes some
+        turns free outright, and prefix reuse makes the rest cost only the new
+        messages. A representative run is [21, 0, 0, 0, 3, 2, 2, 2, 2, 2] - against
+        21 per turn with neither, which is the behaviour that took 173 seconds a turn.
+        """
+        counter = _Counter()
+        c = ConversationCompactor(counter, verify=False, block=20)
+
+        per_turn = []
+        for turns in range(40, 50):
+            before = counter.calls
+            run(c.compact({"messages": self.session(turns), "system": "s"},
+                          limit=8_000, reserve=100))
+            per_turn.append(counter.calls - before)
+
+        cold = per_turn[0]
+        naive_total = cold * len(per_turn)
+        actual_total = sum(per_turn)
+
+        self.assertGreater(cold, 0, "the first turn should do real work")
+        self.assertLess(actual_total, naive_total / 3,
+                        f"session cost {actual_total} vs {naive_total} naive: {per_turn}")
+        later = per_turn[1:]
+        self.assertTrue(all(n < cold for n in later),
+                        f"a later turn cost as much as a cold summary: {per_turn}")
+
+    def test_boundary_is_stable_across_turns(self):
+        """An unquantised boundary moves every turn and defeats the cache."""
+        from agentaus_bridge.compact import split_head_tail
+
+        heads = set()
+        for turns in range(40, 46):
+            head, _ = split_head_tail(self.session(turns), 5000, block=20)
+            heads.add(len(head))
+
+        self.assertLess(len(heads), 6, f"boundary moved every turn: {sorted(heads)}")
+
+    def test_extending_a_prefix_only_summarises_the_new_messages(self):
+        counter = _Counter()
+        c = ConversationCompactor(counter, verify=False, block=1)
+
+        run(c.compact({"messages": self.session(40), "system": "s"},
+                      limit=8_000, reserve=100))
+        cold = counter.calls
+        counter.calls = 0
+        # A much longer session: without prefix reuse this costs as much again.
+        run(c.compact({"messages": self.session(44), "system": "s"},
+                      limit=8_000, reserve=100))
+
+        self.assertLess(counter.calls, cold,
+                        "extending the head cost as much as summarising it cold")
+
+    def test_reused_summary_still_covers_the_whole_head(self):
+        """Incremental reuse must not lose the earlier part of the conversation."""
+        merged_inputs = []
+
+        async def summariser(text: str) -> str:
+            if text.startswith("The following are summaries"):
+                merged_inputs.append(text)
+                return "MERGED: " + text[-200:]
+            return "PART"
+
+        c = ConversationCompactor(summariser, verify=False, block=1)
+        run(c.compact({"messages": self.session(40), "system": "s"},
+                      limit=8_000, reserve=100))
+        plan = run(c.compact({"messages": self.session(44), "system": "s"},
+                             limit=8_000, reserve=100))
+
+        self.assertTrue(merged_inputs, "the prior summary was never merged with the new part")
+        self.assertIn("MERGED", plan["summary"])
+
+    def test_a_changed_prefix_is_not_falsely_reused(self):
+        """Reuse is keyed on content: an edited history must re-summarise."""
+        counter = _Counter()
+        c = ConversationCompactor(counter, verify=False, block=1)
+
+        base = self.session(40)
+        run(c.compact({"messages": base, "system": "s"}, limit=8_000, reserve=100))
+
+        altered = [dict(m) for m in base]
+        altered[0] = {"role": "user", "content": "COMPLETELY DIFFERENT " + "x " * 400}
+        counter.calls = 0
+        run(c.compact({"messages": altered, "system": "s"}, limit=8_000, reserve=100))
+
+        self.assertGreater(counter.calls, 0, "a changed prefix was wrongly reused")

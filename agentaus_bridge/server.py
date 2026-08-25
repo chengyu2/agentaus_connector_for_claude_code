@@ -11,6 +11,7 @@ models in one session instead of replacing them.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import random
@@ -169,6 +170,19 @@ async def messages(request: Request) -> Response:
     wants_stream = bool(body.get("stream"))
     to_agentaus = settings.routes_to_agentaus(model) or not settings.passthrough_enabled
 
+    _request_id.set(_new_request_id())
+    messages_in = len(body.get("messages") or [])
+    rlog(
+        logging.INFO,
+        "recv model=%s route=%s stream=%s msgs=%d est=%d bytes=%d",
+        model or "(none)",
+        "agentaus" if to_agentaus else "anthropic",
+        wants_stream,
+        messages_in,
+        estimate_request_tokens(body),
+        len(raw),
+    )
+
     if settings.log_bodies:
         log.info("request body: %s", json.dumps(body)[:4000])
 
@@ -190,6 +204,52 @@ async def count_tokens(request: Request) -> Response:
         # Claude Code's context meter and auto-compact trigger, not billing.
         return JSONResponse({"input_tokens": estimate_request_tokens(body)})
     return await _passthrough(request, raw)
+
+
+# --------------------------------------------------------------------------------------
+# Request-scoped logging
+# --------------------------------------------------------------------------------------
+
+# Every line for one turn carries the same short id. Without it a long request is
+# indistinguishable from the concurrent summarisation calls it spawns, which is exactly
+# what made a 90-second stall hard to read: sixty identical "200 OK" lines and no way
+# to tell which was the actual turn.
+_request_id: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+
+
+def _new_request_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def rlog(level: int, message: str, *args) -> None:
+    """Log with the current request id prefixed."""
+    log.log(level, "req %s " + message, _request_id.get(), *args)
+
+
+class _Phase:
+    """Times a phase and logs its start and end.
+
+    Start lines matter as much as end lines: a phase that never finishes only shows up
+    in the log as a start with no matching end, and that is the signature of a hang.
+    """
+
+    def __init__(self, name: str, detail: str = "") -> None:
+        self.name = name
+        self.detail = detail
+        self.started = 0.0
+        self.elapsed = 0.0
+
+    def __enter__(self) -> "_Phase":
+        self.started = time.monotonic()
+        rlog(logging.INFO, "%s start%s", self.name, f" ({self.detail})" if self.detail else "")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.elapsed = time.monotonic() - self.started
+        if exc_type is not None:
+            rlog(logging.WARNING, "%s FAILED after %.1fs: %s", self.name, self.elapsed, exc)
+        else:
+            rlog(logging.INFO, "%s done in %.1fs", self.name, self.elapsed)
 
 
 # --------------------------------------------------------------------------------------
@@ -333,11 +393,16 @@ async def _agentaus_summarise(client: httpx.AsyncClient, text: str) -> str:
         "stream": False,
         "system_prompt_overwrite": True,
     }
+    started_at = time.monotonic()
     response = await _post_with_retry(
         client, settings.agentaus_url, json_body=payload, headers=_agentaus_headers()
     )
     if response.status_code >= 400:
+        rlog(logging.WARNING, "helper call failed HTTP %d after %.1fs",
+             response.status_code, time.monotonic() - started_at)
         raise RuntimeError(f"summariser returned HTTP {response.status_code}")
+    rlog(logging.DEBUG, "helper call ok in %.1fs (%d chars in)",
+         time.monotonic() - started_at, len(text))
     data = response.json()
     if isinstance(data.get("error"), dict):
         _learn_limit_from(str(data["error"].get("message") or ""))
@@ -412,6 +477,7 @@ def _get_compactor(request: Request) -> ConversationCompactor:
             lambda text: _agentaus_summarise(client, text),
             max_concurrency=settings.agentaus_summary_concurrency,
             verify=settings.agentaus_verify_summary,
+            block=settings.agentaus_compact_block,
         )
         request.app.state.compactor = existing
     return existing
@@ -581,25 +647,41 @@ async def _handle_agentaus(
     limit = _context_limit()
     reserved = int(body.get("max_tokens") or 0)
     original_estimate = estimate_request_tokens(body)
-    body = await _fit_to_window(request, body, limit=limit, reserve=reserved, scale=1.0)
 
-    # Supplement the system prompt for Agentaus only. Claude turns never reach here -
-    # they are forwarded untouched by _passthrough.
-    if settings.agentaus_guidance:
-        body = {**body, "system": with_guidance(body.get("system"), body)}
+    async def prepare(current: dict, scale: float = 1.0) -> tuple[dict, dict]:
+        """Fit to the window, add the guidance, and build the upstream payload.
 
-    # Built only after the context guard, so any trimming above is reflected in what
-    # actually gets sent. Building it earlier silently discarded the trim.
-    payload = anthropic_request_to_agentaus(
-        body,
-        system_prompt_overwrite=settings.system_prompt_overwrite,
-        stream=settings.upstream_stream and wants_stream,
-    )
-
-    if settings.log_bodies:
-        log.info("-> agentaus payload: %s", json.dumps(payload)[:4000])
+        Returns (body, payload). Compaction can take a minute or more on a long
+        conversation, which is why the streaming path runs this *inside* the response
+        generator rather than before it - see the note there.
+        """
+        before = estimate_request_tokens(current)
+        if before + reserved > int(limit * settings.agentaus_compact_threshold):
+            with _Phase("compaction", f"est {before:,} tok, target {limit:,}"):
+                fitted = await _fit_to_window(
+                    request, current, limit=limit, reserve=reserved, scale=scale
+                )
+            rlog(logging.INFO, "compaction result: %d -> %d est tokens",
+                 before, estimate_request_tokens(fitted))
+        else:
+            fitted = await _fit_to_window(
+                request, current, limit=limit, reserve=reserved, scale=scale
+            )
+        # Supplement the system prompt for Agentaus only. Claude turns never reach
+        # here - they are forwarded untouched by _passthrough.
+        if settings.agentaus_guidance:
+            fitted = {**fitted, "system": with_guidance(fitted.get("system"), fitted)}
+        built = anthropic_request_to_agentaus(
+            fitted,
+            system_prompt_overwrite=settings.system_prompt_overwrite,
+            stream=settings.upstream_stream and wants_stream,
+        )
+        if settings.log_bodies:
+            log.info("-> agentaus payload: %s", json.dumps(built)[:4000])
+        return fitted, built
 
     if not wants_stream:
+        body, payload = await prepare(body)
         # Agentaus is the authority on whether a prompt fits. If it says no, it also
         # says what its real limit is, so the next attempt compacts against that
         # instead of against our estimate.
@@ -693,8 +775,41 @@ async def _handle_agentaus(
             stream=settings.upstream_stream,
         )
 
+    # Compaction is deliberately deferred into the generator rather than done here.
+    # On a long conversation it takes a minute or more, and until this function
+    # returns, Claude Code has received nothing at all - no headers, no message_start,
+    # and critically no keepalive pings, because the response has not begun. That
+    # looks exactly like a hung request: a short "hello" on a large session produced
+    # no visible response for over 90 seconds. Starting the stream first lets pings
+    # flow while the summarising happens.
+    async def stream_with_compaction() -> AsyncIterator[bytes]:
+        try:
+            prepared_body, prepared_payload = await prepare(body)
+
+            async def refit(scale: float) -> dict:
+                _, rebuilt = await prepare(prepared_body, scale)
+                return rebuilt
+
+            rlog(logging.INFO, "upstream start (est %d tok)",
+                 estimate_request_tokens(prepared_body))
+            async for chunk in _agentaus_event_stream(
+                client, prepared_payload, prepared_body, display_model, started, refit
+            ):
+                yield chunk
+        except asyncio.CancelledError:
+            # The client hung up. Worth a line of its own: previously this produced
+            # no log at all, so a turn the user abandoned looked identical to one
+            # still in flight.
+            rlog(logging.WARNING, "client disconnected after %.1fs",
+                 time.monotonic() - started)
+            raise
+        except GeneratorExit:
+            rlog(logging.WARNING, "stream closed early after %.1fs",
+                 time.monotonic() - started)
+            raise
+
     generator = _keepalive(
-        _agentaus_event_stream(client, payload, body, display_model, started, _refit),
+        stream_with_compaction(),
         settings.ping_interval_seconds,
         AnthropicStreamBuilder.ping,
     )

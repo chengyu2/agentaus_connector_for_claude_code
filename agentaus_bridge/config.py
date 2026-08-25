@@ -158,6 +158,12 @@ class Settings:
     agentaus_keep_fraction: float = field(
         default_factory=lambda: _float("AGENTAUS_KEEP_FRACTION", 0.5)
     )
+    # Snap the compaction boundary to a multiple of this many messages. Unquantised,
+    # the boundary advances every turn, the summary cache never hits, and every single
+    # turn re-summarises the whole history - 173 seconds per turn on a real session.
+    agentaus_compact_block: int = field(
+        default_factory=lambda: _int("AGENTAUS_COMPACT_BLOCK", 20)
+    )
     # Re-read the source after summarising to recover specifics the first pass missed.
     # Costs an extra call per chunk and is the largest single fidelity gain.
     agentaus_verify_summary: bool = field(

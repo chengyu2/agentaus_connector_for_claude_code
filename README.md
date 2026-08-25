@@ -315,14 +315,33 @@ ceiling — all of which lived in the very first message, long since compacted a
 
 ### What it costs
 
-The bridge is stateless: Claude Code resends the whole conversation every turn, so a
-naive version would re-summarise the entire history on *every request*. The compacted
-region is a stable prefix, so summaries are cached by content hash and paid for once —
-the first overflowing turn takes an extra call (tens of seconds on a long history), and
-following turns reuse it until the boundary moves.
+The bridge is stateless: Claude Code resends the whole conversation every turn, so the
+naive version re-summarises the entire history on *every request*. Two things stop that.
 
-A head too large for one summarisation call is summarised in pieces, and those summaries
-summarised again, so any length reduces in bounded steps.
+**A quantised boundary.** The split between summarised head and verbatim tail is
+snapped to a multiple of `AGENTAUS_COMPACT_BLOCK` messages. Unquantised it advances by
+about a turn every turn, so the summary is keyed on something that never repeats and
+the cache never hits.
+
+**Prefix reuse.** When the boundary does move, the previous summary already covers
+most of the new head, so only the messages added since are read and merged in.
+
+Measured live on a ~360,000-token conversation:
+
+| Turn | First byte | Total | What happened |
+| --- | --- | --- | --- |
+| 1 (cold) | 10.2s | 190.5s | full summarisation of the history |
+| 2 | 0.4s | 1.6s | cached summary reused |
+| 3 | 0.4s | 3.2s | cached summary reused |
+
+The first turn after a session outgrows the window is genuinely slow — there is no way
+around reading that much text once. Every turn after it is normal speed.
+
+**The response starts before compaction does.** Compaction runs inside the streaming
+generator, not before it, so keepalive pings flow while it works. Getting this wrong is
+what made a plain "hello" on a large session look like a hang: the response had not
+begun, so there was nothing to ping with, and Claude Code sat on an open socket
+receiving zero bytes for over 90 seconds.
 
 ### The guarantees
 
@@ -580,6 +599,8 @@ malformed tool arguments.
 | Agentaus replies with nothing, or the turn fails with no explanation | The conversation exceeded Agentaus' **131,072-token** window. Agentaus reports this as HTTP 200 with the error inside the SSE body, which older builds turned into a silent empty reply. The bridge now rejects it up front with an actionable message. Run `/compact` or `/clear`, or switch to a Claude model. |
 | `This conversation is too long for Agentaus` | Working as intended. Agentaus' window is much smaller than Claude's, and there is no prompt caching, so long sessions hit it quickly. `/compact` usually recovers the session. |
 | `/compact` also fails on Agentaus | Expected once you are past 131k: compaction sends the conversation to the model to be summarised, so it overflows too. Switch to a Claude model, compact there, then switch back. `/clear` also works but discards history. |
+| A short message on a long session takes minutes | The first compaction after a session outgrows the window reads the whole history. Later turns reuse it and are fast. `grep 'compaction done' /tmp/agentaus-bridge.log` shows the split. |
+| Want to know where a slow turn went | Every line for one turn shares a request id: `grep 'req <id>' /tmp/agentaus-bridge.log`. `recv` gives the size on arrival, `compaction start`/`done` the phase timing, `upstream start` the handover, and `client disconnected` if the caller gave up. A start with no matching done is a hang. |
 | `Address already in use` on start | An older bridge is still bound: `lsof -ti tcp:8787 \| xargs kill`. |
 
 ---

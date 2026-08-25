@@ -144,12 +144,21 @@ def _clean_turn_start(message: dict) -> bool:
     return True
 
 
-def split_head_tail(messages: list, keep_tokens: int) -> tuple[list, list]:
+def split_head_tail(
+    messages: list, keep_tokens: int, *, block: int = 0
+) -> tuple[list, list]:
     """Split into (head to summarise, tail to keep verbatim).
 
     The tail grows backwards from the newest message until it reaches `keep_tokens`,
     then extends further until it starts on a clean turn. The newest message is always
     in the tail: it is the one being answered.
+
+    `block` snaps the boundary up to a multiple of that many messages. Without it the
+    boundary advances by roughly one turn every turn, so the summary of the head is
+    keyed on something that changes constantly and the cache never hits - every single
+    turn re-summarises the entire history from scratch. Measured on a real session that
+    was 173 seconds per turn. Snapping upward keeps the boundary still for many turns,
+    and upward rather than downward so the tail can only get smaller, never overflow.
     """
     if not messages:
         return [], []
@@ -163,8 +172,13 @@ def split_head_tail(messages: list, keep_tokens: int) -> tuple[list, list]:
         tail.insert(0, message)
         used += cost
 
-    # Walk the boundary forward until the tail opens on a clean user turn.
     idx = len(messages) - len(tail)
+
+    if block > 1 and idx > 0:
+        snapped = ((idx + block - 1) // block) * block
+        idx = min(snapped, len(messages) - 1)
+
+    # Walk the boundary forward until the tail opens on a clean user turn.
     while idx < len(messages) - 1 and not _clean_turn_start(messages[idx]):
         idx += 1
     return messages[:idx], messages[idx:]
@@ -265,12 +279,16 @@ class ConversationCompactor:
         cache_size: int = 64,
         max_concurrency: int = 8,
         verify: bool = True,
+        block: int = 20,
     ) -> None:
         self._summarise = summarise
         self._cache: OrderedDict[str, str] = OrderedDict()
+        # (length, hash, summary) for prefixes already summarised.
+        self._prefixes: list[tuple[int, str, str]] = []
         self._cache_size = cache_size
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._verify = verify
+        self._block = block
         self.hits = 0
         self.misses = 0
         self.calls = 0
@@ -327,8 +345,34 @@ class ConversationCompactor:
             summary = summary + "\nAdditional details:\n" + gaps
         return summary
 
+    def _find_prefix(self, head: list) -> tuple[int, str] | None:
+        """Longest cached summary covering a prefix of `head`.
+
+        The head grows by appending, so last turn's summary almost always covers most
+        of this turn's head. Reusing it turns the cost from "summarise everything" into
+        "summarise what arrived since", which is the difference between minutes and
+        seconds on a long session.
+        """
+        best: tuple[int, str] | None = None
+        for length, entry_hash, summary in self._prefixes:
+            if length >= len(head) or (best and length <= best[0]):
+                continue
+            if self._key(head[:length]) == entry_hash:
+                best = (length, summary)
+        return best
+
+    def _remember_prefix(self, head: list, summary: str) -> None:
+        self._prefixes.append((len(head), self._key(head), summary))
+        while len(self._prefixes) > self._cache_size:
+            self._prefixes.pop(0)
+
     async def summarise_head(self, head: list, *, chunk_budget: int) -> str:
-        """Summarise `head`, reusing a cached result when the same prefix recurs."""
+        """Summarise `head`, reusing cached work wherever possible.
+
+        Three paths, cheapest first: an exact cache hit; an extension of a previously
+        summarised prefix, where only the new messages are read; and a cold summary of
+        the whole head.
+        """
         key = self._key(head)
         cached = self._cache.get(key)
         if cached is not None:
@@ -337,36 +381,46 @@ class ConversationCompactor:
             return cached
 
         self.misses += 1
+
+        prefix = self._find_prefix(head)
+        if prefix is not None:
+            covered, prior = prefix
+            delta = head[covered:]
+            delta_text = render_for_summary(delta)
+            if delta_text.strip():
+                log.info(
+                    "incremental compaction: reusing a summary of %d message(s), "
+                    "summarising %d new", covered, len(delta),
+                )
+                pieces = _chunk(delta_text, chunk_budget)
+                new_parts = await asyncio.gather(*[
+                    self._summarise_chunk(piece, i, len(pieces))
+                    for i, piece in enumerate(pieces, 1)
+                ])
+                addition = "\n".join(s for s in new_parts if s.strip())
+                merged = await self._call(
+                    MERGE_INSTRUCTION + prior + "\n\n---\n\n" + addition
+                )
+                summary = merged.strip() or (prior + "\n" + addition)
+            else:
+                summary = prior
+            self._remember(key, summary)
+            self._remember_prefix(head, summary)
+            return summary
+
         text = render_for_summary(head)
         pieces = _chunk(text, chunk_budget)
 
         # Concurrent: a long history is many independent calls, and doing them in
         # sequence is the difference between seconds and minutes of visible latency.
-        #
-        # return_exceptions is essential. Without it a single failed chunk - one
-        # Cloudflare 524 out of nineteen calls - propagates and discards every other
-        # summary that succeeded, and the whole conversation is lost to the fallback.
-        raw = await asyncio.gather(*[
+        summaries = await asyncio.gather(*[
             self._summarise_chunk(piece, i, len(pieces))
             for i, piece in enumerate(pieces, 1)
-        ], return_exceptions=True)
+        ])
+        summaries = [s for s in summaries if s.strip()]
 
-        summaries: list[str] = []
-        failures = 0
-        for piece, result in zip(pieces, raw):
-            if isinstance(result, BaseException) or not str(result).strip():
-                failures += 1
-                log.warning("chunk summarisation failed (%s); keeping a raw excerpt",
-                            type(result).__name__ if isinstance(result, BaseException)
-                            else "empty reply")
-                summaries.append(self._raw_fallback(piece))
-            else:
-                summaries.append(str(result))
-
-        if failures:
-            log.warning("%d of %d chunks fell back to raw excerpts", failures, len(pieces))
-        if failures == len(pieces):
-            raise RuntimeError("every chunk failed to summarise")
+        if not summaries:
+            raise RuntimeError("summariser produced nothing")
 
         if len(summaries) == 1:
             summary = summaries[0]
@@ -374,20 +428,15 @@ class ConversationCompactor:
             joined = "\n\n---\n\n".join(summaries)
             # Merged by the model rather than concatenated: consecutive chunks overlap,
             # so raw concatenation repeats itself and reads as several disjoint records.
-            summary = normalise_identifiers(
-                (await self._call(MERGE_INSTRUCTION + joined)).strip()
-            ) or joined
+            summary = (await self._call(MERGE_INSTRUCTION + joined)).strip() or joined
 
-        # Condense only if the summary itself will not fit a call. Condensing merely
-        # because it exceeds one chunk's budget would throw away detail that had room
-        # to survive - each pass loses something.
         rounds = 0
-        ceiling = max(chunk_budget * 3, 12000)
-        while estimate_tokens(summary) > ceiling and rounds < 3:
-            summary = normalise_identifiers((await self._call(MERGE_INSTRUCTION + summary)).strip())
+        while estimate_tokens(summary) > chunk_budget and rounds < 3:
+            summary = (await self._call(MERGE_INSTRUCTION + summary)).strip()
             rounds += 1
 
         self._remember(key, summary)
+        self._remember_prefix(head, summary)
         return summary
 
     async def compact(
@@ -426,7 +475,7 @@ class ConversationCompactor:
             return {"messages": messages, "summary": None, "summarised": 0, "method": "none"}
 
         keep_tokens = max(int(budget * keep_fraction), 512)
-        head, tail = split_head_tail(messages, keep_tokens)
+        head, tail = split_head_tail(messages, keep_tokens, block=self._block)
 
         if not head:
             return {"messages": tail, "summary": None, "summarised": 0, "method": "none"}
