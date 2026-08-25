@@ -165,3 +165,149 @@ except ValueError:
 """,
     },
 ]
+
+# Harder cases. The easy tasks above ceiling out - both arms pass them - so they cannot
+# show whether the compensation helps. These carry a specific trap that a model which
+# writes the obvious solution will fall into: month-end clamping, quoted separators,
+# cycle detection, floating point, eviction order. Exactly the discipline the operating
+# notes are meant to instil.
+HARD_TASKS = [
+    {
+        "id": "add_months",
+        "prompt": (
+            "Write a Python function `add_months(year, month, day, n)` returning a "
+            "(year, month, day) tuple n months later. If the day does not exist in the "
+            "target month, clamp to the last day of that month. n may be negative. "
+            "Output only the function, using no imports."
+        ),
+        "entry": "add_months",
+        "tests": """
+assert add_months(2026, 1, 31, 1) == (2026, 2, 28), "Jan 31 + 1 month clamps to Feb 28"
+assert add_months(2024, 1, 31, 1) == (2024, 2, 29), "leap year"
+assert add_months(2026, 3, 31, -1) == (2026, 2, 28), "negative, clamped"
+assert add_months(2026, 12, 15, 1) == (2027, 1, 15), "year rolls forward"
+assert add_months(2026, 1, 15, -1) == (2025, 12, 15), "year rolls back"
+assert add_months(2026, 5, 31, 1) == (2026, 6, 30), "31-day to 30-day month"
+assert add_months(2026, 6, 10, 0) == (2026, 6, 10)
+assert add_months(2026, 1, 31, 13) == (2027, 2, 28), "more than a year"
+""",
+    },
+    {
+        "id": "parse_csv_line",
+        "prompt": (
+            "Write a Python function `parse_csv_line(line)` splitting one CSV line into "
+            "a list of fields. Fields may be double-quoted; a quoted field can contain "
+            "commas, and a doubled quote (\"\") inside a quoted field means a literal "
+            "quote. Do not use the csv module. Output only the function."
+        ),
+        "entry": "parse_csv_line",
+        "tests": """
+assert parse_csv_line('a,b,c') == ['a','b','c']
+assert parse_csv_line('a,"b,c",d') == ['a','b,c','d'], "comma inside quotes"
+assert parse_csv_line('"a""b"') == ['a"b'], "doubled quote is a literal quote"
+assert parse_csv_line('') == ['']
+assert parse_csv_line('a,,b') == ['a','','b'], "empty field"
+assert parse_csv_line('"",x') == ['','x'], "empty quoted field"
+assert parse_csv_line('a,"b"') == ['a','b']
+""",
+    },
+    {
+        "id": "toposort",
+        "prompt": (
+            "Write a Python function `toposort(graph)` where graph maps a node to a list "
+            "of nodes it depends on. Return a list ordering every node after its "
+            "dependencies. Raise ValueError if there is a cycle. Output only the function."
+        ),
+        "entry": "toposort",
+        "tests": """
+r = toposort({'a': [], 'b': ['a'], 'c': ['b']})
+assert r.index('a') < r.index('b') < r.index('c')
+assert toposort({}) == []
+r = toposort({'a': [], 'b': []})
+assert sorted(r) == ['a','b']
+r = toposort({'a': ['b'], 'b': [], 'c': ['a','b']})
+assert r.index('b') < r.index('a') < r.index('c')
+try:
+    toposort({'a': ['b'], 'b': ['a']}); raise AssertionError("cycle must raise ValueError")
+except ValueError:
+    pass
+try:
+    toposort({'a': ['a']}); raise AssertionError("self-cycle must raise ValueError")
+except ValueError:
+    pass
+""",
+    },
+    {
+        "id": "lru",
+        "prompt": (
+            "Write a Python class `LRU` with `__init__(self, capacity)`, `get(key)` "
+            "returning the value or None, and `put(key, value)`. When over capacity it "
+            "evicts the least recently used entry; both get and put count as use. "
+            "Raise ValueError if capacity < 1. Output only the class."
+        ),
+        "entry": "LRU",
+        "tests": """
+c = LRU(2)
+c.put('a',1); c.put('b',2)
+assert c.get('a') == 1
+c.put('c',3)                      # 'b' is least recently used
+assert c.get('b') is None, "get() must count as a use"
+assert c.get('c') == 3
+c2 = LRU(1)
+c2.put('x',1); c2.put('y',2)
+assert c2.get('x') is None and c2.get('y') == 2
+c3 = LRU(2)
+c3.put('a',1); c3.put('a',9)
+assert c3.get('a') == 9, "re-putting a key must update, not duplicate"
+try:
+    LRU(0); raise AssertionError("capacity 0 must raise ValueError")
+except ValueError:
+    pass
+""",
+    },
+    {
+        "id": "running_median",
+        "prompt": (
+            "Write a Python function `running_stats(nums)` returning a list of "
+            "(count, mean, minimum, maximum) tuples, one per prefix of the input. "
+            "The mean must be exact for floats. Return [] for empty input. "
+            "Output only the function."
+        ),
+        "entry": "running_stats",
+        "tests": """
+assert running_stats([]) == []
+assert running_stats([2]) == [(1, 2.0, 2, 2)]
+r = running_stats([1,2,3])
+assert r[0] == (1,1.0,1,1) and r[2] == (3,2.0,1,3)
+r = running_stats([0.1,0.2])
+assert abs(r[1][1] - 0.15000000000000002) < 1e-12 or abs(r[1][1] - 0.15) < 1e-12
+r = running_stats([-5,-1])
+assert r[1] == (2,-3.0,-5,-1), "negatives"
+""",
+    },
+    {
+        "id": "glob_match",
+        "prompt": (
+            "Write a Python function `matches(pattern, text)` implementing glob matching "
+            "where * matches any sequence including empty, and ? matches exactly one "
+            "character. No other metacharacters. Do not use fnmatch or re. "
+            "Output only the function."
+        ),
+        "entry": "matches",
+        "tests": """
+assert matches('*', '') is True
+assert matches('*', 'anything') is True
+assert matches('a*c', 'abc') is True
+assert matches('a*c', 'ac') is True, "* matches empty"
+assert matches('a?c', 'abc') is True
+assert matches('a?c', 'ac') is False, "? needs exactly one char"
+assert matches('', '') is True
+assert matches('', 'x') is False
+assert matches('a*b*c', 'axxbyyc') is True
+assert matches('*.py', 'main.py') is True
+assert matches('*.py', 'main.pyc') is False
+""",
+    },
+]
+
+TASKS = TASKS + HARD_TASKS
