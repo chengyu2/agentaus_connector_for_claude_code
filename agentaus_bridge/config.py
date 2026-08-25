@@ -24,6 +24,13 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "").strip())
+    except (TypeError, ValueError):
+        return default
+
+
 def _csv(name: str, default: list[str]) -> list[str]:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -96,6 +103,21 @@ class Settings:
     # --- timeouts -----------------------------------------------------------------
     connect_timeout: float = field(default_factory=lambda: float(_int("BRIDGE_CONNECT_TIMEOUT", 15)))
     read_timeout: float = field(default_factory=lambda: float(_int("BRIDGE_READ_TIMEOUT", 600)))
+
+    # --- retries ------------------------------------------------------------------
+    # Transient upstream failures (DNS blips, connection resets, 502/503/504 from a
+    # gateway) otherwise surface in Claude Code as a hard "API Error 502" that kills
+    # the turn. Retrying is only safe before any content has been emitted, which the
+    # streaming path enforces.
+    max_retries: int = field(default_factory=lambda: _int("BRIDGE_MAX_RETRIES", 2))
+    retry_backoff_seconds: float = field(
+        default_factory=lambda: _float("BRIDGE_RETRY_BACKOFF", 0.5)
+    )
+    # Ceiling on a single backoff wait. Claude Code gives up on a silent stream at
+    # 300s, so unbounded doubling would trade a fast error for a hung turn.
+    retry_max_delay_seconds: float = field(
+        default_factory=lambda: _float("BRIDGE_RETRY_MAX_DELAY", 8.0)
+    )
 
     # --- misc ---------------------------------------------------------------------
     log_level: str = field(default_factory=lambda: os.environ.get("BRIDGE_LOG_LEVEL", "info"))

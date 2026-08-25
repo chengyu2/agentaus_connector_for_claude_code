@@ -99,18 +99,7 @@ You can sign up for an Agentaus account and obtain an API key at **[agentaus.com
 
 7. **Optional: set up the launchd service** (macOS only) – see the "Running it in the background" section later in this README.
 
-That’s it! You now have a working copy on GitHub and can share it with classmates or contributors.
-
----
-
-```bash
-./scripts/install.sh                          # venv + dependencies + .env
-$EDITOR .env                                  # paste your AGENTAUS_API_KEY
-./.venv/bin/python -m agentaus_bridge --check  # one live call to Agentaus
-./scripts/start-bridge.sh                     # leave running in this terminal
-```
-
-Then, in a second terminal:
+Once the bridge is running, open a second terminal and start Claude Code:
 
 ```bash
 ./scripts/claude-agentaus.sh
@@ -209,6 +198,50 @@ bridge passes `Authorization` and `x-api-key` straight through.
 
 ---
 
+## Can settings.json point different models at different endpoints?
+
+No — and this is the reason the bridge exists.
+
+Claude Code has exactly **one** `ANTHROPIC_BASE_URL` per session. It is read once at
+startup and applies to every request the CLI makes: your turns, background title and
+summary calls, everything. There is no per-model endpoint map in `settings.json`, and
+the related variables do not provide one:
+
+| Variable | What it actually changes |
+| --- | --- |
+| `ANTHROPIC_BASE_URL` | The single endpoint for **all** requests |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` / `SONNET` / `HAIKU` | Only which **model id** an alias maps to — the request still goes to `ANTHROPIC_BASE_URL` |
+| `ANTHROPIC_CUSTOM_MODEL_OPTION` | Only adds a **row to the `/model` picker** — no endpoint of its own |
+
+So per-model routing has to happen *behind* that one URL. That is precisely what this
+bridge does: Claude Code sees a single endpoint, and the bridge fans out per request on
+the `model` field in the body.
+
+**The upshot is that you already get seamless switching.** Inside one session,
+`/model agentaus` goes to Canberra and `/model opus` goes to Anthropic, with no restart.
+The only thing that needs a restart is *adding* the picker entry, because environment
+variables are read once at startup — not switching between entries afterwards.
+
+### The trade-off this creates
+
+Because everything flows through one process, **the bridge is a single point of failure
+for both providers**. If the bridge is down — or, as happened here, the machine's DNS
+resolver breaks — Claude models stop working too, so you cannot fall back to Claude to
+debug the problem. Two things mitigate it:
+
+- launchd (`KeepAlive`) restarts the bridge automatically if it dies.
+- Transient upstream faults are retried with backoff rather than failing the turn.
+
+If you need a guaranteed escape hatch, keep a second Claude Code profile with no
+`ANTHROPIC_BASE_URL` set at all; it talks to Anthropic directly and bypasses the bridge
+entirely.
+
+The bridge deliberately does **not** fall back to Claude when Agentaus is unreachable.
+Silently sending a prompt to a different provider than the one you selected would move
+your code offshore without telling you.
+
+---
+
 ## How routing works
 
 Every request is routed on the `model` field in the request body:
@@ -263,6 +296,9 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `BRIDGE_CHUNK_CHARS` | `60` | Re-chunk buffered replies into smaller deltas; `0` disables |
 | `BRIDGE_CONNECT_TIMEOUT` | `15` | Connect timeout (seconds) |
 | `BRIDGE_READ_TIMEOUT` | `600` | Read timeout (seconds) |
+| `BRIDGE_MAX_RETRIES` | `2` | Extra attempts after a transient upstream failure |
+| `BRIDGE_RETRY_BACKOFF` | `0.5` | Base backoff in seconds; doubles per attempt, plus jitter |
+| `BRIDGE_RETRY_MAX_DELAY` | `8` | Ceiling on a single backoff wait |
 | `BRIDGE_TOKEN` | *(empty)* | Require this token from clients; empty means no client auth |
 | `BRIDGE_LOG_LEVEL` | `info` | `debug` for per-request detail |
 | `BRIDGE_LOG_BODIES` | `false` | Log full request bodies — **includes your source code** |
@@ -372,6 +408,9 @@ malformed tool arguments.
 | Replies read like a generic assistant, not an agent | `AGENTAUS_SYSTEM_PROMPT_OVERWRITE` got turned off, so the Agentaus persona is back in front of Claude Code's prompt. |
 | `API Error: Failed to parse JSON` | Fixed in this repo. The passthrough was returning the upstream body still gzip-compressed while stripping `content-encoding`. Only larger responses are compressed, so it looked random. Covered by `tests/test_passthrough.py`. |
 | `API Error` / auto mode fails on every action | Do not set `CLAUDE_CODE_ATTRIBUTION_HEADER=0`. Behind a custom base URL it also strips the block from auto-mode permission-classifier requests, which the API declines with 401. |
+| Both Agentaus **and** Claude models fail at once | Almost always DNS or the bridge being down, not either provider. Everything flows through the bridge, so one broken resolver takes out both. See the row below. |
+| `nodename nor servname provided, or not known` | The macOS system resolver (`mDNSResponder`) is wedged. Diagnose by comparing `dig agentaus.com.au` (queries the DNS server directly) with `python3 -c "import socket;socket.getaddrinfo('agentaus.com.au',443)"` (uses the system resolver). If `dig` works and `getaddrinfo` fails, every app on the machine is affected, not just the bridge. Fix: `sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder`, or reboot. |
+| Agentaus vanished from the `/model` list | `.claude/settings.json` is missing or lost `ANTHROPIC_CUSTOM_MODEL_OPTION`. That variable creates the row and is read **once at startup**, so restore the file and restart Claude Code. |
 | `Address already in use` on start | An older bridge is still bound: `lsof -ti tcp:8787 \| xargs kill`. |
 
 ---

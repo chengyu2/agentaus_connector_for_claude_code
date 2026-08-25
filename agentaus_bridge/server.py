@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
 import uuid
 from typing import AsyncIterator, Callable
@@ -173,6 +174,85 @@ async def count_tokens(request: Request) -> Response:
 
 
 # --------------------------------------------------------------------------------------
+# Transient-failure retries
+# --------------------------------------------------------------------------------------
+
+# Status codes worth a second attempt. These are gateway/capacity signals rather than
+# anything about the request itself, so replaying the identical body is safe.
+_RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+# Connection-level faults that never reached the application upstream. A DNS blip
+# ("nodename nor servname provided") arrives as ConnectError; a dropped keep-alive
+# socket arrives as RemoteProtocolError or ConnectError depending on timing.
+_RETRYABLE_EXCEPTIONS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.PoolTimeout,
+    httpx.RemoteProtocolError,
+)
+
+
+def _is_retryable_exception(exc: BaseException) -> bool:
+    return isinstance(exc, _RETRYABLE_EXCEPTIONS)
+
+
+def _describe(exc: BaseException) -> str:
+    """Type plus message. The type alone cannot distinguish a DNS failure from a
+    refused connection, which is the first thing you need when reading the log."""
+    detail = str(exc).strip()
+    return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+
+
+def _retry_delay(attempt: int) -> float:
+    """Exponential backoff with jitter, capped so a long outage still ends the turn.
+
+    Jitter matters when several requests fail at once - Claude Code fires background
+    calls alongside the main turn, and without it they would all retry in lockstep and
+    re-hammer an upstream that is already struggling.
+    """
+    base = settings.retry_backoff_seconds * (2**attempt)
+    return min(base, settings.retry_max_delay_seconds) + random.uniform(
+        0, settings.retry_backoff_seconds
+    )
+
+
+async def _sleep_before_retry(attempt: int, why: str) -> None:
+    delay = _retry_delay(attempt)
+    log.warning("upstream attempt %d failed (%s); retrying in %.2fs", attempt + 1, why, delay)
+    await asyncio.sleep(delay)
+
+
+async def _post_with_retry(
+    client: httpx.AsyncClient, url: str, *, json_body: dict, headers: dict
+) -> httpx.Response:
+    """POST, retrying transient connection faults and gateway status codes.
+
+    Only used for buffered (non-streaming) requests, where replaying costs nothing
+    because no bytes have been handed to the client yet.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(settings.max_retries + 1):
+        try:
+            response = await client.post(url, json=json_body, headers=headers)
+        except httpx.HTTPError as exc:
+            last_exc = exc
+            if not _is_retryable_exception(exc) or attempt == settings.max_retries:
+                raise
+            await _sleep_before_retry(attempt, _describe(exc))
+            continue
+
+        if response.status_code in _RETRYABLE_STATUS and attempt < settings.max_retries:
+            await response.aread()  # release the connection before sleeping
+            await _sleep_before_retry(attempt, f"HTTP {response.status_code}")
+            continue
+        return response
+
+    raise last_exc if last_exc else RuntimeError("retry loop exited without a response")
+
+
+# --------------------------------------------------------------------------------------
 # Agentaus path
 # --------------------------------------------------------------------------------------
 
@@ -203,8 +283,11 @@ async def _handle_agentaus(
 
     if not wants_stream:
         try:
-            upstream = await client.post(
-                settings.agentaus_url, json={**payload, "stream": False}, headers=_agentaus_headers()
+            upstream = await _post_with_retry(
+                client,
+                settings.agentaus_url,
+                json_body={**payload, "stream": False},
+                headers=_agentaus_headers(),
             )
         except httpx.HTTPError as exc:
             return _error_response(502, "api_error", f"Agentaus request failed: {exc}")
@@ -258,82 +341,114 @@ async def _agentaus_event_stream(
     usage: dict | None = None
     accumulator = ToolCallAccumulator()
 
-    try:
-        if payload.get("stream"):
-            async with client.stream(
-                "POST", settings.agentaus_url, json=payload, headers=_agentaus_headers()
-            ) as upstream:
+    # A transient fault before the first content byte can be retried invisibly: the
+    # client has only seen `message_start`, which carries no content. Once any text or
+    # tool call has been emitted a retry would duplicate it, so `emitted` latches the
+    # stream to fail-fast from that point on.
+    attempt = 0
+    while True:
+        emitted = False
+        finish_reason = None
+        usage = None
+        accumulator = ToolCallAccumulator()
+        retry_reason: str | None = None
+
+        try:
+            if payload.get("stream"):
+                async with client.stream(
+                    "POST", settings.agentaus_url, json=payload, headers=_agentaus_headers()
+                ) as upstream:
+                    if upstream.status_code >= 400:
+                        detail = (await upstream.aread()).decode("utf-8", "replace")[:500]
+                        if (
+                            upstream.status_code in _RETRYABLE_STATUS
+                            and attempt < settings.max_retries
+                        ):
+                            retry_reason = f"HTTP {upstream.status_code}"
+                        else:
+                            yield builder.error(
+                                f"Agentaus returned HTTP {upstream.status_code}: {detail}",
+                                _error_type_for_status(upstream.status_code),
+                            )
+                            yield builder.finish("stop", None)
+                            return
+                    else:
+                        async for line in upstream.aiter_lines():
+                            line = line.strip()
+                            if not line or not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if data == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data)
+                            except json.JSONDecodeError:
+                                continue
+
+                            for choice in chunk.get("choices") or []:
+                                delta = choice.get("delta") or {}
+                                text = delta.get("content")
+                                if text:
+                                    emitted = True
+                                    yield builder.text(text)
+                                if delta.get("tool_calls"):
+                                    emitted = True
+                                    accumulator.add(delta["tool_calls"])
+                                if choice.get("finish_reason"):
+                                    finish_reason = choice["finish_reason"]
+                            if chunk.get("usage"):
+                                usage = chunk["usage"]
+            else:
+                upstream = await _post_with_retry(
+                    client,
+                    settings.agentaus_url,
+                    json_body={**payload, "stream": False},
+                    headers=_agentaus_headers(),
+                )
                 if upstream.status_code >= 400:
-                    detail = (await upstream.aread()).decode("utf-8", "replace")[:500]
                     yield builder.error(
-                        f"Agentaus returned HTTP {upstream.status_code}: {detail}",
+                        f"Agentaus returned HTTP {upstream.status_code}: {upstream.text[:500]}",
                         _error_type_for_status(upstream.status_code),
                     )
                     yield builder.finish("stop", None)
                     return
-
-                async for line in upstream.aiter_lines():
-                    line = line.strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-
-                    for choice in chunk.get("choices") or []:
-                        delta = choice.get("delta") or {}
-                        text = delta.get("content")
-                        if text:
-                            yield builder.text(text)
-                        if delta.get("tool_calls"):
-                            accumulator.add(delta["tool_calls"])
-                        if choice.get("finish_reason"):
-                            finish_reason = choice["finish_reason"]
-                    if chunk.get("usage"):
-                        usage = chunk["usage"]
-        else:
-            upstream = await client.post(
-                settings.agentaus_url,
-                json={**payload, "stream": False},
-                headers=_agentaus_headers(),
-            )
-            if upstream.status_code >= 400:
-                yield builder.error(
-                    f"Agentaus returned HTTP {upstream.status_code}: {upstream.text[:500]}",
-                    _error_type_for_status(upstream.status_code),
+                data = upstream.json()
+                choice = (data.get("choices") or [{}])[0]
+                message = choice.get("message") or {}
+                if message.get("content"):
+                    emitted = True
+                    yield builder.text(message["content"])
+                accumulator.add(
+                    [{"index": i, **call} for i, call in enumerate(message.get("tool_calls") or [])]
                 )
+                finish_reason = choice.get("finish_reason")
+                usage = data.get("usage")
+
+        except httpx.HTTPError as exc:
+            if emitted or not _is_retryable_exception(exc) or attempt >= settings.max_retries:
+                log.warning("agentaus stream failed: %s", exc)
+                yield builder.error(f"Agentaus request failed: {exc}", "api_error")
                 yield builder.finish("stop", None)
                 return
-            data = upstream.json()
-            choice = (data.get("choices") or [{}])[0]
-            message = choice.get("message") or {}
-            if message.get("content"):
-                yield builder.text(message["content"])
-            accumulator.add(
-                [{"index": i, **call} for i, call in enumerate(message.get("tool_calls") or [])]
-            )
-            finish_reason = choice.get("finish_reason")
-            usage = data.get("usage")
+            retry_reason = _describe(exc)
 
-        for call in accumulator.drain():
-            yield builder.tool_use(call["id"], call["name"], call["arguments"])
+        if retry_reason:
+            await _sleep_before_retry(attempt, retry_reason)
+            attempt += 1
+            continue
+        break
 
-        yield builder.finish(finish_reason, usage)
-        log.info(
-            "POST /v1/messages model=%s route=agentaus stream=true -> 200 in %.1fs finish=%s usage=%s",
-            model,
-            time.monotonic() - started,
-            finish_reason,
-            usage,
-        )
-    except httpx.HTTPError as exc:
-        log.warning("agentaus stream failed: %s", exc)
-        yield builder.error(f"Agentaus request failed: {exc}", "api_error")
-        yield builder.finish("stop", None)
+    for call in accumulator.drain():
+        yield builder.tool_use(call["id"], call["name"], call["arguments"])
+
+    yield builder.finish(finish_reason, usage)
+    log.info(
+        "POST /v1/messages model=%s route=agentaus stream=true -> 200 in %.1fs finish=%s usage=%s",
+        model,
+        time.monotonic() - started,
+        finish_reason,
+        usage,
+    )
 
 
 async def _keepalive(
@@ -411,13 +526,32 @@ async def _passthrough(request: Request, raw: bytes) -> Response:
         if key.lower() not in _STRIP_REQUEST_HEADERS
     }
 
-    upstream_request = client.build_request(
-        request.method, url, headers=headers, content=raw
-    )
-    try:
-        upstream = await client.send(upstream_request, stream=True)
-    except httpx.HTTPError as exc:
-        return _error_response(502, "api_error", f"Upstream Anthropic request failed: {exc}")
+    # Retry the connect only. Nothing has been written to the client yet, so replaying
+    # the identical body is invisible; once we start streaming the response back a
+    # retry would duplicate bytes, so failures past this point are surfaced as-is.
+    upstream = None
+    for attempt in range(settings.max_retries + 1):
+        upstream_request = client.build_request(
+            request.method, url, headers=headers, content=raw
+        )
+        try:
+            upstream = await client.send(upstream_request, stream=True)
+        except httpx.HTTPError as exc:
+            if not _is_retryable_exception(exc) or attempt == settings.max_retries:
+                return _error_response(
+                    502, "api_error", f"Upstream Anthropic request failed: {exc}"
+                )
+            await _sleep_before_retry(attempt, _describe(exc))
+            continue
+
+        if upstream.status_code in _RETRYABLE_STATUS and attempt < settings.max_retries:
+            await upstream.aclose()
+            await _sleep_before_retry(attempt, f"HTTP {upstream.status_code}")
+            continue
+        break
+
+    if upstream is None:  # pragma: no cover - loop always assigns or returns
+        return _error_response(502, "api_error", "Upstream Anthropic request failed")
 
     response_headers = {
         key: value
