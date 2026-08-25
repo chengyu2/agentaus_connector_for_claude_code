@@ -184,7 +184,7 @@ async def messages(request: Request) -> Response:
     )
 
     if settings.log_bodies:
-        log.info("request body: %s", json.dumps(body)[:4000])
+        rlog(logging.INFO, "request body: %s", json.dumps(body)[:4000])
 
     if to_agentaus:
         return await _handle_agentaus(request, body, model, wants_stream)
@@ -247,7 +247,10 @@ class _Phase:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.elapsed = time.monotonic() - self.started
         if exc_type is not None:
-            rlog(logging.WARNING, "%s FAILED after %.1fs: %s", self.name, self.elapsed, exc)
+            # CancelledError and GeneratorExit carry no message, so name the type -
+            # "FAILED: " with nothing after it says less than it should.
+            reason = str(exc).strip() or exc_type.__name__
+            rlog(logging.WARNING, "%s ended after %.1fs: %s", self.name, self.elapsed, reason)
         else:
             rlog(logging.INFO, "%s done in %.1fs", self.name, self.elapsed)
 
@@ -302,7 +305,7 @@ def _retry_delay(attempt: int) -> float:
 
 async def _sleep_before_retry(attempt: int, why: str) -> None:
     delay = _retry_delay(attempt)
-    log.warning("upstream attempt %d failed (%s); retrying in %.2fs", attempt + 1, why, delay)
+    rlog(logging.WARNING, "upstream attempt %d failed (%s); retrying in %.2fs", attempt + 1, why, delay)
     await asyncio.sleep(delay)
 
 
@@ -366,7 +369,7 @@ def _learn_limit_from(message: str) -> None:
     value = int(match.group(1))
     if value > 0 and value != _learned_limit:
         _learned_limit = value
-        log.info("learned Agentaus context window from the API: %d tokens", value)
+        rlog(logging.INFO, "learned Agentaus context window from the API: %d tokens", value)
 
 
 def _context_limit() -> int:
@@ -430,7 +433,7 @@ async def _self_review(client: httpx.AsyncClient, request_text: str, answer: str
                 client, ADJUDICATE_INSTRUCTION.format(review=review[:6000])
             )
             verdict = not adjudication.strip().upper().startswith("YES")
-            log.info("review verdict was unstated; adjudicated as %s",
+            rlog(logging.INFO, "review verdict was unstated; adjudicated as %s",
                      "sound" if verdict else "defective")
         if verdict:
             return answer
@@ -441,10 +444,10 @@ async def _self_review(client: httpx.AsyncClient, request_text: str, answer: str
             ),
         )
         if revised and revised.strip():
-            log.info("self-review revised the answer (%d -> %d chars)", len(answer), len(revised))
+            rlog(logging.INFO, "self-review revised the answer (%d -> %d chars)", len(answer), len(revised))
             return revised.strip()
     except Exception as exc:
-        log.warning("self-review failed (%s); keeping the original answer", exc)
+        rlog(logging.WARNING, "self-review failed (%s); keeping the original answer", exc)
     return answer
 
 
@@ -596,7 +599,7 @@ async def _fit_to_window(
         fitted["system"] = _with_summary(
             body.get("system"), plan["summary"], plan["summarised"]
         )
-        log.warning(
+        rlog(logging.WARNING, 
             "compacted %d oldest message(s) into a summary for a %d-token target "
             "(~%d -> ~%d tokens)",
             plan["summarised"], target, estimated, estimate_request_tokens(fitted),
@@ -605,7 +608,7 @@ async def _fit_to_window(
     if plan["method"] == "trimmed":
         fitted = {**body, "messages": plan["messages"]}
         fitted["system"] = _with_trim_notice(body.get("system"), plan["dropped"])
-        log.warning(
+        rlog(logging.WARNING, 
             "summarisation could not reach the %d-token target; dropped %d oldest "
             "message(s) instead (~%d -> ~%d tokens)",
             target, plan["dropped"], estimated, estimate_request_tokens(fitted),
@@ -677,7 +680,7 @@ async def _handle_agentaus(
             stream=settings.upstream_stream and wants_stream,
         )
         if settings.log_bodies:
-            log.info("-> agentaus payload: %s", json.dumps(built)[:4000])
+            rlog(logging.INFO, "-> agentaus payload: %s", json.dumps(built)[:4000])
         return fitted, built
 
     if not wants_stream:
@@ -705,7 +708,7 @@ async def _handle_agentaus(
 
             _learn_limit_from(upstream.text)
             scale *= settings.agentaus_fit_shrink
-            log.warning(
+            rlog(logging.WARNING, 
                 "Agentaus rejected the prompt as too long; recompacting to %.0f%% "
                 "of the window and retrying", scale * 100,
             )
@@ -728,7 +731,7 @@ async def _handle_agentaus(
 
         # Agentaus can answer HTTP 200 with an error object instead of choices.
         if isinstance(data.get("error"), dict):
-            log.warning("agentaus in-band error: %s", _agentaus_error_text(data["error"]))
+            rlog(logging.WARNING, "agentaus in-band error: %s", _agentaus_error_text(data["error"]))
             return _error_response(
                 400,
                 data["error"].get("type") or "api_error",
@@ -754,7 +757,7 @@ async def _handle_agentaus(
                         + list((data.get("choices") or [])[1:])}
 
         message = agentaus_response_to_anthropic(data, model=display_model)
-        log.info(
+        rlog(logging.INFO, 
             "POST /v1/messages model=%s route=agentaus stream=false -> 200 in %.1fs in=%s out=%s",
             display_model,
             time.monotonic() - started,
@@ -917,7 +920,7 @@ async def _agentaus_event_stream(
                                     chunk["error"].get("type") or "api_error",
                                 )
                                 yield builder.finish("stop", None)
-                                log.warning(
+                                rlog(logging.WARNING, 
                                     "agentaus in-band error: %s",
                                     _agentaus_error_text(chunk["error"]),
                                 )
@@ -981,7 +984,7 @@ async def _agentaus_event_stream(
 
         except httpx.HTTPError as exc:
             if emitted or not _is_retryable_exception(exc) or attempt >= settings.max_retries:
-                log.warning("agentaus stream failed: %s", exc)
+                rlog(logging.WARNING, "agentaus stream failed: %s", exc)
                 yield builder.error(f"Agentaus request failed: {exc}", "api_error")
                 yield builder.finish("stop", None)
                 return
@@ -1006,7 +1009,7 @@ async def _agentaus_event_stream(
 
     _calibrate_from_usage(original, usage)
     yield builder.finish(finish_reason, usage)
-    log.info(
+    rlog(logging.INFO, 
         "POST /v1/messages model=%s route=agentaus stream=true -> 200 in %.1fs finish=%s usage=%s",
         model,
         time.monotonic() - started,
@@ -1051,7 +1054,7 @@ async def _keepalive(
             if item is sentinel:
                 return
             if isinstance(item, BaseException):
-                log.warning("stream producer error: %s", item)
+                rlog(logging.WARNING, "stream producer error: %s", item)
                 yield AnthropicStreamBuilder.error(str(item), "api_error")
                 return
             yield item
@@ -1134,6 +1137,9 @@ async def _passthrough(request: Request, raw: bytes) -> Response:
                 yield chunk
         finally:
             await upstream.aclose()
+
+    rlog(logging.INFO, "passthrough -> %s %d", url.split("//", 1)[-1][:60],
+         upstream.status_code)
 
     return StreamingResponse(
         body_iterator(),

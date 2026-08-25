@@ -581,6 +581,38 @@ malformed tool arguments.
 
 ---
 
+## Reading the log
+
+`/tmp/agentaus-bridge.log`. Every line for one turn carries the same short request id,
+so a single turn can be followed end to end:
+
+```
+req f5782343 recv model=agentaus route=agentaus stream=True msgs=81 est=241482 bytes=963487
+req f5782343 compaction start (est 241,482 tok, target 131,072)
+req f5782343 compaction done in 189.4s
+req f5782343 compaction result: 241482 -> 2593 est tokens
+req f5782343 upstream start (est 2946 tok)
+req f5782343 POST /v1/messages model=agentaus route=agentaus stream=true -> 200 in 190.5s
+```
+
+| Line | Tells you |
+| --- | --- |
+| `recv` | A request arrived, and how big it is. Logged **on arrival**, not on completion — a hung turn never completes, so a completion-only log never mentions it at all. |
+| `compaction start` / `done` | The slowest phase, timed. A `start` with no matching `done` is the signature of a hang. |
+| `compaction result` | What compaction achieved, in tokens. |
+| `upstream start` | Handed off to Agentaus; anything after this is the model's time, not the bridge's. |
+| `passthrough -> ` | A Claude-model turn was forwarded to Anthropic, with the status. |
+| `client disconnected after` | The caller gave up. Without this line an abandoned turn looks exactly like one still running. |
+| `token calibration:` | The fitted relationship between our token count and the one Agentaus charges. |
+
+To follow one turn: `grep 'req f5782343' /tmp/agentaus-bridge.log`.
+To watch live: `tail -f /tmp/agentaus-bridge.log`.
+
+`BRIDGE_LOG_LEVEL=debug` adds a line per summarisation call. `BRIDGE_LOG_BODIES=true`
+logs full request bodies — **including your source code** — so leave it off routinely.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |
