@@ -43,7 +43,9 @@ $EDITOR .env                                 # paste your AGENTAUS_API_KEY
 ./scripts/start-bridge.sh                     # start the bridge (leave this terminal open)
 ```
 
-### 🎓 Student-friendly walkthrough
+### Step by step guide
+
+You can sign up for an Agentaus account and obtain an API key at **[agentaus.com.au](https://agentaus.com.au)**. After registering, navigate to the API dashboard to create a new key.
 
 **Goal:** Clone this repository, set it up, and run the bridge so you can use the Agentaus model from Claude Code.
 
