@@ -228,6 +228,62 @@ def estimate_request_tokens(body: dict) -> int:
     return estimate_tokens(blob)
 
 
+
+def _starts_a_clean_turn(message: dict) -> bool:
+    """True if the conversation can validly begin at this message.
+
+    A user message carrying `tool_result` blocks refers back to a `tool_use` in the
+    preceding assistant message. Beginning there would leave the result orphaned,
+    which Agentaus rejects, so such a message can never be the new first one.
+    """
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, list):
+        return not any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+        )
+    return True
+
+
+def trim_messages_to_fit(body: dict, limit: int, *, reserve: int = 0) -> tuple[list, int]:
+    """Drop the oldest messages until the request fits Agentaus' context window.
+
+    Returns `(messages, dropped)`. `dropped` is 0 when nothing needed removing.
+
+    Oldest-first is what /compact effectively does, and unlike summarising it costs
+    no extra model calls - which matters because the bridge is stateless and would
+    otherwise re-summarise the whole history on every single turn.
+
+    Dropping continues past the arithmetic threshold until the surviving head is a
+    clean user turn, so tool_use/tool_result pairs are never split.
+
+    If even the final message cannot fit, the caller is told (`dropped` covers every
+    message removed) and should reject rather than send something malformed.
+    """
+    messages = list(body.get("messages") or [])
+    if limit <= 0 or not messages:
+        return messages, 0
+
+    def fits(candidate: list) -> bool:
+        probe = {"system": body.get("system"), "messages": candidate, "tools": body.get("tools")}
+        return estimate_request_tokens(probe) + reserve <= limit
+
+    if fits(messages):
+        return messages, 0
+
+    dropped = 0
+    # Always keep the final message: it carries the request being answered.
+    while len(messages) > 1 and not fits(messages):
+        messages.pop(0)
+        dropped += 1
+        while len(messages) > 1 and not _starts_a_clean_turn(messages[0]):
+            messages.pop(0)
+            dropped += 1
+
+    return messages, dropped
+
+
 def agentaus_response_to_anthropic(data: dict, *, model: str) -> dict:
     """Convert a non-streaming Agentaus completion into an Anthropic Message."""
     choices = data.get("choices") or [{}]

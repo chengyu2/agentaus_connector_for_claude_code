@@ -275,6 +275,47 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL="agentaus"
 
 ---
 
+## What happens when a conversation outgrows Agentaus
+
+Agentaus' window is **131,072 tokens** — prompt and reply together — against Claude's
+much larger one. Two things make this bite sooner than you would expect: there is no
+prompt caching, so every turn resends the whole conversation, and Claude Code sizes its
+auto-compact against the window it *assumes* for a model, which it has no way to learn
+for Agentaus.
+
+Left alone the turn simply dies, and `/compact` cannot rescue it either — compaction
+summarises by sending the conversation to the model, so once you are over the window
+the compaction call is over it too
+([claude-code#25867](https://github.com/anthropics/claude-code/issues/25867)).
+
+So the bridge recovers by itself. When a request would overflow, it drops the oldest
+messages until it fits and sends the rest:
+
+```
+WARNING agentaus-bridge: auto-trimmed 42 oldest message(s) to fit Agentaus'
+        131072-token window (~405767 -> ~121753 tokens)
+```
+
+This is what `/compact` does in effect, minus the summarising — which the bridge cannot
+do cheaply, being stateless: it would have to re-summarise the whole history on every
+single turn. Two properties make the trimming safe:
+
+- **Tool pairs are never split.** A `tool_result` refers back to a `tool_use` in the
+  previous assistant turn, so trimming keeps going until the surviving conversation
+  starts on a clean user turn. Cutting between them produces a request Agentaus rejects.
+- **Agentaus is told.** A note is appended to the system prompt saying how many messages
+  were removed, so the model says it cannot see earlier context instead of inventing it.
+
+The message being answered is always kept. If a *single* message is itself too large to
+fit, nothing can be trimmed and the request is refused with `prompt is too long: N
+tokens > M maximum` — the wording Claude Code matches on to compact and retry.
+
+Set `AGENTAUS_AUTO_TRIM=false` to get the hard error instead. Trimming is lossy, and on
+work where losing the early conversation would be worse than failing outright, failing
+is the better outcome.
+
+---
+
 ## Changing the port
 
 The bridge listens on `127.0.0.1:8787` by default. If something else already owns that
@@ -358,6 +399,7 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_MODEL_MARKERS` | `agentaus` | Comma-separated substrings that route to Agentaus |
 | `AGENTAUS_FORCE_ALL` | `false` | Ignore the model id; send everything to Agentaus |
 | `AGENTAUS_MAX_INPUT_TOKENS` | `131072` | Agentaus' context window. Defaults in code, not `.env`, so a fresh clone is still protected; `0` disables the check |
+| `AGENTAUS_AUTO_TRIM` | `true` | Drop oldest messages to fit the window rather than failing the turn |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | `127.0.0.1` / `8787` | Listen address |
 | `BRIDGE_PASSTHROUGH` | `true` | Forward non-Agentaus models to Anthropic; `false` answers them with Agentaus instead |
 | `ANTHROPIC_UPSTREAM_BASE_URL` | `https://api.anthropic.com` | Passthrough target |
@@ -451,14 +493,32 @@ To avoid keeping a terminal open, install a launchd agent at
 launchctl load ~/Library/LaunchAgents/com.trellisdata.agentaus-bridge.plist
 ```
 
+`RunAtLoad` plus `KeepAlive` means **nothing needs running by hand after a reboot** —
+launchd starts the bridge at login and restarts it if it dies. `.claude/settings.json`
+lives on disk, so Claude Code picks the Agentaus option back up on its own. Confirm with:
+
+```bash
+launchctl list | grep agentaus      # a pid means it is running
+curl -s http://127.0.0.1:8787/healthz
+```
+
+If you run the bridge with `./scripts/start-bridge.sh` in a terminal instead of under
+launchd, that one *does* have to be started again after every reboot.
+
 ---
 
 ## Testing
 
 ```bash
-./.venv/bin/python -m unittest discover -s tests -v   # translation unit tests
-./.venv/bin/python tests/smoke_test.py                # end-to-end, needs a running bridge
+./.venv/bin/python -m unittest discover -s tests -v   # unit tests, no network needed
+./.venv/bin/python tests/smoke_test.py                # quick end-to-end, needs a running bridge
+./.venv/bin/python tests/integration_test.py          # full live flow, costs real tokens
 ```
+
+`integration_test.py` exercises what a real session does, nothing stubbed: per-model
+routing to both providers, switching between them, streaming, tool-call round trips,
+an oversized conversation recovering via auto-trim, and an untrimmable one being
+refused with wording Claude Code can act on.
 
 The unit tests cover the translation edge cases that break agent loops: tool-result
 ordering, fragmented tool-call deltas, block open/close pairing in the SSE stream, and

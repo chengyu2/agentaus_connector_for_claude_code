@@ -132,6 +132,17 @@ class Settings:
     agentaus_max_input_tokens: int = field(
         default_factory=lambda: _int("AGENTAUS_MAX_INPUT_TOKENS", 131072)
     )
+    # When a conversation exceeds the window, drop the oldest messages so the turn
+    # still succeeds instead of dying. This is what /compact does in effect, and it
+    # is the only automatic recovery available to the bridge: Claude Code's model
+    # picker and /compact are client-side and cannot be driven from here.
+    #
+    # On by default because the alternative is a hard failure with no way forward on
+    # Agentaus - /compact cannot rescue it either, since compaction must itself fit
+    # in the window. Set false to get the error instead of silent trimming.
+    agentaus_auto_trim: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_AUTO_TRIM", True)
+    )
 
     # --- misc ---------------------------------------------------------------------
     log_level: str = field(default_factory=lambda: os.environ.get("BRIDGE_LOG_LEVEL", "info"))

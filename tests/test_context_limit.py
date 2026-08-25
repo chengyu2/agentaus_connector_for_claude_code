@@ -223,3 +223,78 @@ class TestCanonicalOverLengthWording(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTrimReachesUpstream(unittest.TestCase):
+    """Regression: trimming was applied to `body` *after* the upstream payload had
+    already been built from it, so the full untrimmed conversation was still sent.
+    Unit-testing the trim function in isolation cannot catch that - only asserting
+    on what the upstream actually received can."""
+
+    PORT = 9942
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.received = []
+        received = cls.received
+
+        class _Recorder(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                raw = self.rfile.read(int(self.headers.get("content-length", 0) or 0))
+                received.append(json.loads(raw or b"{}"))
+                body = json.dumps({
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                                 "message": {"role": "assistant", "content": "ok"}}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a) -> None:
+                pass
+
+        HTTPServer.allow_reuse_address = True
+        cls.server = HTTPServer(("127.0.0.1", cls.PORT), _Recorder)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def test_upstream_receives_the_trimmed_conversation(self):
+        from agentaus_bridge import server
+        from agentaus_bridge.config import settings
+
+        self.received.clear()
+        saved = (settings.agentaus_base_url, settings.agentaus_api_key,
+                 settings.agentaus_max_input_tokens, settings.agentaus_auto_trim)
+        settings.agentaus_base_url = f"http://127.0.0.1:{self.PORT}"
+        settings.agentaus_api_key = "k"
+        settings.agentaus_max_input_tokens = 2000
+        settings.agentaus_auto_trim = True
+        try:
+            messages = []
+            for i in range(20):
+                messages.append({"role": "user", "content": f"turn {i} " + "filler " * 400})
+                messages.append({"role": "assistant", "content": "ok"})
+            messages.append({"role": "user", "content": "final question"})
+            with TestClient(server.app) as client:
+                client.post("/v1/messages", json={
+                    "model": "agentaus", "max_tokens": 32,
+                    "stream": False, "messages": messages,
+                })
+        finally:
+            (settings.agentaus_base_url, settings.agentaus_api_key,
+             settings.agentaus_max_input_tokens, settings.agentaus_auto_trim) = saved
+
+        self.assertEqual(len(self.received), 1, "upstream was not called")
+        sent = self.received[0]["messages"]
+        self.assertLess(len(sent), len(messages),
+                        "upstream got the full conversation - the trim was discarded")
+        blob = json.dumps(sent)
+        self.assertIn("final question", blob, "the question being answered was lost")
+        self.assertLess(len(blob) // 4, 2000 * 2, "trimmed payload still far over the limit")

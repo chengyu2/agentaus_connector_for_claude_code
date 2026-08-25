@@ -30,6 +30,7 @@ from .translate import (
     anthropic_request_to_agentaus,
     estimate_request_tokens,
     sse,
+    trim_messages_to_fit,
 )
 
 log = logging.getLogger("agentaus-bridge")
@@ -256,6 +257,26 @@ async def _post_with_retry(
 # Agentaus path
 # --------------------------------------------------------------------------------------
 
+def _with_trim_notice(system, dropped: int):
+    """Append a note to the system prompt saying history was trimmed.
+
+    Without this the model answers as though it can see the whole conversation and
+    may invent continuity it has no basis for.
+    """
+    notice = (
+        f"\n\n[Note: the {dropped} oldest message(s) of this conversation were removed "
+        f"to fit the context window. If the user refers to something earlier that you "
+        f"cannot see, say so rather than guessing.]"
+    )
+    if system is None:
+        return notice.strip()
+    if isinstance(system, str):
+        return system + notice
+    if isinstance(system, list):
+        return list(system) + [{"type": "text", "text": notice.strip()}]
+    return system
+
+
 def _agentaus_error_text(err: dict) -> str:
     """Flatten an Agentaus error object into a message worth showing a user.
 
@@ -289,11 +310,6 @@ def _agentaus_headers() -> dict:
 async def _handle_agentaus(
     request: Request, body: dict, model: str, wants_stream: bool
 ) -> Response:
-    payload = anthropic_request_to_agentaus(
-        body,
-        system_prompt_overwrite=settings.system_prompt_overwrite,
-        stream=settings.upstream_stream and wants_stream,
-    )
     client: httpx.AsyncClient = request.app.state.client
     started = time.monotonic()
     display_model = model or "agentaus"
@@ -306,6 +322,24 @@ async def _handle_agentaus(
     if limit > 0:
         estimated = estimate_request_tokens(body)
         reserved = int(body.get("max_tokens") or 0)
+        if estimated + reserved > limit and settings.agentaus_auto_trim:
+            kept, dropped = trim_messages_to_fit(body, limit, reserve=reserved)
+            if dropped and len(kept) >= 1:
+                retry_estimate = estimate_request_tokens(
+                    {"system": body.get("system"), "messages": kept, "tools": body.get("tools")}
+                )
+                if retry_estimate + reserved <= limit:
+                    log.warning(
+                        "auto-trimmed %d oldest message(s) to fit Agentaus' %d-token "
+                        "window (~%d -> ~%d tokens)",
+                        dropped, limit, estimated, retry_estimate,
+                    )
+                    body = {**body, "messages": kept}
+                    # Tell Agentaus its view of the conversation is partial, so it can
+                    # say so rather than confidently answering from missing context.
+                    body["system"] = _with_trim_notice(body.get("system"), dropped)
+                    estimated = retry_estimate
+
         if estimated + reserved > limit:
             log.warning(
                 "rejected oversized request: ~%d prompt + %d reserved > %d limit",
@@ -335,6 +369,14 @@ async def _handle_agentaus(
                 f"because compaction must itself fit in the window. "
                 f"(Set AGENTAUS_MAX_INPUT_TOKENS to change this limit.)",
             )
+
+    # Built only after the context guard, so any trimming above is reflected in what
+    # actually gets sent. Building it earlier silently discarded the trim.
+    payload = anthropic_request_to_agentaus(
+        body,
+        system_prompt_overwrite=settings.system_prompt_overwrite,
+        stream=settings.upstream_stream and wants_stream,
+    )
 
     if settings.log_bodies:
         log.info("-> agentaus payload: %s", json.dumps(payload)[:4000])
