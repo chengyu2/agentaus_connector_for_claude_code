@@ -2,3 +2,7 @@
 .env
 __pycache__/
 *.pyc
+
+# Local settings backups
+.claude/settings_old.json
+.claude/settings.local.json
