@@ -58,14 +58,22 @@ def extract_code(text: str) -> str:
 
 def passes(problem: dict, code: str, timeout: int = 15) -> tuple[bool, str]:
     """Run the dataset's own tests against the generated code."""
-    program = (
-        "\n".join([
-            problem["prompt"].split("def ")[0],       # imports from the stub, if any
-            code,
-            problem["test"],
-            f"check({problem['entry_point']})",
-        ])
-    )
+    # The FULL prompt goes first, not just its imports. Several problems define a helper
+    # the solution must call - HumanEval/32 supplies `poly` for `find_zero`, /38 supplies
+    # `encode_cyclic` for `decode_cyclic` - and keeping only the text before the first
+    # `def` threw those away. Three of the first four failures in a real run were this
+    # harness discarding a helper, not a model getting the answer wrong.
+    #
+    # A prompt is valid Python on its own: it ends with the target's signature and a
+    # docstring, which is a legal body. The model's definition then shadows that stub.
+    program = "\n".join([
+        problem["prompt"],
+        "",
+        code,
+        "",
+        problem["test"],
+        f"check({problem['entry_point']})",
+    ])
     with tempfile.TemporaryDirectory() as workdir:
         path = Path(workdir) / "candidate.py"
         path.write_text(program)
