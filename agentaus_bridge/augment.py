@@ -80,6 +80,11 @@ output, read it and interpret it properly. Do not pattern-match a fragment and a
 the rest - a regex over something you have not understood will look right on the case
 you tried and be wrong on the next one.
 
+You have real tools and they really run. A tool result in this conversation is output
+from your own call, not something the user pasted. Never say you cannot access files,
+the filesystem, or a repository - if you need something, call the tool. Never ask the
+user to paste a file you can read yourself.
+
 <tool_selection>
 Finding things in the codebase:
   - `agentaus_search`   - DEFAULT. Any question about how something works, where a
@@ -233,6 +238,24 @@ def review_says_ok(review: str) -> bool:
     return cleaned.startswith("OK") and len(cleaned) < 40
 
 
+def worth_reviewing_turn(body: dict) -> bool:
+    """Whether this turn's answer can be fairly reviewed at all.
+
+    The reviewer is a fresh call given the request and the answer - and nothing else.
+    When the answer was derived from a tool result, the reviewer cannot see that result,
+    so it judges a well-grounded answer as an unverified claim and rewrites it into a
+    refusal.
+
+    Observed live, and it cost hours to find because every component was individually
+    correct: Agentaus read a 60,000-character tender document and correctly listed the
+    Section 5 headings, then the review pass - shown only "list the Section 5 headings"
+    and a list of headings - concluded the document had never been provided and replaced
+    the answer with "Please provide the DOCX file". The bridge was reliably turning a
+    right answer into a wrong one.
+    """
+    return not mid_tool_loop(body)
+
+
 def worth_reviewing(text: str, *, min_chars: int = 200) -> bool:
     """Whether an answer justifies a review pass.
 
@@ -287,6 +310,23 @@ where the code is. You already know.
 """
 
 
+def mid_tool_loop(body: dict) -> bool:
+    """Whether the conversation is waiting on the model to use a tool result it just got.
+
+    Two passes must sit out when this is true, for the same reason: neither the planner
+    nor the reviewer can see tool results, so both judge the turn on the user's original
+    message alone and reach a conclusion the evidence contradicts.
+    """
+    for message in reversed(body.get("messages") or []):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        return isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+        )
+    return False
+
+
 def should_think(body: dict) -> bool:
     """Whether this turn earns a planning pass.
 
@@ -295,7 +335,17 @@ def should_think(body: dict) -> bool:
     agentic - it will act on the world, and acting without a plan is the failure this
     exists to prevent. A bare prose turn gets neither, because a planning round trip on
     "what does this function do" costs latency and buys nothing.
+
+    But NOT when a tool result has just come back. The plan is written from the user's
+    message, and a planner cannot see tool results - so mid-loop it re-plans the step
+    already taken and tells the model to run the tool it just ran. Observed live: the
+    model read a document, was handed a fresh plan saying "read the document", and
+    replied "I am unable to access files on your local system" while holding the file's
+    contents. The plan from the first step is already in the conversation; re-deriving
+    a worse one is not just wasted latency, it is actively misleading.
     """
+    if mid_tool_loop(body):
+        return False
     thinking = body.get("thinking")
     if isinstance(thinking, dict) and thinking.get("type") == "enabled":
         return True

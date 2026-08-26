@@ -230,12 +230,17 @@ class Settings:
     # of the session. Claude Code sends those results back to the bridge on the next
     # turn, so they can be condensed in flight - cached by content, so the conversation
     # prefix stays stable and the compaction cache keeps hitting.
+    # OFF by default, on live evidence rather than principle. Distilling a 60k-character
+    # document added a minute to one turn, and for work where the tool output IS the
+    # subject - a tender document being edited, a log being read line by line -
+    # condensing it destroys the thing the user asked about. It earns its place on long
+    # agentic sessions that would otherwise compact; turn it on there and measure.
     agentaus_distill_results: bool = field(
-        default_factory=lambda: _bool("AGENTAUS_DISTILL_RESULTS", True)
+        default_factory=lambda: _bool("AGENTAUS_DISTILL_RESULTS", False)
     )
     # Results smaller than this are left exactly as they are.
     agentaus_distill_threshold_tokens: int = field(
-        default_factory=lambda: _int("AGENTAUS_DISTILL_THRESHOLD_TOKENS", 4000)
+        default_factory=lambda: _int("AGENTAUS_DISTILL_THRESHOLD_TOKENS", 12000)
     )
     agentaus_distill_chunk_tokens: int = field(
         default_factory=lambda: _int("AGENTAUS_DISTILL_CHUNK_TOKENS", 4000)

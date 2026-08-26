@@ -75,7 +75,9 @@ class TestRequestTranslation(unittest.TestCase):
         self.assertEqual(assistant["tool_calls"][0]["function"]["name"], "Read")
         self.assertEqual(json.loads(assistant["tool_calls"][0]["function"]["arguments"]), {"path": "a.py"})
         self.assertEqual(result["messages"][2]["tool_call_id"], "toolu_1")
-        self.assertEqual(result["messages"][2]["content"], "print(1)")
+        body = result["messages"][2]["content"]
+        self.assertIn('<tool_result tool="Read">', body)
+        self.assertIn("print(1)", body)
 
     def test_tool_result_error_is_marked(self):
         result = anthropic_request_to_agentaus(
@@ -95,7 +97,10 @@ class TestRequestTranslation(unittest.TestCase):
                 ]
             }
         )
-        self.assertIn("[tool error]", result["messages"][0]["content"])
+        body = result["messages"][0]["content"]
+        self.assertIn("<tool_error", body)
+        self.assertIn("no such file", body)
+        self.assertIn("Do not treat its output as an answer", body)
 
     def test_tools_are_mapped_and_server_side_tools_dropped(self):
         result = anthropic_request_to_agentaus(

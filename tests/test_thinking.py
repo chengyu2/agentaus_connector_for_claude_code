@@ -436,3 +436,39 @@ class TestNameResolution(unittest.TestCase):
         self.assertEqual(theirs, [])
         self.assertEqual(mine[0]["name"], tools.SEARCH_TOOL,
                          "a resolved name must be rewritten, or the dispatcher misses it")
+
+
+class TestNoReplanningMidLoop(unittest.TestCase):
+    """A plan is written from the user's message, and the planner never sees tool
+    results. Re-deriving one mid-loop tells the model to redo the step it just did.
+
+    Observed live on a real document: the model read a .docx, was handed a fresh plan
+    saying "read the .docx", and answered "I am unable to access files on your local
+    system" while holding the file's contents.
+    """
+
+    def test_a_fresh_tool_turn_still_plans(self):
+        self.assertTrue(should_think({"tools": [{"name": "Read"}],
+                                      "messages": [{"role": "user", "content": "do it"}]}))
+
+    def test_a_returning_tool_result_does_not(self):
+        self.assertFalse(should_think({
+            "tools": [{"name": "Read"}],
+            "messages": [
+                {"role": "user", "content": "do it"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "a", "name": "Read", "input": {}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "a", "content": "data"}]},
+            ]}))
+
+    def test_a_new_user_message_after_a_tool_plans_again(self):
+        """The loop is over once the user speaks again - that is a new turn."""
+        self.assertTrue(should_think({
+            "tools": [{"name": "Read"}],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "a", "content": "data"}]},
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "now the next bit"},
+            ]}))

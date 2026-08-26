@@ -29,6 +29,7 @@ the thing being debugged.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -157,12 +158,15 @@ class ResultDistiller:
 
     async def _condense(self, tool: str, tool_input: str, text: str) -> str:
         pieces = _chunk(text, self._chunk_tokens)
-        parts = []
-        for piece in pieces:
-            parts.append(normalise_identifiers((await self._call(
-                DISTIL_INSTRUCTION.format(tool=tool, input=tool_input[:400], body=piece)
-            )).strip()))
-        parts = [p for p in parts if p]
+        # Concurrent: the pieces are independent, and doing them in sequence is the
+        # difference between seconds and a minute of latency on one large tool result.
+        # Measured: four sequential chunks added ~60s to a single turn.
+        raw = await asyncio.gather(*[
+            self._call(DISTIL_INSTRUCTION.format(
+                tool=tool, input=tool_input[:400], body=piece))
+            for piece in pieces
+        ])
+        parts = [p for p in (normalise_identifiers((r or "").strip()) for r in raw) if p]
         if not parts:
             raise RuntimeError("distiller produced nothing")
         if len(parts) == 1:

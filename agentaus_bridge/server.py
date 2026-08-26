@@ -36,6 +36,7 @@ from .augment import (
     with_guidance,
     with_plan,
     worth_reviewing,
+    worth_reviewing_turn,
 )
 from .compact import ConversationCompactor
 from .distill import ResultDistiller
@@ -1081,6 +1082,7 @@ async def _handle_agentaus(
         if (
             settings.agentaus_self_review
             and not msg0.get("tool_calls")
+            and worth_reviewing_turn(body)
             and worth_reviewing(msg0.get("content") or "",
                                 min_chars=settings.agentaus_review_min_chars)
         ):
@@ -1397,8 +1399,10 @@ async def _agentaus_event_stream(
 
     answer = "".join(pending)
     if buffering and answer:
-        if not theirs and worth_reviewing(
-            answer, min_chars=settings.agentaus_review_min_chars
+        if (
+            not theirs
+            and worth_reviewing_turn(original)
+            and worth_reviewing(answer, min_chars=settings.agentaus_review_min_chars)
         ):
             answer = await _self_review(client, _last_user_text(original), answer)
         yield builder.text(answer)

@@ -69,16 +69,37 @@ def _system_to_text(system: Any) -> str:
     return _flatten_text(system)
 
 
-def _tool_result_payload(block: dict) -> str:
-    """OpenAI tool messages carry a string; Anthropic tool_result carries blocks."""
+def _tool_result_payload(block: dict, tool_name: str = "") -> str:
+    """OpenAI tool messages carry a string; Anthropic tool_result carries blocks.
+
+    The body is wrapped in a tagged envelope naming the tool that produced it. That is
+    not decoration. Handed a bare 60,000-character document as a `tool` message,
+    Agentaus answered "I am unable to list the headings because the DOCX file hasn't
+    been provided - please upload it" roughly half the time, while holding the entire
+    file. Tagging the result and saying plainly that it is real output made it stop.
+
+    The same lesson as everywhere else here: this model follows explicit structure far
+    more reliably than it follows prose.
+    """
     content = block.get("content")
     text = _flatten_text(content)
     if not text and isinstance(content, list):
         # Non-text results (e.g. an image from a screenshot tool) still need a body.
         text = json.dumps(content)[:8000]
+    if not text:
+        text = "(no output)"
+
     if block.get("is_error"):
-        text = f"[tool error] {text}"
-    return text or "(no output)"
+        return (
+            f'<tool_error tool="{tool_name or "unknown"}">\n{text}\n</tool_error>\n'
+            f"That call failed. Do not treat its output as an answer."
+        )
+    return (
+        f'<tool_result tool="{tool_name or "unknown"}">\n{text}\n</tool_result>\n'
+        f"The content above is the real output of your own {tool_name or 'tool'} call. "
+        f"It is already here - use it to answer now, and never ask for it to be "
+        f"provided, pasted or uploaded."
+    )
 
 
 def anthropic_request_to_agentaus(
@@ -93,6 +114,13 @@ def anthropic_request_to_agentaus(
     system_text = _system_to_text(body.get("system"))
     if system_text:
         messages.append({"role": "system", "content": system_text})
+
+    # tool_use id -> name, so a result can name the call that produced it.
+    called: dict = {}
+    for message in body.get("messages", []) or []:
+        for block in message.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                called[block.get("id") or ""] = block.get("name") or ""
 
     for message in body.get("messages", []) or []:
         role = message.get("role", "user")
@@ -146,7 +174,9 @@ def anthropic_request_to_agentaus(
                 {
                     "role": "tool",
                     "tool_call_id": result.get("tool_use_id", ""),
-                    "content": _tool_result_payload(result),
+                    "content": _tool_result_payload(
+                        result, called.get(result.get("tool_use_id") or "", "")
+                    ),
                 }
             )
 
