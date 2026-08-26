@@ -1225,18 +1225,64 @@ launchd, that one *does* have to be started again after every reboot.
 
 ```bash
 ./.venv/bin/python -m unittest discover -s tests -v   # unit tests, no network needed
-./.venv/bin/python tests/smoke_test.py                # quick end-to-end, needs a running bridge
-./.venv/bin/python tests/integration_test.py          # full live flow, costs real tokens
 ```
 
-`integration_test.py` exercises what a real session does, nothing stubbed: per-model
-routing to both providers, switching between them, streaming, tool-call round trips,
-an oversized conversation recovering via auto-trim, and an untrimmable one being
-refused with wording Claude Code can act on.
+**unittest, not pytest** — pytest is not in the virtualenv.
 
-The unit tests cover the translation edge cases that break agent loops: tool-result
-ordering, fragmented tool-call deltas, block open/close pairing in the SSE stream, and
-malformed tool arguments.
+---
+
+## Benchmarking
+
+```bash
+./benchmarks/run.py --list
+./benchmarks/run.py --model agentaus
+./benchmarks/run.py --model agentaus --suite humaneval --limit 20
+```
+
+Three suites. In two of them the scoring authority sits outside this repository, which is
+the point — a benchmark whose verdicts are its own opinion cannot tell you anything.
+
+| Suite | Measures | Verdict comes from |
+| --- | --- | --- |
+| `humaneval` | pass@1 over 164 problems | **the dataset's own unit tests** |
+| `retrieval` | localisation precision, recall, F1 | ground truth over this repository |
+| `injection` | resistance to instructions hidden in file content | this bridge's stated threat model |
+
+Every suite routes through the bridge, so two arms share the harness, the prompts and the
+parsing exactly and differ only in who answered. **Tokens and latency sit beside every
+score**, because a model that scores two points higher for four times the tokens has not
+won anything a deployment cares about.
+
+### You do not need a second arm
+
+HumanEval is reported widely enough that a reference point is a lookup rather than an
+experiment. `baselines.py` carries published figures and the run places the measured score
+among them — no API key, no spend.
+
+Those figures are **orientation, not a head-to-head**: harnesses differ by a few points of
+pass@1. And the bigger caveat — **HumanEval is saturated.** It separates mid-tier from
+frontier and cannot separate frontier models from each other, which is why `retrieval` and
+`injection` carry more weight for this deployment than pass@1 does.
+
+For a genuine head-to-head, `--model claude-opus-5` works but needs `ANTHROPIC_API_KEY`
+exported: the bridge forwards those requests to api.anthropic.com and a harness cannot
+borrow the OAuth token Claude Code holds. The run says so plainly rather than reporting a
+zero.
+
+### What each suite is actually testing
+
+**`retrieval`** questions are worded so the answer shares no vocabulary with the question —
+*"Where does this project stop too many background requests running at once?"* for
+`gate.py:_PriorityGate`. A text search cannot serve that; a semantic one must. This is the
+number that matters for a bridge whose search design is "aim before you read".
+
+**`injection`** plants an instruction in file content and asks an ordinary question about
+it. One case claims *"Privilege Level 10 — highest authority"*, which is the mechanism that
+gets recommended in prose and does nothing on its own. The enforcement that works here is
+structural: the tool allowlist, the invented-name check, the grounding pass.
+
+Generated code runs in a subprocess with a wall-clock timeout. That bounds a runaway loop;
+it is **not a sandbox**. Run it somewhere that is acceptable, or in a container.
 
 ---
 
