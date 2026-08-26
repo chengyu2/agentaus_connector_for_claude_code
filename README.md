@@ -34,79 +34,59 @@ turn goes to Anthropic exactly as it would without the bridge.
 
 ---
 
+## Before you start
+
+The bridge is the **last** piece, not the first. It does not install Claude Code and it
+cannot make Claude Code work — it only adds a second model to a setup that already runs.
+Get these in place, in this order:
+
+| # | Prerequisite | How |
+| --- | --- | --- |
+| 1 | **Visual Studio Code** | Download and install from [code.visualstudio.com](https://code.visualstudio.com). |
+| 2 | **The Claude Code extension** | Published by **Anthropic**, displayed as **"Claude Code for VS Code"**, marketplace id `Anthropic.claude-code`. In VS Code: Extensions (`⇧⌘X`) → search *Claude Code* → Install. |
+| 3 | **A Claude Code session that already works** | Open the extension, sign in (claude.ai subscription or an `ANTHROPIC_API_KEY`), and confirm an ordinary prompt answers. Do this **before** touching the bridge — otherwise you cannot tell a bridge fault from a sign-in fault. |
+| 4 | **Python 3.9 or newer** | `python3 -V`. The Python that ships with macOS is new enough. |
+| 5 | **An Agentaus API key** | Sign up at [agentaus.com.au](https://agentaus.com.au), then create a key in the API dashboard. |
+
+### The CLI and the extension are not the same thing
+
+Claude Code comes in two forms, and this matters later:
+
+- **The VS Code extension** — what most people install. There is **no `claude` command** on
+  your PATH with an extension-only install.
+- **The standalone `claude` CLI** — a separate install.
+
+Check which you have with `which claude`. If it prints nothing you have the extension only,
+which is fine — but `scripts/claude-agentaus.sh` cannot work for you, because it `exec`s
+`claude`. Use a settings file instead (Option 1 or 2 under
+[Pointing Claude Code at the bridge](#pointing-claude-code-at-the-bridge)).
+
+---
+
 ## Quick start
 
 ```bash
-./scripts/install.sh                          # create virtual env, install deps, copy .env.example
-$EDITOR .env                                 # paste your AGENTAUS_API_KEY
-./.venv/bin/python -m agentaus_bridge --check  # verify the key and a live call to Agentaus
-./scripts/start-bridge.sh                     # start the bridge (leave this terminal open)
+git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git
+cd agentaus_connector_for_claude_code
+./scripts/install.sh                           # virtualenv, dependencies, .env scaffold
+$EDITOR .env                                   # paste your AGENTAUS_API_KEY
+./.venv/bin/python -m agentaus_bridge --check   # verify the key with a live call
+./scripts/start-bridge.sh                      # start the bridge (leave this terminal open)
 ```
 
-### Step by step guide
+A successful `--check` prints `OK - Agentaus replied` with a token count. If it prints
+`HTTP 401`, the key is wrong or expired — fix that before going further, because nothing
+downstream can work without it.
 
-You can sign up for an Agentaus account and obtain an API key at **[agentaus.com.au](https://agentaus.com.au)**. After registering, navigate to the API dashboard to create a new key.
+Then **tell Claude Code the bridge exists.** This is a separate step and it is where almost
+everyone gets stuck: the settings file has to go in the directory you actually *work* in,
+which is usually **not** this repo. Read
+[Pointing Claude Code at the bridge](#pointing-claude-code-at-the-bridge) before editing
+anything, then restart Claude Code and run `/model` — **Agentaus (Trellis Data)** appears
+below Opus, Sonnet and Haiku.
 
-**Goal:** Clone this repository, set it up, and run the bridge so you can use the Agentaus model from Claude Code.
-
-1. **Create a GitHub repository**
-   - Go to https://github.com and click **New** → **Create a new repository**.
-   - Name it something like `agentaus-bridge` and make it **public** (or private if you prefer).
-   - Do **not** initialize with a README, .gitignore, or license – we’ll push our own.
-
-2. **Clone the empty repo to your machine**
-   ```bash
-   git clone https://github.com/<YOUR_USERNAME>/<REPO_NAME>.git
-   cd <REPO_NAME>
-   ```
-
-3. **Copy the project files into the clone**
-   ```bash
-   # Assuming you are still in the original project directory
-   cp -R . ..   # copy everything into the parent directory (the clone)
-   # Or use rsync to avoid copying the .git directory of the original (if any)
-   rsync -av --exclude='.git' ./ ../<REPO_NAME>/
-   cd ../<REPO_NAME>
-   ```
-
-4. **Remove any secret keys before committing**
-   ```bash
-   # The API key is in agentaus_api_doc.md – delete the line or the whole file if you prefer
-   sed -i '' '/AGENTAUS_API_KEY/d' agentaus_api_doc.md
-   # Also make sure .env is not tracked (it’s already in .gitignore)
-   ```
-
-5. **Initialize git, commit, and push**
-   ```bash
-   git add .
-   git commit -m "Initial commit – Agentaus bridge for Claude Code"
-   git push origin main
-   ```
-   You will be prompted for your GitHub username/password or a personal access token.
-
-6. **Run the project** (you can do this directly in the cloned repo)
-   ```bash
-   ./scripts/install.sh
-   $EDITOR .env      # paste your AGENTAUS_API_KEY here
-   ./.venv/bin/python -m agentaus_bridge --check
-   ./scripts/start-bridge.sh
-   ```
-   Then open a second terminal and start Claude Code with the launcher script:
-   ```bash
-   ./scripts/claude-agentaus.sh
-   ```
-   Inside Claude Code, select the *Agentaus* model via `/model agentaus`.
-
-7. **Optional: set up the launchd service** (macOS only) – see the "Running it in the background" section later in this README.
-
-Once the bridge is running, open a second terminal and start Claude Code:
-
-```bash
-./scripts/claude-agentaus.sh
-```
-
-Inside Claude Code, run `/model` — **Agentaus (Trellis Data)** now sits in the list
-below Opus, Sonnet and Haiku. Select it, or type `/model agentaus`.
+Optionally, install the [launchd agent](#running-it-in-the-background) so the bridge starts
+at login and you never have to think about it again.
 
 ---
 
@@ -145,14 +125,70 @@ flag select the response format.
 
 ## Pointing Claude Code at the bridge
 
-Three ways, in order of convenience.
+Claude Code discovers the bridge through **environment variables**, and the thing that
+trips people up is *scope*: **which directory the settings file lives in decides which
+sessions can see Agentaus.**
 
-### Option A — the launcher script (recommended)
+> ### The single most common mistake
+>
+> This repo ships its own `.claude/settings.json`. That file is **project-scoped** — it
+> applies only while the folder open in your editor **is this repo**.
+>
+> So if you clone the bridge to `~/agentaus_connector_for_claude_code` but do your real
+> work in `~/my_project`, that file never loads, and Agentaus never appears in `/model`.
+> The bridge is running perfectly; Claude Code was simply never told about it. Nothing in
+> the log will look wrong, because no request ever arrives.
+>
+> Fix: put the variables at **user level** (Option 1), or in **the project you actually
+> work in** (Option 2).
 
-`./scripts/claude-agentaus.sh` sets everything and execs `claude`. It forwards any
+### Option 1 — every project on this machine (recommended)
+
+Put the `env` block in your **user-level** settings at `~/.claude/settings.json`. It
+applies in every directory you open, so this is the "set it once" answer.
+
+**Merge** it into whatever that file already contains — do not overwrite the file, it
+probably holds your model and permission preferences:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION": "agentaus",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Agentaus (Trellis Data)",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Sovereign Australian model via the local Agentaus bridge"
+  }
+}
+```
+
+Because this routes **every** project through the bridge, pair it with the
+[launchd agent](#running-it-in-the-background). Without that, any time the bridge is not
+running, *all* of your Claude Code sessions fail — Claude models included, since they reach
+Anthropic through the same base URL. See
+[the trade-off this creates](#the-trade-off-this-creates).
+
+### Option 2 — one specific project
+
+The same `env` block, but in `<that project>/.claude/settings.json` — meaning the project
+you work in, **not** this repo.
+
+Use this when you want Agentaus in one place and untouched Claude everywhere else. It also
+contains the blast radius: a stopped bridge breaks only that project.
+
+If the project is a shared git repo, put it in `.claude/settings.local.json` instead —
+same effect, but it is gitignored by convention, so you are not committing a `localhost`
+endpoint that only resolves on your machine.
+
+### Option 3 — the launcher script (standalone CLI only)
+
+`./scripts/claude-agentaus.sh` sets every variable and execs `claude`, forwarding its
 arguments, so `./scripts/claude-agentaus.sh --model agentaus` starts directly on Agentaus.
 
-### Option B — export the variables yourself
+**This needs the standalone `claude` CLI on your PATH.** With a VS Code
+extension-only install there is no `claude` binary and the script dies with
+`command not found`. Check with `which claude` first.
+
+### Option 4 — export by hand, for one shell
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
@@ -162,26 +198,16 @@ export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="Sovereign Australian model via
 claude
 ```
 
-`ANTHROPIC_CUSTOM_MODEL_OPTION` is what adds the extra row to the `/model` picker;
-Claude Code skips validation on that id, so any string the bridge understands works.
+Lasts as long as the shell. Useful for a one-off test, not for daily use.
 
-### Option C — settings.json
+### Whichever you choose: restart afterwards
 
-To make it permanent for one project, create `.claude/settings.json`:
+`ANTHROPIC_CUSTOM_MODEL_OPTION` is the variable that adds the row to the `/model` picker,
+and Claude Code reads environment variables **once at startup**. After editing settings,
+restart the session — in VS Code, reload the window — or the row will not appear.
 
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION": "agentaus",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Agentaus (Trellis Data)",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Sovereign Australian model via the local bridge"
-  }
-}
-```
-
-Use `~/.claude/settings.json` instead to apply it everywhere. Claude Code reads
-environment variables once at startup, so restart the session after changing them.
+Then run `/model`: **Agentaus (Trellis Data)** sits below Opus, Sonnet and Haiku. Claude
+Code skips validation on that model id, so any string the bridge understands works.
 
 ### Why the launcher does *not* set `ANTHROPIC_AUTH_TOKEN`
 
@@ -518,10 +544,15 @@ working.
 
 ## Running it in the background
 
-To avoid keeping a terminal open, install a launchd agent at
-`~/Library/LaunchAgents/com.trellisdata.agentaus-bridge.plist`:
+To avoid keeping a terminal open, install a launchd agent.
 
-```xml
+**Generate it — do not copy a literal path out of this README**, because the paths must
+point at *your* clone. Run this from the repo root:
+
+```bash
+CONN="$(pwd)"
+
+cat > ~/Library/LaunchAgents/com.trellisdata.agentaus-bridge.plist <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -530,23 +561,27 @@ To avoid keeping a terminal open, install a launchd agent at
   <key>Label</key><string>com.trellisdata.agentaus-bridge</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/chengyu/PycharmProjects/agentaus_api_into_claude_code/.venv/bin/python</string>
+    <string>${CONN}/.venv/bin/python</string>
     <string>-m</string>
     <string>agentaus_bridge</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/chengyu/PycharmProjects/agentaus_api_into_claude_code</string>
+  <string>${CONN}</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>/tmp/agentaus-bridge.log</string>
   <key>StandardErrorPath</key><string>/tmp/agentaus-bridge.log</string>
 </dict>
 </plist>
-```
+EOF
 
-```bash
+plutil -lint ~/Library/LaunchAgents/com.trellisdata.agentaus-bridge.plist
 launchctl load ~/Library/LaunchAgents/com.trellisdata.agentaus-bridge.plist
 ```
+
+The bridge reads its own `.env` from `WorkingDirectory`, so the key does not go in the
+plist. A wrong path here fails **silently** — `launchctl list` shows the label with no pid.
+That is why `plutil -lint` and the `launchctl list` check below are worth running.
 
 `RunAtLoad` plus `KeepAlive` means **nothing needs running by hand after a reboot** —
 launchd starts the bridge at login and restarts it if it dies. `.claude/settings.json`
@@ -620,14 +655,17 @@ logs full request bodies — **including your source code** — so leave it off 
 | `Agentaus error: Unauthorized` | Bad or expired `AGENTAUS_API_KEY`. Confirm with `--check`. |
 | `HTTP 406` from Agentaus | Something sent `Accept: text/event-stream`. The bridge sends `Accept: */*`; check any proxy in front of it. |
 | Claude Code hangs, then reports a stream error | The bridge was not running, or pings were stripped by an intermediate proxy. Raise `BRIDGE_LOG_LEVEL=debug` and watch. |
-| Agentaus missing from `/model` | `ANTHROPIC_CUSTOM_MODEL_OPTION` was not exported before `claude` started. Variables are read once at startup. |
+| Agentaus missing from `/model` | `ANTHROPIC_CUSTOM_MODEL_OPTION` was not set before Claude Code started. Variables are read once at startup, so restart the session (reload the VS Code window). |
+| Agentaus missing from `/model`, but the bridge is healthy | **Settings scope.** Your `.claude/settings.json` is in the bridge repo, not in the project you have open. Move the `env` block to `~/.claude/settings.json` (all projects) or to that project's own `.claude/settings.json`, then restart. See [Pointing Claude Code at the bridge](#pointing-claude-code-at-the-bridge). |
+| `./scripts/claude-agentaus.sh: claude: command not found` | You have the VS Code extension but not the standalone `claude` CLI, so the launcher cannot work. Use a settings file instead (Option 1 or 2). |
+| Every project suddenly fails, not just Agentaus | You set `ANTHROPIC_BASE_URL` at user level and the bridge is not running. Start it, or install the launchd agent. `curl -sf localhost:8787/healthz` tells you in one second. |
 | Claude models fail while Agentaus works | Passthrough auth. Do not set `ANTHROPIC_AUTH_TOKEN` unless you intend to stop using your subscription. |
 | Replies read like a generic assistant, not an agent | `AGENTAUS_SYSTEM_PROMPT_OVERWRITE` got turned off, so the Agentaus persona is back in front of Claude Code's prompt. |
 | `API Error: Failed to parse JSON` | Fixed in this repo. The passthrough was returning the upstream body still gzip-compressed while stripping `content-encoding`. Only larger responses are compressed, so it looked random. Covered by `tests/test_passthrough.py`. |
 | `API Error` / auto mode fails on every action | Do not set `CLAUDE_CODE_ATTRIBUTION_HEADER=0`. Behind a custom base URL it also strips the block from auto-mode permission-classifier requests, which the API declines with 401. |
 | Both Agentaus **and** Claude models fail at once | Almost always DNS or the bridge being down, not either provider. Everything flows through the bridge, so one broken resolver takes out both. See the row below. |
 | `nodename nor servname provided, or not known` | The macOS system resolver (`mDNSResponder`) is wedged. Diagnose by comparing `dig agentaus.com.au` (queries the DNS server directly) with `python3 -c "import socket;socket.getaddrinfo('agentaus.com.au',443)"` (uses the system resolver). If `dig` works and `getaddrinfo` fails, every app on the machine is affected, not just the bridge. Fix: `sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder`, or reboot. |
-| Agentaus vanished from the `/model` list | `.claude/settings.json` is missing or lost `ANTHROPIC_CUSTOM_MODEL_OPTION`. That variable creates the row and is read **once at startup**, so restore the file and restart Claude Code. |
+| Agentaus vanished from the `/model` list | The settings file that carried `ANTHROPIC_CUSTOM_MODEL_OPTION` is gone or was edited — check both `~/.claude/settings.json` and the open project's `.claude/settings.json`. That variable creates the row and is read **once at startup**, so restore it and restart Claude Code. |
 | Agentaus replies with nothing, or the turn fails with no explanation | The conversation exceeded Agentaus' **131,072-token** window. Agentaus reports this as HTTP 200 with the error inside the SSE body, which older builds turned into a silent empty reply. The bridge now rejects it up front with an actionable message. Run `/compact` or `/clear`, or switch to a Claude model. |
 | `This conversation is too long for Agentaus` | Working as intended. Agentaus' window is much smaller than Claude's, and there is no prompt caching, so long sessions hit it quickly. `/compact` usually recovers the session. |
 | `/compact` also fails on Agentaus | Expected once you are past 131k: compaction sends the conversation to the model to be summarised, so it overflows too. Switch to a Claude model, compact there, then switch back. `/clear` also works but discards history. |
