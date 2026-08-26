@@ -1,0 +1,17 @@
+{
+ "agentaus": {
+  "humaneval": {
+   "suite": "humaneval",
+   "n": 3,
+   "solved": 3,
+   "pass_at_1": 1.0,
+   "failures": [],
+   "wall_seconds": 14.197654667,
+   "calls": 3,
+   "call_failures": 0,
+   "input_tokens": 2268,
+   "output_tokens": 1149,
+   "median_call_seconds": 4.672247792
+  }
+ }
+}

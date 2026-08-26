@@ -1,343 +1,135 @@
 #!/usr/bin/env python3
-"""A/B benchmark: does the Agentaus compensation layer actually help?
+"""Compare models through the bridge on the same suites, prompts and scoring.
 
-Two independent verdicts per answer:
+    ./benchmarks/run.py --model agentaus
+    ./benchmarks/run.py --model agentaus --model claude-opus-5 --suite humaneval --limit 20
+    ./benchmarks/run.py --list
 
-* **Execution.** The generated function is run against assertions covering the edge
-  cases a weaker model tends to miss. Objective, and the one that settles it.
+Everything goes through the local bridge, which routes on the request's `model` field. So
+the two arms of a comparison share the harness exactly and differ only in who answered -
+which is the one thing a benchmark has to get right and the reason this is cheap here.
 
-* **LLM-as-judge.** Agentaus scores the answer 1-5 for correctness, edge-case handling
-  and clarity, without being told which arm produced it. Catches quality differences
-  that a pass/fail cannot see - an answer can pass the tests while still being fragile.
+A resolve rate alone is not reported. A model that scores two points higher for four times
+the tokens and three times the wall-clock has not won anything a deployment cares about,
+so tokens and latency sit beside every score.
 
-Each task runs twice: once with compensation on, once off. The bridge is reconfigured
-between arms, so the comparison is like-for-like on everything else.
-
-    ./.venv/bin/python benchmarks/run.py                 # all tasks, both arms
-    ./.venv/bin/python benchmarks/run.py --repeat 3      # average over runs
-    ./.venv/bin/python benchmarks/run.py --tasks median,roman
+A second arm is optional. HumanEval is reported widely enough that a reference point is a
+lookup rather than an experiment, so `baselines.py` carries published figures and the run
+places the measured score among them - no API key, no spend. Where a real head-to-head is
+wanted, `--model claude-opus-5` works, but the bridge forwards those requests to
+api.anthropic.com and a harness cannot borrow the OAuth token Claude Code holds, so it
+needs ANTHROPIC_API_KEY and says so plainly rather than reporting a zero.
 """
-
 from __future__ import annotations
 
 import argparse
 import json
-import re
-import subprocess
+import os
 import sys
-import tempfile
-import textwrap
-import urllib.error
-import urllib.request
+import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from benchmarks.tasks import TASKS  # noqa: E402
+sys.path.insert(0, str(Path(__file__).parent))
 
-BRIDGE = "http://127.0.0.1:8787"
+import harness  # noqa: E402
+import humaneval  # noqa: E402
+import baselines  # noqa: E402
+import injection  # noqa: E402
+import retrieval  # noqa: E402
 
-PAIRWISE_PROMPT = """\
-Two candidate solutions to the same programming task are shown below. Decide which is \
-better, judging only on:
+SUITES = {
+    "humaneval": (humaneval.run, "164 problems with their own unit tests. pass@1."),
+    "retrieval": (retrieval.run, "Does it find the right file? Precision, recall, F1."),
+    "injection": (injection.run, "Does text inside a file hijack it? Resist rate."),
+}
 
-- correctness: does it do exactly what was asked?
-- edge cases: empty, zero, negative, duplicate, boundary and invalid input
-- simplicity: no unnecessary complexity
-
-Ignore length, formatting and comments unless they affect correctness. If the two are \
-equivalent in substance, say TIE - do not invent a preference.
-
-TASK:
-{task}
-
-SOLUTION A:
-{a}
-
-SOLUTION B:
-{b}
-
-Reply with ONLY a JSON object:
-{{"winner": "A" | "B" | "TIE", "reason": "one short sentence"}}
-"""
-
-JUDGE_PROMPT = """\
-You are grading a candidate solution to a programming task. Be strict and objective.
-
-TASK:
-{task}
-
-CANDIDATE SOLUTION:
-{answer}
-
-Score each dimension from 1 to 5:
-- correctness: does it implement exactly what was asked?
-- edge_cases: empty, zero, negative, duplicate, boundary and malformed inputs
-- clarity: is it readable and free of unnecessary complexity?
-
-Reply with ONLY a JSON object, no other text:
-{{"correctness": N, "edge_cases": N, "clarity": N, "reason": "one short sentence"}}
-"""
-
-
-def ask(prompt: str, *, max_tokens: int = 900, timeout: int = 300) -> str:
-    body = json.dumps({
-        "model": "agentaus", "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode()
-    req = urllib.request.Request(f"{BRIDGE}/v1/messages", data=body,
-                                 headers={"content-type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read())
-        return "".join(b.get("text", "") for b in data.get("content", []))
-    except urllib.error.HTTPError as e:
-        return f"__ERROR__ {e.code} {e.read().decode()[:200]}"
-    except Exception as e:
-        return f"__ERROR__ {type(e).__name__}: {e}"
-
-
-EXTRACT_PROMPT = """\
-Below is a reply containing a Python solution, possibly with commentary, fenced code \
-blocks, or a usage example alongside the real answer.
-
-Output the complete Python source needed to define `{entry}` and nothing else: no \
-fences, no commentary, no example calls. If several definitions are present, output \
-all of them. Do not modify the code in any way.
-
-REPLY:
-{answer}
-"""
-
-
-def extract_code_regex(answer: str) -> str:
-    """Deterministic fallback: take the longest fenced block, else the whole reply."""
-    fenced = re.findall(r"```(?:python)?\s*\n(.*?)```", answer, re.S)
-    if fenced:
-        return max(fenced, key=len)
-    return answer
-
-
-def extract_code(answer: str, entry: str = "", *, use_model: bool = True) -> str:
-    """Pull the runnable Python out of a reply.
-
-    Asks the model first. A regex over a reply whose shape you have not actually
-    checked works on the case you tried and silently mangles the next one - a reply
-    that fences a usage example after the real answer, or explains in prose containing
-    triple backticks. The regex remains as a fallback so extraction never fails.
-    """
-    if use_model and entry:
-        got = ask(EXTRACT_PROMPT.format(entry=entry, answer=answer[:12000]),
-                  max_tokens=1200, timeout=180)
-        if not got.startswith("__ERROR__"):
-            cleaned = re.sub(r"^```(?:python)?\s*\n|```\s*$", "", got.strip(), flags=re.M)
-            if entry in cleaned:
-                return cleaned
-    return extract_code_regex(answer)
-
-
-def run_tests(code: str, tests: str, entry: str) -> tuple[bool, str]:
-    """Execute the candidate against the task's assertions in a separate process.
-
-    Subprocess rather than exec(): generated code can loop forever or exit, and neither
-    should take the benchmark with it.
-    """
-    if entry not in code:
-        return False, f"no function named {entry}"
-    script = f"{code}\n\n{tests}\nprint('__PASS__')\n"
-    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
-        fh.write(script)
-        path = fh.name
-    try:
-        proc = subprocess.run([sys.executable, path], capture_output=True,
-                              text=True, timeout=20)
-        if "__PASS__" in proc.stdout:
-            return True, ""
-        err = (proc.stderr or proc.stdout).strip().splitlines()
-        return False, (err[-1] if err else "failed")[:120]
-    except subprocess.TimeoutExpired:
-        return False, "timed out"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-    finally:
-        Path(path).unlink(missing_ok=True)
-
-
-def judge(task_prompt: str, answer: str) -> dict:
-    raw = ask(JUDGE_PROMPT.format(task=task_prompt, answer=answer[:6000]),
-              max_tokens=300)
-    match = re.search(r"\{.*\}", raw, re.S)
-    if not match:
-        return {"correctness": 0, "edge_cases": 0, "clarity": 0, "reason": "unparseable"}
-    try:
-        d = json.loads(match.group(0))
-        return {k: int(d.get(k, 0)) for k in ("correctness", "edge_cases", "clarity")} | \
-               {"reason": str(d.get("reason", ""))[:80]}
-    except Exception:
-        return {"correctness": 0, "edge_cases": 0, "clarity": 0, "reason": "unparseable"}
-
-
-def pairwise(task_prompt: str, answer_a: str, answer_b: str, flip: bool) -> str:
-    """Blind pairwise comparison, returning "compensated", "baseline" or "tie".
-
-    Absolute 1-5 scoring ceilings out - almost everything scores 5 and the arms become
-    indistinguishable. Asking which of two is better discriminates far more finely.
-
-    `flip` swaps the presentation order. Judges have a position bias, so which arm is
-    shown first is alternated across tasks and undone when reading the verdict.
-    """
-    first, second = (answer_b, answer_a) if flip else (answer_a, answer_b)
-    raw = ask(PAIRWISE_PROMPT.format(task=task_prompt, a=first[:5000], b=second[:5000]),
-              max_tokens=200)
-    match = re.search(r'"winner"\s*:\s*"(A|B|TIE)"', raw, re.I)
-    if not match:
-        return "tie"
-    winner = match.group(1).upper()
-    if winner == "TIE":
-        return "tie"
-    shown_first_is_compensated = not flip
-    picked_first = winner == "A"
-    return "compensated" if picked_first == shown_first_is_compensated else "baseline"
-
-
-def configure(guidance: bool, review: bool) -> bool:
-    """Restart the bridge with the compensation layer on or off."""
-    import os
-    env = os.environ.copy()
-    env["AGENTAUS_GUIDANCE"] = "true" if guidance else "false"
-    env["AGENTAUS_SELF_REVIEW"] = "true" if review else "false"
-    root = Path(__file__).resolve().parent.parent
-    subprocess.run(["launchctl", "unload",
-                    str(Path.home() / "Library/LaunchAgents/com.trellisdata.agentaus-bridge.plist")],
-                   capture_output=True)
-    subprocess.run(["pkill", "-f", "agentaus_bridge"], capture_output=True)
-    proc = subprocess.Popen(
-        [str(root / ".venv/bin/python"), "-m", "agentaus_bridge"],
-        cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    import time
-    for _ in range(40):
-        time.sleep(0.5)
-        try:
-            with urllib.request.urlopen(f"{BRIDGE}/healthz", timeout=2):
-                return True
-        except Exception:
-            continue
-    proc.kill()
-    return False
-
-
-def restore_launchd() -> None:
-    """Hand the port back to the launchd service.
-
-    Without this the benchmark's own bridge keeps port 8787 and every later request -
-    including a normal Claude Code session - silently hits a process started with
-    benchmark settings. That happened once and looked like a quality regression.
-    """
-    import time
-    subprocess.run(["pkill", "-f", "agentaus_bridge"], capture_output=True)
-    time.sleep(1)
-    subprocess.run(["launchctl", "load",
-                    str(Path.home() / "Library/LaunchAgents/com.trellisdata.agentaus-bridge.plist")],
-                   capture_output=True)
-    time.sleep(2)
+HEADLINE = {"humaneval": ("pass_at_1", "pass@1"),
+            "retrieval": ("f1", "F1"),
+            "injection": ("resist_rate", "resisted")}
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--repeat", type=int, default=1)
-    ap.add_argument("--tasks", default="")
-    ap.add_argument("--no-judge", action="store_true")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--model", action="append", default=[],
+                        help="repeatable; e.g. agentaus, claude-opus-5")
+    parser.add_argument("--suite", action="append", default=[],
+                        help=f"repeatable; one of {', '.join(SUITES)} (default: all)")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="cases per suite - start small, these cost real calls")
+    parser.add_argument("--out", default="benchmarks/results",
+                        help="directory for the JSON record of the run")
+    parser.add_argument("--list", action="store_true", help="list suites and exit")
+    args = parser.parse_args()
 
-    tasks = TASKS
-    if args.tasks:
-        wanted = {t.strip() for t in args.tasks.split(",")}
-        tasks = [t for t in TASKS if t["id"] in wanted]
+    if args.list:
+        for name, (_fn, blurb) in SUITES.items():
+            print(f"  {name:11} {blurb}")
+        return 0
 
-    arms = [("compensated", True, True), ("baseline", False, False)]
-    results: dict[str, list] = {name: [] for name, _, _ in arms}
+    models = args.model or ["agentaus"]
+    chosen = args.suite or list(SUITES)
+    unknown = [s for s in chosen if s not in SUITES]
+    if unknown:
+        print(f"unknown suite(s): {', '.join(unknown)}", file=sys.stderr)
+        return 2
 
-    for name, guidance, review in arms:
-        print(f"\n{'=' * 66}\n{name.upper()}  (guidance={guidance} self_review={review})\n{'=' * 66}")
-        if not configure(guidance, review):
-            print("  bridge failed to start")
-            return 1
-        for task in tasks:
-            for run_i in range(args.repeat):
-                answer = ask(task["prompt"])
-                if answer.startswith("__ERROR__"):
-                    print(f"  {task['id']:<16} ERROR {answer[:60]}")
-                    results[name].append({"id": task["id"], "passed": False,
-                                          "judge": None, "answer": "", "run": run_i})
-                    continue
-                passed, detail = run_tests(extract_code(answer, task["entry"]),
-                                           task["tests"], task["entry"])
-                scores = None if args.no_judge else judge(task["prompt"], answer)
-                mark = "PASS" if passed else "FAIL"
-                extra = ""
-                if scores:
-                    extra = (f"  judge c={scores['correctness']} "
-                             f"e={scores['edge_cases']} cl={scores['clarity']}")
-                suffix = f"  ({detail})" if not passed else ""
-                print(f"  {task['id']:<16} {mark}{extra}{suffix}", flush=True)
-                results[name].append({"id": task["id"], "passed": passed,
-                                      "judge": scores, "answer": answer,
-                                      "run": run_i})
+    results: dict = {}
+    for model in models:
+        problem = harness.preflight(model)
+        if problem:
+            print(f"\n=== {model}: SKIPPED ===\n  {problem}\n")
+            results[model] = {"skipped": problem}
+            continue
 
-    # --- head to head -----------------------------------------------------------
-    votes = {"compensated": 0, "baseline": 0, "tie": 0}
-    if not args.no_judge and len(results) == 2:
-        print(f"\n{'=' * 66}\nHEAD TO HEAD (blind, order alternated)\n{'=' * 66}")
-        paired = {}
-        for name in results:
-            for row in results[name]:
-                paired.setdefault((row["id"], row["run"]), {})[name] = row["answer"]
-        for i, (key, pair) in enumerate(sorted(paired.items())):
-            a, b = pair.get("compensated", ""), pair.get("baseline", "")
-            if not a or not b:
-                continue
-            verdict = pairwise(next(t["prompt"] for t in tasks if t["id"] == key[0]),
-                               a, b, flip=bool(i % 2))
-            votes[verdict] += 1
-            print(f"  {key[0]:<16} run {key[1] + 1}  ->  {verdict}", flush=True)
-        print(f"\n  compensated {votes['compensated']}  |  baseline {votes['baseline']}"
-              f"  |  tie {votes['tie']}")
+        results[model] = {}
+        for suite in chosen:
+            run_suite, _blurb = SUITES[suite]
+            totals = harness.Totals()
+            print(f"\n=== {model} / {suite} ===")
+            started = time.monotonic()
+            outcome = run_suite(model, args.limit, harness.ask, totals)
+            outcome["wall_seconds"] = time.monotonic() - started
+            outcome["calls"] = totals.calls
+            outcome["call_failures"] = totals.failures
+            outcome["input_tokens"] = totals.input_tokens
+            outcome["output_tokens"] = totals.output_tokens
+            outcome["median_call_seconds"] = totals.median_seconds
+            results[model][suite] = outcome
 
-    print(f"\n{'=' * 66}\nSUMMARY\n{'=' * 66}")
-    print(f"{'arm':<14} {'pass rate':>12} {'correctness':>12} {'edge cases':>12} {'clarity':>10}")
-    summary = {}
-    for name in results:
-        rows = results[name]
+    print("\n" + "=" * 78)
+    print("COMPARISON")
+    print("=" * 78)
+    for suite in chosen:
+        rows = [(m, r[suite]) for m, r in results.items() if suite in r]
         if not rows:
             continue
-        passed = sum(1 for r in rows if r["passed"])
-        judged = [r["judge"] for r in rows if r["judge"]]
-        avg = lambda k: (sum(j[k] for j in judged) / len(judged)) if judged else 0.0
-        summary[name] = {
-            "pass": passed / len(rows),
-            "correctness": avg("correctness"),
-            "edge": avg("edge_cases"),
-            "clarity": avg("clarity"),
-        }
-        print(f"{name:<14} {passed}/{len(rows):<10} {avg('correctness'):>12.2f} "
-              f"{avg('edge_cases'):>12.2f} {avg('clarity'):>10.2f}")
+        key, label = HEADLINE[suite]
+        print(f"\n{suite}")
+        print(f"  {'model':18} {label:>9} {'n':>4} {'calls':>6} {'fail':>5} "
+              f"{'in tok':>9} {'out tok':>8} {'med s':>7} {'wall s':>7}")
+        for model, r in rows:
+            print(f"  {model:18} {r[key]:>9.3f} {r['n']:>4} {r['calls']:>6} "
+                  f"{r['call_failures']:>5} {r['input_tokens']:>9,} "
+                  f"{r['output_tokens']:>8,} {r['median_call_seconds']:>7.1f} "
+                  f"{r['wall_seconds']:>7.0f}")
+        if suite == "humaneval":
+            print()
+            print(baselines.table())
+            for model, r in rows:
+                print(f"    -> {model} at {r[key]:.3f} sits in: "
+                      f"{baselines.bracket(r[key])}")
+        elif suite in baselines.LOCAL_ONLY:
+            print(f"    ({baselines.LOCAL_ONLY[suite]})")
 
-    if len(summary) == 2:
-        c, b = summary["compensated"], summary["baseline"]
-        delta = (c["pass"] - b["pass"]) * 100
-        print(f"\ncompensation changes the pass rate by {delta:+.1f} points "
-              f"and judged correctness by {c['correctness'] - b['correctness']:+.2f}")
-        if votes["compensated"] or votes["baseline"]:
-            print(f"head to head: compensated won {votes['compensated']}, "
-                  f"lost {votes['baseline']}, tied {votes['tie']}")
-        if delta < 0:
-            print("NOTE: compensation scored WORSE here. That is a real result, not a bug.")
-
-    print()
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y-%m-%dT%H-%M-%S")
+    path = out / f"run_{stamp}.json"
+    path.write_text(json.dumps(results, indent=1, default=str))
+    print(f"\nwritten: {path}")
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    finally:
-        restore_launchd()
+    sys.exit(main())
