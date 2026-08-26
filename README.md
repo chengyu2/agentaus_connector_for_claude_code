@@ -733,6 +733,49 @@ confined by `AGENTAUS_SEARCH_ROOTS`.
 
 ---
 
+## Finding out what needs fixing
+
+The bridge compensates for a weaker upstream in a dozen places, and every compensation
+logs when it fires. That makes the log a record of which ones are earning their keep,
+which are firing so often they point at a real defect, and which have never fired at all
+— a far better guide than reading the code and guessing.
+
+```bash
+./scripts/diagnose.py                      # reads /tmp/agentaus-bridge.log
+./scripts/diagnose.py path/to/other.log
+```
+
+It prints throughput, tool-call and compaction latencies, then every signal it can find,
+ranked by severity and count, each with what it means and what to do about it. It also
+lists what **never** fired, which is the half people forget: a compensation that has
+never triggered is either healthy or has never been exercised, and those need telling
+apart.
+
+A real run of 223 Agentaus turns reported:
+
+```
+[HIGH  ]    63 x  upstream 5xx / gateway timeout
+[HIGH  ]     6 x  helper call abandoned on timeout
+[HIGH  ]     3 x  tool round limit reached
+[HIGH  ]     1 x  summarisation fell back to trimming     <- real context lost
+[MEDIUM]    14 x  client disconnected mid-turn
+[LOW   ]  1236 x  waited for a concurrency slot
+[LOW   ]    26 x  self-review revised the answer          <- compensation paying off
+```
+
+Read that as one finding, not seven: **the bridge generates far more upstream calls than
+Agentaus absorbs at a cap of 6.** 1236 slot waits and 63 gateway timeouts are the same
+fact seen from two angles, and the disconnects and abandoned helpers follow from it. The
+adaptive chunk ceiling absorbs bursts; sustained load needs fewer calls, which means
+larger search chunks rather than a higher cap.
+
+The single line worth acting on immediately is the quiet one: *summarisation fell back to
+trimming* means compaction could not summarise enough and dropped messages instead. That
+is real conversation lost, and it is the only entry there that costs correctness rather
+than time.
+
+---
+
 ## Configuration reference
 
 All settings are environment variables, readable from `.env`. Shell exports win over
