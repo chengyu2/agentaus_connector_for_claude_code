@@ -28,6 +28,7 @@ import time
 from typing import Awaitable, Callable
 
 from . import documents
+from . import outline
 from .compact import _chunk, normalise_identifiers
 from .config import settings
 from .gate import hold
@@ -504,6 +505,53 @@ def chunk_file(path: str, budget_tokens: int) -> list[tuple[str, int, int, str]]
     return out
 
 
+async def _aim_with_outline(
+    query: str, candidates: list[str], call: Caller
+) -> list[tuple[str, int]]:
+    """Ask the model which sections to read, from structure alone.
+
+    The outline costs nothing - no model call, no upstream request - and answers the
+    cheap half of the problem: "which part of this document is about X" follows from its
+    headings. One call over a table of contents replaces a call per chunk over content.
+
+    Returns [] on anything unexpected, which falls back to reading every chunk. Aiming is
+    an optimisation; missing the answer is not an acceptable price for it.
+    """
+    toc = outline.render(candidates, read=read_text)
+    if not toc.strip():
+        return []
+    try:
+        async with hold("outline pick", "urgent"):
+            reply = await call(outline.PICK_INSTRUCTION.format(
+                query=query, outline=toc,
+                limit=settings.agentaus_search_max_sections,
+            ))
+    except Exception as exc:
+        log.warning("outline pick failed (%s); reading every chunk instead", exc)
+        return []
+    picks = outline.read_picks(reply, candidates)
+    log.info("outline: %d section(s) offered -> %d picked",
+             toc.count("<section "), len(picks))
+    return picks[: settings.agentaus_search_max_sections]
+
+
+def sections_around(path: str, lines: list[int], budget_tokens: int) -> list:
+    """The chunks containing the picked lines, and nothing else."""
+    body = read_text(path)
+    if not body.strip():
+        return []
+    all_lines = body.splitlines()
+    out = []
+    for target in sorted(set(lines)):
+        span = max(1, budget_tokens * 4 // 80)      # ~80 chars a line, in tokens
+        lo = max(0, target - 1 - span // 4)
+        hi = min(len(all_lines), lo + span)
+        if any(lo < e and s < hi for _p, s, e, _b in out):
+            continue                                # already covered by a previous pick
+        out.append((path, lo + 1, hi, "\n".join(all_lines[lo:hi])))
+    return out
+
+
 async def run_search(
     query: str, path: str, glob: str | None, call: Caller, default_path: str | None = None
 ) -> str:
@@ -547,9 +595,24 @@ async def run_search(
         candidates = candidates[: settings.agentaus_search_max_candidates]
 
     budget = effective_chunk_tokens()
+
+    # Aim before reading. One call over a free table of contents, then read only the
+    # sections it names - instead of a call per chunk over everything.
+    aimed = False
     chunks: list[tuple[str, int, int, str]] = []
-    for candidate in candidates:
-        chunks.extend(chunk_file(candidate, budget))
+    if settings.agentaus_search_outline_first and len(candidates) > 1:
+        picks = await _aim_with_outline(query, candidates, call)
+        if picks:
+            by_file: dict = {}
+            for path, line in picks:
+                by_file.setdefault(path, []).append(line)
+            for path, lines in by_file.items():
+                chunks.extend(sections_around(path, lines, budget))
+            aimed = bool(chunks)
+
+    if not chunks:
+        for candidate in candidates:
+            chunks.extend(chunk_file(candidate, budget))
 
     # Rank chunks the same way files were ranked. Shortlisting files is not enough when
     # the corpus is one enormous file: a 434 KB tender document is a single candidate
@@ -557,7 +620,7 @@ async def run_search(
     # being looked for. Measured: 285 seconds before this, and the answer call after it
     # then ran past the client's patience.
     total = len(chunks)
-    if total > settings.agentaus_search_min_candidates:
+    if not aimed and total > settings.agentaus_search_min_candidates:
         bodies = [piece[3].lower() for piece in chunks]
         # Selectivity recomputed ACROSS CHUNKS. Reusing the file-level judgement here is
         # what made this filter a no-op on a single-file corpus.
@@ -580,7 +643,8 @@ async def run_search(
     log.info(
         "search %r: %d file(s) -> %d candidate(s)%s -> %d of %d chunk(s)%s",
         query[:60], len(files), len(candidates),
-        " (brute force: shortlist too thin)" if brute_forced else "",
+        " (brute force: shortlist too thin)" if brute_forced
+        else (" (aimed by outline)" if aimed else ""),
         len(chunks), total, f", {dropped} over the cap" if dropped else "",
     )
 

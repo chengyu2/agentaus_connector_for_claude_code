@@ -365,6 +365,22 @@ class Settings:
     # Ceiling on files one search will read. The shortlist is ranked, so this keeps the
     # best-matching ones. Measured live: without it a loose expansion shortlisted 21 of
     # 40 files and the search took 75 seconds.
+    # Aim before reading: build a free outline of the candidate files, spend ONE call
+    # asking which sections matter, then read only those. The outline costs no upstream
+    # request at all, and on a 434 KB tender response it is 9,276 tokens of structure
+    # standing in for 89,579 tokens of content.
+    #
+    # This is symbol indexing applied to the corpus that is actually here. A Tree-sitter
+    # index answers "where is this function defined" without a fan-out, and answers
+    # nothing about a tender response, which has no functions in it. Documents have
+    # headings; those are the addressable structure.
+    agentaus_search_outline_first: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_SEARCH_OUTLINE_FIRST", True)
+    )
+    # Sections one aimed search will read. Beyond this it is cheaper to read everything.
+    agentaus_search_max_sections: int = field(
+        default_factory=lambda: _int("AGENTAUS_SEARCH_MAX_SECTIONS", 8)
+    )
     agentaus_search_max_candidates: int = field(
         default_factory=lambda: _int("AGENTAUS_SEARCH_MAX_CANDIDATES", 12)
     )
