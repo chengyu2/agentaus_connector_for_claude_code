@@ -31,7 +31,9 @@ from .augment import (
     REVISE_INSTRUCTION,
     declared_verdict,
     plan_prompt,
-    looks_like_tool_refusal,
+    CLASSIFY_REFUSAL_INSTRUCTION,
+    could_be_a_refusal,
+    read_refusal_verdict,
     should_think,
     working_directory,
     with_guidance,
@@ -1025,17 +1027,30 @@ def _is_over_length(text: str) -> bool:
     return "max_model_len" in lowered or "exceeds" in lowered and "prompt" in lowered
 
 
-# Below this share of the window, a timeout cannot be blamed on the prompt. Recompacting
-# a request that occupies a fraction of the context achieves nothing, and the bridge did
-# exactly that: eight minutes of refit-and-retry on a 3,642-token payload while the
-# upstream was timing out on a six-token probe as well. Above it, shrinking is worth a try.
-_REFIT_WORTH_TRYING_ABOVE = 0.25
+# A timeout is only a size problem if the request does not fit. Anything at or under the
+# window is a request Agentaus is able to process, so a 524 on it says the service is
+# slow, not that the prompt is too big - and shrinking it treats the wrong illness.
+#
+# That leaves the three signals cleanly separated, which is the point:
+#
+#   * too big for the window   -> Agentaus says so explicitly ("exceeds max_model_len"),
+#                                 and _is_over_length drives the recompaction.
+#   * approaching the window   -> compaction has already run, proactively, at
+#                                 AGENTAUS_COMPACT_THRESHOLD. Nothing should reach the
+#                                 edge by surprise.
+#   * a 524 under the window   -> the upstream is unwell. Say so.
+#
+# An earlier version used a quarter of the window, which was a number with nothing behind
+# it: it classified a 3,642-token payload as "possibly too big" and spent eight minutes
+# recompacting 3% of a context window while a six-token probe to the same endpoint was
+# also timing out.
+_REFIT_WORTH_TRYING_ABOVE = 1.0
 
 
 def _worth_refitting(body: dict, limit: int) -> bool:
     """Whether a timeout could plausibly be about the size of this request.
 
-    Distinguishes "the conversation is too big" from "the upstream is unwell". Both
+    Distinguishes "the conversation does not fit" from "the upstream is unwell". Both
     arrive as HTTP 524 and only the first is something the bridge can act on.
     """
     if limit <= 0:
@@ -1587,13 +1602,33 @@ async def _agentaus_event_stream(
                      len("".join(pending)))
             pending = []
             continue
-        # A turn that used no tools and claims it has none is not an answer. Re-ask
-        # rather than forwarding it: the tools were on the wire the whole time.
+        # A turn that used no tools and claims it has none is not an answer. Whether it
+        # IS that is a judgement about language, so Agentaus makes it - behind a
+        # structural gate, so the call only happens when there is something to judge.
+        answer_so_far = "".join(pending)
+        is_refusal = False
         if (
-            not mine and not theirs and known
-            and corrections < settings.agentaus_correction_rounds
-            and looks_like_tool_refusal("".join(pending))
+            corrections < settings.agentaus_correction_rounds
+            and could_be_a_refusal(
+                answer_so_far,
+                tools_offered=bool(known),
+                called_a_tool=bool(mine or theirs),
+            )
         ):
+            try:
+                async with hold("refusal check", "urgent"):
+                    verdict = await _agentaus_summarise(
+                        client, CLASSIFY_REFUSAL_INSTRUCTION.format(
+                            answer=answer_so_far[:4000])
+                    )
+                is_refusal = read_refusal_verdict(verdict)
+            except Exception as exc:
+                # Cannot classify it, so forward it. Re-asking a good answer is worse
+                # than letting a bad one through: the user can repeat a turn.
+                rlog(logging.WARNING, "refusal check failed (%s); forwarding the answer",
+                     exc)
+
+        if is_refusal:
             corrections += 1
             rlog(logging.WARNING,
                  "model refused to use tools it has; correcting and re-asking")

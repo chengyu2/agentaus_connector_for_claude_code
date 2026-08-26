@@ -290,62 +290,63 @@ def review_says_ok(review: str) -> bool:
 # Phrasings Agentaus uses when it declines to use tools it was given. It is not
 # refusing on policy grounds - it is asserting, wrongly, that it has no filesystem. The
 # tools were on the wire and the working directory was in the prompt.
-# Asking the user to hand over content the model could have fetched. These need no
-# further context: the request itself IS the failure, whatever noun follows.
-_ASKS_USER_TO_SUPPLY = (
-    "please provide the",
-    "please upload",
-    "please paste",
-    "please share the",
-    "if you can provide",
-    "if you provide the",
-    "could you please provide",
-    "could you please upload",
-    "you can provide the",
-    "provide the relevant excerpt",
-)
+# Whether an answer is a refusal is a judgement about language, not a pattern. Three
+# phrase lists used to live here - roughly forty entries - and they were wrong in both
+# directions: they missed phrasings nobody had thought of, and they needed a separate
+# list of "filesystem words" beside them to stop "I don't have access to next year's
+# budget" being read as a refusal to use tools.
+#
+# Agentaus decides now. The trigger for asking is STRUCTURAL and costs nothing: a turn
+# that was offered tools, called none of them, and produced a short answer. Only then is
+# there anything to classify, and only then is a call worth making.
 
-# Claiming it has no filesystem. Ambiguous alone - "I don't have access to next year's
-# budget" is a legitimate answer about the world - so these require a context word too.
-_DENIES_CAPABILITY = (
-    "don't have the ability",
-    "do not have the ability",
-    "don't have access to",
-    "do not have access to",
-    "unable to access",
-    "cannot access",
-    "can't access",
-    "unable to retrieve",
-    "cannot retrieve",
-    "unable to read",
-    "no ability to browse",
-)
+# A real answer to a substantive question is long. Below this a turn is either an
+# acknowledgement or an excuse, and worth a look; above it, it is an answer.
+_REFUSAL_LENGTH_CEILING = 1200
 
-_REFUSAL_CONTEXT = (
-    "file", "path", "directory", "document", "local", "filesystem", "file system",
-    "repository", "folder", "docx", "pdf", "excerpt", "upload",
-)
+CLASSIFY_REFUSAL_INSTRUCTION = """\
+An AI agent was given tools that read the local filesystem, and a task that needed them.
+It called no tools and replied with the text below.
+
+<reply>
+{answer}
+</reply>
+
+<question>
+Is that reply the agent DECLINING to act - claiming it cannot read files, has no access
+to the filesystem, or asking the human to paste or upload something it could have
+fetched itself?
+
+Or is it a genuine answer, or a legitimate statement about something it really cannot
+know (a future event, a private system, a fact absent from the material)?
+</question>
+
+<output_format>
+Exactly one word: REFUSAL or ANSWER. Nothing else.
+</output_format>
+"""
 
 
-def looks_like_tool_refusal(text: str) -> bool:
-    """Whether an answer is the model declining to use tools it actually has.
+def could_be_a_refusal(answer: str, *, tools_offered: bool, called_a_tool: bool) -> bool:
+    """Whether this turn is even worth classifying - structural, no language involved.
 
-    Observed on roughly half of a batch run: "I can't complete this request because I
-    don't have the ability to search or retrieve content from local file system paths",
-    with `agentaus_search` on the wire and the working directory in the prompt. The
-    other half of the same run answered every row correctly, so this is not a capability
-    limit - it is a persona the bridge has to talk it out of.
+    A cheap gate in front of the model call. A turn that used a tool is acting; a long
+    answer is answering; a turn offered no tools cannot be refusing to use them.
     """
-    if not text:
+    if called_a_tool or not tools_offered:
         return False
-    # Only the opening matters. A long answer that hedges somewhere in the middle is an
-    # answer, not a refusal to act.
-    lowered = text[:2000].lower()
-    if any(phrase in lowered for phrase in _ASKS_USER_TO_SUPPLY):
-        return True
-    if any(phrase in lowered for phrase in _DENIES_CAPABILITY):
-        return any(word in lowered for word in _REFUSAL_CONTEXT)
-    return False
+    text = (answer or "").strip()
+    return 0 < len(text) <= _REFUSAL_LENGTH_CEILING
+
+
+def read_refusal_verdict(verdict: str) -> bool:
+    """Read the one-word answer. Anything unrecognised is treated as a real answer.
+
+    Deliberately biased that way: wrongly re-asking a good answer wastes a round trip
+    and confuses the model, while wrongly accepting a refusal costs one turn the user
+    can simply repeat.
+    """
+    return (verdict or "").strip().upper().startswith("REFUSAL")
 
 
 REFUSAL_CORRECTION = """\

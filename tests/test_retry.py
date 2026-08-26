@@ -468,10 +468,22 @@ class TestSmallRequestTimeoutsAreNotBlamedOnSize(unittest.TestCase):
         body = {"messages": [{"role": "user", "content": "short question"}]}
         self.assertFalse(_worth_refitting(body, 131072))
 
-    def test_a_request_filling_the_window_is_worth_refitting(self):
+    def test_a_request_that_merely_fills_the_window_is_not_blamed_on_size(self):
+        """It fits, so Agentaus can process it - a timeout means slow, not too big."""
         from agentaus_bridge.server import _worth_refitting
-        body = {"messages": [{"role": "user", "content": "x " * 60_000}]}
+        body = {"messages": [{"role": "user", "content": "x " * 40_000}]}
+        self.assertFalse(_worth_refitting(body, 131072))
+
+    def test_a_request_that_does_not_fit_is_worth_refitting(self):
+        from agentaus_bridge.server import _worth_refitting
+        body = {"messages": [{"role": "user", "content": "x " * 200_000}]}
         self.assertTrue(_worth_refitting(body, 131072))
+
+    def test_over_length_still_drives_recompaction_on_its_own_signal(self):
+        """The explicit error is the primary path; the 524 heuristic is the backstop."""
+        from agentaus_bridge.server import _is_over_length
+        self.assertTrue(_is_over_length(
+            "The engine prompt length 224662 exceeds the max_model_len 131072"))
 
     def test_no_limit_means_nothing_to_refit_against(self):
         from agentaus_bridge.server import _worth_refitting

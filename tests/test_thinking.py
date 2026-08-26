@@ -723,51 +723,52 @@ class TestRepeatedBridgeCallsAreShortCircuited(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(server._call_signature(a), server._call_signature(b))
 
 
-class TestToolRefusalDetection(unittest.TestCase):
-    """Half of a batch run refused to use tools it had.
+class TestRefusalClassification(unittest.TestCase):
+    """Whether a reply is a refusal is a judgement about language, so Agentaus makes it.
 
-    "I can't complete this request because I don't have the ability to search or
-    retrieve content from local file system paths" - with `agentaus_search` on the wire
-    and the working directory in the prompt. The other half of the same run answered
-    every row correctly, so it is a persona to be corrected, not a limit to respect.
+    Three phrase lists used to do this - about forty entries - and they were wrong both
+    ways: they missed phrasings nobody had thought of, and they needed a companion list
+    of "filesystem words" to stop "I don't have access to next year's budget" being read
+    as a refusal to use tools. What remains here is only the structural gate that decides
+    whether a call is worth making at all.
     """
 
     def setUp(self):
-        from agentaus_bridge.augment import looks_like_tool_refusal
-        self.refusal = looks_like_tool_refusal
+        from agentaus_bridge.augment import could_be_a_refusal, read_refusal_verdict
+        self.gate = could_be_a_refusal
+        self.verdict = read_refusal_verdict
 
-    def test_the_observed_refusal_is_caught(self):
-        self.assertTrue(self.refusal(
+    def test_a_turn_that_used_a_tool_is_not_refusing(self):
+        self.assertFalse(self.gate("anything", tools_offered=True, called_a_tool=True))
+
+    def test_a_turn_offered_no_tools_cannot_refuse_to_use_them(self):
+        self.assertFalse(self.gate("I cannot read files", tools_offered=False,
+                                   called_a_tool=False))
+
+    def test_a_short_toolless_reply_is_worth_classifying(self):
+        self.assertTrue(self.gate(
             "I'm sorry, but I can't complete this request because I don't have the "
-            "ability to search or retrieve content from local file system paths such "
-            "as /Users/cheng/tenders."))
+            "ability to search local file system paths.",
+            tools_offered=True, called_a_tool=False))
 
-    def test_asking_the_user_to_supply_content_is_caught_whatever_the_noun(self):
-        for text in (
-            "Please provide the relevant excerpt from the DOCX so I can extract them.",
-            "Could you please upload the file?",
-            "If you can provide the text, I will summarise it.",
-            "Please paste the contents here.",
-        ):
-            self.assertTrue(self.refusal(text), text)
+    def test_a_long_answer_is_an_answer(self):
+        """No call is spent on something that is evidently a real reply."""
+        self.assertFalse(self.gate("Here are the headings. " * 200,
+                                   tools_offered=True, called_a_tool=False))
 
-    def test_a_real_answer_is_not_a_refusal(self):
-        self.assertFalse(self.refusal(
-            "The cap is asyncio.Semaphore(6) in gate.py, read from AGENTAUS_MAX_CONCURRENCY."))
+    def test_an_empty_reply_is_not_classified(self):
+        self.assertFalse(self.gate("", tools_offered=True, called_a_tool=False))
+        self.assertFalse(self.gate("   ", tools_offered=True, called_a_tool=False))
 
-    def test_a_legitimate_statement_about_the_world_is_not_a_refusal(self):
-        """"I don't have access to X" is often just true and not about tooling."""
-        self.assertFalse(self.refusal(
-            "I do not have access to next year's budget figures, so I cannot forecast "
-            "the spend beyond June."))
+    def test_the_verdict_is_read_strictly(self):
+        self.assertTrue(self.verdict("REFUSAL"))
+        self.assertTrue(self.verdict("  refusal  "))
+        self.assertFalse(self.verdict("ANSWER"))
 
-    def test_a_hedge_deep_in_a_real_answer_is_not_a_refusal(self):
-        body = ("Here are the Section 5 headings: 5.1 Functional Capability, 5.2 "
-                "Technical and Integration. " * 40
-                + " Note that I cannot access the appendix, which was not provided.")
-        self.assertFalse(self.refusal(body),
-                         "a long answer that hedges at the end was treated as a refusal")
+    def test_an_unreadable_verdict_is_treated_as_a_real_answer(self):
+        """Biased on purpose: re-asking a good answer is worse than passing a bad one,
+        because the user can simply repeat a turn."""
+        for reply in ("I think maybe?", "", None, "Well, it depends"):
+            self.assertFalse(self.verdict(reply), repr(reply))
 
-    def test_empty_is_not_a_refusal(self):
-        self.assertFalse(self.refusal(""))
-        self.assertFalse(self.refusal(None))
+

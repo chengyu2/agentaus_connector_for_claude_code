@@ -802,6 +802,47 @@ than time.
 
 ---
 
+## Pattern matching versus judgement
+
+The bridge exists because Agentaus needs help, so it should ask Agentaus rather than
+guess whenever the question is a judgement. Every remaining regex has been checked
+against that, and the split is not "less is better" — it is **what happens when this
+code runs**.
+
+**Replaced with a model call.** Whether a reply is the model refusing to use tools it
+has. Three phrase lists did this — about forty entries — and they were wrong in both
+directions: they missed phrasings nobody had thought of, and they needed a companion list
+of "filesystem words" beside them so that *"I don't have access to next year's budget"*
+was not read as a refusal to read a file. Agentaus decides now, behind a **structural**
+gate that costs nothing: a turn that was offered tools, called none, and produced a short
+answer. Only then is there anything to judge.
+
+Where a soft check can fail, it fails toward doing nothing: an unreadable verdict is
+treated as a real answer, because re-asking a good answer is worse than passing a weak one
+through — the user can just repeat a turn.
+
+**Kept, deliberately.** Two of them, for the same reason:
+
+| Pattern | Why it stays |
+| --- | --- |
+| `max_model_len\s+(\d+)` | Reads the real context window out of Agentaus' own error text. It runs **when the upstream is already failing** — asking that upstream to parse its own error message is asking the broken thing to explain itself. |
+| `$$…$$` and the typographic table | Turns `EU‑WEST‑2` back into `EU-WEST-2` and `$$retry_budget_ms$$` back into a backticked identifier. A deterministic character mapping. A model asked to fix punctuation would introduce new corruption in the one place the bridge cannot tolerate it — identifiers a coding agent is about to act on. |
+
+Two more are borderline and stay for now: the working-directory patterns in `augment.py`
+(reading a path out of Claude Code's own stable system prompt) and `_SECTION_START` in
+`tools.py` (finding a section boundary for `agentaus_zoom`). Both are candidates for soft
+analysis. The second would cost a model call on every zoom, and zoom being free is worth
+more than the accuracy it would buy — a wrong boundary makes a passage slightly larger,
+which the token budget then trims anyway.
+
+The search prefilter is worth a word because it looks like the same question and is not.
+It uses literal matching to *rank* files and chunks — but the terms it ranks on come from
+**Agentaus expanding the query**, which is the soft half. Replacing the ranking with
+judgement too would mean reading everything to decide what to read, which is what the
+prefilter exists to avoid.
+
+---
+
 ## Configuration reference
 
 All settings are environment variables, readable from `.env`. Shell exports win over
