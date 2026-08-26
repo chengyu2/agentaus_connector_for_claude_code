@@ -19,12 +19,11 @@ That is three extractors for three genuinely different structures, which is not 
 mistake as having two extractors for one - a heading and a function signature are not
 competing descriptions of the same thing.
 
-Python declarations come from `ast`, which is exact and in the standard library. Other
-languages use a declaration-line pass, which is approximate: it finds `def`, `func`,
-`function`, `class`, `struct`, `interface`, `type` and `impl` at low indentation, and will
-miss anything unusual. Tree-sitter would make that exact for every language it has a
-grammar for, at the cost of a real dependency and a grammar per language; the fallback
-below is what runs when it is not installed.
+Code declarations come from Tree-sitter where it is installed - exact, across nineteen
+languages, and able to tell a declaration from the same words inside a docstring. Below
+that sits Python's `ast`, which is exact and always available but only for Python, and
+below that a declaration-line pass that works anywhere and is approximate. Each rung runs
+only when the one above cannot: a fallback chain, not competing answers.
 """
 
 from __future__ import annotations
@@ -35,6 +34,7 @@ import os
 import re
 
 from . import documents
+from . import symbols
 
 log = logging.getLogger("agentaus-bridge")
 
@@ -184,10 +184,13 @@ def of_file(path: str, read=None) -> list[tuple[int, int, str]]:
     suffix = os.path.splitext(path)[1].lower()
     if suffix == ".json":
         return _json_outline(body, path)
-    if suffix in (".py", ".pyi"):
-        return _python_outline(body) or of_text(body)
-    if suffix in _CODE_SUFFIXES:
-        return _code_outline(body) or of_text(body)
+
+    if suffix in _CODE_SUFFIXES or symbols.language_for(path):
+        # Best available, in strict order of exactness.
+        return (symbols.outline_of(path, body)
+                or (_python_outline(body) if suffix in (".py", ".pyi") else [])
+                or _code_outline(body)
+                or of_text(body))
     return of_text(body)
 
 

@@ -2,3 +2,8 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 httpx>=0.27
 tiktoken>=0.7
+
+# Exact declaration indexing for the search outline. Optional: without them the
+# outline falls back to Python's `ast`, then to a declaration-line pass.
+tree-sitter>=0.21
+tree-sitter-language-pack>=0.4

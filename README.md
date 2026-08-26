@@ -994,6 +994,70 @@ Only the search-shaped uses. Bash is still how you run a test.
 
 ---
 
+## Aiming before reading
+
+Search finds things by reading — one model call per chunk. That is what makes it work when
+the answer shares no words with the question, and what makes it cost ten calls on a large
+file.
+
+The cheap half of that problem is structural. *"Which part of this is about security
+accreditation"* follows from declarations or headings, and those cost **nothing** to
+extract: no model call, no upstream request. So the bridge builds an outline locally and
+spends **one** call over a table of contents, then reads only the sections it names.
+
+```
+corpus                              content   outline   ratio
+this bridge's own source (code)      66,486     6,431     10x
+a 434KB tender response (prose)      89,579     9,276     10x
+a returnable-documents .docx         26,865       188    143x
+```
+
+Aiming is an optimisation and never a gate. An unparseable reply, an invented path, a
+failed call — all fall back to reading every chunk, because reading less is not worth
+missing the answer.
+
+### Three extractors, for three structures
+
+| Corpus | Indexed by |
+| --- | --- |
+| Source code | declarations — `def`, `class`, `func`, `struct`, `interface`, `impl`… |
+| Prose | headings — Markdown, bold-only lines, clause numbers like `5.3.1` |
+| JSON | its keys, which is all its structure amounts to |
+
+That is not the same mistake as two extractors for one structure. A function signature and
+a heading are not competing descriptions of the same thing.
+
+### Code uses Tree-sitter, and why that is worth a dependency
+
+Declarations come from **Tree-sitter**, across nineteen languages — Python, JavaScript,
+TypeScript, TSX, Go, Rust, Java, Kotlin, Swift, C, C++, C#, Ruby, PHP, Scala, Bash, SQL,
+Lua, Dart. It produces a Concrete Syntax Tree with every token mapped to an exact byte,
+line and column, so a declaration is what the *grammar* says it is:
+
+```
+     36  def gate()
+     84  class _PriorityGate
+    113  async def acquire(self, priority)
+```
+
+A line pattern gets most of those and is wrong where it matters. It cannot tell a
+declaration from the same words inside a docstring or a comment, and it misses a signature
+written across two lines — both of which are tested for.
+
+There is a strict quality ordering rather than competing implementations, and each rung
+runs only when the one above cannot:
+
+```
+1. Tree-sitter       exact, 19 languages, optional dependency
+2. Python `ast`      exact, one language, always available
+3. declaration pass  approximate, any language, always available
+```
+
+`pip install tree-sitter tree-sitter-language-pack` gets rung one. Without it the outline
+still works — just approximately, for languages other than Python.
+
+---
+
 ## Configuration reference
 
 All settings are environment variables, readable from `.env`. Shell exports win over
@@ -1023,6 +1087,8 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_SEARCH_ROOTS` | *(empty)* | Colon-separated directories search may read. Empty allows any absolute path, matching Claude Code's own `Read` |
 | `AGENTAUS_TOOL_ROUNDS` | `12` | How many rounds of bridge-executed tool calls one turn may run before the answer has to stand |
 | `AGENTAUS_CORRECTION_ROUNDS` | `3` | Rounds spent telling the model a tool it named does not exist. Separate from tool rounds, so being corrected does not consume the budget for real work |
+| `AGENTAUS_SEARCH_OUTLINE_FIRST` | `true` | Build a free structural outline and spend one call choosing sections, instead of a call per chunk |
+| `AGENTAUS_SEARCH_MAX_SECTIONS` | `8` | Sections one aimed search reads before it is cheaper to read everything |
 | `AGENTAUS_SEARCH_MAX_CANDIDATES` | `12` | Ceiling on files one search reads. The shortlist is ranked, so this keeps the best matches |
 | `AGENTAUS_INVESTIGATE` | `true` | Offer `agentaus_investigate`: three independent searches, and a fact must appear in two before it is reported as established |
 | `AGENTAUS_ZOOM` | `true` | Offer `agentaus_zoom`: open a citation from a search result and read it in its section. Without it the model cites evidence it cannot quote from |

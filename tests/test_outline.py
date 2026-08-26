@@ -46,12 +46,22 @@ class Thing:
 '''
 
     def test_python_uses_the_real_parser(self):
+        """Signatures come back richer from Tree-sitter than from a pattern, so these
+        assert what the entry names rather than its exact text."""
         got = outline.of_file("/x/m.py", reader({"/x/m.py": self.PY_SRC}))
-        titles = [t for _l, _d, t in got]
+        titles = " | ".join(t for _l, _d, t in got)
         self.assertIn("def top_level(a, b)", titles)
         self.assertIn("class Thing", titles)
-        self.assertIn("async def async_method(self)", titles)
+        self.assertIn("async def async_method", titles)
         self.assertIn("MAX_RETRIES (constant)", titles)
+
+    def test_a_local_assignment_does_not_drown_the_outline(self):
+        src = "TOP = 1\ndef f():\n    local_thing = 2\n    OTHER = 3\n"
+        titles = " | ".join(t for _l, _d, t in
+                            outline.of_file("/x/m.py", reader({"/x/m.py": src})))
+        self.assertIn("TOP (constant)", titles)
+        self.assertNotIn("local_thing", titles)
+        self.assertNotIn("OTHER", titles)
 
     def test_line_numbers_are_addressable(self):
         got = outline.of_file("/x/m.py", reader({"/x/m.py": self.PY_SRC}))
@@ -66,15 +76,18 @@ class Thing:
 
     def test_other_languages_get_a_declaration_pass(self):
         go = "package main\n\nfunc Handle(w, r) {\n}\n\ntype Server struct {\n}\n"
-        titles = [t for _l, _d, t in outline.of_file("/x/m.go", reader({"/x/m.go": go}))]
+        titles = " | ".join(t for _l, _d, t in
+                            outline.of_file("/x/m.go", reader({"/x/m.go": go})))
         self.assertIn("func Handle", titles)
         self.assertIn("type Server", titles)
 
     def test_typescript_and_rust_too(self):
         ts = "export function render(props) {}\nexport class View {}\n"
         rs = "pub fn main() {}\npub struct Config {}\nimpl Config {}\n"
-        ts_titles = [t for _l, _d, t in outline.of_file("/x/a.ts", reader({"/x/a.ts": ts}))]
-        rs_titles = [t for _l, _d, t in outline.of_file("/x/a.rs", reader({"/x/a.rs": rs}))]
+        ts_titles = " | ".join(t for _l, _d, t in
+                               outline.of_file("/x/a.ts", reader({"/x/a.ts": ts})))
+        rs_titles = " | ".join(t for _l, _d, t in
+                               outline.of_file("/x/a.rs", reader({"/x/a.rs": rs})))
         self.assertIn("function render", ts_titles)
         self.assertIn("class View", ts_titles)
         self.assertIn("fn main", rs_titles)
@@ -165,3 +178,41 @@ class TestItActuallyShrinksThings(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestTreeSitterIsExactWhereAPatternIsNot(unittest.TestCase):
+    """The reason for the dependency: a pattern cannot tell a declaration from the same
+    words inside a string or a comment, and misses anything written across two lines."""
+
+    def setUp(self):
+        from agentaus_bridge import symbols
+        self.symbols = symbols
+        if not symbols.available():
+            self.skipTest("tree-sitter is not installed here")
+
+    def test_a_declaration_inside_a_docstring_is_not_a_declaration(self):
+        src = 'DOC = """\ndef fake_function():\n    pass\n"""\n\ndef real_one():\n    pass\n'
+        titles = " | ".join(t for _l, _d, t in self.symbols.outline_of("/x/a.py", src))
+        self.assertIn("def real_one", titles)
+        self.assertNotIn("fake_function", titles)
+
+    def test_a_declaration_inside_a_comment_is_not_a_declaration(self):
+        src = "// func Commented(x int) {}\nfunc Real(y int) {}\n"
+        titles = " | ".join(t for _l, _d, t in self.symbols.outline_of("/x/a.go", src))
+        self.assertIn("func Real", titles)
+        self.assertNotIn("Commented", titles)
+
+    def test_a_signature_split_across_lines_is_still_found(self):
+        src = "func Handle(\n    w http.ResponseWriter,\n    r *http.Request,\n) {\n}\n"
+        titles = " | ".join(t for _l, _d, t in self.symbols.outline_of("/x/a.go", src))
+        self.assertIn("func Handle", titles)
+
+    def test_nineteen_grammars_are_reachable(self):
+        reachable = sum(1 for lang in set(self.symbols.LANGUAGES.values())
+                        if self.symbols.outline_of(
+                            f"/x/a{next(k for k, v in self.symbols.LANGUAGES.items() if v == lang)}",
+                            "") == [])
+        self.assertGreaterEqual(len(set(self.symbols.LANGUAGES.values())), 15)
+
+    def test_an_unknown_extension_returns_nothing_so_the_caller_falls_through(self):
+        self.assertEqual(self.symbols.outline_of("/x/a.unknownext", "def x(): pass"), [])
