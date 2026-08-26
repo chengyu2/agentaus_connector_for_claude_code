@@ -712,6 +712,27 @@ training — which is `Grep`.
 
 ---
 
+## Where the output goes
+
+**The bridge never writes files.** It translates requests and responses; it has no idea
+what a deliverable is. Output reaches disk exactly one way: Agentaus calls `Write` or
+`Edit`, and **Claude Code** executes it — through the same permission prompt as any other
+write. Nothing is dumped automatically, and there is no output directory.
+
+Two consequences worth knowing:
+
+- **Ask for the file explicitly.** "Review 5.1.1" gets you an answer in the terminal.
+  "Review 5.1.1 and write it to `<path>`" gets you a file.
+- **Markdown, not `.docx`.** A `.docx` is a zip archive, so a text-writing tool cannot
+  produce one — Agentaus can only write text. Have it write `.md`, then convert
+  (`pandoc out.md -o out.docx`) if the buyer needs Word.
+
+`agentaus_search` and `agentaus_zoom` are the exception in the other direction: the bridge
+runs those itself, so they never reach a permission prompt. They are read-only and
+confined by `AGENTAUS_SEARCH_ROOTS`.
+
+---
+
 ## Configuration reference
 
 All settings are environment variables, readable from `.env`. Shell exports win over
@@ -736,13 +757,14 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_SEARCH_MIN_CANDIDATES` | `3` | Below this many shortlisted files, distrust the shortlist and read everything |
 | `AGENTAUS_SEARCH_MAX_FILE_BYTES` | `1048576` | Skip files larger than this |
 | `AGENTAUS_SEARCH_ROOTS` | *(empty)* | Colon-separated directories search may read. Empty allows any absolute path, matching Claude Code's own `Read` |
-| `AGENTAUS_TOOL_ROUNDS` | `3` | How many rounds of bridge-executed tool calls one turn may run before the answer has to stand |
+| `AGENTAUS_TOOL_ROUNDS` | `12` | How many rounds of bridge-executed tool calls one turn may run before the answer has to stand |
 | `AGENTAUS_CORRECTION_ROUNDS` | `3` | Rounds spent telling the model a tool it named does not exist. Separate from tool rounds, so being corrected does not consume the budget for real work |
 | `AGENTAUS_SEARCH_MAX_CANDIDATES` | `12` | Ceiling on files one search reads. The shortlist is ranked, so this keeps the best matches |
 | `AGENTAUS_INVESTIGATE` | `true` | Offer `agentaus_investigate`: three independent searches, and a fact must appear in two before it is reported as established |
 | `AGENTAUS_ZOOM` | `true` | Offer `agentaus_zoom`: open a citation from a search result and read it in its section. Without it the model cites evidence it cannot quote from |
 | `AGENTAUS_ZOOM_RADIUS_LINES` | `120` | How far either side of the cited lines to look for a section boundary |
 | `AGENTAUS_ZOOM_MAX_LINES` | `400` | Hard stop, so a heading-less file cannot return itself whole |
+| `AGENTAUS_ZOOM_MIN_LINES` | `40` | Floor on the window. Tender documents use bold single lines as sub-headings, so boundary detection alone returned 3-line "sections" |
 | `AGENTAUS_ZOOM_MAX_TOKENS` | `6000` | Below this the passage comes back verbatim; above it, Agentaus keeps what serves the stated purpose |
 | `BRIDGE_LOG_BODY_CHARS` | `20000` | How much of a body `BRIDGE_LOG_BODIES` logs |
 | `AGENTAUS_DISTILL_RESULTS` | `false` | Condense oversized tool results before sending them. **Off by default** — see [Distillation](#distillation) |

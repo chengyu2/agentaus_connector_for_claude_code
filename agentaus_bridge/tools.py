@@ -738,7 +738,8 @@ _SECTION_START = re.compile(
 
 
 def _widen_to_section(
-    lines: list[str], start_idx: int, end_idx: int, radius: int, ceiling: int
+    lines: list[str], start_idx: int, end_idx: int, radius: int, ceiling: int,
+    floor_lines: int = 0,
 ) -> tuple[int, int]:
     """Grow [start_idx, end_idx) outward to the section containing it.
 
@@ -773,6 +774,21 @@ def _widen_to_section(
                 break
         else:
             hi = limit
+
+    # A boundary can sit two lines away. Tender and spec documents use a bold single
+    # line as a sub-heading constantly, so honouring the nearest boundary alone returned
+    # three-line "sections" - technically a section, useless to write from. Keep going
+    # outward, boundary by boundary, until there is enough to read.
+    if floor_lines and hi - lo < floor_lines:
+        want = floor_lines - (hi - lo)
+        back = min(want // 2, lo - max(0, start_idx - radius))
+        lo = max(0, lo - back)
+        hi = min(len(lines), hi + (want - back))
+        # Prefer stopping on a boundary if one is within reach of the new edge.
+        for i in range(hi, min(len(lines), hi + 20)):
+            if _SECTION_START.match(lines[i]):
+                hi = i
+                break
 
     if hi - lo > ceiling:
         # Keep the cited range centred rather than truncating one side of it.
@@ -849,6 +865,7 @@ async def run_zoom(
     lo, hi = _widen_to_section(
         lines, start - 1, min(end, len(lines)),
         settings.agentaus_zoom_radius_lines, settings.agentaus_zoom_max_lines,
+        settings.agentaus_zoom_min_lines,
     )
     window = lines[lo:hi]
     numbered = "\n".join(f"{lo + i + 1:6d}  {line}" for i, line in enumerate(window))

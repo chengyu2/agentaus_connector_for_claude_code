@@ -470,3 +470,42 @@ class TestZoom(unittest.TestCase):
             out = run(tools.run_search("where is x", tree.path, None, call))
         self.assertIn(tools.ZOOM_TOOL, out,
                       "a citation is only useful if the model knows it can open it")
+
+
+class TestZoomWindowFloor(unittest.TestCase):
+    """A boundary can sit two lines away.
+
+    Tender documents use a bold single line as a sub-heading constantly, so honouring
+    the nearest boundary alone returned three-line "sections" - technically correct and
+    useless to write from. Observed live on the FIN response: "3 line(s) verbatim".
+    """
+
+    BOLD_HEAVY = "\n".join(
+        [f"**Heading {i}**\nContent line for section {i}\nAnother line for {i}"
+         for i in range(60)]
+    )
+
+    def stub(self):
+        async def call(_: str) -> str:
+            raise AssertionError("should not need the model for a small passage")
+        return call
+
+    def test_a_tiny_section_is_widened_to_something_readable(self):
+        with _Tree({"doc.md": self.BOLD_HEAVY}) as tree:
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 90, 90, "", self.stub()))
+        body = [l for l in out.splitlines() if l.strip() and not l.startswith("/")]
+        self.assertGreaterEqual(len(body), 20,
+                                f"still returned a {len(body)}-line sliver")
+
+    def test_the_cited_line_stays_inside_the_window(self):
+        with _Tree({"doc.md": self.BOLD_HEAVY}) as tree:
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 90, 90, "", self.stub()))
+        nums = [int(l.split()[0]) for l in out.splitlines() if l.strip() and l.split()[0].isdigit()]
+        self.assertLessEqual(min(nums), 90)
+        self.assertGreaterEqual(max(nums), 90)
+
+    def test_a_short_file_is_not_padded_past_its_end(self):
+        with _Tree({"doc.md": "one\ntwo\nthree\n"}) as tree:
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2, "", self.stub()))
+        nums = [int(l.split()[0]) for l in out.splitlines() if l.strip() and l.split()[0].isdigit()]
+        self.assertLessEqual(max(nums), 3)

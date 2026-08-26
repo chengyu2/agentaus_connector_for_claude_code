@@ -236,6 +236,12 @@ class Settings:
     agentaus_zoom_max_lines: int = field(
         default_factory=lambda: _int("AGENTAUS_ZOOM_MAX_LINES", 400)
     )
+    # Floor on the window. Tender and spec documents use bold single lines as sub-headings
+    # constantly, so boundary detection alone returned 3-line "sections" - which defeats
+    # the point of zooming in. Below this many lines, keep widening outward.
+    agentaus_zoom_min_lines: int = field(
+        default_factory=lambda: _int("AGENTAUS_ZOOM_MIN_LINES", 40)
+    )
     # Below this the passage comes back verbatim; above it, Agentaus keeps what serves
     # the stated purpose. Verbatim is strongly preferred - condensing a passage the
     # caller is about to quote from defeats the point of zooming in on it.
@@ -316,8 +322,13 @@ class Settings:
     )
     # How many rounds of bridge-executed tool calls one turn may run before the answer
     # has to stand. Stops a model that keeps searching from never replying.
+    # 3 was chosen when search was the only bridge tool. A real workflow is now search,
+    # then a zoom per citation, then the answer - and a zoom costs a round despite being
+    # free (no model call, returned verbatim). Observed live: an evidence review died at
+    # zoom, search, zoom with the work half done. The runaway protection that matters is
+    # that every round needs the model to emit another tool call.
     agentaus_tool_rounds: int = field(
-        default_factory=lambda: _int("AGENTAUS_TOOL_ROUNDS", 3)
+        default_factory=lambda: _int("AGENTAUS_TOOL_ROUNDS", 12)
     )
     # Rounds spent telling the model a tool it named does not exist. Counted separately
     # from tool rounds on purpose: a correction is the bridge fixing its upstream's
