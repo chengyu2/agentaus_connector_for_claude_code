@@ -886,6 +886,42 @@ def _widen_to_section(
     return lo, hi
 
 
+def _trim_to_budget(
+    lines: list[str], lo: int, hi: int, start_idx: int, end_idx: int, budget_tokens: int
+) -> tuple[int, int]:
+    """Shrink [lo, hi) to fit a token budget, keeping the cited lines.
+
+    A line-count ceiling is the wrong unit when line lengths vary by an order of
+    magnitude: 150 lines is 6,000 characters of source code and 47,000 characters of
+    tender prose. `compact._chunk` already learned this - "sizing is by characters
+    throughout, never by line count" - and zoom was ignoring it, which is how a passage
+    came back at 25,000 characters and broke the turn carrying it.
+
+    The cited lines are never trimmed away; if they alone exceed the budget the caller
+    gets them and nothing else.
+    """
+    def cost(a: int, b: int) -> int:
+        return count_tokens("\n".join(lines[a:b]))
+
+    if cost(lo, hi) <= budget_tokens:
+        return lo, hi
+
+    # Grow outward from the citation instead of shrinking inward: that way the lines
+    # nearest the quote are the ones kept.
+    low, high = max(lo, start_idx), min(hi, max(end_idx, start_idx + 1))
+    while True:
+        widened = False
+        if low > lo and cost(low - 1, high) <= budget_tokens:
+            low -= 1
+            widened = True
+        if high < hi and cost(low, high + 1) <= budget_tokens:
+            high += 1
+            widened = True
+        if not widened:
+            break
+    return low, high
+
+
 ZOOM_INSTRUCTION = """\
 <passage file="{path}" lines="{start}-{end}">
 {body}
@@ -952,6 +988,11 @@ async def run_zoom(
         lines, start - 1, min(end, len(lines)),
         settings.agentaus_zoom_radius_lines, settings.agentaus_zoom_max_lines,
         settings.agentaus_zoom_min_lines,
+    )
+    # Lines decide WHERE the section starts and ends; tokens decide how much of it fits.
+    lo, hi = _trim_to_budget(
+        lines, lo, hi, start - 1, min(end, len(lines)),
+        settings.agentaus_zoom_max_tokens,
     )
     window = lines[lo:hi]
     numbered = "\n".join(f"{lo + i + 1:6d}  {line}" for i, line in enumerate(window))

@@ -448,15 +448,15 @@ class TestZoom(unittest.TestCase):
             run(tools.run_zoom(path, 5, 5, "", call))
         self.assertEqual(call.seen, [], "it called the model on a passage that already fit")
 
-    # Genuinely oversized. The window is bounded by radius first, so exceeding the token
-    # budget takes very long lines - and the budget is now 24k tokens, high enough that
-    # ordinary tender prose comes back verbatim (see TestZoomIsNormallyFree).
-    PROSE = "\n".join(["## Huge section"] + ["y" * 4000 for _ in range(400)])
+    # The window is trimmed to fit the budget now, so condensation only fires when the
+    # CITED LINES THEMSELVES exceed it. One enormous line does that; a long section of
+    # ordinary lines does not, because trimming handles it (see TestZoomIsNormallyFree).
+    PROSE = "\n".join(["## Huge section", "y" * 200_000, "tail"])
 
     def test_an_oversized_section_is_condensed_against_the_purpose(self):
-        call = self.stub(answer="     3  kept line\n[dropped: 200 similar lines]")
+        call = self.stub(answer="     2  kept line\n[dropped: the rest of a huge line]")
         with _Tree({"doc.md": self.PROSE}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 3, 3,
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2,
                                      "find the certifications", call))
         self.assertEqual(len(call.seen), 1, "a passage over the budget was not condensed")
         self.assertIn("find the certifications", call.seen[0])
@@ -466,7 +466,7 @@ class TestZoom(unittest.TestCase):
         async def broken(_: str) -> str:
             raise RuntimeError("upstream down")
         with _Tree({"doc.md": self.PROSE}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 3, 3, "x", broken))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2, "x", broken))
         self.assertIn("truncated", out)
         self.assertIn("yyy", out, "the passage was lost rather than truncated")
 
@@ -638,15 +638,43 @@ class TestZoomIsNormallyFree(unittest.TestCase):
                                      "", must_not_be_called))
         self.assertIn("Paragraph 200", out)
 
-    def test_the_ceiling_still_bites_on_something_genuinely_huge(self):
-        huge = "\n".join("x" * 4000 for _ in range(400))
+    def test_the_ceiling_still_bites_when_the_cited_line_itself_is_huge(self):
+        """Trimming cannot save a citation that is on its own bigger than the budget."""
+        huge = "\n".join(["intro", "x" * 200_000, "tail"])
         seen = []
 
         async def condense(prompt: str) -> str:
             seen.append(prompt)
-            return "     1  kept\n[dropped: the rest]"
+            return "     2  kept\n[dropped: the rest]"
 
         with _Tree({"doc.md": huge}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 5, 5, "why", condense))
-        self.assertEqual(len(seen), 1, "an oversized passage was not condensed at all")
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2, "why", condense))
+        self.assertEqual(len(seen), 1, "an oversized citation was not condensed at all")
         self.assertIn("dropped", out)
+
+
+class TestZoomWindowFitsTheConversation(unittest.TestCase):
+    """A zoom result is read alongside everything else in the turn.
+
+    At a 400-line ceiling, tender prose produced ~25,000-character passages - and two of
+    those in one turn made the next upstream call large enough to draw a Cloudflare 524.
+    Zoom has to be small enough to carry, not just cheap to produce.
+    """
+
+    def test_a_passage_stays_small_enough_to_send(self):
+        prose = "\n".join(
+            f"Paragraph {i}. " + "This sentence runs to the length tender prose runs to, "
+            "carrying detail an evaluator expects to see. " * 3 for i in range(600))
+
+        async def must_not_be_called(_: str) -> str:
+            raise AssertionError("condensed a passage that should be returned verbatim")
+
+        with _Tree({"doc.md": prose}) as tree:
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 300, 300,
+                                     "", must_not_be_called))
+
+        self.assertIn("Paragraph 300", out, "the cited line fell outside the window")
+        self.assertLess(len(out), 40_000,
+                        f"zoom returned {len(out)} chars - too large to sit in a turn")
+        # Still enough context to quote from, with neighbours either side.
+        self.assertGreater(len(out), 3_000, "the window is too small to be useful")

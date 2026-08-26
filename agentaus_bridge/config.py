@@ -250,11 +250,20 @@ class Settings:
     agentaus_zoom: bool = field(default_factory=lambda: _bool("AGENTAUS_ZOOM", True))
     # How far either side of the cited lines to look for a section boundary.
     agentaus_zoom_radius_lines: int = field(
-        default_factory=lambda: _int("AGENTAUS_ZOOM_RADIUS_LINES", 120)
+        default_factory=lambda: _int("AGENTAUS_ZOOM_RADIUS_LINES", 80)
     )
-    # Hard stop, so one heading-less file cannot return itself whole.
+    # Hard stop on the window, and the number that actually matters. It was 400, which
+    # is roughly 25,000 characters of tender prose - so zoom handed back a passage that
+    # size, twice in one turn, and the NEXT upstream call was large enough to draw a
+    # Cloudflare 524. Making zoom free by raising its condensation threshold simply moved
+    # the cost downstream into the conversation.
+    #
+    # 150 lines is ample to quote from with its heading and surrounding sentences intact,
+    # and small enough that two of them still leave room for an answer. The trade sits
+    # here rather than in the threshold: a small window read verbatim beats a large one
+    # that has to be condensed, or that breaks the turn carrying it.
     agentaus_zoom_max_lines: int = field(
-        default_factory=lambda: _int("AGENTAUS_ZOOM_MAX_LINES", 400)
+        default_factory=lambda: _int("AGENTAUS_ZOOM_MAX_LINES", 150)
     )
     # Floor on the window. Tender and spec documents use bold single lines as sub-headings
     # constantly, so boundary detection alone returned 3-line "sections" - which defeats
@@ -267,14 +276,18 @@ class Settings:
     # caller is about to quote from defeats the point of zooming in on it - so this is
     # set high enough that condensation is genuinely rare.
     #
-    # It was 6000, which was wrong by an order of magnitude: a 400-line section of tender
-    # prose is roughly 24,000 characters, so EVERY zoom exceeded it and spent a model
-    # call condensing a passage that would have fitted the caller's window untouched.
-    # Under load those calls took over 240 seconds each and a repair run made no progress
-    # for an hour. Zoom is meant to be free - it reads a file - and now it almost always
-    # is.
+    # This is now a real budget rather than a tripwire. The window is TRIMMED to fit it
+    # (see _trim_to_budget), so condensation only happens when the cited lines themselves
+    # exceed it - which is rare. Previously the window was bounded by line count, which
+    # is the wrong unit when line lengths vary tenfold: 150 lines is 6,000 characters of
+    # source and 47,000 of tender prose. Every zoom then blew the threshold and paid for
+    # a condensation, and raising the threshold instead just moved the bulk downstream
+    # until the turn carrying it drew a 524.
+    #
+    # 6000 tokens is enough to quote from with context, and small enough that two zooms
+    # plus a search result still leave room to answer.
     agentaus_zoom_max_tokens: int = field(
-        default_factory=lambda: _int("AGENTAUS_ZOOM_MAX_TOKENS", 24000)
+        default_factory=lambda: _int("AGENTAUS_ZOOM_MAX_TOKENS", 6000)
     )
 
     # --- Tool-result distillation ----------------------------------------------------
