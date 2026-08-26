@@ -23,6 +23,7 @@ import asyncio
 import fnmatch
 import logging
 import os
+import re
 import time
 from typing import Awaitable, Callable
 
@@ -41,9 +42,10 @@ _TERM_UBIQUITY_CEILING = 0.5
 SEARCH_TOOL = "agentaus_search"
 WEB_SEARCH_TOOL = "agentaus_web_search"
 INVESTIGATE_TOOL = "agentaus_investigate"
+ZOOM_TOOL = "agentaus_zoom"
 
 # Names the bridge answers itself. Anything else is Claude Code's and is passed through.
-BRIDGE_TOOLS = {SEARCH_TOOL, WEB_SEARCH_TOOL, INVESTIGATE_TOOL}
+BRIDGE_TOOLS = {SEARCH_TOOL, WEB_SEARCH_TOOL, INVESTIGATE_TOOL, ZOOM_TOOL}
 
 
 SEARCH_SCHEMA = {
@@ -547,7 +549,15 @@ async def run_search(
         except Exception as exc:
             log.warning("search merge failed (%s); returning the raw hits", exc)
 
-    return header + joined
+    # Close the loop: a citation is only useful if the model knows it can open it.
+    footer = ""
+    if settings.agentaus_zoom:
+        footer = (
+            f"\n\n[Each hit above is a citation, not the whole passage. To quote or "
+            f"paraphrase any of it accurately, call `{ZOOM_TOOL}` with that file and line "
+            f"number and read it in context first.]"
+        )
+    return header + joined + footer
 
 
 INVESTIGATE_SCHEMA = {
@@ -686,6 +696,190 @@ async def run_investigate(
     return merged or "\n\n".join(usable)
 
 
+ZOOM_SCHEMA = {
+    "name": ZOOM_TOOL,
+    "description": (
+        "Read a cited passage in its full surrounding context. Give it a file and a line "
+        "number from an `agentaus_search` result and it returns that passage widened to "
+        "its whole section, with line numbers intact.\n\n"
+        "Use it whenever you need to WRITE from evidence rather than merely cite it. A "
+        "search quotes a line or two - enough to prove something is there, not enough to "
+        "paraphrase it accurately or see what it depends on. Zoom in before you commit "
+        "to wording."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string", "description": "Absolute path to the file."},
+            "start_line": {"type": "integer", "description": "First line of interest (1-based)."},
+            "end_line": {"type": "integer", "description": "Last line of interest. Defaults to start_line."},
+            "purpose": {
+                "type": "string",
+                "description": (
+                    "What you need from the passage. Only used if the section is too "
+                    "large to return whole, in which case it decides what is kept."
+                ),
+            },
+        },
+        "required": ["file_path", "start_line"],
+    },
+}
+
+
+# A line that opens a new section: a Markdown heading, a bold-only line used as one, an
+# underline rule, or a numbered/lettered clause of the kind tenders and specs are made
+# of. Widening to one of these is what makes a passage readable rather than merely
+# larger - a window cut at an arbitrary offset starts mid-sentence and loses the heading
+# that says what the passage is about.
+_SECTION_START = re.compile(
+    r"^\s*(?:#{1,6}\s|\*\*[^*]+\*\*\s*$|={3,}\s*$|-{3,}\s*$"
+    r"|\d+(?:\.\d+)*[.)]\s|[A-Z]\)\s|\[\d+\]\s*\*\*)"
+)
+
+
+def _widen_to_section(
+    lines: list[str], start_idx: int, end_idx: int, radius: int, ceiling: int
+) -> tuple[int, int]:
+    """Grow [start_idx, end_idx) outward to the section containing it.
+
+    Prefers a real boundary within `radius`; falls back to a blank line; failing both,
+    takes the raw radius. `ceiling` is a hard stop so one heading-less file cannot
+    return itself in full.
+    """
+    lo = start_idx
+    floor_ = max(0, start_idx - radius)
+    for i in range(start_idx, floor_ - 1, -1):
+        if i < start_idx and _SECTION_START.match(lines[i]):
+            lo = i
+            break
+    else:
+        for i in range(start_idx, floor_ - 1, -1):
+            if i < start_idx and not lines[i].strip():
+                lo = i + 1
+                break
+        else:
+            lo = floor_
+
+    hi = end_idx
+    limit = min(len(lines), end_idx + radius)
+    for i in range(end_idx, limit):
+        if _SECTION_START.match(lines[i]):
+            hi = i
+            break
+    else:
+        for i in range(limit - 1, end_idx - 1, -1):
+            if not lines[i].strip():
+                hi = i
+                break
+        else:
+            hi = limit
+
+    if hi - lo > ceiling:
+        # Keep the cited range centred rather than truncating one side of it.
+        overflow = (hi - lo) - ceiling
+        trim = overflow // 2
+        lo, hi = lo + trim, hi - (overflow - trim)
+        lo = min(lo, start_idx)
+        hi = max(hi, end_idx)
+    return lo, hi
+
+
+ZOOM_INSTRUCTION = """\
+<passage file="{path}" lines="{start}-{end}">
+{body}
+</passage>
+
+<purpose>
+{purpose}
+</purpose>
+
+<task>
+The passage is too long to return whole. Keep the parts that serve the purpose above and
+drop the rest.
+
+Keep verbatim, with their line numbers: every sentence that bears on the purpose, every
+identifier, certification, standard, product name, number and date. Where you drop
+material, say what you dropped on one line.
+</task>
+
+<output_format>
+The kept lines, each still prefixed with its original line number. Then one
+"[dropped: ...]" line. No tags, no preamble.
+</output_format>
+"""
+
+
+async def run_zoom(
+    file_path: str,
+    start_line: int,
+    end_line: int | None,
+    purpose: str,
+    call: Caller,
+    default_path: str | None = None,
+) -> str:
+    """Return a cited passage widened to its section, with line numbers preserved."""
+    if (not file_path or not os.path.isabs(file_path)) and default_path:
+        file_path = default_path if not file_path else os.path.join(default_path, file_path)
+    if not os.path.isabs(file_path):
+        return f"agentaus_zoom needs an absolute path; got {file_path!r}."
+    if not _allowed_root(file_path):
+        return f"{file_path} is outside AGENTAUS_SEARCH_ROOTS."
+    if not enumerate_files(file_path):
+        return (f"{file_path} cannot be read as text (missing, binary, or excluded). "
+                f"Office documents are zip archives - extract them first.")
+
+    body = read_text(file_path)
+    if not body.strip():
+        return f"{file_path} is empty."
+    lines = body.splitlines()
+
+    try:
+        start = max(1, int(start_line))
+    except (TypeError, ValueError):
+        return f"agentaus_zoom needs an integer start_line; got {start_line!r}."
+    end = start
+    try:
+        if end_line:
+            end = max(start, int(end_line))
+    except (TypeError, ValueError):
+        end = start
+    if start > len(lines):
+        return f"{file_path} has {len(lines)} lines; {start} is past the end."
+
+    lo, hi = _widen_to_section(
+        lines, start - 1, min(end, len(lines)),
+        settings.agentaus_zoom_radius_lines, settings.agentaus_zoom_max_lines,
+    )
+    window = lines[lo:hi]
+    numbered = "\n".join(f"{lo + i + 1:6d}  {line}" for i, line in enumerate(window))
+
+    header = (
+        f"{file_path}:{lo + 1}-{hi}  (you asked for {start}-{end}; widened to the "
+        f"surrounding section)\n"
+    )
+
+    if count_tokens(numbered) <= settings.agentaus_zoom_max_tokens:
+        # Verbatim wherever it fits. Condensing a passage the caller is about to quote
+        # from would defeat the point of zooming in on it.
+        log.info("zoom %s:%d-%d -> %d line(s) verbatim", file_path, start, end, hi - lo)
+        return header + numbered
+
+    try:
+        async with hold("zoom"):
+            kept = await call(ZOOM_INSTRUCTION.format(
+                path=file_path, start=lo + 1, end=hi, body=numbered,
+                purpose=purpose or "understand this passage well enough to quote it accurately",
+            ))
+    except Exception as exc:
+        log.warning("zoom condensation failed (%s); truncating instead", exc)
+        budget = settings.agentaus_zoom_max_tokens * 4
+        return header + numbered[:budget] + "\n[truncated: the section is larger than the limit]"
+
+    kept = normalise_identifiers((kept or "").strip())
+    log.info("zoom %s:%d-%d -> %d line(s) condensed", file_path, start, end, hi - lo)
+    return header + (kept or numbered[: settings.agentaus_zoom_max_tokens * 4])
+
+
 async def execute(
     name: str, arguments: dict, call: Caller, default_path: str | None = None
 ) -> str:
@@ -701,6 +895,15 @@ async def execute(
             )
         if name == WEB_SEARCH_TOOL:
             return await run_web_search(str(arguments.get("query") or ""), call)
+        if name == ZOOM_TOOL:
+            return await run_zoom(
+                str(arguments.get("file_path") or ""),
+                arguments.get("start_line"),
+                arguments.get("end_line"),
+                str(arguments.get("purpose") or ""),
+                call,
+                default_path,
+            )
         if name == INVESTIGATE_TOOL:
             return await run_investigate(
                 str(arguments.get("question") or ""),

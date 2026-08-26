@@ -21,6 +21,7 @@ applying it where there is no gap would only add latency and noise.
 from __future__ import annotations
 
 import re
+import textwrap
 
 # Appended to Claude Code's own system prompt, not a replacement for it. Kept short:
 # every token here is one less available for the conversation, and a long list of
@@ -84,24 +85,6 @@ You have real tools and they really run. A tool result in this conversation is o
 from your own call, not something the user pasted. Never say you cannot access files,
 the filesystem, or a repository - if you need something, call the tool. Never ask the
 user to paste a file you can read yourself.
-
-<tool_selection>
-Finding things in the codebase:
-  - `agentaus_search`   - DEFAULT. Any question about how something works, where a
-                          behaviour lives, what handles a case, or why a value is set.
-                          Ask in plain language. Pass the working directory as `path`.
-  - `agentaus_investigate` - the same, but when being wrong would be expensive. Slower.
-  - `Grep`              - ONLY an exact literal string you can already spell.
-  - `Glob`              - finding files BY NAME. It cannot see inside a file, so it can
-                          never answer a question about content. Do not use it to hunt
-                          for a directory you were already told the path of.
-  - `agentaus_web_search` - anything outside this repository.
-
-If you planned to use a tool, use THAT tool. Do not substitute the one you are more
-familiar with. Listing directories to find your bearings is not progress - if you were
-given a path, use it.
-</tool_selection>
-
 8. Track what you have already done. Do not re-run a tool you have already run in this
 conversation unless the inputs genuinely changed; re-read the earlier result instead.
 Repeating a call you have already made wastes the turn and loses context.
@@ -167,6 +150,68 @@ changed, no mention of the review.
 """
 
 
+# When to reach for each tool the bridge itself provides. Keyed by tool name so the
+# advice can only ever describe a tool that is actually on the wire.
+_WHEN_TO_USE = {
+    "agentaus_search": (
+        "DEFAULT for finding anything. Any question about how something works, where a "
+        "behaviour lives, what handles a case, or why a value is set. Ask in plain "
+        "language and pass the working directory as `path`."
+    ),
+    "agentaus_zoom": (
+        "Open a citation from a search result and read it in its section. Do this BEFORE "
+        "writing from evidence: a search hit proves a fact exists, it does not give you "
+        "enough to paraphrase it or to see what it depends on."
+    ),
+    "agentaus_investigate": (
+        "The same as agentaus_search, but from three independent angles, reporting only "
+        "what two of them agreed on. Slower. Use it when being wrong would be expensive."
+    ),
+    "agentaus_web_search": "Anything outside this repository.",
+    "Grep": "ONLY an exact literal string you can already spell.",
+    "Glob": (
+        "Finding files BY NAME. It cannot see inside a file, so it can never answer a "
+        "question about content. Do not use it to hunt for a directory whose path you "
+        "were already given."
+    ),
+}
+
+
+def tool_selection(body: dict) -> str:
+    """A `<tool_selection>` block describing only the tools actually on the wire.
+
+    Generated, never hardcoded. A static list drifts the moment a feature is switched
+    off: with AGENTAUS_ZOOM=false the model would still be told to call
+    `agentaus_zoom`, invent it, and spend a correction round being told it does not
+    exist - the bridge teaching its own upstream a tool that the bridge removed.
+    """
+    names = [
+        tool["name"]
+        for tool in body.get("tools") or []
+        if isinstance(tool, dict) and tool.get("name")
+    ]
+    described = [(n, _WHEN_TO_USE[n]) for n in names if n in _WHEN_TO_USE]
+    if not described:
+        return ""
+
+    width = max(len(n) for n, _ in described) + 2
+    lines = []
+    for name, advice in described:
+        wrapped = textwrap.wrap(advice, width=76 - width)
+        head = f"  `{name}`".ljust(width + 2)
+        lines.append(f"{head} - {wrapped[0]}")
+        lines.extend(" " * (width + 5) + part for part in wrapped[1:])
+
+    return (
+        "\n<tool_selection>\nFinding things:\n"
+        + "\n".join(lines)
+        + "\n\nIf you planned to use a tool, use THAT tool. Do not substitute the one "
+        "you are more\nfamiliar with. Listing directories to find your bearings is not "
+        "progress - if you\nwere given a path, use it. Every name above is exact; do not "
+        "invent others.\n</tool_selection>\n"
+    )
+
+
 def guidance_for(body: dict) -> str:
     """The notes that apply to this request.
 
@@ -175,7 +220,7 @@ def guidance_for(body: dict) -> str:
     parts that do apply.
     """
     if body.get("tools"):
-        return CORE_GUIDANCE + TOOL_GUIDANCE
+        return CORE_GUIDANCE + TOOL_GUIDANCE + tool_selection(body)
     return CORE_GUIDANCE
 
 

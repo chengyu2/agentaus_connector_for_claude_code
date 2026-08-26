@@ -223,6 +223,25 @@ class Settings:
     agentaus_investigate: bool = field(
         default_factory=lambda: _bool("AGENTAUS_INVESTIGATE", True)
     )
+    # Zoom: read a cited passage in context. A search quotes enough to prove a fact is
+    # there, not enough to paraphrase it accurately - so a model working from search
+    # output alone writes "(evidence: lines 3585-3586)" where a substantive clause was
+    # wanted. Observed on a real tender.
+    agentaus_zoom: bool = field(default_factory=lambda: _bool("AGENTAUS_ZOOM", True))
+    # How far either side of the cited lines to look for a section boundary.
+    agentaus_zoom_radius_lines: int = field(
+        default_factory=lambda: _int("AGENTAUS_ZOOM_RADIUS_LINES", 120)
+    )
+    # Hard stop, so one heading-less file cannot return itself whole.
+    agentaus_zoom_max_lines: int = field(
+        default_factory=lambda: _int("AGENTAUS_ZOOM_MAX_LINES", 400)
+    )
+    # Below this the passage comes back verbatim; above it, Agentaus keeps what serves
+    # the stated purpose. Verbatim is strongly preferred - condensing a passage the
+    # caller is about to quote from defeats the point of zooming in on it.
+    agentaus_zoom_max_tokens: int = field(
+        default_factory=lambda: _int("AGENTAUS_ZOOM_MAX_TOKENS", 6000)
+    )
 
     # --- Tool-result distillation ----------------------------------------------------
     # What exhausts the window is tool output, not conversation: one Read of a large
@@ -355,6 +374,12 @@ class Settings:
     # --- misc ---------------------------------------------------------------------
     log_level: str = field(default_factory=lambda: os.environ.get("BRIDGE_LOG_LEVEL", "info"))
     log_bodies: bool = field(default_factory=lambda: _bool("BRIDGE_LOG_BODIES", False))
+    # How much of a body to log. The old fixed 4000 was shorter than the system prompt
+    # the bridge builds, so the interesting part - the tool list and the tool_selection
+    # block - fell off the end of exactly the line you were reading the log to see.
+    log_body_chars: int = field(
+        default_factory=lambda: _int("BRIDGE_LOG_BODY_CHARS", 20000)
+    )
     # Optional shared secret clients must present. Leave empty for localhost use.
     bridge_token: str = field(default_factory=lambda: os.environ.get("BRIDGE_TOKEN", ""))
 

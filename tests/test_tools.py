@@ -367,3 +367,106 @@ class TestSelectivity(unittest.TestCase):
             tools.selective_terms(chunks, ["document", "semaphore".upper()]),
             ["SEMAPHORE"],
         )
+
+
+class TestZoom(unittest.TestCase):
+    """A search hit proves a fact exists; it does not give enough to write from.
+
+    Observed on a real tender: asked to append substantive clauses backed by evidence,
+    the model produced "(evidence: lines 3585-3586)" - a citation where a sentence was
+    wanted, because a citation was all it had.
+    """
+
+    DOC = "\n".join(
+        ["# Introduction", "intro prose", ""]
+        + [f"filler line {i}" for i in range(40)]
+        + ["", "## Security", "The core service holds ISO/IEC 27001 certification.",
+           "It also meets Essential 8 Maturity Level 2.", "Hosted in Vault Cloud.", ""]
+        + [f"tail line {i}" for i in range(40)]
+        + ["", "## Unrelated", "nothing to see"]
+    )
+
+    def stub(self, answer="kept lines"):
+        seen = []
+        async def call(prompt: str) -> str:
+            seen.append(prompt)
+            return answer
+        call.seen = seen  # type: ignore[attr-defined]
+        return call
+
+    def test_a_citation_is_widened_to_its_section(self):
+        with _Tree({"doc.md": self.DOC}) as tree:
+            path = os.path.join(tree.path, "doc.md")
+            cited = self.DOC.splitlines().index(
+                "The core service holds ISO/IEC 27001 certification.") + 1
+            out = run(tools.run_zoom(path, cited, cited, "", self.stub()))
+
+        self.assertIn("## Security", out, "the heading that names the passage was lost")
+        self.assertIn("Essential 8 Maturity Level 2", out, "neighbouring evidence was lost")
+        self.assertNotIn("## Unrelated", out, "it ran past the end of the section")
+
+    def test_line_numbers_are_preserved_so_citations_stay_valid(self):
+        with _Tree({"doc.md": self.DOC}) as tree:
+            path = os.path.join(tree.path, "doc.md")
+            cited = self.DOC.splitlines().index("Hosted in Vault Cloud.") + 1
+            out = run(tools.run_zoom(path, cited, cited, "", self.stub()))
+        line = next(l for l in out.splitlines() if "Vault Cloud" in l)
+        self.assertTrue(line.strip().startswith(str(cited)),
+                        f"line number missing or wrong: {line!r}")
+
+    def test_it_returns_verbatim_when_it_fits(self):
+        """Condensing a passage the caller is about to quote defeats the point."""
+        call = self.stub()
+        with _Tree({"doc.md": self.DOC}) as tree:
+            path = os.path.join(tree.path, "doc.md")
+            run(tools.run_zoom(path, 5, 5, "", call))
+        self.assertEqual(call.seen, [], "it called the model on a passage that already fit")
+
+    # Real prose, not short code lines: the window is bounded by radius first, so it
+    # only exceeds the token budget when the lines themselves are long - which is
+    # exactly what a tender document looks like.
+    PROSE = "\n".join(
+        ["## Huge section"]
+        + [f"Paragraph {i}. " + "This sentence describes a certification requirement "
+           "in the sort of detail a tender response actually contains. " * 6
+           for i in range(300)]
+    )
+
+    def test_an_oversized_section_is_condensed_against_the_purpose(self):
+        call = self.stub(answer="     3  Paragraph 2 ...\n[dropped: 200 similar paragraphs]")
+        with _Tree({"doc.md": self.PROSE}) as tree:
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 3, 3,
+                                     "find the certifications", call))
+        self.assertEqual(len(call.seen), 1, "a passage over the budget was not condensed")
+        self.assertIn("find the certifications", call.seen[0])
+        self.assertIn("dropped", out)
+
+    def test_a_failed_condensation_truncates_rather_than_losing_the_passage(self):
+        async def broken(_: str) -> str:
+            raise RuntimeError("upstream down")
+        with _Tree({"doc.md": self.PROSE}) as tree:
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 3, 3, "x", broken))
+        self.assertIn("truncated", out)
+        self.assertIn("Paragraph", out, "the passage was lost rather than truncated")
+
+    def test_a_line_past_the_end_says_so(self):
+        with _Tree({"doc.md": "one\ntwo\n"}) as tree:
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 999, None, "", self.stub()))
+        self.assertIn("past the end", out)
+
+    def test_a_docx_is_refused_with_a_useful_reason(self):
+        with _Tree({"r.docx": "PK\x03\x04binary"}) as tree:
+            out = run(tools.run_zoom(os.path.join(tree.path, "r.docx"), 1, 1, "", self.stub()))
+        self.assertIn("zip archives", out)
+
+    def test_a_relative_path_falls_back_to_the_working_directory(self):
+        with _Tree({"doc.md": self.DOC}) as tree:
+            out = run(tools.run_zoom("doc.md", 2, 2, "", self.stub(), default_path=tree.path))
+        self.assertIn("Introduction", out)
+
+    def test_search_output_points_at_zoom(self):
+        with _Tree({"a.py": "x = 1\n"}) as tree:
+            call = responder(terms="x", hit_on="a.py", answer="1: x = 1")
+            out = run(tools.run_search("where is x", tree.path, None, call))
+        self.assertIn(tools.ZOOM_TOOL, out,
+                      "a citation is only useful if the model knows it can open it")

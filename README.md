@@ -652,6 +652,66 @@ after. Its win shows up as *fewer compactions*, not as better answers.
 
 ---
 
+## Zoom: from a citation to something you can write with
+
+`agentaus_search` returns hits like `Drafted_Responses.md:3585-3586` with a line or two
+quoted. That is enough to prove a fact is there and **not** enough to write from — and a
+model given only that produces exactly what you would expect:
+
+```
+ASSERTION: supports scanned images, drawings, correspondence...
+EVIDENCE:  "REST-based API catalogue... accepts any file type"
+ADD:       "(evidence: FIN-2025-26-00616 - lines 3585-3586)"
+```
+
+A citation where a sentence was wanted, because a citation was all it had.
+
+`agentaus_zoom` closes that loop. Give it a file and a line number and it returns the
+passage **widened to its whole section**, with line numbers intact:
+
+```
+agentaus_zoom(file_path=..., start_line=3585, purpose="substantiate OCR claims")
+  │
+  ├─ widen ....... outward from the cited lines to the nearest section boundary —
+  │                a Markdown heading, a bold-only line, a numbered clause — so the
+  │                passage arrives with the heading that says what it is about
+  ├─ bound ....... capped by AGENTAUS_ZOOM_RADIUS_LINES, then MAX_LINES
+  └─ return ...... verbatim if it fits AGENTAUS_ZOOM_MAX_TOKENS; otherwise Agentaus
+                   keeps what serves `purpose` and says what it dropped
+```
+
+**Verbatim is strongly preferred.** Condensing a passage the caller is about to quote from
+defeats the point of zooming in on it, so the model is only involved when the section is
+genuinely too big.
+
+Search results end with a line telling the model this tool exists — a citation is only
+useful if it knows it can open it.
+
+---
+
+## The guidance describes only what is on the wire
+
+The `<tool_selection>` block in the system prompt is **generated per request** from the
+tool list actually being sent, never hardcoded. A static list drifts the moment a feature
+is switched off: with `AGENTAUS_ZOOM=false` the model would still be told to call
+`agentaus_zoom`, invent it, and spend a correction round being told it does not exist —
+the bridge teaching its own upstream a tool the bridge had removed.
+
+Verified on the live bridge with both flags off:
+
+```
+AGENTAUS_ZOOM=false AGENTAUS_INVESTIGATE=false
+  wire     : ['Glob', 'Read', 'agentaus_search', 'agentaus_web_search']
+  guidance : ['Glob', 'agentaus_search', 'agentaus_web_search']
+  drift    : none
+```
+
+The planning pass gets the same treatment: it is handed each tool's name *and* the opening
+of its description, because a planner shown a bare list picks the name it recognises from
+training — which is `Grep`.
+
+---
+
 ## Configuration reference
 
 All settings are environment variables, readable from `.env`. Shell exports win over
@@ -680,6 +740,11 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_CORRECTION_ROUNDS` | `3` | Rounds spent telling the model a tool it named does not exist. Separate from tool rounds, so being corrected does not consume the budget for real work |
 | `AGENTAUS_SEARCH_MAX_CANDIDATES` | `12` | Ceiling on files one search reads. The shortlist is ranked, so this keeps the best matches |
 | `AGENTAUS_INVESTIGATE` | `true` | Offer `agentaus_investigate`: three independent searches, and a fact must appear in two before it is reported as established |
+| `AGENTAUS_ZOOM` | `true` | Offer `agentaus_zoom`: open a citation from a search result and read it in its section. Without it the model cites evidence it cannot quote from |
+| `AGENTAUS_ZOOM_RADIUS_LINES` | `120` | How far either side of the cited lines to look for a section boundary |
+| `AGENTAUS_ZOOM_MAX_LINES` | `400` | Hard stop, so a heading-less file cannot return itself whole |
+| `AGENTAUS_ZOOM_MAX_TOKENS` | `6000` | Below this the passage comes back verbatim; above it, Agentaus keeps what serves the stated purpose |
+| `BRIDGE_LOG_BODY_CHARS` | `20000` | How much of a body `BRIDGE_LOG_BODIES` logs |
 | `AGENTAUS_DISTILL_RESULTS` | `false` | Condense oversized tool results before sending them. **Off by default** — see [Distillation](#distillation) |
 | `AGENTAUS_DISTILL_THRESHOLD_TOKENS` | `12000` | Results smaller than this are never touched |
 | `AGENTAUS_TOOL_LEDGER` | `true` | Append a derived list of tools already run to the system prompt. Costs no Agentaus calls |

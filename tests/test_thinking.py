@@ -574,3 +574,66 @@ class TestReviewIsNotCalledEndToEnd(unittest.IsolatedAsyncioTestCase):
         raw = b"".join(chunks).decode()
         self.assertIn("Functional Capability", raw)
         self.assertNotIn("provide the DOCX", raw)
+
+
+class TestGuidanceNeverDriftsFromTheWire(unittest.TestCase):
+    """The guidance must describe only tools that are actually on the wire.
+
+    It used to be a hardcoded block naming every bridge tool. With
+    AGENTAUS_ZOOM=false the model was still told to call `agentaus_zoom`, would
+    invent it, and spend a correction round being told it does not exist - the bridge
+    teaching its upstream to call a tool the bridge had removed.
+    """
+
+    @staticmethod
+    def named_in(block: str) -> set:
+        import re
+        # Only the leading column of a row is a tool name; backticks also appear in the
+        # advice text (e.g. "pass the working directory as `path`").
+        return set(re.findall(r"^\s+`([A-Za-z_]+)`\s+-", block, re.M))
+
+    def test_it_describes_exactly_what_is_offered(self):
+        from agentaus_bridge.augment import tool_selection
+        offered = [{"name": "Read"}, {"name": "Grep"}, {"name": tools.SEARCH_TOOL}]
+        named = self.named_in(tool_selection({"tools": offered}))
+        self.assertLessEqual(named, {t["name"] for t in offered},
+                             "it named a tool that was never offered")
+        self.assertIn(tools.SEARCH_TOOL, named)
+        self.assertNotIn(tools.ZOOM_TOOL, named, "a tool that is not on the wire was named")
+
+    def test_a_disabled_bridge_tool_is_not_mentioned(self):
+        from agentaus_bridge.augment import tool_selection
+        # What injection produces with AGENTAUS_ZOOM / AGENTAUS_INVESTIGATE off.
+        body = inject_bridge_tools(
+            {"tools": [{"name": "Read", "input_schema": {"type": "object"}}]},
+            [tools.SEARCH_SCHEMA, tools.WEB_SEARCH_SCHEMA],
+        )
+        named = self.named_in(tool_selection(body))
+        self.assertIn(tools.SEARCH_TOOL, named)
+        self.assertNotIn(tools.ZOOM_TOOL, named)
+        self.assertNotIn(tools.INVESTIGATE_TOOL, named)
+
+    def test_an_all_bridge_tool_request_names_them_all(self):
+        from agentaus_bridge.augment import tool_selection
+        body = inject_bridge_tools(
+            {"tools": [{"name": "Grep", "description": "regex",
+                        "input_schema": {"type": "object"}}]},
+            [tools.SEARCH_SCHEMA, tools.WEB_SEARCH_SCHEMA,
+             tools.INVESTIGATE_SCHEMA, tools.ZOOM_SCHEMA],
+        )
+        named = self.named_in(tool_selection(body))
+        self.assertEqual(
+            named,
+            {"Grep", tools.SEARCH_TOOL, tools.WEB_SEARCH_TOOL,
+             tools.INVESTIGATE_TOOL, tools.ZOOM_TOOL},
+        )
+
+    def test_a_turn_with_no_recognised_tools_gets_no_block(self):
+        from agentaus_bridge.augment import tool_selection
+        self.assertEqual(tool_selection({"tools": [{"name": "SomeMcpServerTool"}]}), "")
+        self.assertEqual(tool_selection({}), "")
+
+    def test_guidance_only_carries_the_block_when_tools_are_present(self):
+        from agentaus_bridge.augment import guidance_for
+        self.assertNotIn("<tool_selection>", guidance_for({}))
+        self.assertIn("<tool_selection>", guidance_for({"tools": [{"name": "Grep"}]}))

@@ -194,7 +194,7 @@ async def messages(request: Request) -> Response:
     )
 
     if settings.log_bodies:
-        rlog(logging.INFO, "request body: %s", json.dumps(body)[:4000])
+        rlog(logging.INFO, "request body: %s", json.dumps(body)[: settings.log_body_chars])
 
     if to_agentaus:
         return await _handle_agentaus(request, body, model, wants_stream)
@@ -953,6 +953,8 @@ async def _handle_agentaus(
             offered.append(bridge_tools.WEB_SEARCH_SCHEMA)
         if settings.agentaus_investigate:
             offered.append(bridge_tools.INVESTIGATE_SCHEMA)
+        if settings.agentaus_zoom:
+            offered.append(bridge_tools.ZOOM_SCHEMA)
         if offered:
             fitted = inject_bridge_tools(fitted, offered)
 
@@ -979,7 +981,7 @@ async def _handle_agentaus(
             stream=settings.upstream_stream and wants_stream,
         )
         if settings.log_bodies:
-            rlog(logging.INFO, "-> agentaus payload: %s", json.dumps(built)[:4000])
+            rlog(logging.INFO, "-> agentaus payload: %s", json.dumps(built)[: settings.log_body_chars])
         return fitted, built
 
     if not wants_stream:
