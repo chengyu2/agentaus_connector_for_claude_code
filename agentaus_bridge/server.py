@@ -24,15 +24,20 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from . import tools as bridge_tools
 from .augment import (
     ADJUDICATE_INSTRUCTION,
     REVIEW_INSTRUCTION,
     REVISE_INSTRUCTION,
     declared_verdict,
+    plan_prompt,
+    should_think,
     with_guidance,
+    with_plan,
     worth_reviewing,
 )
 from .compact import ConversationCompactor
+from .gate import hold
 from .tokens import calibrator, has_tokeniser as _has_tokeniser
 from .config import settings
 from .translate import (
@@ -40,6 +45,7 @@ from .translate import (
     ToolCallAccumulator,
     agentaus_response_to_anthropic,
     anthropic_request_to_agentaus,
+    inject_bridge_tools,
     estimate_request_tokens,
     raw_token_count,
     sse,
@@ -451,6 +457,138 @@ async def _self_review(client: httpx.AsyncClient, request_text: str, answer: str
     return answer
 
 
+async def _plan_turn(client: httpx.AsyncClient, body: dict) -> str:
+    """Ask Agentaus to plan this turn before it answers it.
+
+    Agentaus has no native thinking mode, so left alone it answers from the first thing
+    that comes to mind - the documented "started editing before working out what the
+    change required" failure. Asking for the plan as its own turn is the same trade the
+    review pass makes: two cheap passes beat one on a smaller model.
+
+    Never raises. A failed plan returns "" and the turn proceeds unplanned, exactly as
+    it does today - a broken planner must not cost the user their answer.
+    """
+    try:
+        async with hold("planning"):
+            plan = await _agentaus_summarise(
+                client, plan_prompt(_last_user_text(body), body)
+            )
+    except Exception as exc:
+        rlog(logging.WARNING, "planning pass failed (%s); answering unplanned", exc)
+        return ""
+    plan = (plan or "").strip()
+    if plan:
+        rlog(logging.INFO, "planned the turn in %d chars", len(plan))
+    return plan
+
+
+def _openai_calls(data: dict) -> list:
+    """Tool calls from a non-streaming Agentaus response, in the accumulator's shape."""
+    message = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
+    return [
+        {
+            "id": call.get("id") or "",
+            "name": (call.get("function") or {}).get("name") or "",
+            "arguments": (call.get("function") or {}).get("arguments") or "{}",
+        }
+        for call in (message.get("tool_calls") or [])
+    ]
+
+
+def _without_bridge_calls(data: dict) -> dict:
+    """Strip bridge-owned tool calls from a response.
+
+    Needed when the tool-round budget runs out with one still pending: Claude Code has
+    never heard of `agentaus_search` and would fail the tool_use rather than run it, so
+    an unanswered bridge call must never be surfaced.
+    """
+    choices = list(data.get("choices") or [])
+    if not choices:
+        return data
+    choice = dict(choices[0] or {})
+    message = dict(choice.get("message") or {})
+    kept = [
+        call for call in (message.get("tool_calls") or [])
+        if ((call.get("function") or {}).get("name") or "") not in bridge_tools.BRIDGE_TOOLS
+    ]
+    message["tool_calls"] = kept or None
+    if not kept and not (message.get("content") or "").strip():
+        message["content"] = (
+            "I ran out of search rounds before finishing. Ask again and I will continue "
+            "from what I found."
+        )
+    choice["message"] = message
+    if not kept and choice.get("finish_reason") == "tool_calls":
+        choice["finish_reason"] = "stop"
+    return {**data, "choices": [choice] + choices[1:]}
+
+
+def _partition_tool_calls(calls: list) -> tuple[list, list]:
+    """Split accumulated tool calls into (bridge-owned, client-owned)."""
+    mine, theirs = [], []
+    for call in calls:
+        (mine if call.get("name") in bridge_tools.BRIDGE_TOOLS else theirs).append(call)
+    return mine, theirs
+
+
+async def _run_bridge_tools(
+    client: httpx.AsyncClient, payload: dict, calls: list
+) -> dict:
+    """Execute bridge-owned tool calls and return the payload to send next.
+
+    The results are appended as an assistant turn carrying the tool_calls plus one
+    `tool` message per result - OpenAI's shape, matching what the translator produces
+    for the client's own tools. Claude Code never sees any of it.
+    """
+    async def one(call: dict) -> str:
+        arguments = call.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments or "{}")
+            except json.JSONDecodeError:
+                arguments = {}
+        started_at = time.monotonic()
+        result = await bridge_tools.execute(
+            call.get("name") or "", arguments or {},
+            lambda text: _agentaus_summarise(client, text),
+        )
+        rlog(logging.INFO, "bridge tool %s ran in %.1fs -> %d chars",
+             call.get("name"), time.monotonic() - started_at, len(result))
+        return result
+
+    results = await asyncio.gather(*[one(call) for call in calls])
+
+    messages = list(payload.get("messages") or [])
+    messages.append(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call.get("id") or f"call_{uuid.uuid4().hex[:16]}",
+                    "type": "function",
+                    "function": {
+                        "name": call.get("name", ""),
+                        "arguments": call.get("arguments")
+                        if isinstance(call.get("arguments"), str)
+                        else json.dumps(call.get("arguments") or {}),
+                    },
+                }
+                for call in calls
+            ],
+        }
+    )
+    for call, result in zip(calls, results):
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": call.get("id") or "",
+                "content": result or "(no output)",
+            }
+        )
+    return {**payload, "messages": messages}
+
+
 def _last_user_text(body: dict) -> str:
     """The most recent user message, as the request the review judges against."""
     for message in reversed(body.get("messages") or []):
@@ -478,7 +616,6 @@ def _get_compactor(request: Request) -> ConversationCompactor:
         client = request.app.state.client
         existing = ConversationCompactor(
             lambda text: _agentaus_summarise(client, text),
-            max_concurrency=settings.agentaus_summary_concurrency,
             verify=settings.agentaus_verify_summary,
             block=settings.agentaus_compact_block,
         )
@@ -651,8 +788,12 @@ async def _handle_agentaus(
     reserved = int(body.get("max_tokens") or 0)
     original_estimate = estimate_request_tokens(body)
 
+    # Written once and reused across refits: a refit recompacts the same turn, and
+    # re-planning it would pay for the same call again to get the same plan.
+    plan_holder: dict = {"text": None}
+
     async def prepare(current: dict, scale: float = 1.0) -> tuple[dict, dict]:
-        """Fit to the window, add the guidance, and build the upstream payload.
+        """Fit to the window, add the guidance and the plan, and build the payload.
 
         Returns (body, payload). Compaction can take a minute or more on a long
         conversation, which is why the streaming path runs this *inside* the response
@@ -670,10 +811,29 @@ async def _handle_agentaus(
             fitted = await _fit_to_window(
                 request, current, limit=limit, reserve=reserved, scale=scale
             )
+        # Offer the bridge's own search and steer Grep towards literal lookups. Done
+        # here rather than before compaction so the tool list travels with whatever
+        # survived the fit; it costs ~250 tokens the estimate does not see, which is
+        # immaterial against a 0.8 threshold.
+        offered = []
+        if settings.agentaus_search:
+            offered.append(bridge_tools.SEARCH_SCHEMA)
+        if settings.agentaus_web_search:
+            offered.append(bridge_tools.WEB_SEARCH_SCHEMA)
+        if offered:
+            fitted = inject_bridge_tools(fitted, offered)
+
         # Supplement the system prompt for Agentaus only. Claude turns never reach
         # here - they are forwarded untouched by _passthrough.
         if settings.agentaus_guidance:
             fitted = {**fitted, "system": with_guidance(fitted.get("system"), fitted)}
+
+        if settings.agentaus_thinking and should_think(fitted):
+            if plan_holder["text"] is None:
+                with _Phase("planning"):
+                    plan_holder["text"] = await _plan_turn(client, fitted)
+            fitted = {**fitted, "system": with_plan(fitted.get("system"), plan_holder["text"])}
+
         built = anthropic_request_to_agentaus(
             fitted,
             system_prompt_overwrite=settings.system_prompt_overwrite,
@@ -685,60 +845,82 @@ async def _handle_agentaus(
 
     if not wants_stream:
         body, payload = await prepare(body)
-        # Agentaus is the authority on whether a prompt fits. If it says no, it also
-        # says what its real limit is, so the next attempt compacts against that
-        # instead of against our estimate.
         scale = 1.0
-        for fit_attempt in range(settings.agentaus_fit_attempts + 1):
-            try:
-                upstream = await _post_with_retry(
-                    client,
-                    settings.agentaus_url,
-                    json_body={**payload, "stream": False},
-                    headers=_agentaus_headers(),
+        data: dict = {}
+
+        # Rounds of bridge-executed tool calls. Each round runs the tool, appends its
+        # result, and asks Agentaus again. The loop ends when the model answers with
+        # prose, or with a tool only Claude Code can run.
+        for tool_round in range(settings.agentaus_tool_rounds + 1):
+            # Agentaus is the authority on whether a prompt fits. If it says no, it also
+            # says what its real limit is, so the next attempt compacts against that
+            # instead of against our estimate.
+            for fit_attempt in range(settings.agentaus_fit_attempts + 1):
+                try:
+                    upstream = await _post_with_retry(
+                        client,
+                        settings.agentaus_url,
+                        json_body={**payload, "stream": False},
+                        headers=_agentaus_headers(),
+                    )
+                except httpx.HTTPError as exc:
+                    return _error_response(502, "api_error", f"Agentaus request failed: {exc}")
+
+                over_length = (
+                    upstream.status_code >= 400 and _is_over_length(upstream.text)
                 )
-            except httpx.HTTPError as exc:
-                return _error_response(502, "api_error", f"Agentaus request failed: {exc}")
+                if not over_length or fit_attempt == settings.agentaus_fit_attempts:
+                    break
 
-            over_length = (
-                upstream.status_code >= 400 and _is_over_length(upstream.text)
-            )
-            if not over_length or fit_attempt == settings.agentaus_fit_attempts:
+                _learn_limit_from(upstream.text)
+                scale *= settings.agentaus_fit_shrink
+                rlog(logging.WARNING,
+                    "Agentaus rejected the prompt as too long; recompacting to %.0f%% "
+                    "of the window and retrying", scale * 100,
+                )
+                body = await _fit_to_window(
+                    request, body, limit=_context_limit(), reserve=reserved, scale=scale
+                )
+                payload = anthropic_request_to_agentaus(
+                    body,
+                    system_prompt_overwrite=settings.system_prompt_overwrite,
+                    stream=False,
+                )
+
+            if upstream.status_code >= 400:
+                return _upstream_error_response(upstream.status_code, upstream.text)
+
+            try:
+                data = upstream.json()
+            except ValueError:
+                return _error_response(502, "api_error", "Agentaus returned a non-JSON response")
+
+            # Agentaus can answer HTTP 200 with an error object instead of choices.
+            if isinstance(data.get("error"), dict):
+                rlog(logging.WARNING, "agentaus in-band error: %s", _agentaus_error_text(data["error"]))
+                return _error_response(
+                    400,
+                    data["error"].get("type") or "api_error",
+                    _agentaus_error_text(data["error"]),
+                )
+
+            _calibrate_from_usage(body, data.get("usage"))
+
+            mine, _theirs = _partition_tool_calls(_openai_calls(data))
+            if not mine:
                 break
-
-            _learn_limit_from(upstream.text)
-            scale *= settings.agentaus_fit_shrink
-            rlog(logging.WARNING, 
-                "Agentaus rejected the prompt as too long; recompacting to %.0f%% "
-                "of the window and retrying", scale * 100,
-            )
-            body = await _fit_to_window(
-                request, body, limit=_context_limit(), reserve=reserved, scale=scale
-            )
-            payload = anthropic_request_to_agentaus(
-                body,
-                system_prompt_overwrite=settings.system_prompt_overwrite,
-                stream=False,
-            )
-
-        if upstream.status_code >= 400:
-            return _upstream_error_response(upstream.status_code, upstream.text)
-
-        try:
-            data = upstream.json()
-        except ValueError:
-            return _error_response(502, "api_error", "Agentaus returned a non-JSON response")
-
-        # Agentaus can answer HTTP 200 with an error object instead of choices.
-        if isinstance(data.get("error"), dict):
-            rlog(logging.WARNING, "agentaus in-band error: %s", _agentaus_error_text(data["error"]))
-            return _error_response(
-                400,
-                data["error"].get("type") or "api_error",
-                _agentaus_error_text(data["error"]),
-            )
-
-        _calibrate_from_usage(body, data.get("usage"))
+            if tool_round < settings.agentaus_tool_rounds:
+                rlog(logging.INFO, "running %d bridge tool call(s): %s",
+                     len(mine), ", ".join(c["name"] for c in mine))
+                payload = await _run_bridge_tools(client, payload, mine)
+                continue
+            # Out of rounds with a bridge tool still pending. It must not reach Claude
+            # Code, which has never heard of it and would fail the tool_use outright.
+            rlog(logging.WARNING,
+                 "tool round limit (%d) reached; dropping %d unanswered bridge call(s)",
+                 settings.agentaus_tool_rounds, len(mine))
+            data = _without_bridge_calls(data)
+            break
 
         # Review only a plain text answer. A turn that calls tools is mid-task, and
         # rewriting it would break the tool_use the client is waiting on.
@@ -756,8 +938,12 @@ async def _handle_agentaus(
                 data = {**data, "choices": [{**choice0, "message": msg0}]
                         + list((data.get("choices") or [])[1:])}
 
-        message = agentaus_response_to_anthropic(data, model=display_model)
-        rlog(logging.INFO, 
+        message = agentaus_response_to_anthropic(
+            data,
+            model=display_model,
+            thinking=plan_holder["text"] if settings.agentaus_thinking_visible else None,
+        )
+        rlog(logging.INFO,
             "POST /v1/messages model=%s route=agentaus stream=false -> 200 in %.1fs in=%s out=%s",
             display_model,
             time.monotonic() - started,
@@ -796,7 +982,8 @@ async def _handle_agentaus(
             rlog(logging.INFO, "upstream start (est %d tok)",
                  estimate_request_tokens(prepared_body))
             async for chunk in _agentaus_event_stream(
-                client, prepared_payload, prepared_body, display_model, started, refit
+                client, prepared_payload, prepared_body, display_model, started, refit,
+                plan=plan_holder["text"],
             ):
                 yield chunk
         except asyncio.CancelledError:
@@ -830,6 +1017,7 @@ async def _agentaus_event_stream(
     model: str,
     started: float,
     refit=None,
+    plan: str | None = None,
 ) -> AsyncIterator[bytes]:
     """Produce a valid Anthropic SSE stream from an Agentaus response."""
     builder = AnthropicStreamBuilder(
@@ -838,6 +1026,12 @@ async def _agentaus_event_stream(
         chunk_chars=settings.chunk_chars,
     )
     yield builder.start()
+
+    # The plan leads the message, where a native thinking block would. Emitted before
+    # the upstream call rather than after it, so the user sees the model's reasoning
+    # while the answer is still being generated instead of all at once at the end.
+    if plan and settings.agentaus_thinking_visible:
+        yield builder.thinking(plan)
 
     finish_reason: str | None = None
     usage: dict | None = None
@@ -856,158 +1050,190 @@ async def _agentaus_event_stream(
     fit_attempt = 0
     fit_scale = 1.0
 
-    attempt = 0
+    # Rounds of bridge-executed tool calls. `agentaus_search` is answered here and
+    # re-asked upstream; the client never learns the call happened. Bounded, so a
+    # model that keeps searching still has to produce an answer eventually.
+    tool_round = 0
     while True:
-        emitted = False
-        pending = []
-        finish_reason = None
-        usage = None
-        accumulator = ToolCallAccumulator()
-        retry_reason: str | None = None
+        attempt = 0
+        while True:
+            emitted = False
+            pending = []
+            finish_reason = None
+            usage = None
+            accumulator = ToolCallAccumulator()
+            retry_reason: str | None = None
 
-        try:
-            if payload.get("stream"):
-                async with client.stream(
-                    "POST", settings.agentaus_url, json=payload, headers=_agentaus_headers()
-                ) as upstream:
-                    if upstream.status_code >= 400:
-                        detail = (await upstream.aread()).decode("utf-8", "replace")[:500]
-                        rlog(logging.WARNING,
-                             "agentaus rejected the streamed request: HTTP %d %s",
-                             upstream.status_code, detail)
-                        if (
-                            _is_over_length(detail)
-                            and refit is not None
-                            and fit_attempt < settings.agentaus_fit_attempts
-                        ):
-                            # Nothing has been emitted yet, so the request can be
-                            # recompacted and replayed invisibly.
-                            _learn_limit_from(detail)
-                            fit_attempt += 1
-                            fit_scale *= settings.agentaus_fit_shrink
-                            payload = await refit(fit_scale)
-                            retry_reason = f"prompt too long, refitting to {fit_scale:.0%}"
-                        elif (
-                            upstream.status_code in _RETRYABLE_STATUS
-                            and attempt < settings.max_retries
-                        ):
-                            retry_reason = f"HTTP {upstream.status_code}"
-                        else:
-                            yield builder.error(
-                                f"Agentaus returned HTTP {upstream.status_code}: {detail}",
-                                _error_type_for_status(upstream.status_code),
-                            )
-                            yield builder.finish("stop", None)
-                            return
-                    else:
-                        async for line in upstream.aiter_lines():
-                            line = line.strip()
-                            if not line or not line.startswith("data:"):
-                                continue
-                            data = line[5:].strip()
-                            if data == "[DONE]":
-                                break
-                            try:
-                                chunk = json.loads(data)
-                            except json.JSONDecodeError:
-                                continue
-
-                            # Agentaus reports some failures - an over-length
-                            # prompt among them - as HTTP 200 with an error object
-                            # inside the SSE body. Nothing here has "choices", so
-                            # without this branch the error is skipped and the turn
-                            # ends as an empty, successful-looking message.
-                            if isinstance(chunk.get("error"), dict):
+            try:
+                if payload.get("stream"):
+                    async with client.stream(
+                        "POST", settings.agentaus_url, json=payload, headers=_agentaus_headers()
+                    ) as upstream:
+                        if upstream.status_code >= 400:
+                            detail = (await upstream.aread()).decode("utf-8", "replace")[:500]
+                            rlog(logging.WARNING,
+                                 "agentaus rejected the streamed request: HTTP %d %s",
+                                 upstream.status_code, detail)
+                            if (
+                                _is_over_length(detail)
+                                and refit is not None
+                                and fit_attempt < settings.agentaus_fit_attempts
+                            ):
+                                # Nothing has been emitted yet, so the request can be
+                                # recompacted and replayed invisibly.
+                                _learn_limit_from(detail)
+                                fit_attempt += 1
+                                fit_scale *= settings.agentaus_fit_shrink
+                                payload = await refit(fit_scale)
+                                retry_reason = f"prompt too long, refitting to {fit_scale:.0%}"
+                            elif (
+                                upstream.status_code in _RETRYABLE_STATUS
+                                and attempt < settings.max_retries
+                            ):
+                                retry_reason = f"HTTP {upstream.status_code}"
+                            else:
                                 yield builder.error(
-                                    _agentaus_error_text(chunk["error"]),
-                                    chunk["error"].get("type") or "api_error",
+                                    f"Agentaus returned HTTP {upstream.status_code}: {detail}",
+                                    _error_type_for_status(upstream.status_code),
                                 )
                                 yield builder.finish("stop", None)
-                                rlog(logging.WARNING, 
-                                    "agentaus in-band error: %s",
-                                    _agentaus_error_text(chunk["error"]),
-                                )
                                 return
+                        else:
+                            async for line in upstream.aiter_lines():
+                                line = line.strip()
+                                if not line or not line.startswith("data:"):
+                                    continue
+                                data = line[5:].strip()
+                                if data == "[DONE]":
+                                    break
+                                try:
+                                    chunk = json.loads(data)
+                                except json.JSONDecodeError:
+                                    continue
 
-                            for choice in chunk.get("choices") or []:
-                                delta = choice.get("delta") or {}
-                                text = delta.get("content")
-                                if text:
-                                    if buffering:
-                                        # Held back rather than streamed: an answer
-                                        # already on screen cannot be revised. Agentaus
-                                        # sends its reply in one piece anyway, so this
-                                        # costs little in practice.
-                                        pending.append(text)
-                                    else:
+                                # Agentaus reports some failures - an over-length
+                                # prompt among them - as HTTP 200 with an error object
+                                # inside the SSE body. Nothing here has "choices", so
+                                # without this branch the error is skipped and the turn
+                                # ends as an empty, successful-looking message.
+                                if isinstance(chunk.get("error"), dict):
+                                    yield builder.error(
+                                        _agentaus_error_text(chunk["error"]),
+                                        chunk["error"].get("type") or "api_error",
+                                    )
+                                    yield builder.finish("stop", None)
+                                    rlog(logging.WARNING, 
+                                        "agentaus in-band error: %s",
+                                        _agentaus_error_text(chunk["error"]),
+                                    )
+                                    return
+
+                                for choice in chunk.get("choices") or []:
+                                    delta = choice.get("delta") or {}
+                                    text = delta.get("content")
+                                    if text:
+                                        if buffering:
+                                            # Held back rather than streamed: an answer
+                                            # already on screen cannot be revised. Agentaus
+                                            # sends its reply in one piece anyway, so this
+                                            # costs little in practice.
+                                            pending.append(text)
+                                        else:
+                                            emitted = True
+                                            yield builder.text(text)
+                                    if delta.get("tool_calls"):
                                         emitted = True
-                                        yield builder.text(text)
-                                if delta.get("tool_calls"):
-                                    emitted = True
-                                    accumulator.add(delta["tool_calls"])
-                                if choice.get("finish_reason"):
-                                    finish_reason = choice["finish_reason"]
-                            if chunk.get("usage"):
-                                usage = chunk["usage"]
-            else:
-                upstream = await _post_with_retry(
-                    client,
-                    settings.agentaus_url,
-                    json_body={**payload, "stream": False},
-                    headers=_agentaus_headers(),
-                )
-                if upstream.status_code >= 400:
-                    yield builder.error(
-                        f"Agentaus returned HTTP {upstream.status_code}: {upstream.text[:500]}",
-                        _error_type_for_status(upstream.status_code),
+                                        accumulator.add(delta["tool_calls"])
+                                    if choice.get("finish_reason"):
+                                        finish_reason = choice["finish_reason"]
+                                if chunk.get("usage"):
+                                    usage = chunk["usage"]
+                else:
+                    upstream = await _post_with_retry(
+                        client,
+                        settings.agentaus_url,
+                        json_body={**payload, "stream": False},
+                        headers=_agentaus_headers(),
                     )
+                    if upstream.status_code >= 400:
+                        yield builder.error(
+                            f"Agentaus returned HTTP {upstream.status_code}: {upstream.text[:500]}",
+                            _error_type_for_status(upstream.status_code),
+                        )
+                        yield builder.finish("stop", None)
+                        return
+                    data = upstream.json()
+                    if isinstance(data.get("error"), dict):
+                        yield builder.error(
+                            _agentaus_error_text(data["error"]),
+                            data["error"].get("type") or "api_error",
+                        )
+                        yield builder.finish("stop", None)
+                        return
+                    choice = (data.get("choices") or [{}])[0]
+                    message = choice.get("message") or {}
+                    if message.get("content"):
+                        if buffering:
+                            pending.append(message["content"])
+                        else:
+                            emitted = True
+                            yield builder.text(message["content"])
+                    accumulator.add(
+                        [{"index": i, **call} for i, call in enumerate(message.get("tool_calls") or [])]
+                    )
+                    finish_reason = choice.get("finish_reason")
+                    usage = data.get("usage")
+
+            except httpx.HTTPError as exc:
+                if emitted or not _is_retryable_exception(exc) or attempt >= settings.max_retries:
+                    rlog(logging.WARNING, "agentaus stream failed: %s", exc)
+                    yield builder.error(f"Agentaus request failed: {exc}", "api_error")
                     yield builder.finish("stop", None)
                     return
-                data = upstream.json()
-                if isinstance(data.get("error"), dict):
-                    yield builder.error(
-                        _agentaus_error_text(data["error"]),
-                        data["error"].get("type") or "api_error",
-                    )
-                    yield builder.finish("stop", None)
-                    return
-                choice = (data.get("choices") or [{}])[0]
-                message = choice.get("message") or {}
-                if message.get("content"):
-                    if buffering:
-                        pending.append(message["content"])
-                    else:
-                        emitted = True
-                        yield builder.text(message["content"])
-                accumulator.add(
-                    [{"index": i, **call} for i, call in enumerate(message.get("tool_calls") or [])]
-                )
-                finish_reason = choice.get("finish_reason")
-                usage = data.get("usage")
+                retry_reason = _describe(exc)
 
-        except httpx.HTTPError as exc:
-            if emitted or not _is_retryable_exception(exc) or attempt >= settings.max_retries:
-                rlog(logging.WARNING, "agentaus stream failed: %s", exc)
-                yield builder.error(f"Agentaus request failed: {exc}", "api_error")
-                yield builder.finish("stop", None)
-                return
-            retry_reason = _describe(exc)
+            if retry_reason:
+                await _sleep_before_retry(attempt, retry_reason)
+                attempt += 1
+                continue
+            break
 
-        if retry_reason:
-            await _sleep_before_retry(attempt, retry_reason)
-            attempt += 1
+        calls = accumulator.drain()
+        mine, theirs = _partition_tool_calls(calls)
+        if mine and tool_round < settings.agentaus_tool_rounds:
+            tool_round += 1
+            rlog(logging.INFO, "running %d bridge tool call(s): %s",
+                 len(mine), ", ".join(c["name"] for c in mine))
+            payload = await _run_bridge_tools(client, payload, mine)
+            # Whatever the model said on its way to calling the tool is superseded by
+            # the answer it is about to give with the result in hand, so it is dropped
+            # rather than shown - otherwise the user reads "let me search..." followed
+            # by a search they never saw happen.
+            if pending:
+                rlog(logging.DEBUG, "discarded %d chars of interim narration",
+                     len("".join(pending)))
+            pending = []
             continue
+        if mine:
+            # Out of rounds. These must not be emitted: Claude Code has never heard of
+            # `agentaus_search` and would fail the tool_use rather than run it.
+            rlog(logging.WARNING,
+                 "tool round limit (%d) reached; dropping %d unanswered bridge call(s)",
+                 settings.agentaus_tool_rounds, len(mine))
+            if not pending and not theirs:
+                pending = ["I ran out of search rounds before finishing. Ask again and "
+                           "I will continue from what I found."]
         break
 
     answer = "".join(pending)
     if buffering and answer:
-        if not accumulator.pending() and worth_reviewing(
+        if not theirs and worth_reviewing(
             answer, min_chars=settings.agentaus_review_min_chars
         ):
             answer = await _self_review(client, _last_user_text(original), answer)
         yield builder.text(answer)
 
-    for call in accumulator.drain():
+    for call in theirs:
         yield builder.tool_use(call["id"], call["name"], call["arguments"])
 
     _calibrate_from_usage(original, usage)

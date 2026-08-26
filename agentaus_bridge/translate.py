@@ -205,6 +205,41 @@ def _map_tools(tools: Any) -> list[dict]:
     return mapped
 
 
+# What Grep's description becomes on Agentaus turns. The schema is untouched, so when
+# the model does call Grep, Claude Code executes it exactly as before - only the advice
+# about *when* to reach for it changes.
+_GREP_RESTRICTION = (
+    "Use this ONLY for exact literal matches you can already spell: a known function "
+    "name, a specific error string, a config key. For anything conceptual - how "
+    "something works, where a behaviour lives, what handles a case, why a value is set "
+    "- use `agentaus_search` instead, which reads the code by meaning. A regex over "
+    "code you have not read looks right on the case you tried and is wrong on the next."
+)
+
+
+def inject_bridge_tools(body: dict, extra_tools: list[dict]) -> dict:
+    """Add the bridge's own tools and steer the model away from regex search.
+
+    Returns a new body; the caller's is not mutated. A no-op when the request carries no
+    tools at all, because a turn with no tools is not one where search was on offer.
+    """
+    tools = body.get("tools")
+    if not isinstance(tools, list) or not tools or not extra_tools:
+        return body
+
+    present = {t.get("name") for t in tools if isinstance(t, dict)}
+    rewritten: list[dict] = []
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("name") == "Grep":
+            existing = tool.get("description", "") or ""
+            rewritten.append({**tool, "description": f"{existing}\n\n{_GREP_RESTRICTION}".strip()})
+        else:
+            rewritten.append(tool)
+
+    rewritten.extend(t for t in extra_tools if t.get("name") not in present)
+    return {**body, "tools": rewritten}
+
+
 def _parse_arguments(raw: Any) -> dict:
     if isinstance(raw, dict):
         return raw
@@ -297,13 +332,21 @@ def trim_messages_to_fit(body: dict, limit: int, *, reserve: int = 0) -> tuple[l
     return messages, dropped
 
 
-def agentaus_response_to_anthropic(data: dict, *, model: str) -> dict:
-    """Convert a non-streaming Agentaus completion into an Anthropic Message."""
+def agentaus_response_to_anthropic(
+    data: dict, *, model: str, thinking: str | None = None
+) -> dict:
+    """Convert a non-streaming Agentaus completion into an Anthropic Message.
+
+    `thinking`, when given, is the plan the bridge asked the model to write before
+    answering. It leads the content, as a native thinking block would.
+    """
     choices = data.get("choices") or [{}]
     choice = choices[0] if choices else {}
     message = choice.get("message") or {}
 
     content: list[dict] = []
+    if thinking and thinking.strip():
+        content.append({"type": "thinking", "thinking": thinking.strip()})
     text = message.get("content") or message.get("refusal") or ""
     if text:
         content.append({"type": "text", "text": text})
@@ -319,7 +362,9 @@ def agentaus_response_to_anthropic(data: dict, *, model: str) -> dict:
             }
         )
 
-    if not content:
+    # A message carrying only a thinking block would leave the client with a turn that
+    # reasoned and then said nothing, so the empty text block is still required.
+    if not any(block["type"] != "thinking" for block in content):
         content.append({"type": "text", "text": ""})
 
     usage = data.get("usage") or {}
@@ -400,6 +445,46 @@ class AnthropicStreamBuilder:
             return b""
         self.open_block = False
         return sse("content_block_stop", {"type": "content_block_stop", "index": self.index})
+
+    def thinking(self, text: str) -> bytes:
+        """Emit a complete thinking block: start, thinking_delta, stop.
+
+        Agentaus has no native thinking mode, so this carries a plan the bridge asked
+        it to write as a separate turn. It is genuinely the model's own reasoning about
+        this request, just obtained explicitly rather than natively - so presenting it
+        in the block the client already renders for reasoning is accurate, not a trick.
+
+        No `signature` is attached. Anthropic's API requires one to *replay* a thinking
+        block, but the consumer here is the client's renderer and nothing replays these:
+        when Claude Code sends them back next turn, `anthropic_request_to_agentaus`
+        drops every thinking block on the floor.
+        """
+        if not text or not text.strip():
+            return b""
+        out = self._close_open_block()
+        self.index += 1
+        out += sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": self.index,
+                "content_block": {"type": "thinking", "thinking": ""},
+            },
+        )
+        for piece in chunk_text(text, self.chunk_chars):
+            out += sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": self.index,
+                    "delta": {"type": "thinking_delta", "thinking": piece},
+                },
+            )
+        out += sse(
+            "content_block_stop", {"type": "content_block_stop", "index": self.index}
+        )
+        self.output_tokens += estimate_tokens(text)
+        return out
 
     def text(self, text: str) -> bytes:
         """Emit a text block (opening one if needed) for the given chunk."""

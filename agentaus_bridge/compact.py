@@ -32,6 +32,7 @@ import logging
 from collections import OrderedDict
 from typing import Awaitable, Callable
 
+from .gate import hold
 from .translate import estimate_request_tokens, estimate_tokens
 
 log = logging.getLogger("agentaus-bridge")
@@ -295,7 +296,6 @@ class ConversationCompactor:
         summarise: Summariser,
         *,
         cache_size: int = 64,
-        max_concurrency: int = 6,
         verify: bool = True,
         block: int = 20,
     ) -> None:
@@ -304,7 +304,6 @@ class ConversationCompactor:
         # (length, hash, summary) for prefixes already summarised.
         self._prefixes: list[tuple[int, str, str]] = []
         self._cache_size = cache_size
-        self._semaphore = asyncio.Semaphore(max_concurrency)
         self._verify = verify
         self._block = block
         self.hits = 0
@@ -324,8 +323,13 @@ class ConversationCompactor:
             self._cache.popitem(last=False)
 
     async def _call(self, prompt: str) -> str:
-        """One summariser call, bounded by the concurrency limit."""
-        async with self._semaphore:
+        """One summariser call, bounded by the bridge-wide concurrency cap.
+
+        The cap is shared with every other bridge-initiated call rather than private to
+        the compactor: a long compaction and a search running at once must add up to
+        one limit, not two.
+        """
+        async with hold("summarisation"):
             self.calls += 1
             return (await self._summarise(prompt)) or ""
 

@@ -60,6 +60,10 @@ confident wrong one.
 
 6. Be concise: no preamble, no restating the question, no summary afterwards unless it
 was asked for. When asked for only code, output only code.
+
+6a. Write in Markdown. Use headings, lists and tables where they make the answer easier
+to read, and put every code sample in a fenced block tagged with its language. This does
+not override 6: when only code was asked for, output only the code block itself.
 """
 
 TOOL_GUIDANCE = """\
@@ -215,3 +219,79 @@ def worth_reviewing(text: str, *, min_chars: int = 200) -> bool:
     a round trip and finds nothing.
     """
     return bool(text) and len(text.strip()) >= min_chars
+
+
+# --------------------------------------------------------------------------------------
+# Synthesised thinking
+# --------------------------------------------------------------------------------------
+
+# Claude plans inside a thinking block before it acts. Agentaus has no such mode, so it
+# answers from the first thing that comes to mind - which is where "started editing
+# before working out what the change required" comes from. The bridge gives it the same
+# affordance by asking for the plan as its own turn, then handing that plan back as
+# context for the real one. Two cheap passes beat one expensive one on a smaller model,
+# the same reason the review pass exists.
+PLAN_INSTRUCTION = """\
+You are about to answer the request below. Before you do, plan the turn.
+
+Work out, briefly:
+- What is actually being asked, including anything implied but not stated.
+- What you need to find out before you can answer, and which tool would tell you.
+- The order of steps, and what "done" looks like.
+- Anything you are unsure of, which you must check rather than assume.
+
+Be terse - short lines, no prose, no preamble. This is your own working, not the answer.
+Do not answer the request here, and do not write any code.
+
+{tools}REQUEST:
+{request}
+"""
+
+
+def should_think(body: dict) -> bool:
+    """Whether this turn earns a planning pass.
+
+    Two triggers. An explicit `thinking` block means the user turned extended thinking
+    on in the client, and expects the model to think. Tools present means the turn is
+    agentic - it will act on the world, and acting without a plan is the failure this
+    exists to prevent. A bare prose turn gets neither, because a planning round trip on
+    "what does this function do" costs latency and buys nothing.
+    """
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        return True
+    return bool(body.get("tools"))
+
+
+def plan_prompt(request: str, body: dict | None = None) -> str:
+    """The planning prompt for this turn, naming the tools that are actually available."""
+    names = [
+        tool.get("name")
+        for tool in (body or {}).get("tools") or []
+        if isinstance(tool, dict) and tool.get("name")
+    ]
+    tools = f"TOOLS AVAILABLE: {', '.join(names)}\n\n" if names else ""
+    return PLAN_INSTRUCTION.format(tools=tools, request=request[:12000])
+
+
+def with_plan(system, plan: str) -> object:
+    """Fold the plan into the system prompt for the answer call.
+
+    In the system prompt rather than as an assistant message: injecting a synthetic turn
+    risks two assistant messages in a row, and the plan is guidance about how to answer
+    rather than part of the conversation - the same reasoning that puts the compaction
+    summary here.
+    """
+    if not plan or not plan.strip():
+        return system
+    notice = (
+        "\n\n[Your plan for this turn, which you wrote just now. Follow it, and revise "
+        "it if what you find contradicts it.]\n" + plan.strip()
+    )
+    if system is None:
+        return notice.strip()
+    if isinstance(system, str):
+        return system + notice
+    if isinstance(system, list):
+        return list(system) + [{"type": "text", "text": notice.strip()}]
+    return system

@@ -169,9 +169,16 @@ class Settings:
     agentaus_verify_summary: bool = field(
         default_factory=lambda: _bool("AGENTAUS_VERIFY_SUMMARY", True)
     )
-    # Concurrent summarisation calls. Higher is faster on long histories.
+    # Deprecated in favour of AGENTAUS_MAX_CONCURRENCY below, which caps every
+    # bridge-initiated call rather than only summarisation. Still read when set, so an
+    # existing .env keeps working. See gate.max_concurrency().
     agentaus_summary_concurrency: int = field(
         default_factory=lambda: _int("AGENTAUS_SUMMARY_CONCURRENCY", 8)
+    )
+    summary_concurrency_is_explicit: bool = field(
+        default_factory=lambda: bool(
+            os.environ.get("AGENTAUS_SUMMARY_CONCURRENCY", "").strip()
+        )
     )
     # Tokens of conversation per summarisation call. Smaller means more calls, but
     # each returns faster and is far less likely to hit an origin timeout - a 32k
@@ -180,6 +187,75 @@ class Settings:
     # judged unimportant and dropped.
     agentaus_summary_chunk_tokens: int = field(
         default_factory=lambda: _int("AGENTAUS_SUMMARY_CHUNK_TOKENS", 6000)
+    )
+
+    # --- Bridge-initiated concurrency ------------------------------------------------
+    # One global cap on every Agentaus call the bridge makes on its own initiative:
+    # summarising, gap-checking, merging, self-review, query expansion and chunk search.
+    # Global rather than per-component, because two components each capped at 6 permit
+    # 12, and the number that matters is how hard the bridge hits one upstream.
+    #
+    # The user's own turn is deliberately NOT gated - see gate.py.
+    agentaus_max_concurrency: int = field(
+        default_factory=lambda: _int("AGENTAUS_MAX_CONCURRENCY", 6)
+    )
+    max_concurrency_is_explicit: bool = field(
+        default_factory=lambda: bool(
+            os.environ.get("AGENTAUS_MAX_CONCURRENCY", "").strip()
+        )
+    )
+
+    # --- Bridge-executed search -----------------------------------------------------
+    # Agentaus is handed Grep - a regex tool - as its way of finding things, and a
+    # smaller model writes a regex against a guess about what the code looks like. This
+    # replaces that with a search that reads by meaning: shortlist, chunk, read every
+    # chunk with a real model call, merge the hits.
+    agentaus_search: bool = field(default_factory=lambda: _bool("AGENTAUS_SEARCH", True))
+    # Expose Agentaus' own web search as a tool. Claude Code's WebSearch is an Anthropic
+    # server-side stub with no input_schema, so it is dropped in translation and an
+    # Agentaus turn otherwise has no way to search the web at all.
+    agentaus_web_search: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_WEB_SEARCH", True)
+    )
+    # Tokens of file content per search call. Smaller than the summary chunk: a search
+    # answer is a quote, so fidelity matters more than context, and a fact is a larger
+    # share of a smaller chunk.
+    agentaus_search_chunk_tokens: int = field(
+        default_factory=lambda: _int("AGENTAUS_SEARCH_CHUNK_TOKENS", 4000)
+    )
+    # Ceiling on calls for one search. Truncation is reported in the result and logged -
+    # a silent cap reads as full coverage, which is worse than a stated partial one.
+    agentaus_search_max_chunks: int = field(
+        default_factory=lambda: _int("AGENTAUS_SEARCH_MAX_CHUNKS", 120)
+    )
+    # Below this many shortlisted files, distrust the shortlist and read everything.
+    # This is the case a keyword prefilter gets wrong: the words simply are not there.
+    agentaus_search_min_candidates: int = field(
+        default_factory=lambda: _int("AGENTAUS_SEARCH_MIN_CANDIDATES", 3)
+    )
+    agentaus_search_max_file_bytes: int = field(
+        default_factory=lambda: _int("AGENTAUS_SEARCH_MAX_FILE_BYTES", 1024 * 1024)
+    )
+    # Colon-separated directories the search may read. Empty means any absolute path the
+    # model names, which matches what Claude Code's own Read tool would allow. Set it to
+    # confine the bridge to specific trees.
+    agentaus_search_roots: str = field(
+        default_factory=lambda: os.environ.get("AGENTAUS_SEARCH_ROOTS", "").strip()
+    )
+    # How many rounds of bridge-executed tool calls one turn may run before the answer
+    # has to stand. Stops a model that keeps searching from never replying.
+    agentaus_tool_rounds: int = field(
+        default_factory=lambda: _int("AGENTAUS_TOOL_ROUNDS", 3)
+    )
+
+    # --- Synthesised thinking --------------------------------------------------------
+    # Agentaus has no native thinking, so it acts before it plans. The bridge runs one
+    # planning call first and feeds the result into the answer call.
+    agentaus_thinking: bool = field(default_factory=lambda: _bool("AGENTAUS_THINKING", True))
+    # Show the plan as a real thinking block. Turn off if the client mishandles an
+    # unsigned one; the plan is then folded into the answer call without being shown.
+    agentaus_thinking_visible: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_THINKING_VISIBLE", True)
     )
 
     # --- Agentaus compensation ------------------------------------------------------

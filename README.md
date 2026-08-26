@@ -465,6 +465,135 @@ deliberate: a silent fallback would leave Claude Code pointed at nothing.
 
 ---
 
+## Tools the bridge runs itself
+
+Every other tool in Claude Code belongs to the client: Claude Code sends the schema, the
+bridge translates the call, Claude Code executes it. `agentaus_search` is different. The
+bridge adds it to the tool list Agentaus sees, and when Agentaus calls it the bridge runs
+it and feeds the result straight back. The `tool_use` never reaches Claude Code, so you
+never see a permission prompt for it and never see it in the transcript — only the answer
+it produced.
+
+### Why not just use Grep
+
+Because `Grep` is a regex, and a smaller model writes a regex against a *guess* about
+what the code looks like. It gets a plausible match and answers from it, or gets nothing
+and concludes the code does not exist. Ask *"where do we cap concurrent calls?"* and the
+answer is `asyncio.Semaphore(6)` — which shares not one word with the question.
+
+`agentaus_search` reads by meaning instead:
+
+```
+query: "where do we cap concurrent calls?"
+  │
+  ├─ expand ......... one Agentaus call → semaphore, concurrency, limit, pool
+  ├─ shortlist ...... substring scan over the tree, ranked by distinct-term hits
+  ├─ fallback ....... fewer than 3 candidates? the words are absent, not the answer
+  │                   → read every file instead
+  ├─ chunk .......... 4k tokens each, tagged with path and line range
+  ├─ fan out ........ one Agentaus call per chunk, 6 at a time
+  └─ merge .......... drop the NONEs, keep the quotes, cite file:line
+```
+
+`Grep` is still there and Claude Code still executes it — only its *description* changes
+on Agentaus turns, to say it is for exact literal matches you can already spell. The
+schema is untouched.
+
+**What it will not read.** `.env` files, `*.pem`, `*.key`, SSH keys and `.git/` are
+excluded no matter what matches. Set `AGENTAUS_SEARCH_ROOTS` to confine the bridge to
+specific trees — worth doing, because these reads never pass through Claude Code's
+permission prompts.
+
+**What it costs.** One expansion call plus one call per chunk, capped at
+`AGENTAUS_SEARCH_MAX_CHUNKS`. When the cap truncates a search, the result says so — a
+silent cap reads as full coverage, which is worse than a stated partial one.
+
+---
+
+## Web search
+
+Claude Code's `WebSearch` is an Anthropic **server-side** tool: it arrives as
+`{"type": "web_search_20250305", "name": "web_search"}` with no `input_schema`, and the
+translator drops it along with every other server-side stub. So an Agentaus turn has no
+web search of its own — it can `WebFetch` a URL it already has, but it cannot discover one.
+
+Agentaus does have web search. It is triggered by the **prompt**, not by a parameter:
+the phrase *"web search this"* is what turns it on. That makes it invisible to an agent
+loop — the model either happens to say it or does not, and nothing can observe the result
+or cite it.
+
+`agentaus_web_search` turns that convention into a tool. The bridge runs it by making one
+Agentaus call whose prompt begins `web search this: <query>`, and asks for source URLs
+rather than an answer from memory:
+
+```
+agentaus_web_search("latest httpx release")
+        │
+        └─ Agentaus  ← "web search this: latest httpx release
+                         Answer from what the search returns, not from memory.
+                         For every fact you state, give the source URL..."
+```
+
+The search runs **inside Agentaus**, so nothing leaves the sovereign path to answer it —
+unlike `WebFetch`, whose page summarisation is performed by Claude Code and routes to
+Anthropic even on an Agentaus turn.
+
+**Expect it to be slower than an ordinary reply**, because a real search runs behind it.
+The keepalive pings are what stop that looking like a stall. Turn it off with
+`AGENTAUS_WEB_SEARCH=false`.
+
+---
+
+## Thinking, synthesised
+
+Claude plans inside a thinking block before it acts. Agentaus has no such mode, so left
+alone it answers from the first thing that comes to mind — the "started editing before
+working out what the change required" failure.
+
+So the bridge asks for the plan as its own turn, shows it as a thinking block, and hands
+it back as context for the real call:
+
+```
+your message
+     │
+     ├─ plan call ...... "what does this turn require? what must you find out?"
+     │                    → rendered as ✻ Thinking… in the UI
+     ├─ answer call .... same request, with the plan in the system prompt
+     └─ review call .... "what is wrong with this answer?" → revise if needed
+```
+
+It runs when the turn carries tools, or when you have extended thinking switched on in
+Claude Code — the client's own toggle drives it. A plain prose question gets neither,
+because a planning round trip on *"what does this function do"* costs latency and buys
+nothing.
+
+This is the same trade the review pass makes: **two cheap passes beat one expensive one
+on a smaller model.** It also costs a round trip, so `AGENTAUS_THINKING=false` turns it
+off, and `AGENTAUS_THINKING_VISIBLE=false` keeps the plan without displaying it.
+
+Nothing replays these blocks: when Claude Code sends them back on the next turn, the
+translator drops them, the same as it does for Claude's own.
+
+---
+
+## One cap on everything the bridge does on its own
+
+The bridge makes Agentaus calls you never asked for — summarising a long history,
+checking that summary for gaps, reviewing an answer, planning a turn, reading every chunk
+of a haystack. `AGENTAUS_MAX_CONCURRENCY` (default **6**) bounds all of them together.
+
+Global rather than per-feature, deliberately: two features each capped at 6 permit 12, and
+the number that matters is how hard the bridge hits one upstream. **Your own turn is never
+gated** — queueing the request you actually made behind the bridge's background work would
+turn a busy cap into a visible stall.
+
+The consequence worth knowing: a cold compaction is roughly 47 calls and will hold the cap
+for its duration, so a search starting at that moment waits. Compaction runs before a turn
+and search during it, so they rarely overlap. When a call does wait more than a second, the
+log says so.
+
+---
+
 ## Configuration reference
 
 All settings are environment variables, readable from `.env`. Shell exports win over
@@ -481,6 +610,17 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_FORCE_ALL` | `false` | Ignore the model id; send everything to Agentaus |
 | `AGENTAUS_MAX_INPUT_TOKENS` | `131072` | Agentaus' context window. Defaults in code and self-corrects from Agentaus' own error messages; setting it explicitly overrides both. `0` disables the check |
 | `AGENTAUS_AUTO_TRIM` | `true` | Compact the older conversation into a summary rather than failing the turn |
+| `AGENTAUS_MAX_CONCURRENCY` | `6` | One global cap on every Agentaus call the bridge makes on its own initiative — summarising, reviewing, planning, searching. Your own turn is never queued behind it. Replaces `AGENTAUS_SUMMARY_CONCURRENCY`, which is still read when set |
+| `AGENTAUS_SEARCH` | `true` | Offer `agentaus_search`, the bridge-executed semantic search, and steer `Grep` towards literal lookups |
+| `AGENTAUS_WEB_SEARCH` | `true` | Offer `agentaus_web_search`, which drives Agentaus' own web search. Claude Code's `WebSearch` is dropped in translation, so without this an Agentaus turn cannot search the web at all |
+| `AGENTAUS_SEARCH_CHUNK_TOKENS` | `4000` | File content per search call |
+| `AGENTAUS_SEARCH_MAX_CHUNKS` | `120` | Ceiling on calls for one search. Truncation is reported in the result, never silent |
+| `AGENTAUS_SEARCH_MIN_CANDIDATES` | `3` | Below this many shortlisted files, distrust the shortlist and read everything |
+| `AGENTAUS_SEARCH_MAX_FILE_BYTES` | `1048576` | Skip files larger than this |
+| `AGENTAUS_SEARCH_ROOTS` | *(empty)* | Colon-separated directories search may read. Empty allows any absolute path, matching Claude Code's own `Read` |
+| `AGENTAUS_TOOL_ROUNDS` | `3` | How many rounds of bridge-executed tool calls one turn may run before the answer has to stand |
+| `AGENTAUS_THINKING` | `true` | Plan the turn in a separate call before answering it |
+| `AGENTAUS_THINKING_VISIBLE` | `true` | Show that plan as a thinking block. `false` still uses it, but does not display it |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | `127.0.0.1` / `8787` | Listen address |
 | `BRIDGE_PASSTHROUGH` | `true` | Forward non-Agentaus models to Anthropic; `false` answers them with Agentaus instead |
 | `ANTHROPIC_UPSTREAM_BASE_URL` | `https://api.anthropic.com` | Passthrough target |
@@ -519,12 +659,12 @@ and `--check` (verify the credential and exit).
 | Feature | Behaviour |
 | --- | --- |
 | Images and PDFs | Agentaus is text-only, so attachments become a bracketed note rather than being silently dropped. Screenshot-based workflows will not work. |
-| Extended thinking | Agentaus exposes no reasoning channel. `thinking` blocks from earlier Claude turns are stripped before sending. |
+| Extended thinking | Agentaus exposes no reasoning channel, so `thinking` blocks from earlier Claude turns are stripped before sending. The bridge substitutes its own: it asks Agentaus to plan the turn as a separate call and shows that plan as a thinking block. See [Thinking, synthesised](#thinking-synthesised). |
 | Context window | Agentaus accepts **131,072 tokens** total, prompt plus reply — far less than Claude. Claude Code sizes auto-compact against the window it *assumes* for a model and cannot learn Agentaus' real one, so it will not compact in time by itself. The bridge enforces the limit and phrases the refusal as `prompt is too long: N tokens > M maximum`, the wording Claude Code matches on to compact and retry. **If you are already well over the limit, `/compact` fails too** — compaction summarises by sending the conversation to the model, so it needs to fit in the window as well ([claude-code#25867](https://github.com/anthropics/claude-code/issues/25867)). Switch to a Claude model, `/compact` there, then switch back — an escape you only have because the bridge keeps both providers live in one session. |
 | Prompt caching | Not supported upstream, so `cache_control` markers do nothing. Every turn resends the whole conversation — the main cost driver in long sessions. |
 | Token counting | Agentaus has no tokenizer endpoint, so `/v1/messages/count_tokens` returns a chars÷4 estimate. It feeds the context meter and auto-compact trigger only, never billing. |
 | `max_tokens`, `temperature` | Accepted by Agentaus but ignored, so they are passed along without effect. |
-| Anthropic server-side tools | Web search and code execution tool stubs have no `input_schema` and are dropped; Agentaus has its own internal web search which it triggers on its own judgement. |
+| Anthropic server-side tools | Web search and code execution stubs have no `input_schema` and are dropped, so Claude Code's own `WebSearch` never reaches Agentaus. The bridge replaces it with `agentaus_web_search`, which drives Agentaus' own search — see [Web search](#web-search). `WebFetch` is a client-side tool and survives translation unchanged. |
 
 **Worth knowing before you rely on it**
 

@@ -242,8 +242,16 @@ class TestQualityDesign(unittest.TestCase):
         self.assertGreater(in_flight["peak"], 1, "summarisation ran one chunk at a time")
 
     def test_concurrency_is_bounded(self):
-        """Unbounded fan-out on a very long history would hammer the API."""
+        """Unbounded fan-out on a very long history would hammer the API.
+
+        The cap is the bridge-wide one, not the compactor's own: summarisation shares
+        it with search and every other bridge-initiated call, so that two features
+        running at once add up to one limit rather than two.
+        """
         import asyncio as aio
+
+        from agentaus_bridge import gate
+        from agentaus_bridge.config import settings
 
         in_flight = {"now": 0, "peak": 0}
 
@@ -254,10 +262,59 @@ class TestQualityDesign(unittest.TestCase):
             in_flight["now"] -= 1
             return "s"
 
-        c = ConversationCompactor(slow, max_concurrency=3, verify=False)
-        run(c.compact({"messages": convo(400), "system": "s"}, limit=4000, reserve=100))
+        previous = (settings.agentaus_max_concurrency, settings.max_concurrency_is_explicit)
+        settings.agentaus_max_concurrency = 3
+        settings.max_concurrency_is_explicit = True
+        gate.reset()
+        try:
+            c = ConversationCompactor(slow, verify=False)
+            run(c.compact({"messages": convo(400), "system": "s"}, limit=4000, reserve=100))
+        finally:
+            settings.agentaus_max_concurrency, settings.max_concurrency_is_explicit = previous
+            gate.reset()
 
         self.assertLessEqual(in_flight["peak"], 3)
+
+    def test_the_cap_is_shared_not_per_component(self):
+        """Two fan-outs running at once must add up to one limit, not two.
+
+        This is the whole reason the semaphore is global. Per-component caps look tidy
+        and permit twice the traffic, which is the number that actually matters.
+        """
+        import asyncio as aio
+
+        from agentaus_bridge import gate
+        from agentaus_bridge.config import settings
+
+        in_flight = {"now": 0, "peak": 0}
+
+        async def slow(_: str) -> str:
+            in_flight["now"] += 1
+            in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+            await aio.sleep(0.01)
+            in_flight["now"] -= 1
+            return "s"
+
+        previous = (settings.agentaus_max_concurrency, settings.max_concurrency_is_explicit)
+        settings.agentaus_max_concurrency = 4
+        settings.max_concurrency_is_explicit = True
+        gate.reset()
+
+        async def both() -> None:
+            first = ConversationCompactor(slow, verify=False)
+            second = ConversationCompactor(slow, verify=False)
+            await aio.gather(
+                first.compact({"messages": convo(400), "system": "a"}, limit=4000, reserve=100),
+                second.compact({"messages": convo(400), "system": "b"}, limit=4000, reserve=100),
+            )
+
+        try:
+            run(both())
+        finally:
+            settings.agentaus_max_concurrency, settings.max_concurrency_is_explicit = previous
+            gate.reset()
+
+        self.assertLessEqual(in_flight["peak"], 4, "two compactors ran to two separate caps")
 
     def test_verification_pass_recovers_missed_detail(self):
         """The gap pass exists to catch what a single summarising pass drops."""
