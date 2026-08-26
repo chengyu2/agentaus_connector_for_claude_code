@@ -295,7 +295,7 @@ class ConversationCompactor:
         summarise: Summariser,
         *,
         cache_size: int = 64,
-        max_concurrency: int = 8,
+        max_concurrency: int = 6,
         verify: bool = True,
         block: int = 20,
     ) -> None:
