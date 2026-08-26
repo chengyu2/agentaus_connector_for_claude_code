@@ -272,40 +272,21 @@ class Settings:
     agentaus_zoom_radius_lines: int = field(
         default_factory=lambda: _int("AGENTAUS_ZOOM_RADIUS_LINES", 80)
     )
-    # Hard stop on the window, and the number that actually matters. It was 400, which
-    # is roughly 25,000 characters of tender prose - so zoom handed back a passage that
-    # size, twice in one turn, and the NEXT upstream call was large enough to draw a
-    # Cloudflare 524. Making zoom free by raising its condensation threshold simply moved
-    # the cost downstream into the conversation.
+    # A floor on the window, in tokens. Boundary detection alone can return a
+    # three-line "section" - tender and spec documents use a bold single line as a
+    # sub-heading constantly - and three lines is technically a section and useless to
+    # quote from. Below this, keep widening outward.
     #
-    # 150 lines is ample to quote from with its heading and surrounding sentences intact,
-    # and small enough that two of them still leave room for an answer. The trade sits
-    # here rather than in the threshold: a small window read verbatim beats a large one
-    # that has to be condensed, or that breaks the turn carrying it.
-    agentaus_zoom_max_lines: int = field(
-        default_factory=lambda: _int("AGENTAUS_ZOOM_MAX_LINES", 150)
+    # In tokens, not lines, because lines are not a unit of size: 40 lines is 300 tokens
+    # of source code and 4,000 tokens of tender prose. The line-counted version of this
+    # setting, and a line-counted ceiling beside it, are what let a passage reach 25,000
+    # characters and break the turn carrying it.
+    agentaus_zoom_min_tokens: int = field(
+        default_factory=lambda: _int("AGENTAUS_ZOOM_MIN_TOKENS", 600)
     )
-    # Floor on the window. Tender and spec documents use bold single lines as sub-headings
-    # constantly, so boundary detection alone returned 3-line "sections" - which defeats
-    # the point of zooming in. Below this many lines, keep widening outward.
-    agentaus_zoom_min_lines: int = field(
-        default_factory=lambda: _int("AGENTAUS_ZOOM_MIN_LINES", 40)
-    )
-    # Below this the passage comes back verbatim; above it, Agentaus keeps what serves
-    # the stated purpose. Verbatim is strongly preferred - condensing a passage the
-    # caller is about to quote from defeats the point of zooming in on it - so this is
-    # set high enough that condensation is genuinely rare.
-    #
-    # This is now a real budget rather than a tripwire. The window is TRIMMED to fit it
-    # (see _trim_to_budget), so condensation only happens when the cited lines themselves
-    # exceed it - which is rare. Previously the window was bounded by line count, which
-    # is the wrong unit when line lengths vary tenfold: 150 lines is 6,000 characters of
-    # source and 47,000 of tender prose. Every zoom then blew the threshold and paid for
-    # a condensation, and raising the threshold instead just moved the bulk downstream
-    # until the turn carrying it drew a 524.
-    #
-    # 6000 tokens is enough to quote from with context, and small enough that two zooms
-    # plus a search result still leave room to answer.
+    # Below this the passage is returned whole; above it, trimmed outward from the
+    # citation so the nearest lines survive. There is no separate line ceiling: this is
+    # the only size limit, and it is the one that matters.
     agentaus_zoom_max_tokens: int = field(
         default_factory=lambda: _int("AGENTAUS_ZOOM_MAX_TOKENS", 6000)
     )

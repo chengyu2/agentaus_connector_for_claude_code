@@ -826,6 +826,16 @@ ZOOM_SCHEMA = {
 # of. Widening to one of these is what makes a passage readable rather than merely
 # larger - a window cut at an arbitrary offset starts mid-sentence and loses the heading
 # that says what the passage is about.
+# A STRONG boundary genuinely separates subjects: a Markdown heading, or a horizontal
+# rule. Growing a passage through one merges two subjects, and quoting from material
+# under a different heading is how a claim ends up attributed to the wrong requirement.
+#
+# A weak boundary is presentational - a bold line used as a sub-heading, a numbered
+# clause. Tender and spec documents are full of them, often every second or third line,
+# so treating them as hard stops returns three-line passages that are technically
+# sections and useless to quote from. A passage may grow through those.
+_STRONG_SECTION_START = re.compile(r"^\s*(?:#{1,6}\s|={3,}\s*$|-{3,}\s*$)")
+
 _SECTION_START = re.compile(
     r"^\s*(?:#{1,6}\s|\*\*[^*]+\*\*\s*$|={3,}\s*$|-{3,}\s*$"
     r"|\d+(?:\.\d+)*[.)]\s|[A-Z]\)\s|\[\d+\]\s*\*\*)"
@@ -833,8 +843,7 @@ _SECTION_START = re.compile(
 
 
 def _widen_to_section(
-    lines: list[str], start_idx: int, end_idx: int, radius: int, ceiling: int,
-    floor_lines: int = 0,
+    lines: list[str], start_idx: int, end_idx: int, radius: int,
 ) -> tuple[int, int]:
     """Grow [start_idx, end_idx) outward to the section containing it.
 
@@ -870,33 +879,12 @@ def _widen_to_section(
         else:
             hi = limit
 
-    # A boundary can sit two lines away. Tender and spec documents use a bold single
-    # line as a sub-heading constantly, so honouring the nearest boundary alone returned
-    # three-line "sections" - technically a section, useless to write from. Keep going
-    # outward, boundary by boundary, until there is enough to read.
-    if floor_lines and hi - lo < floor_lines:
-        want = floor_lines - (hi - lo)
-        back = min(want // 2, lo - max(0, start_idx - radius))
-        lo = max(0, lo - back)
-        hi = min(len(lines), hi + (want - back))
-        # Prefer stopping on a boundary if one is within reach of the new edge.
-        for i in range(hi, min(len(lines), hi + 20)):
-            if _SECTION_START.match(lines[i]):
-                hi = i
-                break
-
-    if hi - lo > ceiling:
-        # Keep the cited range centred rather than truncating one side of it.
-        overflow = (hi - lo) - ceiling
-        trim = overflow // 2
-        lo, hi = lo + trim, hi - (overflow - trim)
-        lo = min(lo, start_idx)
-        hi = max(hi, end_idx)
     return lo, hi
 
 
-def _trim_to_budget(
-    lines: list[str], lo: int, hi: int, start_idx: int, end_idx: int, budget_tokens: int
+def _fit_to_budget(
+    lines: list[str], lo: int, hi: int, start_idx: int, end_idx: int,
+    budget_tokens: int, floor_tokens: int = 0,
 ) -> tuple[int, int]:
     """Shrink [lo, hi) to fit a token budget, keeping the cited lines.
 
@@ -913,6 +901,24 @@ def _trim_to_budget(
         return count_tokens("\n".join(lines[a:b]))
 
     if cost(lo, hi) <= budget_tokens:
+        # Under the ceiling. Grow outward if it is also under the floor - a boundary can
+        # sit two lines from the citation, and a three-line section is useless to quote.
+        #
+        # Growth stops AT a boundary rather than through one. Widening past a heading
+        # merges the next section into this one, which is worse than a short passage: the
+        # caller is told it has the section containing its citation, and quoting from
+        # material under a different heading is how a claim ends up attributed to the
+        # wrong requirement.
+        while floor_tokens and cost(lo, hi) < floor_tokens:
+            widened = False
+            if lo > 0 and not _STRONG_SECTION_START.match(lines[lo - 1]):
+                lo -= 1
+                widened = True
+            if hi < len(lines) and not _STRONG_SECTION_START.match(lines[hi]):
+                hi += 1
+                widened = True
+            if not widened or cost(lo, hi) > budget_tokens:
+                break
         return lo, hi
 
     # Grow outward from the citation instead of shrinking inward: that way the lines
@@ -979,26 +985,31 @@ async def run_zoom(
             end = max(start, int(end_line))
     except (TypeError, ValueError):
         end = start
-    # A range of hundreds of lines is not a citation, and _trim_to_budget never trims
-    # the cited range - so a wide one defeats the budget entirely and used to push the
-    # passage into condensation. Cap it; the surrounding section still gets included.
-    span_cap = max(1, settings.agentaus_zoom_min_lines)
-    if end - start + 1 > span_cap:
-        log.info("zoom range %d-%d is %d lines; treating the first %d as the citation",
-                 start, end, end - start + 1, span_cap)
-        end = start + span_cap - 1
+    # A range of hundreds of lines is not a citation, and the cited range is never
+    # trimmed away - so a wide one defeats the budget entirely. Capped in tokens, like
+    # every other size here: walk forward from the citation until it fills the budget.
+    if end > start:
+        capped = start
+        while capped < end and count_tokens(
+            "\n".join(lines[start - 1:capped])
+        ) < settings.agentaus_zoom_max_tokens:
+            capped += 1
+        if capped < end:
+            log.info("zoom range %d-%d exceeds the token budget; treating %d-%d as the "
+                     "citation", start, end, start, capped)
+            end = capped
     if start > len(lines):
         return f"{file_path} has {len(lines)} lines; {start} is past the end."
 
+    # Lines decide WHERE a section begins and ends - that is navigation, and a heading
+    # is found by walking lines. Tokens decide how much of it comes back. Those are the
+    # only two jobs, and they no longer share a unit.
     lo, hi = _widen_to_section(
-        lines, start - 1, min(end, len(lines)),
-        settings.agentaus_zoom_radius_lines, settings.agentaus_zoom_max_lines,
-        settings.agentaus_zoom_min_lines,
+        lines, start - 1, min(end, len(lines)), settings.agentaus_zoom_radius_lines,
     )
-    # Lines decide WHERE the section starts and ends; tokens decide how much of it fits.
-    lo, hi = _trim_to_budget(
+    lo, hi = _fit_to_budget(
         lines, lo, hi, start - 1, min(end, len(lines)),
-        settings.agentaus_zoom_max_tokens,
+        settings.agentaus_zoom_max_tokens, settings.agentaus_zoom_min_tokens,
     )
     window = lines[lo:hi]
     numbered = "\n".join(f"{lo + i + 1:6d}  {line}" for i, line in enumerate(window))

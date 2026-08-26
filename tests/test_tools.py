@@ -464,11 +464,23 @@ class TestZoomWindowFloor(unittest.TestCase):
         return call
 
     def test_a_tiny_section_is_widened_to_something_readable(self):
+        """Bold lines are weak boundaries - a passage may grow through them."""
         with _Tree({"doc.md": self.BOLD_HEAVY}) as tree:
             out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 90, 90))
-        body = [l for l in out.splitlines() if l.strip() and not l.startswith("/")]
+        body = [l for l in out.splitlines()
+                if l.strip() and l.split()[0].isdigit()]
         self.assertGreaterEqual(len(body), 20,
                                 f"still returned a {len(body)}-line sliver")
+
+    def test_a_strong_boundary_is_not_crossed(self):
+        """A Markdown heading separates subjects; merging them misattributes a quote."""
+        body = ("# First subject\n" + "content of the first\n" * 5
+                + "# Second subject\n" + "content of the second\n" * 5)
+        with _Tree({"doc.md": body}) as tree:
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 3, 3))
+        self.assertIn("first", out)
+        self.assertNotIn("Second subject", out,
+                         "the passage grew through a heading into another subject")
 
     def test_the_cited_line_stays_inside_the_window(self):
         with _Tree({"doc.md": self.BOLD_HEAVY}) as tree:
@@ -649,3 +661,40 @@ class TestZoomNeverCallsAModel(unittest.TestCase):
         with _Tree({"doc.md": body}) as tree:
             out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 10, 1900))
         self.assertLess(len(out), 60_000, "a 1890-line 'citation' was returned whole")
+
+
+class TestZoomSizesInTokensOnly(unittest.TestCase):
+    """Lines navigate; tokens size. Nothing measures size in lines any more.
+
+    A line is not a unit of size - 40 lines is 300 tokens of source code and 4,000 of
+    tender prose - and the line-counted ceiling and floor that used to sit around the
+    token budget are what let a passage reach 25,000 characters and break the turn
+    carrying it.
+    """
+
+    def test_no_line_based_size_settings_remain(self):
+        from agentaus_bridge.config import settings
+        for name in ("agentaus_zoom_max_lines", "agentaus_zoom_min_lines"):
+            self.assertFalse(hasattr(settings, name),
+                             f"{name} measures size in lines")
+        self.assertTrue(hasattr(settings, "agentaus_zoom_min_tokens"))
+        self.assertTrue(hasattr(settings, "agentaus_zoom_max_tokens"))
+        # Radius survives, because searching N lines for a heading is navigation.
+        self.assertTrue(hasattr(settings, "agentaus_zoom_radius_lines"))
+
+    def test_the_same_line_count_yields_similar_token_counts_across_formats(self):
+        """The property line-based limits could not give: consistent size."""
+        # Both must be large enough to be trimmed, or the comparison is between two
+        # whole files rather than between two windows.
+        code = "\n".join(f"x{i} = {i}  # a trailing comment of some length here" * 3
+                         for i in range(4000))
+        prose = "\n".join(f"Paragraph {i}. " + "A sentence of tender length. " * 8
+                          for i in range(4000))
+        sizes = []
+        for name, body in (("code.py", code), ("prose.md", prose)):
+            with _Tree({name: body}) as tree:
+                out = run(tools.run_zoom(os.path.join(tree.path, name), 2000, 2000))
+            sizes.append(len(out))
+        ratio = max(sizes) / min(sizes)
+        self.assertLess(ratio, 3.0,
+                        f"code and prose returned wildly different sizes: {sizes}")
