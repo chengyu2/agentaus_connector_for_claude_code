@@ -693,22 +693,41 @@ ADD:       "(evidence: FIN-2025-26-00616 - lines 3585-3586)"
 A citation where a sentence was wanted, because a citation was all it had.
 
 `agentaus_zoom` closes that loop. Give it a file and a line number and it returns the
-passage **widened to its whole section**, with line numbers intact:
+passage **widened to its section, verbatim, with line numbers intact** — and never calls a
+model to do it:
 
 ```
-agentaus_zoom(file_path=..., start_line=3585, purpose="substantiate OCR claims")
+agentaus_zoom(file_path=..., start_line=3359)
   │
-  ├─ widen ....... outward from the cited lines to the nearest section boundary —
-  │                a Markdown heading, a bold-only line, a numbered clause — so the
-  │                passage arrives with the heading that says what it is about
-  ├─ bound ....... capped by AGENTAUS_ZOOM_RADIUS_LINES, then MAX_LINES
-  └─ return ...... verbatim if it fits AGENTAUS_ZOOM_MAX_TOKENS; otherwise Agentaus
-                   keeps what serves `purpose` and says what it dropped
+  ├─ widen ..... outward to the nearest section boundary — Markdown heading, bold-only
+  │              line, numbered clause — so the passage arrives with its heading
+  ├─ trim ...... to AGENTAUS_ZOOM_MAX_TOKENS, growing outward from the citation so the
+  │              lines nearest the quote are the ones kept
+  └─ return .... tagged, so the model knows it is holding a window and not a whole file
+
+<passage file="…" lines="3352-3366" you_asked_for="3359-3359"
+         section_ends_at="3366" verbatim="true" complete="true">
+  3352  **Secure, governed environment**
+  ...
+</passage>
 ```
 
-**Verbatim is strongly preferred.** Condensing a passage the caller is about to quote from
-defeats the point of zooming in on it, so the model is only involved when the section is
-genuinely too big.
+The attributes are the point. A passage that stops mid-section reads, to a model, like a
+file that stops there — so it either concludes the content is absent or quotes across the
+cut. `complete="false"` and `section_ends_at` say otherwise, and this model follows
+structure far more reliably than it follows a sentence.
+
+**It never condenses.** It used to, above a token threshold, and that was wrong from the
+start: the point of zooming into a citation is to see the exact words before quoting them,
+and condensing them first destroys the only thing the caller came for. Truncating verbatim
+is strictly better and instant.
+
+Getting that wrong was expensive. The threshold was an order of magnitude too low, so
+every zoom over ordinary tender prose paid for a model call — 73 to 125 seconds under
+load, into a 240-second helper timeout, stalling a batch run for an hour. Raising the
+threshold moved the bulk downstream until the turn carrying it drew a Cloudflare 524. The
+whole class of problem disappeared when the condensation path was deleted rather than
+tuned.
 
 Search results end with a line telling the model this tool exists — a citation is only
 useful if it knows it can open it.

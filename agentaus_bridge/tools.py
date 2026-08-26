@@ -815,13 +815,6 @@ ZOOM_SCHEMA = {
             "file_path": {"type": "string", "description": "Absolute path to the file."},
             "start_line": {"type": "integer", "description": "First line of interest (1-based)."},
             "end_line": {"type": "integer", "description": "Last line of interest. Defaults to start_line."},
-            "purpose": {
-                "type": "string",
-                "description": (
-                    "What you need from the passage. Only used if the section is too "
-                    "large to return whole, in which case it decides what is kept."
-                ),
-            },
         },
         "required": ["file_path", "start_line"],
     },
@@ -938,40 +931,27 @@ def _trim_to_budget(
     return low, high
 
 
-ZOOM_INSTRUCTION = """\
-<passage file="{path}" lines="{start}-{end}">
-{body}
-</passage>
-
-<purpose>
-{purpose}
-</purpose>
-
-<task>
-The passage is too long to return whole. Keep the parts that serve the purpose above and
-drop the rest.
-
-Keep verbatim, with their line numbers: every sentence that bears on the purpose, every
-identifier, certification, standard, product name, number and date. Where you drop
-material, say what you dropped on one line.
-</task>
-
-<output_format>
-The kept lines, each still prefixed with its original line number. Then one
-"[dropped: ...]" line. No tags, no preamble.
-</output_format>
-"""
-
-
 async def run_zoom(
     file_path: str,
     start_line: int,
     end_line: int | None,
-    purpose: str,
-    call: Caller,
     default_path: str | None = None,
 ) -> str:
-    """Return a cited passage widened to its section, with line numbers preserved."""
+    """Return a cited passage widened to its section, with line numbers preserved.
+
+    Reads a file. Nothing else - no model call, in any circumstance.
+
+    It used to condense a passage that exceeded the return budget, and that was wrong
+    from the start: the whole purpose of zooming into a citation is to see the exact
+    words before quoting them, and condensing them first destroys the one thing the
+    caller came for. Truncating verbatim is strictly better, and instant.
+
+    The cost of getting that wrong was not theoretical. The threshold was set an order of
+    magnitude too low, so every zoom over ordinary tender prose paid for a model call;
+    those took 73 to 125 seconds under load, hit a 240-second helper timeout, and stalled
+    a batch run for an hour. Raising the threshold moved the bulk downstream until the
+    turn carrying it drew a Cloudflare 524. None of it needed to happen.
+    """
     if (not file_path or not os.path.isabs(file_path)) and default_path:
         file_path = default_path if not file_path else os.path.join(default_path, file_path)
     if not os.path.isabs(file_path):
@@ -999,6 +979,14 @@ async def run_zoom(
             end = max(start, int(end_line))
     except (TypeError, ValueError):
         end = start
+    # A range of hundreds of lines is not a citation, and _trim_to_budget never trims
+    # the cited range - so a wide one defeats the budget entirely and used to push the
+    # passage into condensation. Cap it; the surrounding section still gets included.
+    span_cap = max(1, settings.agentaus_zoom_min_lines)
+    if end - start + 1 > span_cap:
+        log.info("zoom range %d-%d is %d lines; treating the first %d as the citation",
+                 start, end, end - start + 1, span_cap)
+        end = start + span_cap - 1
     if start > len(lines):
         return f"{file_path} has {len(lines)} lines; {start} is past the end."
 
@@ -1015,36 +1003,36 @@ async def run_zoom(
     window = lines[lo:hi]
     numbered = "\n".join(f"{lo + i + 1:6d}  {line}" for i, line in enumerate(window))
 
-    header = (
-        f"{file_path}:{lo + 1}-{hi}  (you asked for {start}-{end}; widened to the "
-        f"surrounding section)\n"
+    # Truncation happens only when the cited lines alone exceed the budget, since the
+    # surrounding context was already trimmed to fit. Nothing is ever summarised.
+    budget = settings.agentaus_zoom_max_tokens * 4
+    if count_tokens(numbered) > settings.agentaus_zoom_max_tokens:
+        cut = numbered[:budget]
+        end_of_line = cut.rfind("\n")
+        numbered = cut[:end_of_line] if end_of_line > 0 else cut
+        shown = lo + len(numbered.splitlines())
+    else:
+        shown = hi
+
+    # Tagged, not prefaced with a sentence. A window into a file needs to announce that
+    # it IS a window - otherwise the model reads a passage that stops mid-section and
+    # concludes the file stops there, or quotes across the cut. The attributes carry that
+    # unambiguously, and this model follows structure far more reliably than prose.
+    log.info("zoom %s:%d-%d -> lines %d-%d verbatim",
+             file_path, start, end, lo + 1, shown)
+    complete = "true" if shown >= hi else "false"
+    return (
+        f'<passage file="{file_path}" lines="{lo + 1}-{shown}" '
+        f'you_asked_for="{start}-{end}" section_ends_at="{hi}" '
+        f'verbatim="true" complete="{complete}">\n'
+        + numbered
+        + "\n</passage>\n"
+        + ("Every line above is exact - nothing summarised or reworded, so quote freely."
+           if complete == "true" else
+           f"Every line above is exact - nothing summarised or reworded, so quote freely. "
+           f"The section continues past line {shown}; call {ZOOM_TOOL} with "
+           f"start_line={shown + 1} for the rest.")
     )
-
-    if count_tokens(numbered) <= settings.agentaus_zoom_max_tokens:
-        # Verbatim wherever it fits. Condensing a passage the caller is about to quote
-        # from would defeat the point of zooming in on it.
-        log.info("zoom %s:%d-%d -> %d line(s) verbatim", file_path, start, end, hi - lo)
-        return header + numbered
-
-    prompt = ZOOM_INSTRUCTION.format(
-        path=file_path, start=lo + 1, end=hi, body=numbered,
-        purpose=purpose or "understand this passage well enough to quote it accurately",
-    )
-    try:
-        async with hold("zoom", "urgent"):
-            kept = await call(prompt)
-    except Exception as exc:
-        # Truncating verbatim is a better answer than a condensation that never arrives,
-        # and the learned ceiling is told about it so the next caller aims lower.
-        if is_capacity_failure(exc):
-            note_capacity_failure(count_tokens(prompt))
-        log.warning("zoom condensation failed (%s); truncating instead", exc)
-        budget = settings.agentaus_zoom_max_tokens * 4
-        return header + numbered[:budget] + "\n[truncated: the section is larger than the limit]"
-
-    kept = normalise_identifiers((kept or "").strip())
-    log.info("zoom %s:%d-%d -> %d line(s) condensed", file_path, start, end, hi - lo)
-    return header + (kept or numbered[: settings.agentaus_zoom_max_tokens * 4])
 
 
 async def execute(
@@ -1067,8 +1055,6 @@ async def execute(
                 str(arguments.get("file_path") or ""),
                 arguments.get("start_line"),
                 arguments.get("end_line"),
-                str(arguments.get("purpose") or ""),
-                call,
                 default_path,
             )
         if name == INVESTIGATE_TOOL:

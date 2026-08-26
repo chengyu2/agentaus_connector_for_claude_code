@@ -385,7 +385,7 @@ class TestZoom(unittest.TestCase):
             path = os.path.join(tree.path, "doc.md")
             cited = self.DOC.splitlines().index(
                 "The core service holds ISO/IEC 27001 certification.") + 1
-            out = run(tools.run_zoom(path, cited, cited, "", self.stub()))
+            out = run(tools.run_zoom(path, cited, cited))
 
         self.assertIn("## Security", out, "the heading that names the passage was lost")
         self.assertIn("Essential 8 Maturity Level 2", out, "neighbouring evidence was lost")
@@ -395,7 +395,7 @@ class TestZoom(unittest.TestCase):
         with _Tree({"doc.md": self.DOC}) as tree:
             path = os.path.join(tree.path, "doc.md")
             cited = self.DOC.splitlines().index("Hosted in Vault Cloud.") + 1
-            out = run(tools.run_zoom(path, cited, cited, "", self.stub()))
+            out = run(tools.run_zoom(path, cited, cited))
         line = next(l for l in out.splitlines() if "Vault Cloud" in l)
         self.assertTrue(line.strip().startswith(str(cited)),
                         f"line number missing or wrong: {line!r}")
@@ -405,7 +405,7 @@ class TestZoom(unittest.TestCase):
         call = self.stub()
         with _Tree({"doc.md": self.DOC}) as tree:
             path = os.path.join(tree.path, "doc.md")
-            run(tools.run_zoom(path, 5, 5, "", call))
+            run(tools.run_zoom(path, 5, 5))
         self.assertEqual(call.seen, [], "it called the model on a passage that already fit")
 
     # The window is trimmed to fit the budget now, so condensation only fires when the
@@ -413,26 +413,9 @@ class TestZoom(unittest.TestCase):
     # ordinary lines does not, because trimming handles it (see TestZoomIsNormallyFree).
     PROSE = "\n".join(["## Huge section", "y" * 200_000, "tail"])
 
-    def test_an_oversized_section_is_condensed_against_the_purpose(self):
-        call = self.stub(answer="     2  kept line\n[dropped: the rest of a huge line]")
-        with _Tree({"doc.md": self.PROSE}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2,
-                                     "find the certifications", call))
-        self.assertEqual(len(call.seen), 1, "a passage over the budget was not condensed")
-        self.assertIn("find the certifications", call.seen[0])
-        self.assertIn("dropped", out)
-
-    def test_a_failed_condensation_truncates_rather_than_losing_the_passage(self):
-        async def broken(_: str) -> str:
-            raise RuntimeError("upstream down")
-        with _Tree({"doc.md": self.PROSE}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2, "x", broken))
-        self.assertIn("truncated", out)
-        self.assertIn("yyy", out, "the passage was lost rather than truncated")
-
     def test_a_line_past_the_end_says_so(self):
         with _Tree({"doc.md": "one\ntwo\n"}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 999, None, "", self.stub()))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 999, None))
         self.assertIn("past the end", out)
 
     def test_a_docx_is_refused_only_when_it_cannot_be_read(self):
@@ -441,8 +424,7 @@ class TestZoom(unittest.TestCase):
         settings.agentaus_office_extract = False
         try:
             with _Tree({"r.docx": "PK\x03\x04binary"}) as tree:
-                out = run(tools.run_zoom(os.path.join(tree.path, "r.docx"), 1, 1, "",
-                                         self.stub()))
+                out = run(tools.run_zoom(os.path.join(tree.path, "r.docx"), 1, 1))
         finally:
             settings.agentaus_office_extract = previous
         self.assertIn("no reader for it is", out)
@@ -452,7 +434,7 @@ class TestZoom(unittest.TestCase):
 
     def test_a_relative_path_falls_back_to_the_working_directory(self):
         with _Tree({"doc.md": self.DOC}) as tree:
-            out = run(tools.run_zoom("doc.md", 2, 2, "", self.stub(), default_path=tree.path))
+            out = run(tools.run_zoom("doc.md", 2, 2, default_path=tree.path))
         self.assertIn("Introduction", out)
 
     def test_search_output_points_at_zoom(self):
@@ -483,21 +465,21 @@ class TestZoomWindowFloor(unittest.TestCase):
 
     def test_a_tiny_section_is_widened_to_something_readable(self):
         with _Tree({"doc.md": self.BOLD_HEAVY}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 90, 90, "", self.stub()))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 90, 90))
         body = [l for l in out.splitlines() if l.strip() and not l.startswith("/")]
         self.assertGreaterEqual(len(body), 20,
                                 f"still returned a {len(body)}-line sliver")
 
     def test_the_cited_line_stays_inside_the_window(self):
         with _Tree({"doc.md": self.BOLD_HEAVY}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 90, 90, "", self.stub()))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 90, 90))
         nums = [int(l.split()[0]) for l in out.splitlines() if l.strip() and l.split()[0].isdigit()]
         self.assertLessEqual(min(nums), 90)
         self.assertGreaterEqual(max(nums), 90)
 
     def test_a_short_file_is_not_padded_past_its_end(self):
         with _Tree({"doc.md": "one\ntwo\nthree\n"}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2, "", self.stub()))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2))
         nums = [int(l.split()[0]) for l in out.splitlines() if l.strip() and l.split()[0].isdigit()]
         self.assertLessEqual(max(nums), 3)
 
@@ -604,32 +586,8 @@ class TestZoomIsNormallyFree(unittest.TestCase):
             raise AssertionError("zoom spent a model call on a passage that fits")
 
         with _Tree({"doc.md": prose}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 200, 200,
-                                     "", must_not_be_called))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 200, 200))
         self.assertIn("Paragraph 200", out)
-
-    def test_the_ceiling_still_bites_when_the_cited_line_itself_is_huge(self):
-        """Trimming cannot save a citation that is on its own bigger than the budget."""
-        huge = "\n".join(["intro", "x" * 200_000, "tail"])
-        seen = []
-
-        async def condense(prompt: str) -> str:
-            seen.append(prompt)
-            return "     2  kept\n[dropped: the rest]"
-
-        with _Tree({"doc.md": huge}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2, "why", condense))
-        self.assertEqual(len(seen), 1, "an oversized citation was not condensed at all")
-        self.assertIn("dropped", out)
-
-
-class TestZoomWindowFitsTheConversation(unittest.TestCase):
-    """A zoom result is read alongside everything else in the turn.
-
-    At a 400-line ceiling, tender prose produced ~25,000-character passages - and two of
-    those in one turn made the next upstream call large enough to draw a Cloudflare 524.
-    Zoom has to be small enough to carry, not just cheap to produce.
-    """
 
     def test_a_passage_stays_small_enough_to_send(self):
         prose = "\n".join(
@@ -640,11 +598,54 @@ class TestZoomWindowFitsTheConversation(unittest.TestCase):
             raise AssertionError("condensed a passage that should be returned verbatim")
 
         with _Tree({"doc.md": prose}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 300, 300,
-                                     "", must_not_be_called))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 300, 300))
 
         self.assertIn("Paragraph 300", out, "the cited line fell outside the window")
         self.assertLess(len(out), 40_000,
                         f"zoom returned {len(out)} chars - too large to sit in a turn")
         # Still enough context to quote from, with neighbours either side.
         self.assertGreater(len(out), 3_000, "the window is too small to be useful")
+
+
+class TestZoomNeverCallsAModel(unittest.TestCase):
+    """Zoom reads a file. That is the whole contract.
+
+    It used to condense a passage that exceeded its return budget, which was wrong from
+    the start: the point of zooming into a citation is to see the exact words before
+    quoting them. Getting it wrong cost real time - 73- and 125-second zooms, a
+    240-second helper timeout, and an hour of a stalled batch run.
+    """
+
+    async def _never(self, _: str) -> str:
+        raise AssertionError("zoom called a model")
+
+    def test_a_short_passage_is_verbatim(self):
+        with _Tree({"doc.md": "# H\nalpha\nbeta\ngamma\n"}) as tree:
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2))
+        self.assertIn("alpha", out)
+        self.assertIn("verbatim", out)
+
+    def test_an_enormous_cited_line_is_truncated_not_condensed(self):
+        with _Tree({"doc.md": "intro\n" + "x" * 400_000 + "\ntail\n"}) as tree:
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2))
+        self.assertIn("xxx", out, "the passage was lost")
+        self.assertIn("verbatim", out, "the header must still promise verbatim text")
+
+    def test_the_header_states_the_range_actually_returned(self):
+        body = "\n".join(f"line {i} " + "y" * 400 for i in range(400))
+        with _Tree({"doc.md": body}) as tree:
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 200, 200))
+        header = out.splitlines()[0]
+        shown = [int(l.split()[0]) for l in out.splitlines()[1:]
+                 if l.strip() and l.split()[0].isdigit()]
+        self.assertIn(f'-{max(shown)}"', header,
+                      f"header {header!r} disagrees with the lines returned")
+        self.assertIn('you_asked_for="200-200"', header)
+        self.assertIn('verbatim="true"', header)
+
+    def test_a_wide_range_is_capped_to_a_citation(self):
+        """A range of hundreds of lines is not a citation, and cannot be trimmed."""
+        body = "\n".join(f"line {i}" for i in range(2000))
+        with _Tree({"doc.md": body}) as tree:
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 10, 1900))
+        self.assertLess(len(out), 60_000, "a 1890-line 'citation' was returned whole")
