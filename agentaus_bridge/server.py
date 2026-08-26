@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import documents
 from . import persisted
+from . import syntax
 from . import tools as bridge_tools
 from .augment import (
     ADJUDICATE_INSTRUCTION,
@@ -573,6 +574,34 @@ async def _answer_without_tools(client: httpx.AsyncClient, payload: dict) -> str
     except Exception as exc:
         rlog(logging.WARNING, "forced answer failed (%s)", exc)
         return ""
+
+
+async def _fix_syntax(client: httpx.AsyncClient, answer: str) -> str:
+    """If the answer's Python does not parse, ask once for the typo to be fixed.
+
+    Deterministic detection, so this costs nothing on an answer that is fine. Any failure
+    returns the original: a broken repair must not lose a mostly-correct answer.
+    """
+    error = syntax.first_error(answer)
+    if not error:
+        return answer
+    rlog(logging.WARNING, "answer does not parse (%s); asking for a fix", error)
+    try:
+        async with hold("syntax fix", "urgent"):
+            fixed = await _agentaus_summarise(
+                client, syntax.FIX_INSTRUCTION.format(error=error, answer=answer[:12000])
+            )
+    except Exception as exc:
+        rlog(logging.WARNING, "syntax fix failed (%s); keeping the answer", exc)
+        return answer
+    if not fixed or not fixed.strip():
+        return answer
+    if syntax.first_error(fixed):
+        # Still broken. The original is no worse and may be closer to right.
+        rlog(logging.WARNING, "the fix does not parse either; keeping the original")
+        return answer
+    rlog(logging.INFO, "syntax fixed (%d -> %d chars)", len(answer), len(fixed))
+    return fixed.strip()
 
 
 async def _check_grounding(
@@ -1425,6 +1454,14 @@ async def _handle_agentaus(
                 choice0 = (data.get("choices") or [{}])[0]
                 msg0 = choice0.get("message") or {}
 
+        if (settings.agentaus_syntax_check and not msg0.get("tool_calls")
+                and (msg0.get("content") or "").strip()):
+            parsed = await _fix_syntax(client, msg0["content"])
+            if parsed != msg0.get("content"):
+                msg0 = {**msg0, "content": parsed}
+                data = {**data, "choices": [{**choice0, "message": msg0}]
+                        + list((data.get("choices") or [])[1:])}
+
         # Review only a plain text answer. A turn that calls tools is mid-task, and
         # rewriting it would break the tool_use the client is waiting on.
         if (
@@ -1820,6 +1857,10 @@ async def _agentaus_event_stream(
         if retried:
             answer = retried
             pending = [answer]
+
+    if buffering and answer and settings.agentaus_syntax_check and not theirs:
+        answer = await _fix_syntax(client, answer)
+        pending = [answer]
 
     if buffering and answer:
         if not theirs and worth_reviewing_turn(original) and worth_reviewing(

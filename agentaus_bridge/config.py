@@ -447,6 +447,13 @@ class Settings:
     # self-review cannot be - the reviewer sees the ledger of executed calls, so "you
     # claim this about a file you never opened" is checkable rather than a guess. It runs
     # on exactly the turns review has to sit out, which is where claims outrun evidence.
+    # Check that Python in an answer actually parses. Costs nothing to detect - ast.parse
+    # decides it - and one round trip to fix. The review pass is asked "is this correct",
+    # which needs a model and which passed a mismatched bracket; "does this parse" needs
+    # no model and is never a matter of opinion.
+    agentaus_syntax_check: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_SYNTAX_CHECK", True)
+    )
     agentaus_grounding_check: bool = field(
         default_factory=lambda: _bool("AGENTAUS_GROUNDING_CHECK", True)
     )
