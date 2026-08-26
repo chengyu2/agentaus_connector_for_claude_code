@@ -25,7 +25,7 @@ from .config import settings
 
 log = logging.getLogger("agentaus-bridge")
 
-_gate: asyncio.Semaphore | None = None
+_gate: "_PriorityGate | None" = None
 _gate_loop: asyncio.AbstractEventLoop | None = None
 
 # Waiting is normal; waiting a long time is worth knowing about, because it is the
@@ -49,8 +49,8 @@ def gate() -> asyncio.Semaphore:
         loop = asyncio.get_event_loop()
     except RuntimeError:  # no current loop - let the caller's own failure surface
         loop = None
-    if _gate is None or loop is not _gate_loop:
-        _gate = asyncio.Semaphore(max_concurrency())
+    if _gate is None or loop is not _gate_loop or _gate.capacity != max_concurrency():
+        _gate = _PriorityGate(max_concurrency())
         _gate_loop = loop
     return _gate
 
@@ -81,18 +81,87 @@ def reset() -> None:
     _gate, _gate_loop = None, None
 
 
+class _PriorityGate:
+    """Capacity with a queue that is not first-come-first-served.
+
+    Not every bridge call is equally urgent, and a plain semaphore cannot express that.
+    A search chunk is inside a tool the model is blocked on - the user is watching a
+    cursor. The second pass that checks a summary for gaps, or the review that critiques
+    an answer, improves quality and can wait: neither is required for the turn to be
+    correct.
+
+    With one FIFO queue a burst of background work delays the calls a user is waiting on,
+    which is how a run comes to spend 1236 waits on slots while the thing being waited
+    for is a quality pass nobody asked for. Urgent waiters are served first here, and
+    background waiters take what is left.
+    """
+
+    __slots__ = ("_capacity", "_free", "_waiters", "_sequence")
+
+    def __init__(self, capacity: int) -> None:
+        self._capacity = capacity
+        self._free = capacity
+        # (priority, arrival, future) - priority first, then arrival, so equal-priority
+        # waiters still queue fairly rather than by chance.
+        self._waiters: list = []
+        self._sequence = 0
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    async def acquire(self, priority: int) -> None:
+        if self._free > 0 and not self._waiters:
+            self._free -= 1
+            return
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        self._sequence += 1
+        self._waiters.append((priority, self._sequence, future))
+        self._waiters.sort(key=lambda row: (row[0], row[1]))
+        try:
+            await future
+        except asyncio.CancelledError:
+            # Cancelled while queued: leave no ghost waiter behind, and if a slot was
+            # handed to us in the same tick, pass it on rather than leaking capacity.
+            self._waiters = [w for w in self._waiters if w[2] is not future]
+            if future.done() and not future.cancelled():
+                self._release_one()
+            raise
+
+    def release(self) -> None:
+        self._release_one()
+
+    def _release_one(self) -> None:
+        while self._waiters:
+            _priority, _seq, future = self._waiters.pop(0)
+            if not future.done():
+                future.set_result(None)
+                return
+        self._free = min(self._capacity, self._free + 1)
+
+
+# Lower number wins. Background work yields to anything a turn is actually waiting on.
+URGENT = 0
+NORMAL = 1
+BACKGROUND = 2
+
+_PRIORITIES = {"urgent": URGENT, "normal": NORMAL, "background": BACKGROUND}
+
+
 class _Held:
     """Async context manager that acquires the gate and reports a long wait."""
 
-    __slots__ = ("_label", "_started")
+    __slots__ = ("_label", "_priority", "_started")
 
-    def __init__(self, label: str) -> None:
+    def __init__(self, label: str, priority: str) -> None:
         self._label = label
+        self._priority = _PRIORITIES.get(priority, NORMAL)
         self._started = 0.0
 
     async def __aenter__(self) -> "_Held":
         self._started = time.monotonic()
-        await gate().acquire()
+        await gate().acquire(self._priority)
         waited = time.monotonic() - self._started
         if waited >= _SLOW_WAIT_SECONDS:
             log.info(
@@ -105,6 +174,11 @@ class _Held:
         gate().release()
 
 
-def hold(label: str = "helper call") -> _Held:
-    """`async with hold("search"):` around one bridge-initiated Agentaus call."""
-    return _Held(label)
+def hold(label: str = "helper call", priority: str = "normal") -> _Held:
+    """`async with hold("search", "urgent"):` around one bridge-initiated call.
+
+    "urgent"     - a turn is blocked on this; serve it first.
+    "normal"     - the default.
+    "background" - improves quality but the turn is correct without it, so it yields.
+    """
+    return _Held(label, priority)

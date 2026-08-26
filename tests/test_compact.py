@@ -556,3 +556,119 @@ class TestIncrementalCompaction(unittest.TestCase):
         run(c.compact({"messages": altered, "system": "s"}, limit=8_000, reserve=100))
 
         self.assertGreater(counter.calls, 0, "a changed prefix was wrongly reused")
+
+
+class TestPriorityGate(unittest.TestCase):
+    """Not every bridge call is equally urgent, and a plain semaphore cannot say so.
+
+    A search chunk is inside a tool the model is blocked on. A gap-check or a review
+    improves quality and can wait. With one FIFO queue a burst of the second delays the
+    first, which is how a run spends 1236 waits on slots for work nobody asked for.
+    """
+
+    def setUp(self):
+        from agentaus_bridge import gate
+        from agentaus_bridge.config import settings
+        self.gate = gate
+        self.settings = settings
+        self._saved = (settings.agentaus_max_concurrency,
+                       settings.max_concurrency_is_explicit)
+        settings.agentaus_max_concurrency = 1
+        settings.max_concurrency_is_explicit = True
+        gate.reset()
+
+    def tearDown(self):
+        (self.settings.agentaus_max_concurrency,
+         self.settings.max_concurrency_is_explicit) = self._saved
+        self.gate.reset()
+
+    def test_urgent_work_is_served_before_background_work(self):
+        import asyncio as aio
+        order = []
+
+        async def worker(name, priority, delay):
+            await aio.sleep(delay)
+            async with self.gate.hold(name, priority):
+                order.append(name)
+                await aio.sleep(0.01)
+
+        async def main():
+            # The single slot is taken first, so everything else queues. Background
+            # waiters arrive FIRST and must still be served last.
+            async with self.gate.hold("holder", "normal"):
+                tasks = [
+                    aio.ensure_future(worker("bg1", "background", 0.005)),
+                    aio.ensure_future(worker("bg2", "background", 0.006)),
+                    aio.ensure_future(worker("urgent", "urgent", 0.010)),
+                ]
+                await aio.sleep(0.05)
+            await aio.gather(*tasks)
+
+        run(main())
+        self.assertEqual(order[0], "urgent",
+                         f"background work was served before urgent work: {order}")
+
+    def test_equal_priority_still_queues_fairly(self):
+        import asyncio as aio
+        order = []
+
+        async def worker(name, delay):
+            await aio.sleep(delay)
+            async with self.gate.hold(name, "normal"):
+                order.append(name)
+
+        async def main():
+            async with self.gate.hold("holder", "normal"):
+                tasks = [aio.ensure_future(worker(f"w{i}", 0.005 * i)) for i in range(1, 4)]
+                await aio.sleep(0.05)
+            await aio.gather(*tasks)
+
+        run(main())
+        self.assertEqual(order, ["w1", "w2", "w3"], f"arrival order was lost: {order}")
+
+    def test_capacity_is_still_respected(self):
+        import asyncio as aio
+        self.settings.agentaus_max_concurrency = 3
+        self.gate.reset()
+        live = {"now": 0, "peak": 0}
+
+        async def worker(priority):
+            async with self.gate.hold("w", priority):
+                live["now"] += 1
+                live["peak"] = max(live["peak"], live["now"])
+                await aio.sleep(0.01)
+                live["now"] -= 1
+
+        async def main():
+            await aio.gather(*[
+                worker("urgent" if i % 2 else "background") for i in range(12)
+            ])
+
+        run(main())
+        self.assertLessEqual(live["peak"], 3)
+        self.assertGreater(live["peak"], 1, "it serialised instead of running concurrently")
+
+    def test_a_cancelled_waiter_does_not_leak_a_slot(self):
+        import asyncio as aio
+
+        async def main():
+            async with self.gate.hold("holder", "normal"):
+                doomed = aio.ensure_future(self._take())
+                await aio.sleep(0.01)
+                doomed.cancel()
+                try:
+                    await doomed
+                except aio.CancelledError:
+                    pass
+            # The slot must be usable again immediately.
+            await aio.wait_for(self._take(), timeout=1.0)
+
+        run(main())
+
+    async def _take(self):
+        async with self.gate.hold("probe", "normal"):
+            return True
+
+    def test_the_cap_follows_a_settings_change(self):
+        self.settings.agentaus_max_concurrency = 5
+        self.assertEqual(self.gate.gate().capacity, 5)

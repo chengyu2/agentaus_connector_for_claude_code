@@ -208,7 +208,7 @@ async def run_web_search(query: str, call: Caller) -> str:
         return "agentaus_web_search needs a query."
     started_at = time.monotonic()
     try:
-        async with hold("web search"):
+        async with hold("web search", "urgent"):
             answer = await call(WEB_SEARCH_INSTRUCTION.format(query=query))
     except Exception as exc:
         log.warning("web search failed for %r (%s)", query[:60], exc)
@@ -392,7 +392,7 @@ async def expand_query(query: str, call: Caller) -> list[str]:
     code that does it, and expansion is what bridges that.
     """
     try:
-        async with hold("query expansion"):
+        async with hold("query expansion", "urgent"):
             raw = await call(EXPAND_INSTRUCTION.format(query=query))
     except Exception as exc:
         log.warning("query expansion failed (%s); falling back to the query's own words", exc)
@@ -578,7 +578,7 @@ async def run_search(
         )
         size = count_tokens(prompt)
         try:
-            async with hold("search chunk"):
+            async with hold("search chunk", "urgent"):
                 answer = await call(prompt)
         except Exception as exc:
             if is_capacity_failure(exc) and depth < 2 and len(body.splitlines()) > 4:
@@ -626,7 +626,7 @@ async def run_search(
     joined = "\n\n".join(hits)
     if count_tokens(joined) > settings.agentaus_search_chunk_tokens:
         try:
-            async with hold("search merge"):
+            async with hold("search merge", "urgent"):
                 merged = await call(
                     MERGE_HITS_INSTRUCTION.format(query=query, body=joined)
                 )
@@ -770,7 +770,7 @@ async def run_investigate(
                 "corroborated.]\n\n" + usable[0])
 
     try:
-        async with hold("investigate merge"):
+        async with hold("investigate merge", "urgent"):
             merged = await call(CORROBORATE_INSTRUCTION.format(
                 question=question, body="\n\n".join(usable)
             ))
@@ -968,7 +968,7 @@ async def run_zoom(
         return header + numbered
 
     try:
-        async with hold("zoom"):
+        async with hold("zoom", "urgent"):
             kept = await call(ZOOM_INSTRUCTION.format(
                 path=file_path, start=lo + 1, end=hi, body=numbered,
                 purpose=purpose or "understand this passage well enough to quote it accurately",

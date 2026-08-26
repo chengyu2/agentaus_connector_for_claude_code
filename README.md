@@ -587,6 +587,32 @@ the number that matters is how hard the bridge hits one upstream. **Your own tur
 gated** — queueing the request you actually made behind the bridge's background work would
 turn a busy cap into a visible stall.
 
+### Not every call waits its turn
+
+The cap is one number, but the calls behind it are not equivalent. A search chunk sits
+inside a tool the model is blocked on — someone is watching a cursor. The second pass that
+checks a summary for gaps, or the review that critiques an answer, improves quality and
+the turn is correct without it.
+
+A plain semaphore cannot say that, so a burst of background work delays the calls a user
+is waiting on. The gate is priority-ordered instead:
+
+| Priority | Calls | Behaviour |
+| --- | --- | --- |
+| **urgent** | planning, query expansion, search chunks, zoom, web search, merges | served first |
+| **normal** | compaction summarisation | default |
+| **background** | summary gap-check, self-review, revision, distillation | yields to both |
+
+Equal priorities still queue by arrival, so this changes who waits, never whether the cap
+holds.
+
+Two things came out of building it. The review pass was **never gated at all** — up to
+three calls per answer went straight past the cap the rest of the bridge respects. And
+`AGENTAUS_HELPER_TIMEOUT` was 240s, which abandoned work that was still coming: a slow
+call is not a failed one, and six abandoned calls in one run were all of that kind. It is
+900s now, and exists to bound a socket that will never speak again rather than to give up
+on a busy upstream.
+
 The consequence worth knowing: a cold compaction is roughly 47 calls and will hold the cap
 for its duration, so a search starting at that moment waits. Compaction runs before a turn
 and search during it, so they rarely overlap. When a call does wait more than a second, the
@@ -792,7 +818,7 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_FORCE_ALL` | `false` | Ignore the model id; send everything to Agentaus |
 | `AGENTAUS_MAX_INPUT_TOKENS` | `131072` | Agentaus' context window. Defaults in code and self-corrects from Agentaus' own error messages; setting it explicitly overrides both. `0` disables the check |
 | `AGENTAUS_AUTO_TRIM` | `true` | Compact the older conversation into a summary rather than failing the turn |
-| `AGENTAUS_MAX_CONCURRENCY` | `6` | One global cap on every Agentaus call the bridge makes on its own initiative — summarising, reviewing, planning, searching. Your own turn is never queued behind it. Replaces `AGENTAUS_SUMMARY_CONCURRENCY`, which is still read when set |
+| `AGENTAUS_MAX_CONCURRENCY` | `8` | One global cap on every Agentaus call the bridge makes on its own initiative — summarising, reviewing, planning, searching. Your own turn is never queued behind it. Replaces `AGENTAUS_SUMMARY_CONCURRENCY`, which is still read when set |
 | `AGENTAUS_SEARCH` | `true` | Offer `agentaus_search`, the bridge-executed semantic search, and steer `Grep` towards literal lookups |
 | `AGENTAUS_WEB_SEARCH` | `true` | Offer `agentaus_web_search`, which drives Agentaus' own web search. Claude Code's `WebSearch` is dropped in translation, so without this an Agentaus turn cannot search the web at all |
 | `AGENTAUS_SEARCH_CHUNK_TOKENS` | `8000` | File content per search call. Measured: 4000 costs 48s/16 calls, 8000 costs 29s/10, 16000 costs 22s/4 — all find the same facts, but bigger chunks quote less back |

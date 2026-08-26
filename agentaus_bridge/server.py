@@ -504,29 +504,36 @@ async def _self_review(client: httpx.AsyncClient, request_text: str, answer: str
     Any failure returns the original: a broken review must never lose a good answer.
     """
     try:
-        review = await _agentaus_summarise(
-            client, REVIEW_INSTRUCTION.format(request=request_text[:12000], answer=answer[:12000])
-        )
+        async with hold("self-review", "background"):
+            review = await _agentaus_summarise(
+                client,
+                REVIEW_INSTRUCTION.format(
+                    request=request_text[:12000], answer=answer[:12000]
+                ),
+            )
         verdict = declared_verdict(review)
         if verdict is None:
             # The reviewer did not follow the format. Ask it rather than guessing from
             # the prose: sniffing for "OK" misreads both "OK, but the empty case is
             # broken" and a bare approval wrapped in markdown, and the two mistakes
             # fail in opposite directions.
-            adjudication = await _agentaus_summarise(
-                client, ADJUDICATE_INSTRUCTION.format(review=review[:6000])
-            )
+            async with hold("review adjudication", "background"):
+                adjudication = await _agentaus_summarise(
+                    client, ADJUDICATE_INSTRUCTION.format(review=review[:6000])
+                )
             verdict = not adjudication.strip().upper().startswith("YES")
             rlog(logging.INFO, "review verdict was unstated; adjudicated as %s",
                      "sound" if verdict else "defective")
         if verdict:
             return answer
-        revised = await _agentaus_summarise(
-            client,
-            REVISE_INSTRUCTION.format(
-                request=request_text[:12000], answer=answer[:12000], defects=review[:6000]
-            ),
-        )
+        async with hold("revision", "background"):
+            revised = await _agentaus_summarise(
+                client,
+                REVISE_INSTRUCTION.format(
+                    request=request_text[:12000], answer=answer[:12000],
+                    defects=review[:6000],
+                ),
+            )
         if revised and revised.strip():
             rlog(logging.INFO, "self-review revised the answer (%d -> %d chars)", len(answer), len(revised))
             return revised.strip()
@@ -547,7 +554,7 @@ async def _plan_turn(client: httpx.AsyncClient, body: dict) -> str:
     it does today - a broken planner must not cost the user their answer.
     """
     try:
-        async with hold("planning"):
+        async with hold("planning", "urgent"):
             plan = await _agentaus_summarise(
                 client, plan_prompt(_last_user_text(body), body)
             )

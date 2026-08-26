@@ -208,14 +208,16 @@ class Settings:
     agentaus_stream_helpers: bool = field(
         default_factory=lambda: _bool("AGENTAUS_STREAM_HELPERS", False)
     )
-    # Hard ceiling on ONE bridge-initiated call, streamed or buffered. The main turn's
-    # read timeout is deliberately generous; a helper that inherits it can hang a whole
-    # run behind a socket that will never speak again.
+    # Hard ceiling on ONE bridge-initiated call, streamed or buffered. Generous on
+    # purpose: a slow call is not a failed one, and abandoning work that was still
+    # coming wastes the whole call. It exists to bound a socket that will never speak
+    # again, not to give up on a busy upstream - 6 abandoned calls in one run were all
+    # of the second kind.
     agentaus_helper_timeout_seconds: float = field(
-        default_factory=lambda: _float("AGENTAUS_HELPER_TIMEOUT", 240.0)
+        default_factory=lambda: _float("AGENTAUS_HELPER_TIMEOUT", 900.0)
     )
     agentaus_max_concurrency: int = field(
-        default_factory=lambda: _int("AGENTAUS_MAX_CONCURRENCY", 6)
+        default_factory=lambda: _int("AGENTAUS_MAX_CONCURRENCY", 8)
     )
     max_concurrency_is_explicit: bool = field(
         default_factory=lambda: bool(

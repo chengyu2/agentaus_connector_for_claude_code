@@ -152,7 +152,7 @@ class ResultDistiller:
             self._cache.popitem(last=False)
 
     async def _call(self, prompt: str) -> str:
-        async with hold("distillation"):
+        async with hold("distillation", "background"):
             self.calls += 1
             return (await self._summarise(prompt)) or ""
 

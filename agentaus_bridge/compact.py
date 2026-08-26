@@ -301,6 +301,8 @@ class ConversationCompactor:
         block: int = 20,
     ) -> None:
         self._summarise = summarise
+        # Compaction itself blocks the turn, so it is not background work.
+        self._priority = "normal"
         self._cache: OrderedDict[str, str] = OrderedDict()
         # (length, hash, summary) for prefixes already summarised.
         self._prefixes: list[tuple[int, str, str]] = []
@@ -330,7 +332,7 @@ class ConversationCompactor:
         the compactor: a long compaction and a search running at once must add up to
         one limit, not two.
         """
-        async with hold("summarisation"):
+        async with hold("summarisation", self._priority):
             self.calls += 1
             return (await self._summarise(prompt)) or ""
 
@@ -364,11 +366,17 @@ class ConversationCompactor:
         # Second pass: ask what the first pass missed, and fold it back in. This is
         # the single biggest fidelity win - "what is missing" is a far easier question
         # for the model than "summarise well".
-        gaps = normalise_identifiers((await self._call(
-            GAP_INSTRUCTION
-            + "\n<summary>\n" + summary + "\n</summary>"
-            + "\n\n<original>\n" + chunk + "\n</original>\n"
-        )).strip())
+        # The gap pass is a quality improvement: the summary is usable without it, so it
+        # yields to anything a turn is blocked on.
+        previous, self._priority = self._priority, "background"
+        try:
+            gaps = normalise_identifiers((await self._call(
+                GAP_INSTRUCTION
+                + "\n<summary>\n" + summary + "\n</summary>"
+                + "\n\n<original>\n" + chunk + "\n</original>\n"
+            )).strip())
+        finally:
+            self._priority = previous
         if gaps and gaps.upper().strip().rstrip(".") != "NONE":
             summary = summary + "\nAdditional details:\n" + gaps
         return summary
