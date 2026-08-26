@@ -199,8 +199,20 @@ class Settings:
     # Stream the bridge's own helper calls instead of buffering them. A buffered call
     # holds a connection while the server composes the whole reply; a fan-out of those
     # is what saturates Agentaus. Streaming drains sooner and shows progress.
+    # Off by default. Streaming a helper reply is sound in principle and returns first
+    # bytes sooner, but an unattended fan-out found the failure mode: a stalled stream
+    # holds its socket with nothing flowing, and the read timeout is sized for a main
+    # turn, so the call sat for as long as the timeout allowed. Six of those and a batch
+    # run stops making any upstream calls at all while looking perfectly healthy.
+    # Enable it once the timeout below has been exercised under load.
     agentaus_stream_helpers: bool = field(
-        default_factory=lambda: _bool("AGENTAUS_STREAM_HELPERS", True)
+        default_factory=lambda: _bool("AGENTAUS_STREAM_HELPERS", False)
+    )
+    # Hard ceiling on ONE bridge-initiated call, streamed or buffered. The main turn's
+    # read timeout is deliberately generous; a helper that inherits it can hang a whole
+    # run behind a socket that will never speak again.
+    agentaus_helper_timeout_seconds: float = field(
+        default_factory=lambda: _float("AGENTAUS_HELPER_TIMEOUT", 240.0)
     )
     agentaus_max_concurrency: int = field(
         default_factory=lambda: _int("AGENTAUS_MAX_CONCURRENCY", 6)

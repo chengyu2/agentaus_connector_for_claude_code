@@ -287,6 +287,82 @@ def review_says_ok(review: str) -> bool:
     return cleaned.startswith("OK") and len(cleaned) < 40
 
 
+# Phrasings Agentaus uses when it declines to use tools it was given. It is not
+# refusing on policy grounds - it is asserting, wrongly, that it has no filesystem. The
+# tools were on the wire and the working directory was in the prompt.
+# Asking the user to hand over content the model could have fetched. These need no
+# further context: the request itself IS the failure, whatever noun follows.
+_ASKS_USER_TO_SUPPLY = (
+    "please provide the",
+    "please upload",
+    "please paste",
+    "please share the",
+    "if you can provide",
+    "if you provide the",
+    "could you please provide",
+    "could you please upload",
+    "you can provide the",
+    "provide the relevant excerpt",
+)
+
+# Claiming it has no filesystem. Ambiguous alone - "I don't have access to next year's
+# budget" is a legitimate answer about the world - so these require a context word too.
+_DENIES_CAPABILITY = (
+    "don't have the ability",
+    "do not have the ability",
+    "don't have access to",
+    "do not have access to",
+    "unable to access",
+    "cannot access",
+    "can't access",
+    "unable to retrieve",
+    "cannot retrieve",
+    "unable to read",
+    "no ability to browse",
+)
+
+_REFUSAL_CONTEXT = (
+    "file", "path", "directory", "document", "local", "filesystem", "file system",
+    "repository", "folder", "docx", "pdf", "excerpt", "upload",
+)
+
+
+def looks_like_tool_refusal(text: str) -> bool:
+    """Whether an answer is the model declining to use tools it actually has.
+
+    Observed on roughly half of a batch run: "I can't complete this request because I
+    don't have the ability to search or retrieve content from local file system paths",
+    with `agentaus_search` on the wire and the working directory in the prompt. The
+    other half of the same run answered every row correctly, so this is not a capability
+    limit - it is a persona the bridge has to talk it out of.
+    """
+    if not text:
+        return False
+    # Only the opening matters. A long answer that hedges somewhere in the middle is an
+    # answer, not a refusal to act.
+    lowered = text[:2000].lower()
+    if any(phrase in lowered for phrase in _ASKS_USER_TO_SUPPLY):
+        return True
+    if any(phrase in lowered for phrase in _DENIES_CAPABILITY):
+        return any(word in lowered for word in _REFUSAL_CONTEXT)
+    return False
+
+
+REFUSAL_CORRECTION = """\
+<correction>
+That is not true, and it was not the question.
+
+You DO have tools, they are listed in your system prompt, and they run on this machine
+right now. `agentaus_search` and `agentaus_zoom` read the local filesystem directly. The
+absolute path you were given is real and readable.
+
+Nobody is going to paste or upload anything for you. Call the tool.
+
+Start over and follow the task exactly as it was given.
+</correction>
+"""
+
+
 def worth_reviewing_turn(body: dict) -> bool:
     """Whether this turn's answer can be fairly reviewed at all.
 

@@ -31,12 +31,14 @@ from .augment import (
     REVISE_INSTRUCTION,
     declared_verdict,
     plan_prompt,
+    looks_like_tool_refusal,
     should_think,
     working_directory,
     with_guidance,
     with_plan,
     worth_reviewing,
     worth_reviewing_turn,
+    REFUSAL_CORRECTION,
 )
 from .compact import ConversationCompactor
 from .distill import ResultDistiller
@@ -408,6 +410,22 @@ async def _agentaus_summarise(client: httpx.AsyncClient, text: str) -> str:
     }
     started_at = time.monotonic()
 
+    limit = settings.agentaus_helper_timeout_seconds
+    if limit > 0:
+        try:
+            return await asyncio.wait_for(
+                _helper_call(client, payload, text, started_at), timeout=limit
+            )
+        except asyncio.TimeoutError:
+            rlog(logging.WARNING, "helper call exceeded %.0fs and was abandoned", limit)
+            raise RuntimeError(f"helper call timed out after {limit:.0f}s")
+    return await _helper_call(client, payload, text, started_at)
+
+
+async def _helper_call(
+    client: httpx.AsyncClient, payload: dict, text: str, started_at: float
+) -> str:
+    """One helper call, streamed or buffered. Bounded by the caller."""
     if payload["stream"]:
         # Streamed rather than buffered. A buffered helper call holds a connection open
         # while the server composes the entire reply, and a fan-out of those is what
@@ -1486,6 +1504,23 @@ async def _agentaus_event_stream(
                      len("".join(pending)))
             pending = []
             continue
+        # A turn that used no tools and claims it has none is not an answer. Re-ask
+        # rather than forwarding it: the tools were on the wire the whole time.
+        if (
+            not mine and not theirs and known
+            and corrections < settings.agentaus_correction_rounds
+            and looks_like_tool_refusal("".join(pending))
+        ):
+            corrections += 1
+            rlog(logging.WARNING,
+                 "model refused to use tools it has; correcting and re-asking")
+            payload = {**payload, "messages": list(payload.get("messages") or []) + [
+                {"role": "assistant", "content": "".join(pending)[:2000]},
+                {"role": "user", "content": REFUSAL_CORRECTION},
+            ]}
+            pending = []
+            continue
+
         if mine:
             # Out of rounds. These must not be emitted: Claude Code has never heard of
             # `agentaus_search` and would fail the tool_use rather than run it.
