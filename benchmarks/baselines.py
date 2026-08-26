@@ -37,8 +37,22 @@ LOCAL_ONLY = {
 }
 
 
+# Above this, a HumanEval score says more about the dataset than about the model.
+# HumanEval was published in 2021 and has been scraped into essentially every training
+# corpus since. A mid-tier model scoring at or above the frontier tier on it is the
+# expected signature of contamination, not evidence of frontier capability - and quoting
+# it as capability is how benchmark numbers stop meaning anything.
+_IMPLAUSIBLE = 0.93
+
+
 def bracket(score: float) -> str:
-    """Where a measured pass@1 sits among the reference points."""
+    """Where a measured pass@1 sits, and a warning when it sits too high to believe."""
+    if score >= _IMPLAUSIBLE:
+        return (f"{score:.3f} - ABOVE the frontier reference. Read this as a CONTAMINATION "
+                f"SIGNAL, not as capability: HumanEval is from 2021 and is in every "
+                f"training corpus. Do not quote it as a capability result. The suites that "
+                f"still discriminate here are retrieval and injection, whose cases were "
+                f"written after the fact and cannot have been trained on.")
     for label, value, _note in HUMANEVAL:
         if score >= value - 0.05:
             return label

@@ -1,0 +1,30 @@
+{
+ "agentaus": {
+  "humaneval": {
+   "suite": "humaneval",
+   "n": 164,
+   "solved": 161,
+   "pass_at_1": 0.9817073170731707,
+   "failures": [
+    [
+     "HumanEval/100",
+     "SyntaxError: closing parenthesis ']' does not match opening parenthesis '('"
+    ],
+    [
+     "HumanEval/116",
+     "AssertionError"
+    ],
+    [
+     "HumanEval/145",
+     "AssertionError"
+    ]
+   ],
+   "wall_seconds": 1004.566347375,
+   "calls": 164,
+   "call_failures": 0,
+   "input_tokens": 141102,
+   "output_tokens": 84722,
+   "median_call_seconds": 5.255027333000001
+  }
+ }
+}
