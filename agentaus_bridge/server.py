@@ -321,13 +321,33 @@ async def _sleep_before_retry(attempt: int, why: str) -> None:
     await asyncio.sleep(delay)
 
 
+# Gateway timeouts are in _RETRYABLE_STATUS because a busy gateway often succeeds on a
+# second try. That is true of a small request and false of a large one: if the origin
+# could not finish this prompt in time, it will not finish the identical prompt in time
+# either. Replaying it costs the timeout again and changes nothing.
+#
+# Observed: a zoom condensation 524'd and was replayed four times, roughly two minutes
+# apart - eight minutes spent to arrive back where it started, while the caller had a
+# perfectly good fallback it could have used immediately.
+_CAPACITY_STATUS = {504, 520, 522, 524}
+
+
 async def _post_with_retry(
-    client: httpx.AsyncClient, url: str, *, json_body: dict, headers: dict
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    json_body: dict,
+    headers: dict,
+    retry_capacity: bool = True,
 ) -> httpx.Response:
     """POST, retrying transient connection faults and gateway status codes.
 
     Only used for buffered (non-streaming) requests, where replaying costs nothing
     because no bytes have been handed to the client yet.
+
+    `retry_capacity=False` surfaces a gateway timeout immediately instead of replaying
+    it. Callers that can make the request smaller - split a chunk, truncate a passage,
+    recompact a conversation - want the failure now, not four timeouts later.
     """
     last_exc: Exception | None = None
     for attempt in range(settings.max_retries + 1):
@@ -339,6 +359,13 @@ async def _post_with_retry(
                 raise
             await _sleep_before_retry(attempt, _describe(exc))
             continue
+
+        if not retry_capacity and response.status_code in _CAPACITY_STATUS:
+            await response.aread()
+            rlog(logging.WARNING,
+                 "HTTP %d on a helper call; surfacing it rather than replaying the same "
+                 "prompt", response.status_code)
+            return response
 
         if response.status_code in _RETRYABLE_STATUS and attempt < settings.max_retries:
             await response.aread()  # release the connection before sleeping
@@ -441,7 +468,8 @@ async def _helper_call(
             payload = {**payload, "stream": False}
 
     response = await _post_with_retry(
-        client, settings.agentaus_url, json_body=payload, headers=_agentaus_headers()
+        client, settings.agentaus_url, json_body=payload, headers=_agentaus_headers(),
+        retry_capacity=False,
     )
     if response.status_code >= 400:
         rlog(logging.WARNING, "helper call failed HTTP %d after %.1fs",

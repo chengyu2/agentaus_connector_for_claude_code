@@ -967,13 +967,18 @@ async def run_zoom(
         log.info("zoom %s:%d-%d -> %d line(s) verbatim", file_path, start, end, hi - lo)
         return header + numbered
 
+    prompt = ZOOM_INSTRUCTION.format(
+        path=file_path, start=lo + 1, end=hi, body=numbered,
+        purpose=purpose or "understand this passage well enough to quote it accurately",
+    )
     try:
         async with hold("zoom", "urgent"):
-            kept = await call(ZOOM_INSTRUCTION.format(
-                path=file_path, start=lo + 1, end=hi, body=numbered,
-                purpose=purpose or "understand this passage well enough to quote it accurately",
-            ))
+            kept = await call(prompt)
     except Exception as exc:
+        # Truncating verbatim is a better answer than a condensation that never arrives,
+        # and the learned ceiling is told about it so the next caller aims lower.
+        if is_capacity_failure(exc):
+            note_capacity_failure(count_tokens(prompt))
         log.warning("zoom condensation failed (%s); truncating instead", exc)
         budget = settings.agentaus_zoom_max_tokens * 4
         return header + numbered[:budget] + "\n[truncated: the section is larger than the limit]"

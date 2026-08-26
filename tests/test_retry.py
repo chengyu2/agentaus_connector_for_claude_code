@@ -361,3 +361,94 @@ class TestTimeoutIsTreatedAsTooBig(unittest.TestCase):
         text = "The engine prompt length 224662 exceeds the max_model_len 131072"
         self.assertTrue(_is_over_length(text))
         self.assertFalse(_is_too_slow(text), "the two signals must stay distinguishable")
+
+
+class TestCapacityFailuresAreNotReplayed(unittest.TestCase):
+    """A gateway timeout on a large prompt is not a transient blip.
+
+    524 sits in _RETRYABLE_STATUS because a busy gateway often succeeds on a second try.
+    That holds for a small request and fails for a large one: if the origin could not
+    finish this prompt in time, it will not finish the identical prompt in time either.
+
+    Observed: a zoom condensation 524'd and was replayed four times, about two minutes
+    apart - eight minutes to arrive back where it started, while the caller had a
+    perfectly good fallback available immediately.
+    """
+
+    def test_capacity_statuses_are_named_separately_from_retryable_ones(self):
+        from agentaus_bridge.server import _CAPACITY_STATUS, _RETRYABLE_STATUS
+        self.assertTrue(_CAPACITY_STATUS <= _RETRYABLE_STATUS,
+                        "a capacity status must still be retryable for small requests")
+        self.assertIn(524, _CAPACITY_STATUS)
+        self.assertNotIn(429, _CAPACITY_STATUS,
+                         "rate limiting IS worth replaying; it is not a capacity failure")
+        self.assertNotIn(500, _CAPACITY_STATUS)
+
+    def test_a_helper_call_surfaces_a_524_on_the_first_attempt(self):
+        import asyncio
+
+        from agentaus_bridge import server
+
+        class _Always524:
+            def __init__(self):
+                self.attempts = 0
+
+            async def post(self, url, *, json=None, headers=None):  # noqa: A002
+                self.attempts += 1
+
+                class _R:
+                    status_code = 524
+                    text = "origin timed out"
+
+                    async def aread(self):
+                        return b""
+
+                return _R()
+
+        client = _Always524()
+        loop = asyncio.new_event_loop()
+        try:
+            response = loop.run_until_complete(server._post_with_retry(
+                client, "http://x", json_body={}, headers={}, retry_capacity=False))
+        finally:
+            loop.close()
+        self.assertEqual(response.status_code, 524)
+        self.assertEqual(client.attempts, 1,
+                         f"the same oversized prompt was replayed {client.attempts} times")
+
+    def test_the_main_turn_still_retries_a_524(self):
+        """The main turn has no smaller version to fall back to, so replaying is all
+        it has - and a busy gateway does often succeed on a second attempt."""
+        import asyncio
+
+        from agentaus_bridge import server
+        from agentaus_bridge.config import settings
+
+        class _Flaky:
+            def __init__(self):
+                self.attempts = 0
+
+            async def post(self, url, *, json=None, headers=None):  # noqa: A002
+                self.attempts += 1
+                code = 524 if self.attempts == 1 else 200
+
+                class _R:
+                    status_code = code
+
+                    async def aread(self):
+                        return b""
+
+                return _R()
+
+        client = _Flaky()
+        previous = settings.retry_backoff_seconds
+        settings.retry_backoff_seconds = 0.001
+        loop = asyncio.new_event_loop()
+        try:
+            response = loop.run_until_complete(server._post_with_retry(
+                client, "http://x", json_body={}, headers={}))
+        finally:
+            loop.close()
+            settings.retry_backoff_seconds = previous
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(client.attempts, 2)
