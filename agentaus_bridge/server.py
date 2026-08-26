@@ -872,6 +872,9 @@ async def _agentaus_event_stream(
                 ) as upstream:
                     if upstream.status_code >= 400:
                         detail = (await upstream.aread()).decode("utf-8", "replace")[:500]
+                        rlog(logging.WARNING,
+                             "agentaus rejected the streamed request: HTTP %d %s",
+                             upstream.status_code, detail)
                         if (
                             _is_over_length(detail)
                             and refit is not None
@@ -1173,6 +1176,11 @@ def _error_response(status: int, error_type: str, message: str) -> JSONResponse:
 
 
 def _upstream_error_response(status: int, text: str) -> JSONResponse:
+    # Log the body, not just the status. httpx already logs "HTTP/1.1 400 Bad Request"
+    # and stops there, so a rejection that is not about prompt length leaves no trace
+    # of its cause - which is precisely the case a malformed-request bug presents as.
+    rlog(logging.WARNING, "agentaus rejected the request: HTTP %d %s",
+         status, (text or "")[:1000])
     return _error_response(
         status, _error_type_for_status(status), f"Agentaus error: {text[:500]}"
     )

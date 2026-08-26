@@ -81,6 +81,39 @@ class TestSplit(unittest.TestCase):
             self.assertFalse(any(b.get("type") == "tool_result" for b in first["content"]),
                              "tail begins with an orphaned tool_result")
 
+    def test_tail_is_clean_when_the_conversation_ends_mid_tool_loop(self):
+        """The boundary must go backwards when there is no clean turn ahead of it.
+
+        Compaction usually fires on a user's message, so the newest message is a clean
+        turn and the tail can start there. Fire it on a tool result instead - the model
+        called a tool, the result came back large enough to tip the window - and every
+        message from the boundary on is part of an exchange that has not closed. Walking
+        forward settles on the `tool_result`, whose `tool_use` is now in the summarised
+        head, and Agentaus answers 400 with no explanation.
+        """
+        messages = [{"role": "user", "content": "old " * 500},
+                    {"role": "assistant", "content": "older reply"}]
+        messages += [
+            {"role": "user", "content": "read those files"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "x" * 40000}]},
+        ]
+
+        head, tail = split_head_tail(messages, 50)
+
+        self.assertTrue(head, "nothing was summarised")
+        first = tail[0]
+        self.assertEqual(first["role"], "user")
+        if isinstance(first.get("content"), list):
+            self.assertFalse(
+                any(b.get("type") == "tool_result" for b in first["content"]),
+                "tail begins with a tool_result whose tool_use went into the head",
+            )
+        # The tool_use answering the kept tool_result has to travel with it.
+        self.assertIn("t1", json.dumps(tail), "tool_use was separated from its result")
+
     def test_head_and_tail_together_are_the_original(self):
         messages = convo(10)
         head, tail = split_head_tail(messages, 400)

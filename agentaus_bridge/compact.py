@@ -153,6 +153,10 @@ def split_head_tail(
     then extends further until it starts on a clean turn. The newest message is always
     in the tail: it is the one being answered.
 
+    "Until it starts on a clean turn" usually means moving the boundary forward, which
+    keeps the tail small. When compaction lands mid-tool-loop there is no clean turn
+    ahead to move to, and the boundary has to go backwards instead - see below.
+
     `block` snaps the boundary up to a multiple of that many messages. Without it the
     boundary advances by roughly one turn every turn, so the summary of the head is
     keyed on something that changes constantly and the cache never hits - every single
@@ -178,9 +182,23 @@ def split_head_tail(
         snapped = ((idx + block - 1) // block) * block
         idx = min(snapped, len(messages) - 1)
 
-    # Walk the boundary forward until the tail opens on a clean user turn.
-    while idx < len(messages) - 1 and not _clean_turn_start(messages[idx]):
-        idx += 1
+    # The tail must open on a clean user turn. Prefer the nearest one at or after the
+    # boundary, because moving forward keeps the tail small.
+    forward = idx
+    while forward < len(messages) and not _clean_turn_start(messages[forward]):
+        forward += 1
+
+    if forward < len(messages):
+        idx = forward
+    else:
+        # Nothing clean ahead: the conversation ends mid-tool-loop, so every message
+        # from the boundary on belongs to an exchange that has not closed. Stopping at
+        # the last message would open the tail on a `tool_result` whose `tool_use` had
+        # just gone into the head, and Agentaus rejects that with a bare 400 - no
+        # mention of prompt length, because length is not the problem. Walk back to the
+        # last clean turn instead: it keeps the pair whole for a slightly larger tail.
+        while idx > 0 and not _clean_turn_start(messages[idx]):
+            idx -= 1
     return messages[:idx], messages[idx:]
 
 
@@ -498,13 +516,21 @@ class ConversationCompactor:
 
         # Summary absent or still too large: drop the head outright. Worse, but it
         # keeps the turn alive, which is the whole point.
-        kept = tail
+        kept = list(tail)
         dropped = len(head)
-        while len(kept) > 1 and total(kept) > limit:
-            kept.pop(0)
-            dropped += 1
-            while len(kept) > 1 and not _clean_turn_start(kept[0]):
-                kept.pop(0)
-                dropped += 1
+        while total(kept) > limit:
+            # Drop a whole turn at a time. Popping message by message is what lets the
+            # list end up opening on a `tool_result` whose `tool_use` has just been
+            # dropped, so advance to the next clean turn or stop.
+            nxt = 1
+            while nxt < len(kept) and not _clean_turn_start(kept[nxt]):
+                nxt += 1
+            if nxt >= len(kept):
+                # Only the unfinished trailing exchange is left. Cutting into it would
+                # orphan a tool_result, which fails the turn outright; going over the
+                # limit only might, and Agentaus is the authority on that.
+                break
+            kept = kept[nxt:]
+            dropped += nxt
         return {"messages": kept, "summary": None, "summarised": 0,
                 "method": "trimmed", "dropped": dropped}
