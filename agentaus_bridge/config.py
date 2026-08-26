@@ -196,6 +196,12 @@ class Settings:
     # 12, and the number that matters is how hard the bridge hits one upstream.
     #
     # The user's own turn is deliberately NOT gated - see gate.py.
+    # Stream the bridge's own helper calls instead of buffering them. A buffered call
+    # holds a connection while the server composes the whole reply; a fan-out of those
+    # is what saturates Agentaus. Streaming drains sooner and shows progress.
+    agentaus_stream_helpers: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_STREAM_HELPERS", True)
+    )
     agentaus_max_concurrency: int = field(
         default_factory=lambda: _int("AGENTAUS_MAX_CONCURRENCY", 6)
     )
@@ -281,19 +287,21 @@ class Settings:
     agentaus_tool_ledger_limit: int = field(
         default_factory=lambda: _int("AGENTAUS_TOOL_LEDGER_LIMIT", 40)
     )
-    # Tokens of file content per search call. Measured on a 434 KB tender document,
-    # searching for facts known to be in it (ISO 27001, IRAP, Essential 8, classification):
+    # Tokens of file content per search call. Agentaus has a 131k window and a helper
+    # call carries no system prompt, so most of that window was going unused - and the
+    # cost of NOT using it is not latency, it is call volume. Measured on an 89,579-token
+    # tender document, searching for facts known to be in it:
     #
-    #   4000 tok  ->  48s, 16 calls, 6740 chars of evidence, all facts found
-    #   8000 tok  ->  29s, 10 calls, 3184 chars, all facts found
-    #  16000 tok  ->  22s,  4 calls, 1333 chars, all facts found
+    #    8000 tok  ->  25s, 10 calls, 2676 chars of evidence, 5/5 facts found
+    #   48000 tok  ->  23s,  4 calls, 1782 chars,             5/5 facts found
     #
-    # Every size found every fact, so the trade is cost against how much gets quoted
-    # back: bigger chunks mean each call summarises more and quotes less. 8000 halves
-    # the cost of 4000 while keeping the detail. Going much further also risks the
-    # Cloudflare 524 that a 32k summarisation chunk once produced.
+    # Same wall-clock and same recall for 60% fewer calls. That matters because the real
+    # failure mode is saturating Agentaus: three concurrent searches at 8k queue ~30
+    # requests behind a cap of 6 and the whole run stalls, which is how a batch job came
+    # to make no progress at all. Bigger chunks quote less back per hit, so this is a
+    # trade - but fewer, larger requests are markedly kinder to a busy upstream.
     agentaus_search_chunk_tokens: int = field(
-        default_factory=lambda: _int("AGENTAUS_SEARCH_CHUNK_TOKENS", 8000)
+        default_factory=lambda: _int("AGENTAUS_SEARCH_CHUNK_TOKENS", 48000)
     )
     # Ceiling on calls for one search. Truncation is reported in the result and logged -
     # a silent cap reads as full coverage, which is worse than a stated partial one.

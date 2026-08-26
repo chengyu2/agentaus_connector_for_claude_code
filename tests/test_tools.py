@@ -327,24 +327,50 @@ class TestChunkLevelPrefilter(unittest.TestCase):
     """
 
     def test_chunks_without_a_term_are_not_read(self):
-        # One file, many chunks, the term in only one of them.
-        body = ("filler paragraph about unrelated matters\n" * 400
-                + "the SEMAPHORE lives here\n"
-                + "more filler about other things entirely\n" * 400)
-        with _Tree({"big.md": body}) as tree:
-            call = responder(terms="SEMAPHORE", hit_on="big.md", answer="found")
-            run(tools.run_search("where is the cap", tree.path, None, call))
-        chunk_prompts = [p for p in call.seen if "<excerpt file=" in p]
-        self.assertGreaterEqual(len(chunk_prompts), 1)
-        self.assertLessEqual(len(chunk_prompts), 3,
-                             "every chunk was read despite only one containing the term")
+        """Enough hits to clear the min_candidates floor, so the filter really applies.
+
+        With fewer than `agentaus_search_min_candidates` matching chunks the fallback
+        correctly reads everything - so a fixture with a single hit tests the fallback,
+        not the filter.
+        """
+        filler = "filler paragraph about unrelated matters\n" * 60
+        # 20 chunk-sized blocks; the term appears in 4 of them.
+        body = "".join(
+            (filler + "the SEMAPHORE lives here\n") if i % 5 == 0 else filler
+            for i in range(20)
+        )
+        previous = settings.agentaus_search_chunk_tokens
+        settings.agentaus_search_chunk_tokens = 600
+        try:
+            with _Tree({"big.md": body}) as tree:
+                call = responder(terms="SEMAPHORE", hit_on="big.md", answer="found")
+                run(tools.run_search("where is the cap", tree.path, None, call))
+        finally:
+            settings.agentaus_search_chunk_tokens = previous
+
+        read = [p for p in call.seen if "<excerpt file=" in p]
+        with_term = [p for p in read if "SEMAPHORE" in p]
+        self.assertGreaterEqual(len(read), 3, "the filter dropped everything")
+        self.assertLess(len(read), 20, f"read {len(read)} chunks; the filter did nothing")
+        self.assertEqual(len(read), len(with_term),
+                         "it read chunks that contain none of the terms")
 
     def test_too_few_matching_chunks_still_reads_everything(self):
-        """The needle property must survive: absent words are not an absent answer."""
-        body = "alpha beta gamma\n" * 3000
-        with _Tree({"big.md": body}) as tree:
-            call = responder(terms="zzznotpresent", hit_on="big.md", answer="found")
-            run(tools.run_search("what is here", tree.path, None, call))
+        """The needle property must survive: absent words are not an absent answer.
+
+        Chunk size is pinned rather than inherited: the default is sized for real
+        corpora, and at 48k tokens this whole fixture is one chunk - which would pass
+        the assertion for the wrong reason.
+        """
+        previous = settings.agentaus_search_chunk_tokens
+        settings.agentaus_search_chunk_tokens = 2000
+        try:
+            body = "alpha beta gamma\n" * 3000
+            with _Tree({"big.md": body}) as tree:
+                call = responder(terms="zzznotpresent", hit_on="big.md", answer="found")
+                run(tools.run_search("what is here", tree.path, None, call))
+        finally:
+            settings.agentaus_search_chunk_tokens = previous
         chunk_prompts = [p for p in call.seen if "<excerpt file=" in p]
         self.assertGreater(len(chunk_prompts), 1, "the fallback did not read everything")
 

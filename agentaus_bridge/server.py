@@ -403,10 +403,25 @@ async def _agentaus_summarise(client: httpx.AsyncClient, text: str) -> str:
     """
     payload = {
         "messages": [{"role": "user", "content": text}],
-        "stream": False,
+        "stream": settings.agentaus_stream_helpers,
         "system_prompt_overwrite": True,
     }
     started_at = time.monotonic()
+
+    if payload["stream"]:
+        # Streamed rather than buffered. A buffered helper call holds a connection open
+        # while the server composes the entire reply, and a fan-out of those is what
+        # saturates Agentaus - a batch run once queued ~135 of them and stopped making
+        # progress at all. Streaming returns the first bytes as they are generated, so a
+        # slow reply stops looking like a dead one and the connection drains sooner.
+        try:
+            return await _stream_helper(client, payload, text, started_at)
+        except (httpx.HTTPError, RuntimeError) as exc:
+            # Falling back rather than failing: a streaming fault must not cost the
+            # caller its summary when the buffered path still works.
+            rlog(logging.WARNING, "streamed helper call failed (%s); retrying buffered", exc)
+            payload = {**payload, "stream": False}
+
     response = await _post_with_retry(
         client, settings.agentaus_url, json_body=payload, headers=_agentaus_headers()
     )
@@ -421,6 +436,47 @@ async def _agentaus_summarise(client: httpx.AsyncClient, text: str) -> str:
         _learn_limit_from(str(data["error"].get("message") or ""))
         raise RuntimeError(str(data["error"].get("message"))[:200])
     return ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+
+
+async def _stream_helper(
+    client: httpx.AsyncClient, payload: dict, text: str, started_at: float
+) -> str:
+    """Consume a streamed helper reply and return the assembled content."""
+    parts: list[str] = []
+    first_byte = 0.0
+    async with client.stream(
+        "POST", settings.agentaus_url, json=payload, headers=_agentaus_headers()
+    ) as upstream:
+        if upstream.status_code >= 400:
+            detail = (await upstream.aread()).decode("utf-8", "replace")[:300]
+            _learn_limit_from(detail)
+            raise RuntimeError(f"HTTP {upstream.status_code}: {detail}")
+        async for line in upstream.aiter_lines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            body = line[5:].strip()
+            if body == "[DONE]":
+                break
+            try:
+                chunk = json.loads(body)
+            except json.JSONDecodeError:
+                continue
+            # Agentaus reports some failures as HTTP 200 with an error object inside the
+            # stream; without this the reply looks empty and successful.
+            if isinstance(chunk.get("error"), dict):
+                message = str(chunk["error"].get("message") or "")
+                _learn_limit_from(message)
+                raise RuntimeError(message[:200] or "error inside the helper stream")
+            for choice in chunk.get("choices") or []:
+                piece = (choice.get("delta") or {}).get("content")
+                if piece:
+                    if not parts:
+                        first_byte = time.monotonic() - started_at
+                    parts.append(piece)
+    rlog(logging.DEBUG, "helper stream ok in %.1fs (first byte %.1fs, %d chars in)",
+         time.monotonic() - started_at, first_byte, len(text))
+    return "".join(parts)
 
 
 async def _self_review(client: httpx.AsyncClient, request_text: str, answer: str) -> str:
