@@ -52,7 +52,7 @@ def responder(*, terms: str = "semaphore\nconcurrency", hit_on: str = "", answer
 
     async def call(prompt: str) -> str:
         seen.append(prompt)
-        if prompt.startswith("A developer is searching"):
+        if "<question>" in prompt and "<excerpt" not in prompt and "list the literal strings" in prompt.lower():
             return terms
         if hit_on and hit_on in prompt:
             return answer
@@ -92,7 +92,7 @@ class TestSearchFindsWhatRegexCannot(unittest.TestCase):
             out = run(tools.run_search("what does it return", tree.path, None, call))
 
         self.assertIn("b.py", out)
-        chunk_prompts = [p for p in call.seen if p.startswith("Below is an excerpt")]
+        chunk_prompts = [p for p in call.seen if "<excerpt file=" in p]
         self.assertEqual(len(chunk_prompts), 2, "brute force did not read every file")
 
 
@@ -134,7 +134,7 @@ class TestResultsAreReportedHonestly(unittest.TestCase):
         """
         with _Tree({"a.py": "x = 1\n"}) as tree:
             async def call(prompt: str) -> str:
-                if prompt.startswith("A developer is searching"):
+                if "<question>" in prompt and "<excerpt" not in prompt and "list the literal strings" in prompt.lower():
                     return "x"
                 return "1: see $$retry_budget_ms$$ in EU‑WEST‑2"
             out = run(tools.run_search("where is x", tree.path, None, call))
@@ -197,7 +197,7 @@ class TestConcurrency(unittest.TestCase):
         in_flight = {"now": 0, "peak": 0}
 
         async def slow(prompt: str) -> str:
-            if prompt.startswith("A developer is searching"):
+            if "<question>" in prompt and "<excerpt" not in prompt and "list the literal strings" in prompt.lower():
                 return "value"
             in_flight["now"] += 1
             in_flight["peak"] = max(in_flight["peak"], in_flight["now"])

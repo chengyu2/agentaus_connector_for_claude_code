@@ -59,7 +59,9 @@ class TestWhenThinkingRuns(unittest.TestCase):
 
     def test_the_plan_prompt_names_the_tools_actually_available(self):
         prompt = plan_prompt("fix it", {"tools": [{"name": "Read"}, {"name": "Bash"}]})
-        self.assertIn("Read, Bash", prompt)
+        self.assertIn('<tool name="Read">', prompt)
+        self.assertIn('<tool name="Bash">', prompt)
+        self.assertIn("<tools_available>", prompt)
         self.assertIn("fix it", prompt)
 
     def test_an_empty_plan_leaves_the_system_prompt_alone(self):
@@ -185,12 +187,51 @@ class TestBridgeToolsNeverReachTheClient(unittest.TestCase):
         self.assertEqual(len(body["tools"]), 1)
 
     def test_calls_are_split_by_owner(self):
-        mine, theirs = _partition_tool_calls([
+        mine, theirs, invented = _partition_tool_calls([
             {"id": "1", "name": tools.SEARCH_TOOL, "arguments": "{}"},
             {"id": "2", "name": "Read", "arguments": "{}"},
-        ])
+        ], {"Read", tools.SEARCH_TOOL})
         self.assertEqual([c["id"] for c in mine], ["1"])
         self.assertEqual([c["id"] for c in theirs], ["2"])
+        self.assertEqual(invented, [])
+
+    def test_a_tool_the_model_made_up_is_caught(self):
+        """Observed on the first live Agentaus turn: it answered a search by calling
+        `open_file`, which nobody had offered it. Passing that to Claude Code fails a
+        tool_use for a tool that does not exist, and the turn dies looking like a
+        bridge fault."""
+        mine, theirs, invented = _partition_tool_calls([
+            {"id": "1", "name": "open_file", "arguments": "{}"},
+            {"id": "2", "name": "Read", "arguments": "{}"},
+        ], {"Read", tools.SEARCH_TOOL})
+        self.assertEqual(mine, [])
+        self.assertEqual([c["id"] for c in theirs], ["2"])
+        self.assertEqual([c["id"] for c in invented], ["1"])
+
+    def test_nothing_is_called_invented_when_the_offered_set_is_unknown(self):
+        """Without the list actually sent upstream, nothing can be judged invented -
+        so the check is skipped rather than guessed at."""
+        mine, theirs, invented = _partition_tool_calls(
+            [{"id": "1", "name": "whatever", "arguments": "{}"}], set())
+        self.assertEqual(invented, [])
+        self.assertEqual([c["id"] for c in theirs], ["1"])
+
+    def test_the_correction_names_the_real_tools(self):
+        from agentaus_bridge.server import _correction_for
+        text = _correction_for({"name": "open_file"}, {"Read", "Grep"})
+        self.assertIn("open_file", text)
+        self.assertIn("Grep, Read", text)
+        self.assertIn("invented", text)
+
+    def test_known_names_come_from_the_payload_actually_sent(self):
+        from agentaus_bridge.server import _known_tool_names
+        self.assertEqual(
+            _known_tool_names({"tools": [
+                {"type": "function", "function": {"name": "Read"}},
+                {"type": "function", "function": {"name": "agentaus_search"}},
+            ]}),
+            {"Read", "agentaus_search"},
+        )
 
     def test_an_unanswered_bridge_call_is_stripped_from_the_response(self):
         """Out of tool rounds, the pending call must not be surfaced: Claude Code has
@@ -284,7 +325,7 @@ class TestTheInnerToolLoop(unittest.IsolatedAsyncioTestCase):
 
         upstream = _ScriptedAgentaus()
 
-        async def fake_search(name, arguments, call):
+        async def fake_search(name, arguments, call, default_path=None):
             return "gate.py:12  _gate = asyncio.Semaphore(6)"
 
         previous = settings.agentaus_self_review
@@ -356,3 +397,42 @@ class TestTheInnerToolLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(upstream.bodies), 1, "a client tool must not be re-asked")
         self.assertIn("tool_use", raw)
         self.assertIn("Read", raw)
+
+
+class TestNameResolution(unittest.TestCase):
+    """A model that spells a tool name carelessly has not invented a tool.
+
+    Observed live: a turn spent one of its three tool rounds being corrected from `read`
+    to `Read`. That is the same tool, and burning a round on it left nothing for the
+    work the rounds were for.
+    """
+
+    def setUp(self):
+        from agentaus_bridge.server import _canonical
+        self.canonical = _canonical
+        self.known = {"Read", "Grep", "agentaus_search"}
+
+    def test_case_is_forgiven(self):
+        self.assertEqual(self.canonical("read", self.known), "Read")
+        self.assertEqual(self.canonical("GREP", self.known), "Grep")
+
+    def test_separators_are_forgiven(self):
+        self.assertEqual(self.canonical("agentaus-search", self.known), "agentaus_search")
+        self.assertEqual(self.canonical("agentaussearch", self.known), "agentaus_search")
+
+    def test_an_exact_name_passes_straight_through(self):
+        self.assertEqual(self.canonical("Read", self.known), "Read")
+
+    def test_a_genuinely_invented_name_is_not_rescued(self):
+        """`open_file` is not a misspelling of anything offered - it was made up."""
+        self.assertIsNone(self.canonical("open_file", self.known))
+
+    def test_a_resolved_call_is_routed_by_its_canonical_name(self):
+        mine, theirs, invented = _partition_tool_calls(
+            [{"id": "1", "name": "AGENTAUS_SEARCH", "arguments": "{}"}],
+            {"Read", tools.SEARCH_TOOL},
+        )
+        self.assertEqual(invented, [])
+        self.assertEqual(theirs, [])
+        self.assertEqual(mine[0]["name"], tools.SEARCH_TOOL,
+                         "a resolved name must be rewritten, or the dispatcher misses it")

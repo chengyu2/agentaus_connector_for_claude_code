@@ -20,6 +20,8 @@ applying it where there is no gap would only add latency and noise.
 
 from __future__ import annotations
 
+import re
+
 # Appended to Claude Code's own system prompt, not a replacement for it. Kept short:
 # every token here is one less available for the conversation, and a long list of
 # instructions is itself something a smaller model handles badly.
@@ -78,6 +80,19 @@ output, read it and interpret it properly. Do not pattern-match a fragment and a
 the rest - a regex over something you have not understood will look right on the case
 you tried and be wrong on the next one.
 
+<tool_selection>
+Finding things in the codebase:
+  - `agentaus_search`   - DEFAULT. Any question about how something works, where a
+                          behaviour lives, what handles a case, or why a value is set.
+                          Ask in plain language. Pass the working directory as `path`.
+  - `agentaus_investigate` - the same, but when being wrong would be expensive. Slower.
+  - `Grep`              - ONLY an exact literal string you can already spell.
+  - `agentaus_web_search` - anything outside this repository.
+
+If you planned to use a tool, use THAT tool. Do not substitute the one you are more
+familiar with.
+</tool_selection>
+
 8. Track what you have already done. Do not re-run a tool you have already run in this
 conversation unless the inputs genuinely changed; re-read the earlier result instead.
 Repeating a call you have already made wastes the turn and loses context.
@@ -113,11 +128,13 @@ VERDICT: DEFECTS
 If DEFECTS, list them below that line, one per line, each with the specific fix.
 Say OK when the answer is sound - do not invent a defect to seem thorough.
 
-REQUEST:
+<request>
 {request}
+</request>
 
-ANSWER:
+<answer>
 {answer}
+</answer>
 """
 
 REVISE_INSTRUCTION = """\
@@ -127,14 +144,17 @@ Produce a corrected answer.
 Output only the corrected answer itself - no preamble, no explanation of what you \
 changed, no mention of the review.
 
-REQUEST:
+<request>
 {request}
+</request>
 
-YOUR PREVIOUS ANSWER:
+<your_previous_answer>
 {answer}
+</your_previous_answer>
 
-DEFECTS FOUND:
+<defects_found>
 {defects}
+</defects_found>
 """
 
 
@@ -169,8 +189,9 @@ Does the review below report any actual defect that needs fixing?
 
 Answer with exactly one word: YES or NO.
 
-REVIEW:
+<review>
 {review}
+</review>
 """
 
 
@@ -232,19 +253,37 @@ def worth_reviewing(text: str, *, min_chars: int = 200) -> bool:
 # context for the real one. Two cheap passes beat one expensive one on a smaller model,
 # the same reason the review pass exists.
 PLAN_INSTRUCTION = """\
-You are about to answer the request below. Before you do, plan the turn.
+You are an agent working inside a code repository. Plan the turn below before you act.
 
+This is your own private working. Nobody reads it and nobody answers it, so a plan that \
+asks a question is a plan that does nothing. Everything you need is either already \
+here or reachable with the tools listed - go and get it.
+
+{context}<task>
 Work out, briefly:
 - What is actually being asked, including anything implied but not stated.
-- What you need to find out before you can answer, and which tool would tell you.
+- What you must find out first, and WHICH LISTED TOOL will tell you. Name the tool \
+exactly as it is written above and give the arguments you will pass it.
 - The order of steps, and what "done" looks like.
 - Anything you are unsure of, which you must check rather than assume.
+</task>
 
-Be terse - short lines, no prose, no preamble. This is your own working, not the answer.
-Do not answer the request here, and do not write any code.
+<rules>
+- Use ONLY the tools listed above. Do not invent a tool name. If nothing listed can get \
+you a fact, say so and plan around it.
+- Choose the tool by what its description says it is for, not by which name you \
+recognise. If a tool exists for searching by meaning, prefer it over a regex search for \
+any question about how something works or where a behaviour lives - a regex only finds \
+text you can already spell.
+- Never plan to ask the user for something you can look up yourself - especially not \
+where the code is. You already know.
+- Be terse: short lines, no prose, no preamble.
+- Do not answer the request here, and do not write code here.
+</rules>
 
-{tools}REQUEST:
+<request>
 {request}
+</request>
 """
 
 
@@ -263,15 +302,86 @@ def should_think(body: dict) -> bool:
     return bool(body.get("tools"))
 
 
+# Claude Code states the working directory in its system prompt, in one of a few
+# phrasings. The planning call is a *fresh* conversation - it does not inherit that
+# prompt - so without lifting the path out explicitly the planner has no idea where the
+# code is. Observed live: it planned to "ask user for the codebase source (repo URL,
+# internal path, or name)" while the answer was sitting in the system prompt all along.
+_CWD_PATTERNS = (
+    re.compile(r"(?:primary\s+)?working\s+directory[^\n:]*:\s*(\S+)", re.I),
+    re.compile(r"\bcwd\b[^\n:]*:\s*(\S+)", re.I),
+    re.compile(r"current\s+(?:working\s+)?dir(?:ectory)?[^\n:]*:\s*(\S+)", re.I),
+)
+
+
+def working_directory(system) -> str | None:
+    """The repository path Claude Code named in its system prompt, if it named one."""
+    if isinstance(system, list):
+        text = "\n".join(
+            b.get("text", "") for b in system if isinstance(b, dict) and b.get("text")
+        )
+    elif isinstance(system, str):
+        text = system
+    else:
+        return None
+    for pattern in _CWD_PATTERNS:
+        found = pattern.search(text)
+        if found:
+            path = found.group(1).strip().strip("`'\".,")
+            if path.startswith("/") or path.startswith("~"):
+                return path
+    return None
+
+
+_TOOL_BLURB_CHARS = 240
+
+
+def _one_line(description) -> str:
+    """The first sentence or two of a tool description, on one line.
+
+    Claude Code's descriptions run to paragraphs, and a planning prompt carrying all of
+    them would cost more window than the plan is worth. The opening is where each one
+    says what it is for, which is the only part the planner needs.
+    """
+    text = " ".join(str(description or "").split())
+    if len(text) <= _TOOL_BLURB_CHARS:
+        return text
+    cut = text[:_TOOL_BLURB_CHARS]
+    stop = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+    return (cut[: stop + 1] if stop > 80 else cut).rstrip() + " …"
+
+
 def plan_prompt(request: str, body: dict | None = None) -> str:
-    """The planning prompt for this turn, naming the tools that are actually available."""
-    names = [
-        tool.get("name")
-        for tool in (body or {}).get("tools") or []
-        if isinstance(tool, dict) and tool.get("name")
-    ]
-    tools = f"TOOLS AVAILABLE: {', '.join(names)}\n\n" if names else ""
-    return PLAN_INSTRUCTION.format(tools=tools, request=request[:12000])
+    """The planning prompt for this turn, naming the tools that are actually available.
+
+    The tool list is not decoration: a planner shown no tools plans to ask questions,
+    and a planner shown the wrong ones invents names. Both were observed live.
+    """
+    body = body or {}
+    lines = []
+    cwd = working_directory(body.get("system"))
+    if cwd:
+        lines.append(
+            f"<working_directory>\n{cwd}\n</working_directory>\n"
+            f"That is the repository. Pass it as the `path` argument to any tool "
+            f"needing one."
+        )
+
+    # Names alone are not enough. Given a bare list, the planner picks the tool it knows
+    # from training - which is `Grep` - and never reaches for the better one it has
+    # never heard of. Observed live: the plan chose a regex over `agentaus_search` for a
+    # conceptual question, which is the exact failure this whole feature exists to stop.
+    entries = []
+    for tool in body.get("tools") or []:
+        if not (isinstance(tool, dict) and tool.get("name")):
+            continue
+        entries.append(f"  <tool name=\"{tool['name']}\">{_one_line(tool.get('description'))}</tool>")
+    if entries:
+        lines.append("<tools_available>\n" + "\n".join(entries)
+                     + "\n</tools_available>\nUse these exact names and no others.")
+
+    context = ("\n\n".join(lines) + "\n\n") if lines else ""
+    return PLAN_INSTRUCTION.format(context=context, request=request[:12000])
 
 
 def with_plan(system, plan: str) -> object:

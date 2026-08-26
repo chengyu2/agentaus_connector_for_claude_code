@@ -32,12 +32,15 @@ from .augment import (
     declared_verdict,
     plan_prompt,
     should_think,
+    working_directory,
     with_guidance,
     with_plan,
     worth_reviewing,
 )
 from .compact import ConversationCompactor
+from .distill import ResultDistiller
 from .gate import hold
+from .ledger import with_ledger
 from .tokens import calibrator, has_tokeniser as _has_tokeniser
 from .config import settings
 from .translate import (
@@ -523,41 +526,81 @@ def _without_bridge_calls(data: dict) -> dict:
     return {**data, "choices": [choice] + choices[1:]}
 
 
-def _partition_tool_calls(calls: list) -> tuple[list, list]:
-    """Split accumulated tool calls into (bridge-owned, client-owned)."""
-    mine, theirs = [], []
-    for call in calls:
-        (mine if call.get("name") in bridge_tools.BRIDGE_TOOLS else theirs).append(call)
-    return mine, theirs
+def _known_tool_names(payload: dict) -> set:
+    """Every tool name the model was actually offered, from the payload it was sent."""
+    names = set()
+    for tool in (payload or {}).get("tools") or []:
+        name = ((tool or {}).get("function") or {}).get("name")
+        if name:
+            names.add(name)
+    return names
 
 
-async def _run_bridge_tools(
-    client: httpx.AsyncClient, payload: dict, calls: list
-) -> dict:
-    """Execute bridge-owned tool calls and return the payload to send next.
+def _canonical(name: str, known: set) -> str | None:
+    """The offered tool `name` refers to, allowing for how models mangle names.
 
-    The results are appended as an assistant turn carrying the tool_calls plus one
-    `tool` message per result - OpenAI's shape, matching what the translator produces
-    for the client's own tools. Claude Code never sees any of it.
+    `read` for `Read`, `agentaus-search` for `agentaus_search`. Observed live: a turn
+    spent one of its three tool rounds being corrected from `read` to `Read`, which is
+    not a mistake worth a round trip - it is the same tool, spelled carelessly.
     """
-    async def one(call: dict) -> str:
-        arguments = call.get("arguments")
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments or "{}")
-            except json.JSONDecodeError:
-                arguments = {}
-        started_at = time.monotonic()
-        result = await bridge_tools.execute(
-            call.get("name") or "", arguments or {},
-            lambda text: _agentaus_summarise(client, text),
-        )
-        rlog(logging.INFO, "bridge tool %s ran in %.1fs -> %d chars",
-             call.get("name"), time.monotonic() - started_at, len(result))
-        return result
+    if name in known:
+        return name
+    squashed = name.lower().replace("_", "").replace("-", "").replace(" ", "")
+    for candidate in known:
+        if candidate.lower().replace("_", "").replace("-", "").replace(" ", "") == squashed:
+            return candidate
+    return None
 
-    results = await asyncio.gather(*[one(call) for call in calls])
 
+def _partition_tool_calls(calls: list, known: set | None = None) -> tuple[list, list, list]:
+    """Split tool calls into (bridge-owned, client-owned, invented).
+
+    The third bucket is not defensive programming - it is a failure observed on the
+    first live Agentaus turn, which answered a search by calling a tool named
+    `open_file` that no one had offered it. Passing that through means Claude Code
+    fails a tool_use for a tool it has never heard of, and the turn dies on an error
+    that looks like the bridge's fault.
+
+    `known` is the set of names actually sent upstream. Without it nothing can be
+    called invented, so the check is skipped rather than guessed at.
+    """
+    mine, theirs, invented = [], [], []
+    for call in calls:
+        name = call.get("name") or ""
+        if known:
+            resolved = _canonical(name, known | set(bridge_tools.BRIDGE_TOOLS))
+            if resolved is None:
+                invented.append(call)
+                continue
+            if resolved != name:
+                rlog(logging.INFO, "tool name %r resolved to %r", name, resolved)
+                call = {**call, "name": resolved}
+                name = resolved
+        if name in bridge_tools.BRIDGE_TOOLS:
+            mine.append(call)
+        else:
+            theirs.append(call)
+    return mine, theirs, invented
+
+
+def _correction_for(call: dict, known: set) -> str:
+    """What to tell a model that called a tool which does not exist."""
+    offered = ", ".join(sorted(known)) or "(none)"
+    return (
+        f"There is no tool named {call.get('name')!r}. You invented it. "
+        f"The tools you actually have are: {offered}. "
+        f"Call one of those by its exact name, or answer from what you already know. "
+        f"Do not guess at a tool name again."
+    )
+
+
+def _with_tool_results(payload: dict, calls: list, results: list) -> dict:
+    """Append calls and their results to a payload, in OpenAI's shape.
+
+    Assistant turn carrying the tool_calls, then one `tool` message per result - the
+    same shape the translator produces for the client's own tools, so the model sees no
+    difference between a tool the bridge ran and one Claude Code ran.
+    """
     messages = list(payload.get("messages") or [])
     messages.append(
         {
@@ -587,6 +630,59 @@ async def _run_bridge_tools(
             }
         )
     return {**payload, "messages": messages}
+
+
+def _without_unknown_calls(data: dict, known: set) -> dict:
+    """Strip invented tool calls from a non-streaming response."""
+    choices = list(data.get("choices") or [])
+    if not choices:
+        return data
+    choice = dict(choices[0] or {})
+    message = dict(choice.get("message") or {})
+    kept = [
+        c for c in (message.get("tool_calls") or [])
+        if ((c.get("function") or {}).get("name") or "") in known
+    ]
+    message["tool_calls"] = kept or None
+    if not kept and not (message.get("content") or "").strip():
+        message["content"] = (
+            "I tried to use a tool that does not exist and could not recover. "
+            "Ask again and I will use one of the tools I actually have."
+        )
+    choice["message"] = message
+    if not kept and choice.get("finish_reason") == "tool_calls":
+        choice["finish_reason"] = "stop"
+    return {**data, "choices": [choice] + choices[1:]}
+
+
+async def _run_bridge_tools(
+    client: httpx.AsyncClient, payload: dict, calls: list, default_path: str | None = None
+) -> dict:
+    """Execute bridge-owned tool calls and return the payload to send next.
+
+    The results are appended as an assistant turn carrying the tool_calls plus one
+    `tool` message per result - OpenAI's shape, matching what the translator produces
+    for the client's own tools. Claude Code never sees any of it.
+    """
+    async def one(call: dict) -> str:
+        arguments = call.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments or "{}")
+            except json.JSONDecodeError:
+                arguments = {}
+        started_at = time.monotonic()
+        result = await bridge_tools.execute(
+            call.get("name") or "", arguments or {},
+            lambda text: _agentaus_summarise(client, text),
+            default_path,
+        )
+        rlog(logging.INFO, "bridge tool %s ran in %.1fs -> %d chars",
+             call.get("name"), time.monotonic() - started_at, len(result))
+        return result
+
+    results = await asyncio.gather(*[one(call) for call in calls])
+    return _with_tool_results(payload, calls, results)
 
 
 def _last_user_text(body: dict) -> str:
@@ -620,6 +716,25 @@ def _get_compactor(request: Request) -> ConversationCompactor:
             block=settings.agentaus_compact_block,
         )
         request.app.state.compactor = existing
+    return existing
+
+
+def _get_distiller(request: Request) -> ResultDistiller:
+    """One distiller per process, so its cache survives between turns.
+
+    Without the cache each turn would re-condense the same immutable tool results, which
+    is both wasted spend and - worse - a conversation prefix that changes every request,
+    which would stop the compactor's cache ever hitting again.
+    """
+    existing = getattr(request.app.state, "distiller", None)
+    if existing is None:
+        client = request.app.state.client
+        existing = ResultDistiller(
+            lambda text: _agentaus_summarise(client, text),
+            threshold_tokens=settings.agentaus_distill_threshold_tokens,
+            chunk_tokens=settings.agentaus_distill_chunk_tokens,
+        )
+        request.app.state.distiller = existing
     return existing
 
 
@@ -799,6 +914,21 @@ async def _handle_agentaus(
         conversation, which is why the streaming path runs this *inside* the response
         generator rather than before it - see the note there.
         """
+        # Condense oversized tool results BEFORE fitting. Order matters: this is what
+        # decides whether compaction is needed at all, and compacting first would
+        # summarise output that was about to be condensed anyway.
+        if settings.agentaus_distill_results:
+            raw = estimate_request_tokens(current)
+            current = await _get_distiller(request).distill(current)
+            shrunk = estimate_request_tokens(current)
+            if shrunk < raw:
+                rlog(logging.INFO, "distillation: %d -> %d est tokens", raw, shrunk)
+
+        # The ledger is built here, from the message list as it stands *before*
+        # compaction. That is the whole point: the calls that fall out of the window are
+        # the ones the model forgets it already made.
+        ledger_source = list(current.get("messages") or [])
+
         before = estimate_request_tokens(current)
         if before + reserved > int(limit * settings.agentaus_compact_threshold):
             with _Phase("compaction", f"est {before:,} tok, target {limit:,}"):
@@ -820,8 +950,16 @@ async def _handle_agentaus(
             offered.append(bridge_tools.SEARCH_SCHEMA)
         if settings.agentaus_web_search:
             offered.append(bridge_tools.WEB_SEARCH_SCHEMA)
+        if settings.agentaus_investigate:
+            offered.append(bridge_tools.INVESTIGATE_SCHEMA)
         if offered:
             fitted = inject_bridge_tools(fitted, offered)
+
+        if settings.agentaus_tool_ledger:
+            fitted = {**fitted, "system": with_ledger(
+                fitted.get("system"), ledger_source,
+                limit=settings.agentaus_tool_ledger_limit,
+            )}
 
         # Supplement the system prompt for Agentaus only. Claude turns never reach
         # here - they are forwarded untouched by _passthrough.
@@ -851,6 +989,7 @@ async def _handle_agentaus(
         # Rounds of bridge-executed tool calls. Each round runs the tool, appends its
         # result, and asks Agentaus again. The loop ends when the model answers with
         # prose, or with a tool only Claude Code can run.
+        corrections = 0
         for tool_round in range(settings.agentaus_tool_rounds + 1):
             # Agentaus is the authority on whether a prompt fits. If it says no, it also
             # says what its real limit is, so the next attempt compacts against that
@@ -906,13 +1045,26 @@ async def _handle_agentaus(
 
             _calibrate_from_usage(body, data.get("usage"))
 
-            mine, _theirs = _partition_tool_calls(_openai_calls(data))
+            known = _known_tool_names(payload)
+            mine, _theirs, invented = _partition_tool_calls(_openai_calls(data), known)
+            if invented and corrections < settings.agentaus_correction_rounds:
+                corrections += 1
+                rlog(logging.WARNING, "model invented %d tool name(s): %s; correcting",
+                     len(invented), ", ".join(c["name"] for c in invented))
+                payload = _with_tool_results(
+                    payload, invented, [_correction_for(c, known) for c in invented])
+                continue
             if not mine:
+                if invented:
+                    rlog(logging.WARNING, "dropping %d invented tool call(s) - out of "
+                         "rounds to correct them", len(invented))
+                    data = _without_unknown_calls(data, known)
                 break
             if tool_round < settings.agentaus_tool_rounds:
                 rlog(logging.INFO, "running %d bridge tool call(s): %s",
                      len(mine), ", ".join(c["name"] for c in mine))
-                payload = await _run_bridge_tools(client, payload, mine)
+                payload = await _run_bridge_tools(
+                    client, payload, mine, working_directory(body.get("system")))
                 continue
             # Out of rounds with a bridge tool still pending. It must not reach Claude
             # Code, which has never heard of it and would fail the tool_use outright.
@@ -1054,6 +1206,7 @@ async def _agentaus_event_stream(
     # re-asked upstream; the client never learns the call happened. Bounded, so a
     # model that keeps searching still has to produce an answer eventually.
     tool_round = 0
+    corrections = 0
     while True:
         attempt = 0
         while True:
@@ -1199,12 +1352,29 @@ async def _agentaus_event_stream(
             break
 
         calls = accumulator.drain()
-        mine, theirs = _partition_tool_calls(calls)
+        known = _known_tool_names(payload)
+        mine, theirs, invented = _partition_tool_calls(calls, known)
+        if invented and corrections < settings.agentaus_correction_rounds:
+            # Correct it and ask again rather than failing a tool the client cannot run.
+            # Deliberately NOT charged to tool_round: a correction is the bridge fixing
+            # its own upstream's mistake, and spending the budget for real work on it
+            # is what made a live turn run out before it could answer.
+            corrections += 1
+            rlog(logging.WARNING, "model invented %d tool name(s): %s; correcting",
+                 len(invented), ", ".join(c["name"] for c in invented))
+            payload = _with_tool_results(
+                payload, invented, [_correction_for(c, known) for c in invented])
+            pending = []
+            continue
+        if invented:
+            rlog(logging.WARNING, "dropping %d invented tool call(s) - out of rounds",
+                 len(invented))
         if mine and tool_round < settings.agentaus_tool_rounds:
             tool_round += 1
             rlog(logging.INFO, "running %d bridge tool call(s): %s",
                  len(mine), ", ".join(c["name"] for c in mine))
-            payload = await _run_bridge_tools(client, payload, mine)
+            payload = await _run_bridge_tools(
+                client, payload, mine, working_directory(original.get("system")))
             # Whatever the model said on its way to calling the tool is superseded by
             # the answer it is about to give with the result in hand, so it is dropped
             # rather than shown - otherwise the user reads "let me search..." followed

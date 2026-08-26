@@ -59,7 +59,8 @@ Rules:
 - Use terse bullet points grouped under short headings.
 - Do not add commentary, preamble, or a closing summary.
 
-Conversation to compact:
+The conversation is inside <conversation> tags below. Your output is the record itself,
+with no tags around it.
 """
 
 
@@ -68,8 +69,8 @@ Conversation to compact:
 # easier question to answer well than "summarise this", and it recovers detail the
 # first pass elided.
 GAP_INSTRUCTION = """\
-Below is a SUMMARY of part of a software engineering conversation, followed by the \
-ORIGINAL text it was made from.
+A <summary> of part of a software engineering conversation is below, followed by the \
+<original> text it was made from.
 
 List any concrete facts present in the ORIGINAL but missing from the SUMMARY. Focus on:
 file paths, function and variable names, commands, flags, version numbers, ports, URLs, \
@@ -84,8 +85,8 @@ missing, output exactly: NONE
 # Merging concatenated per-chunk summaries produces repetition and loses ordering.
 # Asking the model to reorganise them keeps the record readable as one account.
 MERGE_INSTRUCTION = """\
-The following are summaries of consecutive parts of one software engineering \
-conversation. Merge them into a single coherent record.
+Inside <summaries> below are summaries of consecutive parts of one software \
+engineering conversation. Merge them into a single coherent record.
 
 - Keep every specific fact: paths, identifiers, commands, numbers, decisions and reasons.
 - Remove duplication, but never drop a detail that appears only once.
@@ -352,7 +353,10 @@ class ConversationCompactor:
     async def _summarise_chunk(self, chunk: str, index: int, total: int) -> str:
         label = f" (part {index} of {total})" if total > 1 else ""
         summary = normalise_identifiers(
-            (await self._call(SUMMARY_INSTRUCTION + label + "\n" + chunk)).strip()
+            (await self._call(
+                SUMMARY_INSTRUCTION + label
+                + "\n<conversation>\n" + chunk + "\n</conversation>\n"
+            )).strip()
         )
         if not self._verify:
             return summary
@@ -361,7 +365,9 @@ class ConversationCompactor:
         # the single biggest fidelity win - "what is missing" is a far easier question
         # for the model than "summarise well".
         gaps = normalise_identifiers((await self._call(
-            GAP_INSTRUCTION + "SUMMARY:\n" + summary + "\n\nORIGINAL:\n" + chunk
+            GAP_INSTRUCTION
+            + "\n<summary>\n" + summary + "\n</summary>"
+            + "\n\n<original>\n" + chunk + "\n</original>\n"
         )).strip())
         if gaps and gaps.upper().strip().rstrip(".") != "NONE":
             summary = summary + "\nAdditional details:\n" + gaps
@@ -421,7 +427,8 @@ class ConversationCompactor:
                 ])
                 addition = "\n".join(s for s in new_parts if s.strip())
                 merged = await self._call(
-                    MERGE_INSTRUCTION + prior + "\n\n---\n\n" + addition
+                    MERGE_INSTRUCTION + "\n<summaries>\n" + prior
+                    + "\n\n---\n\n" + addition + "\n</summaries>\n"
                 )
                 summary = merged.strip() or (prior + "\n" + addition)
             else:
@@ -450,11 +457,15 @@ class ConversationCompactor:
             joined = "\n\n---\n\n".join(summaries)
             # Merged by the model rather than concatenated: consecutive chunks overlap,
             # so raw concatenation repeats itself and reads as several disjoint records.
-            summary = (await self._call(MERGE_INSTRUCTION + joined)).strip() or joined
+            summary = (await self._call(
+                MERGE_INSTRUCTION + "\n<summaries>\n" + joined + "\n</summaries>\n"
+            )).strip() or joined
 
         rounds = 0
         while estimate_tokens(summary) > chunk_budget and rounds < 3:
-            summary = (await self._call(MERGE_INSTRUCTION + summary)).strip()
+            summary = (await self._call(
+                MERGE_INSTRUCTION + "\n<summaries>\n" + summary + "\n</summaries>\n"
+            )).strip()
             rounds += 1
 
         self._remember(key, summary)

@@ -322,9 +322,9 @@ class TestQualityDesign(unittest.TestCase):
 
         async def summariser(text: str) -> str:
             seen_prompts.append(text)
-            if text.startswith("Below is a SUMMARY"):
+            if "<summary>" in text:
                 return "- the port is 9473"      # the gap pass finds a missed fact
-            if text.startswith("The following are summaries"):
+            if "<summaries>" in text:
                 # Merge must carry its input through, or it would mask what the
                 # earlier passes produced and this test would prove nothing.
                 return text.split("\n\n", 1)[-1]
@@ -334,14 +334,14 @@ class TestQualityDesign(unittest.TestCase):
         plan = run(c.compact({"messages": convo(40), "system": "s"}, limit=3000, reserve=100))
 
         self.assertIn("9473", plan["summary"], "recovered detail was not folded back in")
-        self.assertTrue(any(p.startswith("Below is a SUMMARY") for p in seen_prompts),
+        self.assertTrue(any("<summary>" in p for p in seen_prompts),
                         "no verification pass was made")
 
     def test_verification_ignores_an_explicit_nothing_missing(self):
         async def summariser(text: str) -> str:
-            if text.startswith("Below is a SUMMARY"):
+            if "<summary>" in text:
                 return "NONE"
-            if text.startswith("The following are summaries"):
+            if "<summaries>" in text:
                 return text.split("\n\n", 1)[-1]
             return "real summary"
 
@@ -528,7 +528,7 @@ class TestIncrementalCompaction(unittest.TestCase):
         merged_inputs = []
 
         async def summariser(text: str) -> str:
-            if text.startswith("The following are summaries"):
+            if "<summaries>" in text:
                 merged_inputs.append(text)
                 return "MERGED: " + text[-200:]
             return "PART"

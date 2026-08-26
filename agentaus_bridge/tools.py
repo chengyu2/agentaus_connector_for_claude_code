@@ -35,11 +35,15 @@ log = logging.getLogger("agentaus-bridge")
 
 Caller = Callable[[str], Awaitable[str]]
 
+# A term present in more than this fraction of files is treated as noise for ranking.
+_TERM_UBIQUITY_CEILING = 0.5
+
 SEARCH_TOOL = "agentaus_search"
 WEB_SEARCH_TOOL = "agentaus_web_search"
+INVESTIGATE_TOOL = "agentaus_investigate"
 
 # Names the bridge answers itself. Anything else is Claude Code's and is passed through.
-BRIDGE_TOOLS = {SEARCH_TOOL, WEB_SEARCH_TOOL}
+BRIDGE_TOOLS = {SEARCH_TOOL, WEB_SEARCH_TOOL, INVESTIGATE_TOOL}
 
 
 SEARCH_SCHEMA = {
@@ -109,12 +113,16 @@ WEB_SEARCH_SCHEMA = {
 WEB_SEARCH_INSTRUCTION = """\
 web search this: {query}
 
+<task>
 Answer from what the search returns, not from memory. For every fact you state, give the \
 source URL it came from. If the search finds nothing useful, say so plainly rather than \
 answering from what you already believe - a confident answer from memory is exactly what \
 this search was run to avoid.
+</task>
 
-Be terse. No preamble.
+<output_format>
+Terse. Markdown. Each fact followed by its source URL. No preamble, no tags.
+</output_format>
 """
 
 
@@ -230,48 +238,72 @@ def read_text(path: str) -> str:
 
 
 EXPAND_INSTRUCTION = """\
-A developer is searching a codebase for the answer to this question:
+A developer is searching a codebase for the answer to the question below.
 
+<question>
 {query}
+</question>
 
+<task>
 List the literal strings most likely to appear in source code that answers it: function \
 and variable names, class names, config keys, library calls, error text. Include \
 synonyms and the terms a programmer would actually type, not the words of the question.
 
-Output 5 to 10 terms, one per line, nothing else. No numbering, no explanation.
+Prefer specific terms over general ones. A word like "max", "call" or "limit" appears in \
+every file of every codebase and tells the search nothing.
+</task>
+
+<output_format>
+5 to 10 terms, one per line, nothing else. No numbering, no explanation, no tags.
+</output_format>
 """
 
 
 CHUNK_INSTRUCTION = """\
-Below is an excerpt from `{path}` (lines {start}-{end}).
-
-Decide whether it contains anything that answers this question:
-
+<question>
 {query}
+</question>
 
-If it does, quote the relevant lines verbatim with their line numbers, then add one \
-short sentence saying how they answer it. Quote only what is relevant - not the whole \
+<excerpt file="{path}" lines="{start}-{end}">
+{body}
+</excerpt>
+
+<task>
+Decide whether the excerpt contains anything that answers the question.
+
+If it does: quote the relevant lines verbatim with their line numbers, then add one \
+short sentence saying how they answer it. Quote only what is relevant, never the whole \
 excerpt.
 
-If it does not, reply with exactly: NONE
+If it does not: reply with exactly NONE and nothing else.
+</task>
 
-EXCERPT:
-{body}
+<output_format>
+Either the quoted lines, or the single word NONE. No tags, no preamble.
+</output_format>
 """
 
 
 MERGE_HITS_INSTRUCTION = """\
-Below are separate excerpts from a codebase, each already judged relevant to this \
-question:
-
+<question>
 {query}
+</question>
 
-Combine them into one answer. Keep every file path and line number exactly as written. \
-Order them so the most direct answer comes first. Remove repetition, but never drop a \
-location that appears only once. Do not add anything that is not below.
-
-EXCERPTS:
+<excerpts>
 {body}
+</excerpts>
+
+<task>
+Each excerpt above was already judged relevant. Combine them into one answer.
+
+Keep every file path and line number exactly as written. Order them so the most direct \
+answer comes first. Remove repetition, but never drop a location that appears only once. \
+Add nothing that is not above.
+</task>
+
+<output_format>
+The combined answer. No tags, no preamble.
+</output_format>
 """
 
 
@@ -308,19 +340,41 @@ async def expand_query(query: str, call: Caller) -> list[str]:
 
 
 def shortlist(files: list[str], terms: list[str]) -> list[tuple[str, int]]:
-    """Files containing any expanded term, ranked by how many distinct terms hit.
+    """Files containing an expanded term, ranked by how many distinct terms hit.
 
     A plain substring scan in Python rather than a ripgrep subprocess: `rg` is a shell
     function provided by the Claude Code extension and is not on a clean PATH, so the
     launchd-managed bridge cannot see it. At repo scale the difference does not matter.
+
+    Terms that appear in nearly every file are dropped before ranking. Expansion returns
+    words a programmer would type, and some of those - "max", "limit", "call" - are in
+    every file of any codebase. Counting them ranks nothing and shortlists everything:
+    on a live search they turned 40 files into 21 "candidates" and a 75-second fan-out.
     """
     lowered = [t.lower() for t in terms]
-    scored: list[tuple[str, int]] = []
+    bodies: dict[str, str] = {}
     for path in files:
         body = read_text(path).lower()
-        if not body:
-            continue
-        hits = sum(1 for term in lowered if term in body)
+        if body:
+            bodies[path] = body
+
+    if not bodies:
+        return []
+
+    # Keep only terms selective enough to distinguish one file from another.
+    ceiling = max(1, int(len(bodies) * _TERM_UBIQUITY_CEILING))
+    selective = []
+    for term in lowered:
+        matches = sum(1 for body in bodies.values() if term in body)
+        if 0 < matches <= ceiling:
+            selective.append(term)
+    # If every term was ubiquitous, ranking on them is still better than nothing.
+    if not selective:
+        selective = lowered
+
+    scored = []
+    for path, body in bodies.items():
+        hits = sum(1 for term in selective if term in body)
         if hits:
             scored.append((path, hits))
     scored.sort(key=lambda pair: (-pair[1], pair[0]))
@@ -343,11 +397,22 @@ def chunk_file(path: str, budget_tokens: int) -> list[tuple[str, int, int, str]]
 
 
 async def run_search(
-    query: str, path: str, glob: str | None, call: Caller
+    query: str, path: str, glob: str | None, call: Caller, default_path: str | None = None
 ) -> str:
-    """Execute one `agentaus_search` call and return text for the tool result."""
+    """Execute one `agentaus_search` call and return text for the tool result.
+
+    A missing or relative `path` falls back to the repository Claude Code named in its
+    system prompt. Refusing instead would spend a whole tool round teaching the model
+    something the bridge already knows.
+    """
+    if (not path or not os.path.isabs(path)) and default_path:
+        resolved = default_path if not path else os.path.join(default_path, path)
+        log.info("search path %r resolved against the working directory -> %s",
+                 path, resolved)
+        path = resolved
     if not os.path.isabs(path):
-        return f"agentaus_search needs an absolute path; got {path!r}."
+        return (f"agentaus_search needs an absolute path; got {path!r}. "
+                f"Pass the repository's absolute path as `path`.")
     if not os.path.exists(path):
         return f"No such path: {path}"
     if not _allowed_root(path):
@@ -369,6 +434,9 @@ async def run_search(
     if len(candidates) < settings.agentaus_search_min_candidates:
         candidates = files
         brute_forced = True
+    elif len(candidates) > settings.agentaus_search_max_candidates:
+        # Ranked, so this keeps the files that matched the most distinct terms.
+        candidates = candidates[: settings.agentaus_search_max_candidates]
 
     chunks: list[tuple[str, int, int, str]] = []
     for candidate in candidates:
@@ -438,7 +506,145 @@ async def run_search(
     return header + joined
 
 
-async def execute(name: str, arguments: dict, call: Caller) -> str:
+INVESTIGATE_SCHEMA = {
+    "name": INVESTIGATE_TOOL,
+    "description": (
+        "Investigate a question about a codebase from several independent angles at "
+        "once, and report only what more than one of them agreed on.\n\n"
+        "Slower and more thorough than `agentaus_search`. Use it when being wrong would "
+        "be expensive: before a refactor, when tracing why something behaves as it "
+        "does, or when a single search gave an answer you do not fully believe. The "
+        "report separates what was corroborated from what only one angle found."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "What you need to establish, as a plain-language question.",
+            },
+            "path": {
+                "type": "string",
+                "description": "Absolute path to the directory to investigate.",
+            },
+        },
+        "required": ["question", "path"],
+    },
+}
+
+
+# Three angles on the same question. Deliberately different rather than three copies of
+# one prompt: redundancy catches a flaky answer, but only diversity catches a failure
+# mode a single framing cannot see. "Where is it defined" and "what breaks if it
+# changes" fail in different places, which is what makes their agreement worth
+# something.
+INVESTIGATE_LENSES = (
+    ("definition", "Where is this implemented or defined? Name the file and the lines."),
+    ("usage", "Where is this called, read or depended on from elsewhere?"),
+    ("consequence", "What behaviour depends on this, and what would break if it changed?"),
+)
+
+
+CORROBORATE_INSTRUCTION = """\
+Three independent searches were run over the same codebase to answer one question. Each \
+looked from a different angle and did not see the others' results.
+
+<question>
+{question}
+</question>
+
+<reports>
+{body}
+</reports>
+
+<task>
+Produce one report with exactly two sections:
+
+## Established
+Facts that appear in TWO OR MORE of the reports below. For each, give the file and line \
+numbers, exactly as written.
+
+## Single-source
+Facts that appear in only ONE report. These may still be true - one angle often sees \
+something the others had no reason to look at - but they were not corroborated, so say \
+so rather than presenting them as settled.
+
+Rules:
+- Two reports naming the same file and behaviour agree, even in different words.
+- Never invent a fact to fill a section. An empty section is a real result: write "none".
+- Reproduce every path and identifier EXACTLY, in backticks, with plain ASCII hyphens.
+- No preamble.
+</task>
+
+<output_format>
+Markdown, with the two headings above. No tags.
+</output_format>
+"""
+
+
+async def run_investigate(
+    question: str, path: str, call: Caller, default_path: str | None = None
+) -> str:
+    """Answer one question from several angles and report what corroborates.
+
+    The lenses run concurrently and each is an ordinary `run_search`, so the whole thing
+    is bounded by the same global cap as everything else - three searches share the six
+    slots rather than getting six each.
+    """
+    question = (question or "").strip()
+    if not question:
+        return "agentaus_investigate needs a question."
+    if (not path or not os.path.isabs(path)) and default_path:
+        path = default_path if not path else os.path.join(default_path, path)
+    if not os.path.isabs(path):
+        return f"agentaus_investigate needs an absolute path; got {path!r}."
+
+    started_at = time.monotonic()
+    reports = await asyncio.gather(*[
+        run_search(f"{question}\n\nSpecifically: {angle}", path, None, call,
+                   default_path)
+        for _name, angle in INVESTIGATE_LENSES
+    ], return_exceptions=True)
+
+    usable = []
+    for (name, _angle), report in zip(INVESTIGATE_LENSES, reports):
+        if isinstance(report, Exception):
+            log.warning("investigate lens %s failed: %s", name, report)
+            continue
+        if report and "No excerpt" not in report:
+            usable.append(f"### Report: {name}\n{report}")
+
+    log.info("investigate %r: %d of %d lens(es) found something in %.1fs",
+             question[:60], len(usable), len(INVESTIGATE_LENSES),
+             time.monotonic() - started_at)
+
+    if not usable:
+        return (
+            f"None of the {len(INVESTIGATE_LENSES)} angles found anything under {path} "
+            f"for: {question}"
+        )
+    if len(usable) == 1:
+        # Nothing to corroborate against. Saying so is more useful than a "## Established"
+        # heading over a single unverified source, which would read as agreement.
+        return ("[Only one of the three angles found anything, so nothing here is "
+                "corroborated.]\n\n" + usable[0])
+
+    try:
+        async with hold("investigate merge"):
+            merged = await call(CORROBORATE_INSTRUCTION.format(
+                question=question, body="\n\n".join(usable)
+            ))
+    except Exception as exc:
+        log.warning("investigate merge failed (%s); returning the raw reports", exc)
+        return "\n\n".join(usable)
+
+    merged = normalise_identifiers((merged or "").strip())
+    return merged or "\n\n".join(usable)
+
+
+async def execute(
+    name: str, arguments: dict, call: Caller, default_path: str | None = None
+) -> str:
     """Run one bridge-owned tool call. Never raises - a failure becomes tool output."""
     try:
         if name == SEARCH_TOOL:
@@ -447,9 +653,17 @@ async def execute(name: str, arguments: dict, call: Caller) -> str:
                 str(arguments.get("path") or ""),
                 (arguments.get("glob") or None),
                 call,
+                default_path,
             )
         if name == WEB_SEARCH_TOOL:
             return await run_web_search(str(arguments.get("query") or ""), call)
+        if name == INVESTIGATE_TOOL:
+            return await run_investigate(
+                str(arguments.get("question") or ""),
+                str(arguments.get("path") or ""),
+                call,
+                default_path,
+            )
         return f"[bridge] Unknown tool {name!r}."
     except Exception as exc:  # a broken tool must not end the turn
         log.warning("bridge tool %s failed: %s", name, exc)

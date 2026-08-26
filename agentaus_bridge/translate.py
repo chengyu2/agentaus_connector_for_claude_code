@@ -209,11 +209,13 @@ def _map_tools(tools: Any) -> list[dict]:
 # the model does call Grep, Claude Code executes it exactly as before - only the advice
 # about *when* to reach for it changes.
 _GREP_RESTRICTION = (
-    "Use this ONLY for exact literal matches you can already spell: a known function "
-    "name, a specific error string, a config key. For anything conceptual - how "
-    "something works, where a behaviour lives, what handles a case, why a value is set "
-    "- use `agentaus_search` instead, which reads the code by meaning. A regex over "
-    "code you have not read looks right on the case you tried and is wrong on the next."
+    "RESTRICTED: use this ONLY for an exact literal string you can already spell - a "
+    "known function name, a specific error message, a config key. If the question is "
+    "about how something works, where a behaviour lives, what handles a case, or why a "
+    "value is set, this is the WRONG TOOL: call `agentaus_search` instead, which reads "
+    "the code by meaning and finds the answer even when your words appear nowhere in "
+    "it. A regex over code you have not read looks right on the case you tried and is "
+    "wrong on the next.\n\nOriginal description follows.\n"
 )
 
 
@@ -232,7 +234,7 @@ def inject_bridge_tools(body: dict, extra_tools: list[dict]) -> dict:
     for tool in tools:
         if isinstance(tool, dict) and tool.get("name") == "Grep":
             existing = tool.get("description", "") or ""
-            rewritten.append({**tool, "description": f"{existing}\n\n{_GREP_RESTRICTION}".strip()})
+            rewritten.append({**tool, "description": f"{_GREP_RESTRICTION}\n{existing}".strip()})
         else:
             rewritten.append(tool)
 

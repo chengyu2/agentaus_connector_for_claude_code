@@ -217,6 +217,40 @@ class Settings:
     agentaus_web_search: bool = field(
         default_factory=lambda: _bool("AGENTAUS_WEB_SEARCH", True)
     )
+    # Multi-angle investigation: three independent searches, and only what two of them
+    # agreed on is reported as established. Slower than one search, so it is offered as
+    # a separate tool rather than made the default.
+    agentaus_investigate: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_INVESTIGATE", True)
+    )
+
+    # --- Tool-result distillation ----------------------------------------------------
+    # What exhausts the window is tool output, not conversation: one Read of a large
+    # file can be most of the real headroom, and it stays in the transcript for the rest
+    # of the session. Claude Code sends those results back to the bridge on the next
+    # turn, so they can be condensed in flight - cached by content, so the conversation
+    # prefix stays stable and the compaction cache keeps hitting.
+    agentaus_distill_results: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_DISTILL_RESULTS", True)
+    )
+    # Results smaller than this are left exactly as they are.
+    agentaus_distill_threshold_tokens: int = field(
+        default_factory=lambda: _int("AGENTAUS_DISTILL_THRESHOLD_TOKENS", 4000)
+    )
+    agentaus_distill_chunk_tokens: int = field(
+        default_factory=lambda: _int("AGENTAUS_DISTILL_CHUNK_TOKENS", 4000)
+    )
+
+    # --- Tool ledger -----------------------------------------------------------------
+    # Derived from the conversation, never stored, and costs no Agentaus calls. Built
+    # from the pre-compaction message list on purpose: the calls that fall out of the
+    # window are exactly the ones the model forgets it already made.
+    agentaus_tool_ledger: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_TOOL_LEDGER", True)
+    )
+    agentaus_tool_ledger_limit: int = field(
+        default_factory=lambda: _int("AGENTAUS_TOOL_LEDGER_LIMIT", 40)
+    )
     # Tokens of file content per search call. Smaller than the summary chunk: a search
     # answer is a quote, so fidelity matters more than context, and a fact is a larger
     # share of a smaller chunk.
@@ -233,6 +267,12 @@ class Settings:
     agentaus_search_min_candidates: int = field(
         default_factory=lambda: _int("AGENTAUS_SEARCH_MIN_CANDIDATES", 3)
     )
+    # Ceiling on files one search will read. The shortlist is ranked, so this keeps the
+    # best-matching ones. Measured live: without it a loose expansion shortlisted 21 of
+    # 40 files and the search took 75 seconds.
+    agentaus_search_max_candidates: int = field(
+        default_factory=lambda: _int("AGENTAUS_SEARCH_MAX_CANDIDATES", 12)
+    )
     agentaus_search_max_file_bytes: int = field(
         default_factory=lambda: _int("AGENTAUS_SEARCH_MAX_FILE_BYTES", 1024 * 1024)
     )
@@ -246,6 +286,13 @@ class Settings:
     # has to stand. Stops a model that keeps searching from never replying.
     agentaus_tool_rounds: int = field(
         default_factory=lambda: _int("AGENTAUS_TOOL_ROUNDS", 3)
+    )
+    # Rounds spent telling the model a tool it named does not exist. Counted separately
+    # from tool rounds on purpose: a correction is the bridge fixing its upstream's
+    # mistake, and charging it to the budget for real work is what made a live turn run
+    # out of rounds before it could answer.
+    agentaus_correction_rounds: int = field(
+        default_factory=lambda: _int("AGENTAUS_CORRECTION_ROUNDS", 3)
     )
 
     # --- Synthesised thinking --------------------------------------------------------
