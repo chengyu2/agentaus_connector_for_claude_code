@@ -92,10 +92,14 @@ Finding things in the codebase:
                           Ask in plain language. Pass the working directory as `path`.
   - `agentaus_investigate` - the same, but when being wrong would be expensive. Slower.
   - `Grep`              - ONLY an exact literal string you can already spell.
+  - `Glob`              - finding files BY NAME. It cannot see inside a file, so it can
+                          never answer a question about content. Do not use it to hunt
+                          for a directory you were already told the path of.
   - `agentaus_web_search` - anything outside this repository.
 
 If you planned to use a tool, use THAT tool. Do not substitute the one you are more
-familiar with.
+familiar with. Listing directories to find your bearings is not progress - if you were
+given a path, use it.
 </tool_selection>
 
 8. Track what you have already done. Do not re-run a tool you have already run in this

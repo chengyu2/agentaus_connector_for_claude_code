@@ -162,6 +162,11 @@ _SKIP_SUFFIXES = {
     ".bz2", ".xz", ".7z", ".mp4", ".mov", ".mp3", ".wav", ".woff", ".woff2", ".ttf",
     ".otf", ".eot", ".so", ".dylib", ".dll", ".exe", ".bin", ".class", ".jar", ".pyc",
     ".pyo", ".wasm", ".lock", ".map", ".min.js", ".min.css",
+    # Office formats are zip archives. Read as text they are binary noise, and a search
+    # will happily chunk that noise and spend a model call on every piece of it -
+    # observed burning most of a 120-chunk budget on one 350 KB .docx.
+    ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".odt", ".ods", ".odp", ".rtf",
+    ".sqlite", ".db", ".parquet", ".pkl", ".npy", ".npz",
 }
 
 # Never read, regardless of what the model asks for or what the query matches. Secrets
@@ -201,8 +206,10 @@ def _allowed_root(path: str) -> bool:
 def enumerate_files(path: str, glob: str | None = None) -> list[str]:
     """Readable text files under `path`, in a stable order."""
     if os.path.isfile(path):
-        name = os.path.basename(path)
-        if _is_secret(name):
+        name = os.path.basename(path).lower()
+        # Naming a binary explicitly does not make it readable as text, so the same
+        # exclusions apply to a direct path as to a walked one.
+        if _is_secret(name) or any(name.endswith(suffix) for suffix in _SKIP_SUFFIXES):
             return []
         return [path]
 
@@ -339,6 +346,30 @@ async def expand_query(query: str, call: Caller) -> list[str]:
     return unique[:20]
 
 
+def selective_terms(texts: list[str], terms: list[str]) -> list[str]:
+    """The subset of `terms` that actually distinguishes one text from another.
+
+    A term present in more than half the texts carries no signal: expansion returns the
+    words a programmer would type, and some of those - "document", "max", "call" - are
+    in almost everything. Ranking on them ranks nothing.
+
+    Measured over whatever is being ranked, not always over files. Ranking chunks with
+    selectivity computed across files is meaningless when the corpus is ONE file: there
+    is nothing for a term to be ubiquitous *across*, so every term survives and every
+    chunk scores. That is how a 434 KB document came to be read 29 chunks out of 29.
+    """
+    if not texts:
+        return list(terms)
+    ceiling = max(1, int(len(texts) * _TERM_UBIQUITY_CEILING))
+    keep = []
+    for term in terms:
+        matches = sum(1 for body in texts if term in body)
+        if 0 < matches <= ceiling:
+            keep.append(term)
+    # Every term ubiquitous means ranking on them is still better than not ranking.
+    return keep or list(terms)
+
+
 def shortlist(files: list[str], terms: list[str]) -> list[tuple[str, int]]:
     """Files containing an expanded term, ranked by how many distinct terms hit.
 
@@ -361,16 +392,7 @@ def shortlist(files: list[str], terms: list[str]) -> list[tuple[str, int]]:
     if not bodies:
         return []
 
-    # Keep only terms selective enough to distinguish one file from another.
-    ceiling = max(1, int(len(bodies) * _TERM_UBIQUITY_CEILING))
-    selective = []
-    for term in lowered:
-        matches = sum(1 for body in bodies.values() if term in body)
-        if 0 < matches <= ceiling:
-            selective.append(term)
-    # If every term was ubiquitous, ranking on them is still better than nothing.
-    if not selective:
-        selective = lowered
+    selective = selective_terms(list(bodies.values()), lowered)
 
     scored = []
     for path, body in bodies.items():
@@ -442,15 +464,37 @@ async def run_search(
     for candidate in candidates:
         chunks.extend(chunk_file(candidate, settings.agentaus_search_chunk_tokens))
 
+    # Rank chunks the same way files were ranked. Shortlisting files is not enough when
+    # the corpus is one enormous file: a 434 KB tender document is a single candidate
+    # that still costs 27 model calls, and 22 of those chunks contain none of the terms
+    # being looked for. Measured: 285 seconds before this, and the answer call after it
+    # then ran past the client's patience.
+    total = len(chunks)
+    if total > settings.agentaus_search_min_candidates:
+        bodies = [piece[3].lower() for piece in chunks]
+        # Selectivity recomputed ACROSS CHUNKS. Reusing the file-level judgement here is
+        # what made this filter a no-op on a single-file corpus.
+        selective = selective_terms(bodies, [t.lower() for t in terms])
+        scored = []
+        for piece, body in zip(chunks, bodies):
+            hits = sum(1 for term in selective if term in body)
+            if hits:
+                scored.append((hits, piece))
+        # Same reasoning as the file shortlist: too few hits means the words are absent,
+        # not the answer, so read everything rather than trusting the filter.
+        if len(scored) >= settings.agentaus_search_min_candidates:
+            scored.sort(key=lambda pair: -pair[0])
+            chunks = [piece for _hits, piece in scored]
+
     cap = settings.agentaus_search_max_chunks
     dropped = max(0, len(chunks) - cap)
     chunks = chunks[:cap]
 
     log.info(
-        "search %r: %d file(s) -> %d candidate(s)%s -> %d chunk(s)%s",
+        "search %r: %d file(s) -> %d candidate(s)%s -> %d of %d chunk(s)%s",
         query[:60], len(files), len(candidates),
         " (brute force: shortlist too thin)" if brute_forced else "",
-        len(chunks), f", {dropped} over the cap" if dropped else "",
+        len(chunks), total, f", {dropped} over the cap" if dropped else "",
     )
 
     if not chunks:

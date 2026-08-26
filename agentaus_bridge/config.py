@@ -256,11 +256,19 @@ class Settings:
     agentaus_tool_ledger_limit: int = field(
         default_factory=lambda: _int("AGENTAUS_TOOL_LEDGER_LIMIT", 40)
     )
-    # Tokens of file content per search call. Smaller than the summary chunk: a search
-    # answer is a quote, so fidelity matters more than context, and a fact is a larger
-    # share of a smaller chunk.
+    # Tokens of file content per search call. Measured on a 434 KB tender document,
+    # searching for facts known to be in it (ISO 27001, IRAP, Essential 8, classification):
+    #
+    #   4000 tok  ->  48s, 16 calls, 6740 chars of evidence, all facts found
+    #   8000 tok  ->  29s, 10 calls, 3184 chars, all facts found
+    #  16000 tok  ->  22s,  4 calls, 1333 chars, all facts found
+    #
+    # Every size found every fact, so the trade is cost against how much gets quoted
+    # back: bigger chunks mean each call summarises more and quotes less. 8000 halves
+    # the cost of 4000 while keeping the detail. Going much further also risks the
+    # Cloudflare 524 that a 32k summarisation chunk once produced.
     agentaus_search_chunk_tokens: int = field(
-        default_factory=lambda: _int("AGENTAUS_SEARCH_CHUNK_TOKENS", 4000)
+        default_factory=lambda: _int("AGENTAUS_SEARCH_CHUNK_TOKENS", 8000)
     )
     # Ceiling on calls for one search. Truncation is reported in the result and logged -
     # a silent cap reads as full coverage, which is worse than a stated partial one.

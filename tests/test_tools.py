@@ -293,3 +293,77 @@ class TestWebSearch(unittest.TestCase):
 
         out = run(tools.execute(tools.WEB_SEARCH_TOOL, {"query": "x"}, call))
         self.assertEqual(out, "answered")
+
+
+class TestBinaryFormatsAreSkipped(unittest.TestCase):
+    """Office documents are zip archives. Read as text they are noise, and a search
+    will chunk that noise and spend one model call per piece - observed burning most of
+    a 120-chunk budget on a single 350 KB .docx in a real tender directory."""
+
+    def test_office_and_binary_files_are_not_enumerated(self):
+        with _Tree({
+            "notes.md": "the real content\n",
+            "response.docx": "PK\x03\x04binary noise",
+            "data.xlsx": "PK\x03\x04more noise",
+            "deck.pptx": "PK\x03\x04noise",
+            "cache.sqlite": "SQLite format 3",
+        }) as tree:
+            names = {os.path.basename(f) for f in tools.enumerate_files(tree.path)}
+        self.assertEqual(names, {"notes.md"})
+
+    def test_a_docx_named_directly_is_still_refused(self):
+        """Naming it explicitly does not make it readable as text."""
+        with _Tree({"response.docx": "PK\x03\x04binary"}) as tree:
+            path = os.path.join(tree.path, "response.docx")
+            self.assertEqual(tools.enumerate_files(path), [])
+
+
+class TestChunkLevelPrefilter(unittest.TestCase):
+    """Shortlisting files is not enough when the corpus is one enormous file.
+
+    A 434 KB tender document is a single candidate that still costs one model call per
+    chunk, and most of those chunks contain none of the terms being searched for.
+    Measured on that file: 285 seconds before chunks were ranked too.
+    """
+
+    def test_chunks_without_a_term_are_not_read(self):
+        # One file, many chunks, the term in only one of them.
+        body = ("filler paragraph about unrelated matters\n" * 400
+                + "the SEMAPHORE lives here\n"
+                + "more filler about other things entirely\n" * 400)
+        with _Tree({"big.md": body}) as tree:
+            call = responder(terms="SEMAPHORE", hit_on="big.md", answer="found")
+            run(tools.run_search("where is the cap", tree.path, None, call))
+        chunk_prompts = [p for p in call.seen if "<excerpt file=" in p]
+        self.assertGreaterEqual(len(chunk_prompts), 1)
+        self.assertLessEqual(len(chunk_prompts), 3,
+                             "every chunk was read despite only one containing the term")
+
+    def test_too_few_matching_chunks_still_reads_everything(self):
+        """The needle property must survive: absent words are not an absent answer."""
+        body = "alpha beta gamma\n" * 3000
+        with _Tree({"big.md": body}) as tree:
+            call = responder(terms="zzznotpresent", hit_on="big.md", answer="found")
+            run(tools.run_search("what is here", tree.path, None, call))
+        chunk_prompts = [p for p in call.seen if "<excerpt file=" in p]
+        self.assertGreater(len(chunk_prompts), 1, "the fallback did not read everything")
+
+
+class TestSelectivity(unittest.TestCase):
+    def test_a_term_in_everything_is_dropped(self):
+        texts = ["alpha document", "beta document", "gamma document", "delta document"]
+        self.assertEqual(tools.selective_terms(texts, ["document", "alpha"]), ["alpha"])
+
+    def test_all_ubiquitous_terms_are_kept_rather_than_ranking_on_nothing(self):
+        texts = ["document", "document", "document"]
+        self.assertEqual(tools.selective_terms(texts, ["document"]), ["document"])
+
+    def test_measured_over_chunks_not_files(self):
+        """The single-file case. Selectivity across one file filters nothing, which is
+        why a 434 KB document was read 29 chunks out of 29."""
+        chunks = ["intro document blah", "document about ingestion",
+                  "document about OCR", "SEMAPHORE lives here document"]
+        self.assertEqual(
+            tools.selective_terms(chunks, ["document", "semaphore".upper()]),
+            ["SEMAPHORE"],
+        )
