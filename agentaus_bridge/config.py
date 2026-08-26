@@ -245,6 +245,31 @@ class Settings:
         default_factory=lambda: _float("AGENTAUS_OFFICE_TIMEOUT", 120.0)
     )
 
+    # PDFs get their own ladder rather than going through LibreOffice, whose PDF
+    # importer returns a stylesheet and a pile of GIFs where the text should be.
+    agentaus_pdf_extract: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_PDF_EXTRACT", True)
+    )
+    agentaus_pdf_ocr: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_PDF_OCR", True)
+    )
+    # Below this a page is treated as having no text layer and is sent to OCR. Set from
+    # the corpus: real text pages run 500+ characters, cover pages run tens.
+    agentaus_pdf_min_chars_per_page: int = field(
+        default_factory=lambda: _int("AGENTAUS_PDF_MIN_CHARS_PER_PAGE", 80)
+    )
+    # OCR costs about half a second a page. A 93-page scan is a minute, which is worth
+    # it once and not worth it by accident, so it is capped and the cap is logged.
+    agentaus_pdf_ocr_max_pages: int = field(
+        default_factory=lambda: _int("AGENTAUS_PDF_OCR_MAX_PAGES", 40)
+    )
+    agentaus_pdf_dpi: int = field(
+        default_factory=lambda: _int("AGENTAUS_PDF_DPI", 200)
+    )
+    agentaus_pdf_timeout_seconds: float = field(
+        default_factory=lambda: _float("AGENTAUS_PDF_TIMEOUT", 120.0)
+    )
+
     # --- Bridge-executed search -----------------------------------------------------
     # Agentaus is handed Grep - a regex tool - as its way of finding things, and a
     # smaller model writes a regex against a guess about what the code looks like. This

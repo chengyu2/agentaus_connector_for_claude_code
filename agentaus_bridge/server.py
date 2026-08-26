@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import documents
 from . import persisted
 from . import syntax
+from . import schema as tool_schema
 from . import tools as bridge_tools
 from .augment import (
     ADJUDICATE_INSTRUCTION,
@@ -842,6 +843,72 @@ def _correction_for(call: dict, known: set) -> str:
     )
 
 
+def _tool_schemas(payload: dict) -> dict:
+    """Each offered tool's input schema, by name - the client's own and the bridge's.
+
+    Both live in the same payload: bridge tools are injected into `tools` alongside the
+    client's before the request goes upstream, so one lookup validates either kind.
+    """
+    schemas = {}
+    for tool in (payload or {}).get("tools") or []:
+        function = (tool or {}).get("function") or {}
+        name = function.get("name")
+        if name:
+            schemas[name] = function.get("parameters") or {}
+    return schemas
+
+
+def _validate_tool_calls(calls: list, schemas: dict) -> list:
+    """Fix what is unambiguously fixable; report what is not.
+
+    Coerced arguments are written back onto the call, so a double-encoded payload is
+    repaired in place rather than spending a correction round. Returns
+    `(call, message)` for every call that is still invalid - those must not be passed
+    on, because the client will reject them and the turn is spent either way.
+    """
+    broken = []
+    for call in calls:
+        schema = schemas.get(call.get("name") or "")
+        if not schema:
+            continue
+        fixed, problems = tool_schema.validate(call.get("arguments"), schema)
+        if problems:
+            broken.append((call, tool_schema.correction_for(
+                call.get("name") or "", problems, schema)))
+            continue
+        encoded = json.dumps(fixed)
+        if encoded != call.get("arguments"):
+            log.debug("repaired arguments for %s", call.get("name"))
+        call["arguments"] = encoded
+    return broken
+
+
+def _with_coerced_calls(data: dict, calls: list) -> dict:
+    """Put repaired arguments back into a non-streaming response.
+
+    The streaming path emits from the call dicts themselves, so writing back is enough
+    there. This path emits from `data`, which the call dicts were only copied out of.
+    """
+    repaired = {call.get("id"): call.get("arguments") for call in calls if call.get("id")}
+    if not repaired:
+        return data
+    choices = list(data.get("choices") or [])
+    if not choices:
+        return data
+    choice = dict(choices[0] or {})
+    message = dict(choice.get("message") or {})
+    rebuilt = []
+    for call in message.get("tool_calls") or []:
+        if call.get("id") in repaired:
+            function = dict(call.get("function") or {})
+            function["arguments"] = repaired[call["id"]]
+            call = {**call, "function": function}
+        rebuilt.append(call)
+    message["tool_calls"] = rebuilt
+    choice["message"] = message
+    return {**data, "choices": [choice] + choices[1:]}
+
+
 def _with_tool_results(payload: dict, calls: list, results: list) -> dict:
     """Append calls and their results to a payload, in OpenAI's shape.
 
@@ -1410,7 +1477,8 @@ async def _handle_agentaus(
             _calibrate_from_usage(body, data.get("usage"))
 
             known = _known_tool_names(payload)
-            mine, _theirs, invented = _partition_tool_calls(_openai_calls(data), known)
+            calls = _openai_calls(data)
+            mine, _theirs, invented = _partition_tool_calls(calls, known)
             if invented and corrections < settings.agentaus_correction_rounds:
                 corrections += 1
                 rlog(logging.WARNING, "model invented %d tool name(s): %s; correcting",
@@ -1418,6 +1486,18 @@ async def _handle_agentaus(
                 payload = _with_tool_results(
                     payload, invented, [_correction_for(c, known) for c in invented])
                 continue
+            broken = _validate_tool_calls(mine + _theirs, _tool_schemas(payload))
+            if broken and corrections < settings.agentaus_correction_rounds:
+                corrections += 1
+                rlog(logging.WARNING, "%d malformed tool call(s): %s; correcting",
+                     len(broken), "; ".join(m for _, m in broken)[:300])
+                payload = _with_tool_results(
+                    payload, [c for c, _ in broken], [m for _, m in broken])
+                continue
+            if broken:
+                rlog(logging.WARNING, "forwarding %d malformed tool call(s) - out of "
+                     "rounds to correct them", len(broken))
+            data = _with_coerced_calls(data, calls)
             if not mine:
                 if invented:
                     rlog(logging.WARNING, "dropping %d invented tool call(s) - out of "
@@ -1775,6 +1855,21 @@ async def _agentaus_event_stream(
         if invented:
             rlog(logging.WARNING, "dropping %d invented tool call(s) - out of rounds",
                  len(invented))
+        # A well-named call with malformed arguments is rejected by the client with a
+        # wall of validator internals, which costs the turn and tells the model nothing.
+        # Same budget as an invented name: it is the same class of mistake.
+        broken = _validate_tool_calls(mine + theirs, _tool_schemas(payload))
+        if broken and corrections < settings.agentaus_correction_rounds:
+            corrections += 1
+            rlog(logging.WARNING, "%d malformed tool call(s): %s; correcting",
+                 len(broken), "; ".join(m for _, m in broken)[:300])
+            payload = _with_tool_results(
+                payload, [c for c, _ in broken], [m for _, m in broken])
+            pending = []
+            continue
+        if broken:
+            rlog(logging.WARNING, "forwarding %d malformed tool call(s) - out of rounds",
+                 len(broken))
         if mine and tool_round < settings.agentaus_tool_rounds:
             tool_round += 1
             rlog(logging.INFO, "running %d bridge tool call(s): %s",

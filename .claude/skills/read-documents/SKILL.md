@@ -8,7 +8,7 @@ description: Read Word documents, spreadsheets, presentations and PDFs correctly
 ## Why not just read the file
 
 A `.docx`, `.xlsx` and `.pptx` are zip archives. Read as text they are binary noise. A PDF
-is worse: it will happily return megabytes of nonsense that looks like content.
+is worse: read as text it returns megabytes of nonsense that looks like content.
 
 The bridge converts them with LibreOffice automatically, so `agentaus_search` and
 `agentaus_zoom` see them as text with **table rows on one line, cells separated by ` | `**.
@@ -36,12 +36,23 @@ was blamed on the upstream.
 
 ## PDFs
 
-Text-layer PDFs convert. **Image-only PDFs do not** — scans, certificates, anything
-exported as pictures. LibreOffice returns a page of CSS and a heap of GIFs, which is not
-the document.
+PDFs do **not** go through LibreOffice. Its importer opens a PDF as a drawing: one real
+tender PDF came back as 112 characters of stylesheet and a hundred GIFs, which reads as
+"this document is empty" when it was eight pages of text.
 
-When a PDF yields almost nothing, say so. Do not describe what a certificate probably says.
-An unreadable document named as unreadable is useful; one guessed at is not.
+They go through a ladder instead — several extractors tried in order, then OCR on any
+page that still came back blank or garbled. Scanned pages and image-only certificates are
+readable. Across the 48 PDFs this was built against, all 48 extract.
+
+Two things follow for you:
+
+- **Pages are numbered.** Extracted text carries `[page N]` markers. Cite them — a page is
+  the only coordinate a PDF has, and a quote from a 93-page tender cannot be checked
+  without one.
+- **Read the log line if something looks thin.** It names the tier that won and how many
+  pages needed OCR. A PDF that yields almost nothing after all that is genuinely close to
+  empty — say so rather than describing what a certificate probably says. An unreadable
+  document named as unreadable is useful; one guessed at is not.
 
 ## Rules
 

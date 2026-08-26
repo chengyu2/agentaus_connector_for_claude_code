@@ -230,7 +230,7 @@ _SKIP_DIRS = {
 
 # Binary and generated content: reading it costs a model call and answers nothing.
 _SKIP_SUFFIXES = {
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".tar",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".zip", ".gz", ".tar",
     ".bz2", ".xz", ".7z", ".mp4", ".mov", ".mp3", ".wav", ".woff", ".woff2", ".ttf",
     ".otf", ".eot", ".so", ".dylib", ".dll", ".exe", ".bin", ".class", ".jar", ".pyc",
     ".pyo", ".wasm", ".lock", ".map", ".min.js", ".min.css",
@@ -243,10 +243,18 @@ _SKIP_SUFFIXES = {
 
 
 def _skipped_suffixes() -> set:
-    """Suffixes to walk past. Office formats join the list only if we cannot read them."""
-    if documents.available():
-        return _SKIP_SUFFIXES
-    return _SKIP_SUFFIXES | documents.OFFICE_SUFFIXES
+    """Suffixes to walk past.
+
+    Formats we can extract are not skipped; formats we cannot are. Office documents and
+    PDFs are asked about separately because they need different tools, and a machine
+    with poppler but no LibreOffice can read one and not the other.
+    """
+    skipped = set(_SKIP_SUFFIXES)
+    if not documents.available("x.docx"):
+        skipped |= documents.OFFICE_SUFFIXES
+    if not documents.available("x.pdf"):
+        skipped |= documents.PDF_SUFFIXES
+    return skipped
 
 # Never read, regardless of what the model asks for or what the query matches. Secrets
 # do not stop being secrets because a search term happened to appear in them, and the
@@ -322,7 +330,7 @@ def read_text(path: str) -> str:
     shortlist all see a .docx the same way: as its text, with table rows on one line and
     cells separated by ` | `.
     """
-    if documents.is_office_document(path) and documents.available():
+    if documents.is_office_document(path) and documents.available(path):
         return documents.extract(path)
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
@@ -1069,7 +1077,7 @@ async def run_zoom(
     if not _allowed_root(file_path):
         return f"{file_path} is outside AGENTAUS_SEARCH_ROOTS."
     if not enumerate_files(file_path):
-        if documents.is_office_document(file_path) and not documents.available():
+        if documents.is_office_document(file_path) and not documents.available(file_path):
             return (f"{file_path} is an office document and no reader for it is "
                     f"available.\n{documents.install_hint(file_path)}")
         return f"{file_path} cannot be read as text (missing, binary, or excluded)."

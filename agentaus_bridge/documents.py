@@ -78,12 +78,34 @@ def soffice() -> str | None:
     return _binary
 
 
+# PDFs are handled by their own ladder (`pdf.py`), not by LibreOffice. LibreOffice can
+# open a PDF, but its importer treats it as a drawing to be edited: converting one here
+# produced 112 characters of CSS and a hundred GIFs, which read as "this document is
+# empty" when the document was eight pages of text.
+PDF_SUFFIXES = {".pdf"}
+
+READABLE_SUFFIXES = OFFICE_SUFFIXES | PDF_SUFFIXES
+
+
+def is_pdf(path: str) -> bool:
+    return Path(path).suffix.lower() in PDF_SUFFIXES
+
+
 def is_office_document(path: str) -> bool:
-    return Path(path).suffix.lower() in OFFICE_SUFFIXES
+    """Whether this is a file the bridge must extract rather than read as text.
+
+    Includes PDFs. The name is now slightly wrong and the behaviour is right: every
+    caller wants "is this unreadable as text", and a PDF read with `read_text` is 1.4MB
+    of binary noise in the transcript.
+    """
+    return Path(path).suffix.lower() in READABLE_SUFFIXES
 
 
 def available(path: str | None = None) -> bool:
-    """Whether office extraction can be performed. `path` is accepted for symmetry."""
+    """Whether extraction can be performed for `path`, which needs different tools."""
+    if path and is_pdf(path):
+        from . import pdf as _pdf
+        return settings.agentaus_pdf_extract and _pdf.available()
     return settings.agentaus_office_extract and soffice() is not None
 
 
@@ -97,6 +119,10 @@ def install_hint(path: str = "") -> str:
     dependency: a row that reads one way in development and another in CI is a bug nobody
     finds until it matters.
     """
+    if path and is_pdf(path):
+        from . import pdf as _pdf
+        return _pdf.install_hint()
+
     return (
         "LibreOffice reads these. Install it and the bridge picks it up with no further "
         "configuration:\n"
@@ -166,12 +192,19 @@ def extract(path: str) -> str:
     Never raises: a document that will not convert should look like a document with
     nothing readable in it, not fail the turn that touched it.
     """
-    if not available():
-        return ""
     key = _key(path)
     cached = _cache.get(key)
     if cached is not None:
         return cached
+
+    if is_pdf(path):
+        from . import pdf as _pdf
+        text = _pdf.extract(path)
+        _cache[key] = text
+        return text
+
+    if not available():
+        return ""
 
     binary = soffice()
     with tempfile.TemporaryDirectory(prefix="agentaus-office-") as workdir:

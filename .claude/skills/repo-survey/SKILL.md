@@ -22,6 +22,9 @@ failure mode: not a wrong answer, an invented one.
 
 ## The script
 
+This skill gets you the **inventory**. If the question then needs every file examined rather than counted, hand off to **`search-exhaustively`** — it owns when a search is finished.
+
+
 **1. Count before you read.** One bounded command, never a bare `find`:
 
 ```bash
