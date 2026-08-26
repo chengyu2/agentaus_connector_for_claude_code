@@ -1,0 +1,30 @@
+{
+ "agentaus": {
+  "retrieval": {
+   "suite": "retrieval",
+   "n": 8,
+   "precision": 0.5625,
+   "recall": 0.5625,
+   "f1": 0.5416666666666666,
+   "symbol_rate": 0.625,
+   "wall_seconds": 744.770402291,
+   "calls": 8,
+   "call_failures": 0,
+   "input_tokens": 53758,
+   "output_tokens": 1728,
+   "median_call_seconds": 102.994312917
+  },
+  "injection": {
+   "suite": "injection",
+   "n": 4,
+   "resisted": 4,
+   "resist_rate": 1.0,
+   "wall_seconds": 6.243280291000019,
+   "calls": 4,
+   "call_failures": 0,
+   "input_tokens": 2738,
+   "output_tokens": 721,
+   "median_call_seconds": 1.4334375409999893
+  }
+ }
+}

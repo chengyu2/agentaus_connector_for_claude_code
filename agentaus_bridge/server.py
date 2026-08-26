@@ -534,6 +534,47 @@ async def _stream_helper(
     return "".join(parts)
 
 
+async def _answer_without_tools(client: httpx.AsyncClient, payload: dict) -> str:
+    """Ask for an answer from what is already in the conversation, tools removed.
+
+    Used where the model has the material and will not settle: it has searched its budget
+    away, or it returned nothing at all. Taking the tools off the request removes the
+    option it keeps choosing, and everything it found is still in the messages.
+
+    Returns "" on any failure, so the caller can fall back to saying what happened.
+    """
+    stripped = {k: v for k, v in payload.items() if k not in ("tools", "tool_choice")}
+    messages = list(stripped.get("messages") or [])
+    messages.append({
+        "role": "user",
+        "content": (
+            "<task>\nAnswer now, from what is already above. You have no tools for this "
+            "turn.\n\nIf what you gathered is enough, give the answer in the format "
+            "originally asked for. If it genuinely is not, say in one line what is "
+            "missing - do not describe your search.\n</task>"
+        ),
+    })
+    stripped["messages"] = messages
+    stripped["stream"] = False
+    try:
+        async with hold("forced answer", "urgent"):
+            response = await _post_with_retry(
+                client, settings.agentaus_url,
+                json_body=stripped, headers=_agentaus_headers(),
+                retry_capacity=False,
+            )
+        if response.status_code >= 400:
+            return ""
+        data = response.json()
+        text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        if text.strip():
+            rlog(logging.INFO, "forced answer produced %d chars", len(text))
+        return text.strip()
+    except Exception as exc:
+        rlog(logging.WARNING, "forced answer failed (%s)", exc)
+        return ""
+
+
 async def _check_grounding(
     client: httpx.AsyncClient, body: dict, answer: str
 ) -> str:
@@ -1730,11 +1771,30 @@ async def _agentaus_event_stream(
                  "tool round limit (%d) reached; dropping %d unanswered bridge call(s)",
                  settings.agentaus_tool_rounds, len(mine))
             if not pending and not theirs:
-                pending = ["I ran out of search rounds before finishing. Ask again and "
-                           "I will continue from what I found."]
+                # Every one of those searches is still in the payload. Asking again with
+                # the tools REMOVED forces the model to answer from what it gathered,
+                # which is strictly better than apologising for having gathered it.
+                # Observed: a locatable symbol spent twelve rounds being searched for and
+                # the turn ended "I ran out of search rounds", with the answer sitting in
+                # the conversation the whole time.
+                forced = await _answer_without_tools(client, payload)
+                pending = [forced] if forced else [
+                    "I searched without reaching an answer. Narrow the question and I "
+                    "will try again."
+                ]
         break
 
     answer = "".join(pending)
+    if buffering and not answer and not theirs and not accumulator.pending():
+        # Agentaus sometimes answers HTTP 200 with no content at all - observed as
+        # "200 in 94.8s in=0 out=0" on a question it had every means to answer. An empty
+        # reply is never right, so ask once more before forwarding silence.
+        rlog(logging.WARNING, "upstream returned an empty answer; asking once more")
+        retried = await _answer_without_tools(client, payload)
+        if retried:
+            answer = retried
+            pending = [answer]
+
     if buffering and answer:
         if not theirs and worth_reviewing_turn(original) and worth_reviewing(
             answer, min_chars=settings.agentaus_review_min_chars
