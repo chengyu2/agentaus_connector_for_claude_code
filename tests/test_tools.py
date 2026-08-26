@@ -448,18 +448,13 @@ class TestZoom(unittest.TestCase):
             run(tools.run_zoom(path, 5, 5, "", call))
         self.assertEqual(call.seen, [], "it called the model on a passage that already fit")
 
-    # Real prose, not short code lines: the window is bounded by radius first, so it
-    # only exceeds the token budget when the lines themselves are long - which is
-    # exactly what a tender document looks like.
-    PROSE = "\n".join(
-        ["## Huge section"]
-        + [f"Paragraph {i}. " + "This sentence describes a certification requirement "
-           "in the sort of detail a tender response actually contains. " * 6
-           for i in range(300)]
-    )
+    # Genuinely oversized. The window is bounded by radius first, so exceeding the token
+    # budget takes very long lines - and the budget is now 24k tokens, high enough that
+    # ordinary tender prose comes back verbatim (see TestZoomIsNormallyFree).
+    PROSE = "\n".join(["## Huge section"] + ["y" * 4000 for _ in range(400)])
 
     def test_an_oversized_section_is_condensed_against_the_purpose(self):
-        call = self.stub(answer="     3  Paragraph 2 ...\n[dropped: 200 similar paragraphs]")
+        call = self.stub(answer="     3  kept line\n[dropped: 200 similar lines]")
         with _Tree({"doc.md": self.PROSE}) as tree:
             out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 3, 3,
                                      "find the certifications", call))
@@ -473,7 +468,7 @@ class TestZoom(unittest.TestCase):
         with _Tree({"doc.md": self.PROSE}) as tree:
             out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 3, 3, "x", broken))
         self.assertIn("truncated", out)
-        self.assertIn("Paragraph", out, "the passage was lost rather than truncated")
+        self.assertIn("yyy", out, "the passage was lost rather than truncated")
 
     def test_a_line_past_the_end_says_so(self):
         with _Tree({"doc.md": "one\ntwo\n"}) as tree:
@@ -617,3 +612,41 @@ class TestLearnedCapacity(unittest.TestCase):
 
         self.assertIn("SEMAPHORE", out, "the timed-out chunk was dropped instead of split")
         self.assertGreater(calls["n"], 1, "it never retried the halves")
+
+
+class TestZoomIsNormallyFree(unittest.TestCase):
+    """Zoom reads a file. It should almost never spend a model call.
+
+    The threshold was 6000 tokens while the window it feeds is 131k, and a 400-line
+    section of tender prose is ~24,000 characters - so every zoom exceeded it and
+    condensed a passage that would have fitted untouched. Under load those calls took
+    over 240s each and a repair run made no progress for an hour.
+    """
+
+    def test_a_full_size_section_of_real_prose_is_returned_verbatim(self):
+        # 400 lines - the AGENTAUS_ZOOM_MAX_LINES ceiling - of tender-length sentences.
+        prose = "\n".join(
+            f"Paragraph {i}. " + "This sentence carries the sort of detail a tender "
+            "response actually contains, at the length such documents run to. " * 3
+            for i in range(400))
+
+        async def must_not_be_called(_: str) -> str:
+            raise AssertionError("zoom spent a model call on a passage that fits")
+
+        with _Tree({"doc.md": prose}) as tree:
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 200, 200,
+                                     "", must_not_be_called))
+        self.assertIn("Paragraph 200", out)
+
+    def test_the_ceiling_still_bites_on_something_genuinely_huge(self):
+        huge = "\n".join("x" * 4000 for _ in range(400))
+        seen = []
+
+        async def condense(prompt: str) -> str:
+            seen.append(prompt)
+            return "     1  kept\n[dropped: the rest]"
+
+        with _Tree({"doc.md": huge}) as tree:
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 5, 5, "why", condense))
+        self.assertEqual(len(seen), 1, "an oversized passage was not condensed at all")
+        self.assertIn("dropped", out)

@@ -264,9 +264,17 @@ class Settings:
     )
     # Below this the passage comes back verbatim; above it, Agentaus keeps what serves
     # the stated purpose. Verbatim is strongly preferred - condensing a passage the
-    # caller is about to quote from defeats the point of zooming in on it.
+    # caller is about to quote from defeats the point of zooming in on it - so this is
+    # set high enough that condensation is genuinely rare.
+    #
+    # It was 6000, which was wrong by an order of magnitude: a 400-line section of tender
+    # prose is roughly 24,000 characters, so EVERY zoom exceeded it and spent a model
+    # call condensing a passage that would have fitted the caller's window untouched.
+    # Under load those calls took over 240 seconds each and a repair run made no progress
+    # for an hour. Zoom is meant to be free - it reads a file - and now it almost always
+    # is.
     agentaus_zoom_max_tokens: int = field(
-        default_factory=lambda: _int("AGENTAUS_ZOOM_MAX_TOKENS", 6000)
+        default_factory=lambda: _int("AGENTAUS_ZOOM_MAX_TOKENS", 24000)
     )
 
     # --- Tool-result distillation ----------------------------------------------------
