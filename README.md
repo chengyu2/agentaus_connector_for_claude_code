@@ -867,6 +867,26 @@ cells:
 One line per row means a line number still identifies a row, so `agentaus_zoom` cites into
 a spreadsheet exactly as it cites into source code.
 
+### One reader, on purpose
+
+If LibreOffice is absent, the bridge says so and tells you how to install it. It does not
+fall back to a lighter library.
+
+`python-docx` and `openpyxl` would handle `.docx` and `.xlsx` in 496 KB against
+LibreOffice's 795 MB, so the temptation is obvious. They are also a **second
+implementation of "how does a table become text"** — different format coverage, and a
+different rendering of the same document. Two answers to that question is worse than one
+large dependency: a row that reads one way on a laptop and another way in CI is a bug
+nobody finds until a number is wrong in a tender response.
+
+```
+macOS   brew install --cask libreoffice
+Debian  sudo apt install libreoffice-writer libreoffice-calc
+```
+
+Nothing to configure afterwards — `soffice` is found on `$PATH` or in the usual
+locations, and `AGENTAUS_SOFFICE_PATH` covers an unusual one.
+
 ### Why not just strip the XML
 
 Because it fails quietly. Measured against LibreOffice on one real 43-row requirements

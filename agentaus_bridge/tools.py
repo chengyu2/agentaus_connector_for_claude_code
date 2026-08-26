@@ -980,8 +980,8 @@ async def run_zoom(
         return f"{file_path} is outside AGENTAUS_SEARCH_ROOTS."
     if not enumerate_files(file_path):
         if documents.is_office_document(file_path) and not documents.available():
-            return (f"{file_path} is an office document and LibreOffice is not available "
-                    f"to read it. Install LibreOffice, or set AGENTAUS_SOFFICE_PATH.")
+            return (f"{file_path} is an office document and no reader for it is "
+                    f"available.\n{documents.install_hint(file_path)}")
         return f"{file_path} cannot be read as text (missing, binary, or excluded)."
 
     body = read_text(file_path)

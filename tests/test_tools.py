@@ -445,8 +445,10 @@ class TestZoom(unittest.TestCase):
                                          self.stub()))
         finally:
             settings.agentaus_office_extract = previous
-        self.assertIn("LibreOffice is not available", out)
-        self.assertIn("AGENTAUS_SOFFICE_PATH", out, "it should say how to fix it")
+        self.assertIn("no reader for it is", out)
+        self.assertIn("brew install --cask libreoffice", out,
+                      "it should say exactly how to fix it")
+        self.assertIn("AGENTAUS_SOFFICE_PATH", out)
 
     def test_a_relative_path_falls_back_to_the_working_directory(self):
         with _Tree({"doc.md": self.DOC}) as tree:

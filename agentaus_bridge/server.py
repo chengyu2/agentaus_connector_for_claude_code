@@ -24,6 +24,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from . import documents
 from . import tools as bridge_tools
 from .augment import (
     ADJUDICATE_INSTRUCTION,
@@ -1124,6 +1125,13 @@ async def _handle_agentaus(
         conversation, which is why the streaming path runs this *inside* the response
         generator rather than before it - see the note there.
         """
+        # A `.docx` read by Claude Code's own Read tool arrives as zip noise, because
+        # that tool runs on the client and a `.docx` is a zip. Fix it before anything
+        # else looks at it - distillation would otherwise spend model calls condensing
+        # binary, and the model would answer from nothing.
+        if settings.agentaus_office_extract:
+            current = documents.repair_tool_results(current)
+
         # Condense oversized tool results BEFORE fitting. Order matters: this is what
         # decides whether compaction is needed at all, and compacting first would
         # summarise output that was about to be condensed anyway.

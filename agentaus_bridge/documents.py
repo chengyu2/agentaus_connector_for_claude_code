@@ -82,9 +82,28 @@ def is_office_document(path: str) -> bool:
     return Path(path).suffix.lower() in OFFICE_SUFFIXES
 
 
-def available() -> bool:
-    """Whether office extraction can actually be performed."""
+def available(path: str | None = None) -> bool:
+    """Whether office extraction can be performed. `path` is accepted for symmetry."""
     return settings.agentaus_office_extract and soffice() is not None
+
+
+def install_hint(path: str = "") -> str:
+    """What to tell someone whose document cannot be read.
+
+    One instruction, because there is one way to read these files here. Pure-Python
+    readers exist and are far smaller, but they would be a SECOND implementation of "how
+    does a table become text" - with different format coverage and a different rendering
+    of the same document. Two answers to that question is worse than one large
+    dependency: a row that reads one way in development and another in CI is a bug nobody
+    finds until it matters.
+    """
+    return (
+        "LibreOffice reads these. Install it and the bridge picks it up with no further "
+        "configuration:\n"
+        "  macOS   brew install --cask libreoffice\n"
+        "  Debian  sudo apt install libreoffice-writer libreoffice-calc\n"
+        "  or set AGENTAUS_SOFFICE_PATH if it is installed somewhere unusual."
+    )
 
 
 # Converted text, keyed by path plus mtime plus size. A conversion is expensive and a
@@ -196,3 +215,85 @@ def extract(path: str) -> str:
 def reset_cache() -> None:
     """For tests, and for a caller that knows a document changed under it."""
     _cache.clear()
+
+
+# Fields a client tool uses to name the file it read. Claude Code's `Read` uses
+# `file_path`; other tools and MCP servers vary.
+_PATH_FIELDS = ("file_path", "path", "notebook_path", "filename", "file")
+
+
+def _named_path(tool_input) -> str | None:
+    if not isinstance(tool_input, dict):
+        return None
+    for field in _PATH_FIELDS:
+        value = tool_input.get(field)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def repair_tool_results(body: dict) -> dict:
+    """Replace office-document read results with real text.
+
+    Claude Code's `Read` runs on the client, so the bridge cannot change what it does -
+    and what it does with a `.docx` is hand back zip noise, because a `.docx` is a zip.
+    The bridge can fix the result: it knows which file the call named, it runs on the same
+    machine, and it can read the document properly.
+
+    Strictly better than what arrives, so it does not try to judge whether the original
+    "looks like garbage" - a client that returned something useful for an office document
+    would have had to read it the same way. Substitution is keyed on the file's own
+    content (see `extract`), so the conversation prefix stays stable across turns and the
+    compaction cache keeps hitting.
+    """
+    if not available():
+        return body
+
+    messages = body.get("messages") or []
+    named: dict = {}
+    for message in messages:
+        for block in message.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                path = _named_path(block.get("input"))
+                if path and is_office_document(path):
+                    named[block.get("id") or ""] = path
+    if not named:
+        return body
+
+    repaired_any = False
+    out = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+        blocks, changed = [], False
+        for block in content:
+            path = (
+                named.get(block.get("tool_use_id") or "")
+                if isinstance(block, dict) and block.get("type") == "tool_result"
+                else None
+            )
+            if not path or block.get("is_error"):
+                blocks.append(block)
+                continue
+            text = extract(path)
+            if not text:
+                blocks.append(block)
+                continue
+            changed = repaired_any = True
+            blocks.append({
+                **block,
+                "content": (
+                    f"[The bridge re-read {os.path.basename(path)} with LibreOffice, "
+                    f"because an office document is a zip archive and cannot be read as "
+                    f"text. Table rows are one line each, cells separated by ' | '.]\n"
+                    + text
+                ),
+            })
+        out.append({**message, "content": blocks} if changed else message)
+
+    if repaired_any:
+        log.info("re-read %d office document result(s) that arrived as binary", len(named))
+        return {**body, "messages": out}
+    return body

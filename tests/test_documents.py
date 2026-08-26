@@ -131,3 +131,91 @@ class TestCaching(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestRepairingClientSideReads(unittest.TestCase):
+    """Claude Code's `Read` runs on the client, so the bridge cannot change what it does.
+
+    What it does with a `.docx` is hand back zip noise, because a `.docx` is a zip. The
+    bridge knows which file the call named and runs on the same machine, so it can fix
+    the result before anything else reads it.
+    """
+
+    def setUp(self):
+        documents.reset_cache()
+        if not documents.available():
+            self.skipTest("LibreOffice is not installed here")
+
+    def _conversation(self, path, content, is_error=False, tool="Read", field="file_path"):
+        result = {"type": "tool_result", "tool_use_id": "t1", "content": content}
+        if is_error:
+            result["is_error"] = True
+        return {"messages": [
+            {"role": "user", "content": "read it"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": tool, "input": {field: path}}]},
+            {"role": "user", "content": [result]},
+        ]}
+
+    def _docx(self, directory):
+        """A real .docx, built by LibreOffice so the test does not ship a binary."""
+        import subprocess
+        src = os.path.join(directory, "src.txt")
+        with open(src, "w") as fh:
+            fh.write("Heading\nA line of real content\n")
+        subprocess.run([documents.soffice(),
+                        f"-env:UserInstallation=file://{directory}/profile",
+                        "--headless", "--convert-to", "docx", "--outdir", directory, src],
+                       capture_output=True, timeout=120)
+        return os.path.join(directory, "src.docx")
+
+    def test_zip_noise_is_replaced_with_the_document_text(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            docx = self._docx(d)
+            if not os.path.exists(docx):
+                self.skipTest("could not build a .docx fixture")
+            body = self._conversation(docx, "PK\x03\x04\x14\x00binary noise")
+            fixed = documents.repair_tool_results(body)
+            text = fixed["messages"][2]["content"][0]["content"]
+            self.assertIn("A line of real content", text)
+            self.assertIn("LibreOffice", text, "it should say why the result changed")
+
+    def test_a_non_office_read_is_left_alone(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.py")
+            with open(path, "w") as fh:
+                fh.write("x = 1\n")
+            body = self._conversation(path, "x = 1")
+            self.assertIs(documents.repair_tool_results(body), body)
+
+    def test_an_error_result_is_left_alone(self):
+        """Its exact text is what is being debugged."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            docx = self._docx(d)
+            if not os.path.exists(docx):
+                self.skipTest("could not build a .docx fixture")
+            body = self._conversation(docx, "permission denied", is_error=True)
+            self.assertIs(documents.repair_tool_results(body), body)
+
+    def test_a_missing_document_leaves_the_result_untouched(self):
+        body = self._conversation("/nonexistent/report.docx", "PK\x03\x04")
+        self.assertIs(documents.repair_tool_results(body), body)
+
+    def test_it_is_a_no_op_when_extraction_is_off(self):
+        previous = settings.agentaus_office_extract
+        settings.agentaus_office_extract = False
+        try:
+            body = self._conversation("/some/report.docx", "PK\x03\x04")
+            self.assertIs(documents.repair_tool_results(body), body)
+        finally:
+            settings.agentaus_office_extract = previous
+
+    def test_other_path_field_names_are_recognised(self):
+        """Not every tool calls it file_path - MCP servers and others vary."""
+        self.assertEqual(documents._named_path({"path": "/a/b.docx"}), "/a/b.docx")
+        self.assertEqual(documents._named_path({"filename": "/a/b.xlsx"}), "/a/b.xlsx")
+        self.assertIsNone(documents._named_path({"query": "not a path"}))
+        self.assertIsNone(documents._named_path("not a dict"))
