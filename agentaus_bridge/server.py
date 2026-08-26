@@ -656,16 +656,55 @@ def _without_unknown_calls(data: dict, known: set) -> dict:
     return {**data, "choices": [choice] + choices[1:]}
 
 
+def _call_signature(call: dict) -> str:
+    """A stable key for "this exact tool call", for spotting a repeat."""
+    arguments = call.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments or "{}")
+        except json.JSONDecodeError:
+            arguments = {"_raw": arguments}
+    return json.dumps(
+        {"n": call.get("name") or "", "a": arguments or {}}, sort_keys=True, default=str
+    )
+
+
 async def _run_bridge_tools(
-    client: httpx.AsyncClient, payload: dict, calls: list, default_path: str | None = None
+    client: httpx.AsyncClient,
+    payload: dict,
+    calls: list,
+    default_path: str | None = None,
+    seen: dict | None = None,
 ) -> dict:
     """Execute bridge-owned tool calls and return the payload to send next.
 
     The results are appended as an assistant turn carrying the tool_calls plus one
     `tool` message per result - OpenAI's shape, matching what the translator produces
     for the client's own tools. Claude Code never sees any of it.
+
+    `seen` remembers what has already run this turn. It has to, because the tool ledger
+    cannot: bridge tool calls never enter the Anthropic message list, so the ledger -
+    which is derived from that list - is blind to exactly the tools most likely to be
+    repeated. Observed live: one turn made twelve bridge calls, zooming the same passage
+    twice and re-running a 58-second search, then exhausted its round budget with the
+    work unfinished. The model was doing the thing `augment.py` already documents, on the
+    only tools nothing was watching.
     """
+    seen = seen if seen is not None else {}
+
     async def one(call: dict) -> str:
+        signature = _call_signature(call)
+        if signature in seen:
+            # Answered from cache, and said so plainly. Repeating the work would cost a
+            # round and a minute to hand back bytes the model already has.
+            rlog(logging.WARNING, "bridge tool %s repeated with identical arguments; "
+                 "returning the earlier result", call.get("name"))
+            return (
+                "[You already ran this exact call earlier in this turn. This is the same "
+                "result, not a new one. Use it and move on - do not call it again.]\n"
+                + seen[signature]
+            )
+
         arguments = call.get("arguments")
         if isinstance(arguments, str):
             try:
@@ -680,6 +719,7 @@ async def _run_bridge_tools(
         )
         rlog(logging.INFO, "bridge tool %s ran in %.1fs -> %d chars",
              call.get("name"), time.monotonic() - started_at, len(result))
+        seen[signature] = result
         return result
 
     results = await asyncio.gather(*[one(call) for call in calls])
@@ -993,6 +1033,7 @@ async def _handle_agentaus(
         # result, and asks Agentaus again. The loop ends when the model answers with
         # prose, or with a tool only Claude Code can run.
         corrections = 0
+        ran: dict = {}
         for tool_round in range(settings.agentaus_tool_rounds + 1):
             # Agentaus is the authority on whether a prompt fits. If it says no, it also
             # says what its real limit is, so the next attempt compacts against that
@@ -1067,7 +1108,7 @@ async def _handle_agentaus(
                 rlog(logging.INFO, "running %d bridge tool call(s): %s",
                      len(mine), ", ".join(c["name"] for c in mine))
                 payload = await _run_bridge_tools(
-                    client, payload, mine, working_directory(body.get("system")))
+                    client, payload, mine, working_directory(body.get("system")), ran)
                 continue
             # Out of rounds with a bridge tool still pending. It must not reach Claude
             # Code, which has never heard of it and would fail the tool_use outright.
@@ -1211,6 +1252,7 @@ async def _agentaus_event_stream(
     # model that keeps searching still has to produce an answer eventually.
     tool_round = 0
     corrections = 0
+    ran: dict = {}
     while True:
         attempt = 0
         while True:
@@ -1378,7 +1420,7 @@ async def _agentaus_event_stream(
             rlog(logging.INFO, "running %d bridge tool call(s): %s",
                  len(mine), ", ".join(c["name"] for c in mine))
             payload = await _run_bridge_tools(
-                client, payload, mine, working_directory(original.get("system")))
+                client, payload, mine, working_directory(original.get("system")), ran)
             # Whatever the model said on its way to calling the tool is superseded by
             # the answer it is about to give with the result in hand, so it is dropped
             # rather than shown - otherwise the user reads "let me search..." followed

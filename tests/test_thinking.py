@@ -637,3 +637,87 @@ class TestGuidanceNeverDriftsFromTheWire(unittest.TestCase):
         from agentaus_bridge.augment import guidance_for
         self.assertNotIn("<tool_selection>", guidance_for({}))
         self.assertIn("<tool_selection>", guidance_for({"tools": [{"name": "Grep"}]}))
+
+
+class _CountingTools:
+    """Upstream that keeps asking for the same bridge tool call."""
+
+    def __init__(self, repeats: int = 3) -> None:
+        self.repeats = repeats
+        self.turns = 0
+
+    async def post(self, url, *, json=None, headers=None):  # noqa: A002
+        self.turns += 1
+        if self.turns <= self.repeats:
+            return _FakeResponse({
+                "choices": [{"message": {"content": "", "tool_calls": [
+                    {"id": f"c{self.turns}", "type": "function", "function": {
+                        "name": tools.SEARCH_TOOL,
+                        "arguments": '{"query": "same question", "path": "/tmp"}'}},
+                ]}, "finish_reason": "tool_calls"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            })
+        return _FakeResponse({
+            "choices": [{"message": {"content": "the answer"}, "finish_reason": "stop"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+
+
+class TestRepeatedBridgeCallsAreShortCircuited(unittest.IsolatedAsyncioTestCase):
+    """The tool ledger cannot see bridge tool calls.
+
+    They never enter the Anthropic message list, so the ledger - which is derived from
+    that list - is blind to exactly the tools most likely to be repeated. Observed live:
+    one turn made twelve bridge calls, zoomed the same passage twice, re-ran a
+    58-second search, and exhausted its round budget unfinished.
+    """
+
+    async def test_an_identical_call_is_answered_from_the_earlier_result(self):
+        from unittest import mock
+
+        from agentaus_bridge import server
+        from agentaus_bridge.config import settings
+
+        executed = []
+
+        async def counting_execute(name, arguments, call, default_path=None):
+            executed.append((name, arguments.get("query")))
+            return "the search result"
+
+        previous = settings.agentaus_self_review
+        settings.agentaus_self_review = False
+        upstream = _CountingTools(repeats=3)
+        try:
+            with mock.patch.object(tools, "execute", counting_execute):
+                chunks = []
+                async for chunk in server._agentaus_event_stream(
+                    upstream,
+                    {"messages": [{"role": "user", "content": "q"}], "stream": False},
+                    {"messages": [{"role": "user", "content": "q"}]},
+                    "agentaus",
+                    0.0,
+                ):
+                    chunks.append(chunk)
+        finally:
+            settings.agentaus_self_review = previous
+
+        self.assertEqual(len(executed), 1,
+                         f"the same search ran {len(executed)} times instead of once")
+        raw = b"".join(chunks).decode()
+        self.assertIn("the answer", raw)
+
+    async def test_a_different_call_still_runs(self):
+        from agentaus_bridge import server
+
+        calls = [
+            {"id": "1", "name": tools.SEARCH_TOOL, "arguments": '{"query": "a"}'},
+            {"id": "2", "name": tools.SEARCH_TOOL, "arguments": '{"query": "b"}'},
+        ]
+        self.assertNotEqual(server._call_signature(calls[0]),
+                            server._call_signature(calls[1]))
+
+    async def test_argument_order_does_not_defeat_the_check(self):
+        from agentaus_bridge import server
+        a = {"id": "1", "name": "t", "arguments": '{"x": 1, "y": 2}'}
+        b = {"id": "2", "name": "t", "arguments": '{"y": 2, "x": 1}'}
+        self.assertEqual(server._call_signature(a), server._call_signature(b))
