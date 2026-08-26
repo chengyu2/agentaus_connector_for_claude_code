@@ -163,7 +163,8 @@ class TestRenderingAndPicking(unittest.TestCase):
         prompt = outline.PICK_INSTRUCTION.format(query="q", outline="o", limit=8,
                                                  budget=24000)
         self.assertIn("24000", prompt)
-        self.assertIn("Picking too little is the more expensive mistake", prompt)
+        self.assertIn("Picking too little is the more", prompt)
+        self.assertIn("not read at all", prompt)
 
     def test_picks_are_parsed(self):
         picks = outline.read_picks("/x/a.py:12\n/x/b.md:340", ["/x/a.py", "/x/b.md"])

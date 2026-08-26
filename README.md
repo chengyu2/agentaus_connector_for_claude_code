@@ -1058,6 +1058,35 @@ still works — just approximately, for languages other than Python.
 
 ---
 
+## Skills: the know-how, not the capability
+
+A **tool** does something — a round trip that returns data. A **skill** tells the model
+*how* — Markdown loaded into context that returns behaviour. The bridge ships tools; the
+skills in `.claude/skills/` ship the procedures, and Claude Code loads one when its
+description matches what you asked for.
+
+They matter more here than they would with a stronger model. Most of the disappointing
+answers this bridge produced were not capability gaps — they were a competent model taking
+the wrong approach, and an approach is exactly what a skill supplies.
+
+| Skill | The pain point it encodes |
+| --- | --- |
+| `repo-survey` | Asked to review a repo, ran one `find`, answered from a 2 KB preview of a 1.6 MB listing, and **invented a policy that does not exist** |
+| `find-in-code` | Reached for `Grep` and `find` — which cannot answer *"where do we cap concurrent calls"*, since the answer shares no word with the question |
+| `read-documents` | A regex flatten of a `.docx` lost **2,695 characters** across 12 rows and could not see the compliance column |
+| `tender-evidence` | Four rows of 43 proposed additions asserting real certifications **with no quote behind them** |
+| `bridge-diagnose` | 63 timeouts and 1236 slot waits read as separate faults when they were one |
+
+Each names the failure it prevents, with the measurement, because a rule whose reason is
+stated is followed more reliably than one asserted. They are deliberately short — every
+token of instruction is one less for the conversation, and a long list of rules is itself
+something a smaller model handles badly.
+
+Nothing about them is Agentaus-specific. They are ordinary Claude Code skills and work on
+any model; they simply matter more where the model needs the script.
+
+---
+
 ## Configuration reference
 
 All settings are environment variables, readable from `.env`. Shell exports win over
