@@ -843,6 +843,52 @@ prefilter exists to avoid.
 
 ---
 
+## Word documents and spreadsheets
+
+A `.docx` is a zip archive, so the bridge used to walk past office documents as binary.
+That meant `agentaus_search` and `agentaus_zoom` could not see a tender response, a
+requirements matrix or a specification — which is exactly where that material lives.
+
+They are read by default now, converted with **LibreOffice**, which knows the format.
+Nothing to configure if LibreOffice is installed; `soffice` is found in the usual places
+or on `$PATH`, `AGENTAUS_SOFFICE_PATH` overrides it, and `AGENTAUS_OFFICE_EXTRACT=false`
+goes back to skipping them.
+
+**Tables survive, and that is the point.** A row becomes one line with ` | ` between
+cells:
+
+```
+   79  5.3
+   80  Security and Governance
+   81  Reference | Requirement | Compliance
+   85  5.3.4 | Essential: Model governance documentation... | Yes
+```
+
+One line per row means a line number still identifies a row, so `agentaus_zoom` cites into
+a spreadsheet exactly as it cites into source code.
+
+### Why not just strip the XML
+
+Because it fails quietly. Measured against LibreOffice on one real 43-row requirements
+table, a regex flatten of the document XML:
+
+- lost **2,695 characters** of answer text across 12 rows — **56% of one row**, whose
+  evidence review then came back empty and looked like an upstream fault
+- could not see the **compliance column at all**, having no idea where one cell ended and
+  the next began
+- guessed at row boundaries, so the final row **swallowed 77,000 characters** of the rest
+  of the document
+
+None of that raises an error. It just produces slightly wrong input, which produces
+confidently wrong output.
+
+Conversions are cached per file, keyed on path, mtime and size — so a search reading many
+chunks converts once, and a document edited under the bridge is re-read rather than served
+stale. Each conversion gets a private LibreOffice profile, because concurrent `soffice`
+invocations otherwise fight over the shared one and a run silently produces nothing.
+
+---
+
 ## Configuration reference
 
 All settings are environment variables, readable from `.env`. Shell exports win over
@@ -860,6 +906,9 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_MAX_INPUT_TOKENS` | `131072` | Agentaus' context window. Defaults in code and self-corrects from Agentaus' own error messages; setting it explicitly overrides both. `0` disables the check |
 | `AGENTAUS_AUTO_TRIM` | `true` | Compact the older conversation into a summary rather than failing the turn |
 | `AGENTAUS_MAX_CONCURRENCY` | `8` | One global cap on every Agentaus call the bridge makes on its own initiative — summarising, reviewing, planning, searching. Your own turn is never queued behind it. Replaces `AGENTAUS_SUMMARY_CONCURRENCY`, which is still read when set |
+| `AGENTAUS_OFFICE_EXTRACT` | `true` | Read `.docx`, `.xlsx`, `.pptx` and friends via LibreOffice, tables intact. `false` skips them as binary |
+| `AGENTAUS_SOFFICE_PATH` | *(auto)* | Path to `soffice`. Empty searches the usual locations, then `$PATH` |
+| `AGENTAUS_OFFICE_TIMEOUT` | `120` | Ceiling on one conversion |
 | `AGENTAUS_SEARCH` | `true` | Offer `agentaus_search`, the bridge-executed semantic search, and steer `Grep` towards literal lookups |
 | `AGENTAUS_WEB_SEARCH` | `true` | Offer `agentaus_web_search`, which drives Agentaus' own web search. Claude Code's `WebSearch` is dropped in translation, so without this an Agentaus turn cannot search the web at all |
 | `AGENTAUS_SEARCH_CHUNK_TOKENS` | `8000` | File content per search call. Measured: 4000 costs 48s/16 calls, 8000 costs 29s/10, 16000 costs 22s/4 — all find the same facts, but bigger chunks quote less back |

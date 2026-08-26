@@ -27,6 +27,7 @@ import re
 import time
 from typing import Awaitable, Callable
 
+from . import documents
 from .compact import _chunk, normalise_identifiers
 from .config import settings
 from .gate import hold
@@ -232,12 +233,19 @@ _SKIP_SUFFIXES = {
     ".bz2", ".xz", ".7z", ".mp4", ".mov", ".mp3", ".wav", ".woff", ".woff2", ".ttf",
     ".otf", ".eot", ".so", ".dylib", ".dll", ".exe", ".bin", ".class", ".jar", ".pyc",
     ".pyo", ".wasm", ".lock", ".map", ".min.js", ".min.css",
-    # Office formats are zip archives. Read as text they are binary noise, and a search
-    # will happily chunk that noise and spend a model call on every piece of it -
-    # observed burning most of a 120-chunk budget on one 350 KB .docx.
-    ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".odt", ".ods", ".odp", ".rtf",
+    # Office formats are zip archives, so reading them as text is noise. They are NOT
+    # in this set: `documents.extract` converts them with LibreOffice instead, which is
+    # where requirements matrices and tender responses actually live. They fall back to
+    # being skipped only when LibreOffice is unavailable - see _skipped_suffixes().
     ".sqlite", ".db", ".parquet", ".pkl", ".npy", ".npz",
 }
+
+
+def _skipped_suffixes() -> set:
+    """Suffixes to walk past. Office formats join the list only if we cannot read them."""
+    if documents.available():
+        return _SKIP_SUFFIXES
+    return _SKIP_SUFFIXES | documents.OFFICE_SUFFIXES
 
 # Never read, regardless of what the model asks for or what the query matches. Secrets
 # do not stop being secrets because a search term happened to appear in them, and the
@@ -279,10 +287,11 @@ def enumerate_files(path: str, glob: str | None = None) -> list[str]:
         name = os.path.basename(path).lower()
         # Naming a binary explicitly does not make it readable as text, so the same
         # exclusions apply to a direct path as to a walked one.
-        if _is_secret(name) or any(name.endswith(suffix) for suffix in _SKIP_SUFFIXES):
+        if _is_secret(name) or any(name.endswith(s) for s in _skipped_suffixes()):
             return []
         return [path]
 
+    skipped = _skipped_suffixes()
     found: list[str] = []
     for directory, subdirs, names in os.walk(path):
         # Pruned in place so os.walk does not descend into them at all.
@@ -291,7 +300,7 @@ def enumerate_files(path: str, glob: str | None = None) -> list[str]:
             if _is_secret(name):
                 continue
             lowered = name.lower()
-            if any(lowered.endswith(suffix) for suffix in _SKIP_SUFFIXES):
+            if any(lowered.endswith(suffix) for suffix in skipped):
                 continue
             if glob and not fnmatch.fnmatch(name, glob):
                 continue
@@ -306,7 +315,14 @@ def enumerate_files(path: str, glob: str | None = None) -> list[str]:
 
 
 def read_text(path: str) -> str:
-    """File contents, or empty string if it cannot be read as text."""
+    """File contents as text, converting office documents on the way through.
+
+    One entry point for every reader in this module, so search, zoom and the file
+    shortlist all see a .docx the same way: as its text, with table rows on one line and
+    cells separated by ` | `.
+    """
+    if documents.is_office_document(path) and documents.available():
+        return documents.extract(path)
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             return handle.read()
@@ -963,8 +979,10 @@ async def run_zoom(
     if not _allowed_root(file_path):
         return f"{file_path} is outside AGENTAUS_SEARCH_ROOTS."
     if not enumerate_files(file_path):
-        return (f"{file_path} cannot be read as text (missing, binary, or excluded). "
-                f"Office documents are zip archives - extract them first.")
+        if documents.is_office_document(file_path) and not documents.available():
+            return (f"{file_path} is an office document and LibreOffice is not available "
+                    f"to read it. Install LibreOffice, or set AGENTAUS_SOFFICE_PATH.")
+        return f"{file_path} cannot be read as text (missing, binary, or excluded)."
 
     body = read_text(file_path)
     if not body.strip():

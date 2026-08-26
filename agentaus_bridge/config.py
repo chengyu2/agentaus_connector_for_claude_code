@@ -225,6 +225,26 @@ class Settings:
         )
     )
 
+    # --- Office documents -----------------------------------------------------------
+    # Word documents and spreadsheets are zip archives, so the bridge used to skip them
+    # as binary - which meant search and zoom could not see a tender response or a
+    # requirements matrix, which is where that material actually lives. LibreOffice
+    # converts them with their tables intact.
+    #
+    # On by default: reading a .docx as noise is never the behaviour anyone wanted. Set
+    # false to go back to skipping them.
+    agentaus_office_extract: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_OFFICE_EXTRACT", True)
+    )
+    # Path to `soffice`. Empty means look in the usual places, then $PATH.
+    soffice_path: str = field(
+        default_factory=lambda: os.environ.get("AGENTAUS_SOFFICE_PATH", "").strip()
+    )
+    # A conversion that hangs must not hang the turn that touched the file.
+    agentaus_office_timeout_seconds: float = field(
+        default_factory=lambda: _float("AGENTAUS_OFFICE_TIMEOUT", 120.0)
+    )
+
     # --- Bridge-executed search -----------------------------------------------------
     # Agentaus is handed Grep - a regex tool - as its way of finding things, and a
     # smaller model writes a regex against a guess about what the code looks like. This

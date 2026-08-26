@@ -296,83 +296,43 @@ class TestWebSearch(unittest.TestCase):
 
 
 class TestBinaryFormatsAreSkipped(unittest.TestCase):
-    """Office documents are zip archives. Read as text they are noise, and a search
-    will chunk that noise and spend one model call per piece - observed burning most of
-    a 120-chunk budget on a single 350 KB .docx in a real tender directory."""
+    """Genuinely unreadable formats are still walked past.
 
-    def test_office_and_binary_files_are_not_enumerated(self):
+    Office documents used to be in this list. They are not any more - LibreOffice reads
+    them (see test_documents.py) - because a tender response or requirements matrix is
+    exactly the material worth searching, and skipping it was never what anyone wanted.
+    """
+
+    def test_binary_data_files_are_not_enumerated(self):
         with _Tree({
             "notes.md": "the real content\n",
-            "response.docx": "PK\x03\x04binary noise",
-            "data.xlsx": "PK\x03\x04more noise",
-            "deck.pptx": "PK\x03\x04noise",
             "cache.sqlite": "SQLite format 3",
+            "weights.npy": "\x93NUMPY",
+            "data.parquet": "PAR1",
         }) as tree:
             names = {os.path.basename(f) for f in tools.enumerate_files(tree.path)}
         self.assertEqual(names, {"notes.md"})
 
-    def test_a_docx_named_directly_is_still_refused(self):
-        """Naming it explicitly does not make it readable as text."""
-        with _Tree({"response.docx": "PK\x03\x04binary"}) as tree:
-            path = os.path.join(tree.path, "response.docx")
-            self.assertEqual(tools.enumerate_files(path), [])
+    def test_office_documents_are_enumerated_when_they_can_be_read(self):
+        from agentaus_bridge import documents
+        if not documents.available():
+            self.skipTest("LibreOffice is not installed here")
+        with _Tree({"notes.md": "x\n", "response.docx": "PK\x03\x04"}) as tree:
+            names = {os.path.basename(f) for f in tools.enumerate_files(tree.path)}
+        self.assertIn("response.docx", names,
+                      "an office document was skipped despite being readable")
 
-
-class TestChunkLevelPrefilter(unittest.TestCase):
-    """Shortlisting files is not enough when the corpus is one enormous file.
-
-    A 434 KB tender document is a single candidate that still costs one model call per
-    chunk, and most of those chunks contain none of the terms being searched for.
-    Measured on that file: 285 seconds before chunks were ranked too.
-    """
-
-    def test_chunks_without_a_term_are_not_read(self):
-        """Enough hits to clear the min_candidates floor, so the filter really applies.
-
-        With fewer than `agentaus_search_min_candidates` matching chunks the fallback
-        correctly reads everything - so a fixture with a single hit tests the fallback,
-        not the filter.
-        """
-        filler = "filler paragraph about unrelated matters\n" * 60
-        # 20 chunk-sized blocks; the term appears in 4 of them.
-        body = "".join(
-            (filler + "the SEMAPHORE lives here\n") if i % 5 == 0 else filler
-            for i in range(20)
-        )
-        previous = settings.agentaus_search_chunk_tokens
-        settings.agentaus_search_chunk_tokens = 600
+    def test_office_documents_are_skipped_when_they_cannot(self):
+        from agentaus_bridge import documents
+        from agentaus_bridge.config import settings
+        previous = settings.agentaus_office_extract
+        settings.agentaus_office_extract = False
         try:
-            with _Tree({"big.md": body}) as tree:
-                call = responder(terms="SEMAPHORE", hit_on="big.md", answer="found")
-                run(tools.run_search("where is the cap", tree.path, None, call))
+            with _Tree({"notes.md": "x\n", "response.docx": "PK\x03\x04"}) as tree:
+                names = {os.path.basename(f) for f in tools.enumerate_files(tree.path)}
         finally:
-            settings.agentaus_search_chunk_tokens = previous
-
-        read = [p for p in call.seen if "<excerpt file=" in p]
-        with_term = [p for p in read if "SEMAPHORE" in p]
-        self.assertGreaterEqual(len(read), 3, "the filter dropped everything")
-        self.assertLess(len(read), 20, f"read {len(read)} chunks; the filter did nothing")
-        self.assertEqual(len(read), len(with_term),
-                         "it read chunks that contain none of the terms")
-
-    def test_too_few_matching_chunks_still_reads_everything(self):
-        """The needle property must survive: absent words are not an absent answer.
-
-        Chunk size is pinned rather than inherited: the default is sized for real
-        corpora, and at 48k tokens this whole fixture is one chunk - which would pass
-        the assertion for the wrong reason.
-        """
-        previous = settings.agentaus_search_chunk_tokens
-        settings.agentaus_search_chunk_tokens = 2000
-        try:
-            body = "alpha beta gamma\n" * 3000
-            with _Tree({"big.md": body}) as tree:
-                call = responder(terms="zzznotpresent", hit_on="big.md", answer="found")
-                run(tools.run_search("what is here", tree.path, None, call))
-        finally:
-            settings.agentaus_search_chunk_tokens = previous
-        chunk_prompts = [p for p in call.seen if "<excerpt file=" in p]
-        self.assertGreater(len(chunk_prompts), 1, "the fallback did not read everything")
+            settings.agentaus_office_extract = previous
+        self.assertEqual(names, {"notes.md"})
 
 
 class TestSelectivity(unittest.TestCase):
@@ -475,10 +435,18 @@ class TestZoom(unittest.TestCase):
             out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 999, None, "", self.stub()))
         self.assertIn("past the end", out)
 
-    def test_a_docx_is_refused_with_a_useful_reason(self):
-        with _Tree({"r.docx": "PK\x03\x04binary"}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "r.docx"), 1, 1, "", self.stub()))
-        self.assertIn("zip archives", out)
+    def test_a_docx_is_refused_only_when_it_cannot_be_read(self):
+        from agentaus_bridge.config import settings
+        previous = settings.agentaus_office_extract
+        settings.agentaus_office_extract = False
+        try:
+            with _Tree({"r.docx": "PK\x03\x04binary"}) as tree:
+                out = run(tools.run_zoom(os.path.join(tree.path, "r.docx"), 1, 1, "",
+                                         self.stub()))
+        finally:
+            settings.agentaus_office_extract = previous
+        self.assertIn("LibreOffice is not available", out)
+        self.assertIn("AGENTAUS_SOFFICE_PATH", out, "it should say how to fix it")
 
     def test_a_relative_path_falls_back_to_the_working_directory(self):
         with _Tree({"doc.md": self.DOC}) as tree:
