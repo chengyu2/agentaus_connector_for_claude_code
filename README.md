@@ -594,6 +594,64 @@ log says so.
 
 ---
 
+## What the live model taught us
+
+Everything in the bridge was written against unit tests first. Driving real turns at
+Agentaus found failures no test would have caught, and the fixes are worth knowing about
+if you extend this.
+
+**Tag everything.** Agentaus follows explicit structure far more reliably than prose with
+capitalised headings. Every prompt the bridge builds uses XML tags — `<request>`,
+`<excerpt>`, `<tools_available>`, `<task>`, `<output_format>` — and so does every tool
+result it forwards. This is where most of the reliability came from, not from better
+wording.
+
+**A helper pass must never judge what it cannot see.** The bridge runs three extra calls
+around a turn: plan before, review after, and distil in between. Each is a *fresh*
+conversation. Two of them were actively harmful mid-tool-loop:
+
+- The **planner** does not inherit the conversation, so on the second step of a tool loop
+  it re-planned the step already taken — telling the model to read a file it was holding.
+- The **reviewer** sees only the request and the answer. Given "list the Section 5
+  headings" and a correct list of headings, with the source document invisible to it, it
+  ruled the answer unverified and the revise pass replaced it with *"Please provide the
+  DOCX file."* Measured on a real tender document: **0 of 6 turns correct through the
+  bridge, 3 of 3 posting the identical payload straight to Agentaus.** The model was
+  never the problem.
+
+Both now sit out whenever the last message is a tool result. Same document afterwards:
+**5 of 6**.
+
+**The model invents tool names, and misspells real ones.** It answered a search by calling
+`open_file`, which nobody offered it — passed through, that fails a `tool_use` in Claude
+Code for a tool it has never heard of, and the turn dies looking like a bridge fault.
+Invented names are caught and corrected upstream; `read` for `Read` is resolved silently
+rather than spending a round.
+
+**Descriptions decide tool choice, and position within them matters.** Given a bare list
+of names the planner picks `Grep`, the one it knows from training. It sees each tool's
+description now — and the restriction had to move to the *front* of Grep's description,
+because a caveat appended after a paragraph loses to a strong prior.
+
+---
+
+## Distillation
+
+`AGENTAUS_DISTILL_RESULTS` condenses tool results over `AGENTAUS_DISTILL_THRESHOLD_TOKENS`
+before they reach Agentaus, cached by content so the conversation prefix stays stable and
+the compaction cache keeps hitting.
+
+**It is off by default**, on evidence rather than principle. Condensing a 60,000-character
+document added about a minute to one turn, and on work where the tool output *is* the
+subject — a tender document being edited, a log being read line by line — condensing it
+destroys the thing the user asked about.
+
+Turn it on for long agentic sessions that would otherwise compact repeatedly, where
+trading fidelity for window is the right trade, and measure the compaction rate before and
+after. Its win shows up as *fewer compactions*, not as better answers.
+
+---
+
 ## Configuration reference
 
 All settings are environment variables, readable from `.env`. Shell exports win over
@@ -619,6 +677,12 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_SEARCH_MAX_FILE_BYTES` | `1048576` | Skip files larger than this |
 | `AGENTAUS_SEARCH_ROOTS` | *(empty)* | Colon-separated directories search may read. Empty allows any absolute path, matching Claude Code's own `Read` |
 | `AGENTAUS_TOOL_ROUNDS` | `3` | How many rounds of bridge-executed tool calls one turn may run before the answer has to stand |
+| `AGENTAUS_CORRECTION_ROUNDS` | `3` | Rounds spent telling the model a tool it named does not exist. Separate from tool rounds, so being corrected does not consume the budget for real work |
+| `AGENTAUS_SEARCH_MAX_CANDIDATES` | `12` | Ceiling on files one search reads. The shortlist is ranked, so this keeps the best matches |
+| `AGENTAUS_INVESTIGATE` | `true` | Offer `agentaus_investigate`: three independent searches, and a fact must appear in two before it is reported as established |
+| `AGENTAUS_DISTILL_RESULTS` | `false` | Condense oversized tool results before sending them. **Off by default** — see [Distillation](#distillation) |
+| `AGENTAUS_DISTILL_THRESHOLD_TOKENS` | `12000` | Results smaller than this are never touched |
+| `AGENTAUS_TOOL_LEDGER` | `true` | Append a derived list of tools already run to the system prompt. Costs no Agentaus calls |
 | `AGENTAUS_THINKING` | `true` | Plan the turn in a separate call before answering it |
 | `AGENTAUS_THINKING_VISIBLE` | `true` | Show that plan as a thinking block. `false` still uses it, but does not display it |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | `127.0.0.1` / `8787` | Listen address |
