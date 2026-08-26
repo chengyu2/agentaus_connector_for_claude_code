@@ -1,6 +1,6 @@
 ---
 name: read-documents
-description: Read Word documents, spreadsheets, presentations and PDFs correctly, keeping tables intact. Use before answering anything about a .docx, .xlsx, .pptx or .pdf, and whenever a document read comes back as binary noise or suspiciously short.
+description: Read Word documents, spreadsheets, presentations and PDFs correctly, keeping tables intact. Use when a question involves a .docx, .xlsx, .pptx or .pdf, when a document read comes back as binary noise or suspiciously short, or before extracting a table from any office file.
 ---
 
 # Reading office documents without losing their tables

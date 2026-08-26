@@ -1,6 +1,6 @@
 ---
 name: find-in-code
-description: Locate something in a codebase or document tree - where a behaviour lives, what handles a case, why a value is set. Use before answering any "where is", "how does this work", or "which file does X" question. Chooses the right search tool and reads the passage before quoting it.
+description: Locate something in a codebase or document tree - where a behaviour lives, what handles a case, why a value is set. Use when asked "where is", "how does this work", "which file does X", or before answering any question whose answer is a location. Chooses the right search tool and reads the passage before quoting it.
 ---
 
 # Finding something, and being able to quote it afterwards
