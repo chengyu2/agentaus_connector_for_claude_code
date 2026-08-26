@@ -705,6 +705,18 @@ def _openai_calls(data: dict) -> list:
     ]
 
 
+def _with_forced_answer(data: dict, text: str) -> dict:
+    """Put a forced answer into a response, clearing the tool calls it replaces."""
+    choices = list(data.get("choices") or [{}])
+    choice = dict(choices[0] or {})
+    message = dict(choice.get("message") or {})
+    message["content"] = text
+    message["tool_calls"] = None
+    choice["message"] = message
+    choice["finish_reason"] = "stop"
+    return {**data, "choices": [choice] + choices[1:]}
+
+
 def _without_bridge_calls(data: dict) -> dict:
     """Strip bridge-owned tool calls from a response.
 
@@ -1394,13 +1406,27 @@ async def _handle_agentaus(
             rlog(logging.WARNING,
                  "tool round limit (%d) reached; dropping %d unanswered bridge call(s)",
                  settings.agentaus_tool_rounds, len(mine))
-            data = _without_bridge_calls(data)
+            # Everything those searches found is still in the payload, so ask again with
+            # the tools removed rather than surfacing an apology for having searched.
+            forced = await _answer_without_tools(client, payload)
+            data = _with_forced_answer(data, forced) if forced else _without_bridge_calls(data)
             break
+
+        choice0 = (data.get("choices") or [{}])[0]
+        msg0 = choice0.get("message") or {}
+
+        # An empty reply is never a valid answer to a question. Observed as
+        # "200 in 94.8s in=0 out=0" on a question the model had every means to answer.
+        if not (msg0.get("content") or "").strip() and not msg0.get("tool_calls"):
+            rlog(logging.WARNING, "upstream returned an empty answer; asking once more")
+            retried = await _answer_without_tools(client, payload)
+            if retried:
+                data = _with_forced_answer(data, retried)
+                choice0 = (data.get("choices") or [{}])[0]
+                msg0 = choice0.get("message") or {}
 
         # Review only a plain text answer. A turn that calls tools is mid-task, and
         # rewriting it would break the tool_use the client is waiting on.
-        choice0 = (data.get("choices") or [{}])[0]
-        msg0 = choice0.get("message") or {}
         if (
             settings.agentaus_self_review
             and not msg0.get("tool_calls")

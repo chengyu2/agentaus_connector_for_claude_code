@@ -378,6 +378,14 @@ class Settings:
         default_factory=lambda: _bool("AGENTAUS_SEARCH_OUTLINE_FIRST", True)
     )
     # Sections one aimed search will read. Beyond this it is cheaper to read everything.
+    # Tokens per aimed section. Deliberately NOT the chunk size: a chunk is sized to
+    # cover a whole file in a few reads, and a section is a passage around one citation.
+    # Reusing the chunk budget here made the first window swallow the file and every
+    # later pick get skipped as overlapping, so an aimed search read one chunk where an
+    # unaimed one read eleven - the opposite of the point.
+    agentaus_search_section_tokens: int = field(
+        default_factory=lambda: _int("AGENTAUS_SEARCH_SECTION_TOKENS", 3000)
+    )
     agentaus_search_max_sections: int = field(
         default_factory=lambda: _int("AGENTAUS_SEARCH_MAX_SECTIONS", 8)
     )

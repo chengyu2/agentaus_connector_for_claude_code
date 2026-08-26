@@ -1,0 +1,18 @@
+{
+ "agentaus": {
+  "retrieval": {
+   "suite": "retrieval",
+   "n": 8,
+   "precision": 0.6875,
+   "recall": 0.6041666666666666,
+   "f1": 0.6041666666666666,
+   "symbol_rate": 0.625,
+   "wall_seconds": 657.545133875,
+   "calls": 8,
+   "call_failures": 0,
+   "input_tokens": 39363,
+   "output_tokens": 1882,
+   "median_call_seconds": 66.25364962499998
+  }
+ }
+}

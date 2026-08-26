@@ -535,20 +535,44 @@ async def _aim_with_outline(
     return picks[: settings.agentaus_search_max_sections]
 
 
-def sections_around(path: str, lines: list[int], budget_tokens: int) -> list:
-    """The chunks containing the picked lines, and nothing else."""
+def sections_around(path: str, lines: list[int], section_tokens: int = 0) -> list:
+    """The passages containing the picked lines, sized in tokens and shared out.
+
+    Sized in tokens, and by its own setting rather than by the chunk budget. A chunk is
+    sized to cover a whole file in a few reads; a section is a passage around one
+    citation, and the two are not the same number.
+
+    Getting that wrong was not subtle. An earlier version sized each window as
+    `chunk_budget * 4 // 80` LINES - 2,400 lines at a 48k chunk budget - so the first
+    pick swallowed most of the file, every later pick was skipped as already covered, and
+    an aimed search read ONE passage where an unaimed one read eleven. Retrieval F1 fell
+    from 0.542 to 0.458, which is how the regression was noticed at all.
+    """
     body = read_text(path)
     if not body.strip():
         return []
     all_lines = body.splitlines()
+    share = max(400, section_tokens or settings.agentaus_search_section_tokens)
+
     out = []
     for target in sorted(set(lines)):
-        span = max(1, budget_tokens * 4 // 80)      # ~80 chars a line, in tokens
-        lo = max(0, target - 1 - span // 4)
-        hi = min(len(all_lines), lo + span)
-        if any(lo < e and s < hi for _p, s, e, _b in out):
-            continue                                # already covered by a previous pick
-        out.append((path, lo + 1, hi, "\n".join(all_lines[lo:hi])))
+        centre = max(0, min(target - 1, len(all_lines) - 1))
+        if any(start - 1 <= centre < end for _p, start, end, _b in out):
+            continue                                # a previous window already covers it
+        lo = hi = centre
+        while True:
+            grew = False
+            if lo > 0 and count_tokens("\n".join(all_lines[lo - 1:hi + 1])) <= share:
+                lo -= 1
+                grew = True
+            if hi + 1 < len(all_lines) and count_tokens(
+                "\n".join(all_lines[lo:hi + 2])
+            ) <= share:
+                hi += 1
+                grew = True
+            if not grew:
+                break
+        out.append((path, lo + 1, hi + 1, "\n".join(all_lines[lo:hi + 1])))
     return out
 
 
@@ -607,8 +631,22 @@ async def run_search(
             for path, line in picks:
                 by_file.setdefault(path, []).append(line)
             for path, lines in by_file.items():
-                chunks.extend(sections_around(path, lines, budget))
+                chunks.extend(sections_around(path, lines))
             aimed = bool(chunks)
+
+    # A handful of picked sections is a NARROWER read than no aiming at all, and the
+    # point of aiming is precision, not less evidence. Below a floor the sections are
+    # kept and the ordinary chunks added behind them: the aimed passages still come
+    # first, so a cap trims the least likely material rather than the most likely.
+    if aimed and len(chunks) < settings.agentaus_search_min_candidates:
+        log.info("outline picked only %d section(s); adding the ordinary chunks behind them",
+                 len(chunks))
+        seen = {(p, s_) for p, s_, _e, _b in chunks}
+        for candidate in candidates:
+            for piece in chunk_file(candidate, budget):
+                if (piece[0], piece[1]) not in seen:
+                    chunks.append(piece)
+        aimed = False          # ranking applies again now that the set is not hand-picked
 
     if not chunks:
         for candidate in candidates:
@@ -643,8 +681,8 @@ async def run_search(
     log.info(
         "search %r: %d file(s) -> %d candidate(s)%s -> %d of %d chunk(s)%s",
         query[:60], len(files), len(candidates),
-        " (brute force: shortlist too thin)" if brute_forced
-        else (" (aimed by outline)" if aimed else ""),
+        ("".join([" (shortlist too thin, all files)" if brute_forced else "",
+                  " (aimed by outline)" if aimed else ""])),
         len(chunks), total, f", {dropped} over the cap" if dropped else "",
     )
 

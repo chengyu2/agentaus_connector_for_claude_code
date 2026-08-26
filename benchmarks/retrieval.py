@@ -9,6 +9,18 @@ Ground truth is this repository, because it is the one codebase whose contents c
 asserted without guessing. Each question has a known answer file and a known symbol, and
 the questions are deliberately worded so that the answer shares no vocabulary with them -
 which is exactly the case a grep cannot serve and a semantic search must.
+
+FROZEN. This list must not be edited in response to a result. One question was widened
+early, correctly - "how does the code find out the real size limit" genuinely has two
+answers, and expecting one of them scored a right answer wrong. But that is a door that
+only opens one way: every subsequent widening raises the score, and a ground truth tuned
+against the answers it receives is not a measurement of anything.
+
+Two questions currently score zero and at least one of them is arguably defensible - "what
+happens when one piece of a lookup takes too long" is handled in `tools.py` by splitting
+the chunk AND in `server.py` by refusing to replay a gateway timeout. It stays as it is.
+Read the reported F1 as a floor, and read that limitation as inherent to ground truth
+written by whoever wrote the code.
 """
 from __future__ import annotations
 
