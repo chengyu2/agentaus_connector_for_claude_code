@@ -472,3 +472,105 @@ class TestNoReplanningMidLoop(unittest.TestCase):
                 {"role": "assistant", "content": "done"},
                 {"role": "user", "content": "now the next bit"},
             ]}))
+
+
+class TestReviewSitsOutOnToolAnswers(unittest.TestCase):
+    """The bridge was reliably turning right answers into wrong ones.
+
+    A reviewer is a fresh call shown the request and the answer and nothing else - it
+    cannot see tool results. Given "list the Section 5 headings" and a correct list of
+    headings, with the source document invisible to it, it ruled the answer unverified
+    and the revise pass replaced it with "Please provide the DOCX file."
+
+    Measured on a real 60,000-character tender document: 0 of 6 turns correct through
+    the bridge, 3 of 3 posting the identical payload straight to Agentaus. Every
+    component was individually correct, which is why only a live document found it.
+    """
+
+    def setUp(self):
+        from agentaus_bridge.augment import worth_reviewing_turn
+        self.worth = worth_reviewing_turn
+
+    def test_an_answer_derived_from_a_tool_result_is_not_reviewed(self):
+        self.assertFalse(self.worth({"messages": [
+            {"role": "user", "content": "list the Section 5 headings"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "ReadDocx", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "the document"}]},
+        ]}))
+
+    def test_a_plain_prose_answer_is_still_reviewed(self):
+        """The review pass is valuable where it can actually judge the answer."""
+        self.assertTrue(self.worth({"messages": [
+            {"role": "user", "content": "write a function that reverses a list"},
+        ]}))
+
+    def test_review_resumes_once_the_user_speaks_again(self):
+        self.assertTrue(self.worth({"messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "data"}]},
+            {"role": "assistant", "content": "here are the headings"},
+            {"role": "user", "content": "now tidy that up"},
+        ]}))
+
+    def test_an_empty_conversation_is_reviewable(self):
+        self.assertTrue(self.worth({}))
+        self.assertTrue(self.worth({"messages": []}))
+
+
+class _ReviewCounting:
+    """An upstream that answers once and records every call it receives."""
+
+    def __init__(self) -> None:
+        self.prompts: list = []
+
+    async def post(self, url, *, json=None, headers=None):  # noqa: A002
+        self.prompts.append(json)
+        return _FakeResponse({
+            "choices": [{"message": {"content":
+                "5.1 Functional Capability, 5.2 Technical and Integration, "
+                "5.3 Security and Governance, 5.4 Responsible AI, 5.5 Vendor Capability."},
+                "finish_reason": "stop"}],
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        })
+
+
+class TestReviewIsNotCalledEndToEnd(unittest.IsolatedAsyncioTestCase):
+    async def test_a_tool_derived_answer_costs_exactly_one_upstream_call(self):
+        """The regression guard for the whole bug.
+
+        With review firing this turn made two to four calls and the answer came back
+        rewritten. One call means the review never ran, which is the fix.
+        """
+        from agentaus_bridge import server
+        from agentaus_bridge.config import settings
+
+        conversation = [
+            {"role": "user", "content": "list the Section 5 headings"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "ReadDocx", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "x " * 4000}]},
+        ]
+        upstream = _ReviewCounting()
+        previous = settings.agentaus_self_review
+        settings.agentaus_self_review = True  # on, and still must not fire
+        try:
+            chunks = []
+            async for chunk in server._agentaus_event_stream(
+                upstream,
+                {"messages": [{"role": "user", "content": "x"}], "stream": False},
+                {"messages": conversation},
+                "agentaus",
+                0.0,
+            ):
+                chunks.append(chunk)
+        finally:
+            settings.agentaus_self_review = previous
+
+        self.assertEqual(len(upstream.prompts), 1,
+                         "the review pass ran on an answer it could not judge")
+        raw = b"".join(chunks).decode()
+        self.assertIn("Functional Capability", raw)
+        self.assertNotIn("provide the DOCX", raw)
