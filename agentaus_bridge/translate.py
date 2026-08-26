@@ -9,6 +9,8 @@ Direction B  Agentaus -> Claude Code:  agentaus_response_to_anthropic()  (non-st
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 
 from .tokens import calibrator, count_tokens
@@ -249,6 +251,17 @@ _GREP_RESTRICTION = (
 )
 
 
+_BASH_RESTRICTION = (
+    "RESTRICTED: do NOT use this to search or survey. `find`, `ls -R`, `grep -r` and "
+    "`cat` over many files all produce more output than this conversation can carry - "
+    "the client truncates it to a preview and you answer from a fragment. To find out "
+    "what is in a codebase, or which files are relevant, call `agentaus_search`: it "
+    "reads by meaning and returns quotes with line numbers. Use Bash for RUNNING "
+    "things - tests, builds, git, one command with bounded output.\n\n"
+    "Original description follows.\n"
+)
+
+
 def inject_bridge_tools(body: dict, extra_tools: list[dict]) -> dict:
     """Add the bridge's own tools and steer the model away from regex search.
 
@@ -265,6 +278,12 @@ def inject_bridge_tools(body: dict, extra_tools: list[dict]) -> dict:
         if isinstance(tool, dict) and tool.get("name") == "Grep":
             existing = tool.get("description", "") or ""
             rewritten.append({**tool, "description": f"{_GREP_RESTRICTION}\n{existing}".strip()})
+        elif isinstance(tool, dict) and tool.get("name") == "Bash":
+            # Same treatment as Grep, and for the same reason: a caveat appended after a
+            # paragraph loses to a strong prior. Only the search-shaped uses are
+            # restricted - Bash is still how you run a test.
+            existing = tool.get("description", "") or ""
+            rewritten.append({**tool, "description": f"{_BASH_RESTRICTION}\n{existing}".strip()})
         else:
             rewritten.append(tool)
 
@@ -362,6 +381,18 @@ def trim_messages_to_fit(body: dict, limit: int, *, reserve: int = 0) -> tuple[l
             dropped += 1
 
     return messages, dropped
+
+
+def _plan_signature(text: str) -> str:
+    """An opaque signature for a synthesised thinking block.
+
+    Anthropic signs thinking blocks so they can be replayed to the API. Nothing replays
+    these - the translator drops every thinking block it is handed back - so this only has
+    to be present and stable, which is what a renderer written against Anthropic's stream
+    shape expects to see.
+    """
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).digest()
+    return "agentaus." + base64.b64encode(digest).decode()
 
 
 def agentaus_response_to_anthropic(
@@ -479,17 +510,21 @@ class AnthropicStreamBuilder:
         return sse("content_block_stop", {"type": "content_block_stop", "index": self.index})
 
     def thinking(self, text: str) -> bytes:
-        """Emit a complete thinking block: start, thinking_delta, stop.
+        """Emit a complete thinking block: start, thinking_delta, signature, stop.
 
-        Agentaus has no native thinking mode, so this carries a plan the bridge asked
-        it to write as a separate turn. It is genuinely the model's own reasoning about
-        this request, just obtained explicitly rather than natively - so presenting it
-        in the block the client already renders for reasoning is accurate, not a trick.
+        Agentaus has no native thinking mode, so this carries a plan the bridge asked it
+        to write as a separate turn. It is genuinely the model's own reasoning about this
+        request, just obtained explicitly rather than natively.
 
-        No `signature` is attached. Anthropic's API requires one to *replay* a thinking
-        block, but the consumer here is the client's renderer and nothing replays these:
-        when Claude Code sends them back next turn, `anthropic_request_to_agentaus`
-        drops every thinking block on the floor.
+        A `signature` IS attached, and that is the fix for a real symptom: a live session
+        produced plans - the log shows them generated in 10.3s and 11.8s - and the client
+        rendered nothing. Anthropic's own streams always carry a signature_delta, and a
+        renderer written against that shape can reasonably discard a block that has none.
+        The value is opaque and locally derived; nothing replays these blocks, because
+        `anthropic_request_to_agentaus` drops every thinking block it is sent back.
+
+        If a client still shows nothing, AGENTAUS_THINKING_VISIBLE=false emits the plan as
+        ordinary tagged text instead, so the reasoning is never simply invisible.
         """
         if not text or not text.strip():
             return b""
@@ -513,10 +548,31 @@ class AnthropicStreamBuilder:
                 },
             )
         out += sse(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": self.index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": _plan_signature(text),
+                },
+            },
+        )
+        out += sse(
             "content_block_stop", {"type": "content_block_stop", "index": self.index}
         )
         self.output_tokens += estimate_tokens(text)
         return out
+
+    def plan_as_text(self, text: str) -> bytes:
+        """The fallback: the plan as visible tagged text rather than a thinking block.
+
+        Used when AGENTAUS_THINKING_VISIBLE is off. Tagged rather than prefaced with a
+        sentence, so it reads as a distinct section and not as part of the answer.
+        """
+        if not text or not text.strip():
+            return b""
+        return self.text(f"<plan>\n{text.strip()}\n</plan>\n\n")
 
     def text(self, text: str) -> bytes:
         """Emit a text block (opening one if needed) for the given chunk."""

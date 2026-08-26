@@ -928,6 +928,72 @@ invocations otherwise fight over the shared one and a run silently produces noth
 
 ---
 
+## When a claim outruns the evidence
+
+The self-review pass has to sit out tool-derived turns — a reviewer shown only the request
+and the answer reads a well-grounded reply as an unverified claim, and rewrites a correct
+answer into *"please provide the document"*. That fix was necessary and it left a hole:
+**the one kind of turn where a claim can outrun the evidence had nothing watching it.**
+
+What that looked like in practice. Asked to survey a repository, a real session ran one
+`find`, and then wrote:
+
+> *"the repo's `_notes.md` usually enforces a single, consistent fit label"* — never opened it
+> *"No apparent breach of the 'prohibitions live once' rule"* — **a policy that does not exist**
+
+Both stated as findings. Nothing checked them.
+
+So there is a second pass for exactly those turns, and it is not blind: it is given the
+**ledger of tools actually executed**, which turns *"you claim this about a file you never
+opened"* from a guess into something checkable.
+
+```
+answer + <tools_it_actually_ran>  →  GROUNDED
+                                 →  GAPS, then one line per unsupported claim
+                                        ↓
+                                 rewrite: each gap removed, or restated as the open
+                                 question it actually is — everything else untouched
+```
+
+An unreadable verdict counts as grounded. Rewriting a good answer is the more expensive
+mistake, and this pass exists because the last one made it.
+
+---
+
+## Truncated tool output is read back from disk
+
+When a tool produces more than the client will carry, Claude Code saves the whole output
+and passes on a preview:
+
+```
+Output too large (1.6MB). Full output saved to: …/tool-results/abc.txt
+Preview (first 2KB):
+```
+
+Sensible for a client, terrible for a model. That is how one session came to survey a
+repository from **2 KB of a 1.6 MB listing** and invent the rest — it was told where the
+full output was and did not read it.
+
+The bridge runs on the same machine, so it does: the preview is replaced with the real
+content before anything else reads the turn, capped by `AGENTAUS_RESTORE_MAX_BYTES` with
+the remainder announced rather than dropped. A preview naming a file that does not exist is
+left alone — a preview is bad, and a preview replaced by nothing is worse.
+
+### And `Bash` is restricted for searching
+
+The same session reached for `find` rather than `agentaus_search`, which is what produced
+the 1.6 MB in the first place. `Bash` now carries the treatment `Grep` got — the
+restriction at the **front** of its description, because a caveat after a paragraph loses
+to a strong prior:
+
+> *RESTRICTED: do NOT use this to search or survey. `find`, `ls -R`, `grep -r` and `cat`
+> over many files all produce more output than this conversation can carry… Use Bash for
+> RUNNING things — tests, builds, git, one command with bounded output.*
+
+Only the search-shaped uses. Bash is still how you run a test.
+
+---
+
 ## Configuration reference
 
 All settings are environment variables, readable from `.env`. Shell exports win over
@@ -968,6 +1034,9 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_DISTILL_RESULTS` | `false` | Condense oversized tool results before sending them. **Off by default** — see [Distillation](#distillation) |
 | `AGENTAUS_DISTILL_THRESHOLD_TOKENS` | `12000` | Results smaller than this are never touched |
 | `AGENTAUS_TOOL_LEDGER` | `true` | Append a derived list of tools already run to the system prompt. Costs no Agentaus calls |
+| `AGENTAUS_GROUNDING_CHECK` | `true` | Check a tool-derived answer against the tools actually run, and strip claims nothing supports |
+| `AGENTAUS_RESTORE_PERSISTED` | `true` | When the client truncates a tool result to a preview, read the file it saved instead |
+| `AGENTAUS_RESTORE_MAX_BYTES` | `400000` | Ceiling on what is read back |
 | `AGENTAUS_THINKING` | `true` | Plan the turn in a separate call before answering it |
 | `AGENTAUS_THINKING_VISIBLE` | `true` | Show that plan as a thinking block. `false` still uses it, but does not display it |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | `127.0.0.1` / `8787` | Listen address |

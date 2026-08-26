@@ -313,6 +313,19 @@ class Settings:
         default_factory=lambda: _int("AGENTAUS_DISTILL_CHUNK_TOKENS", 4000)
     )
 
+    # --- Truncated tool output -------------------------------------------------------
+    # When a tool produces more than the client will carry, Claude Code saves the whole
+    # output to a file and passes a 2 KB preview. Sensible for a client, terrible for a
+    # model: one observed session surveyed a repository from 2 KB of a 1.6 MB listing and
+    # invented the rest. The bridge runs on the same machine and reads the file.
+    agentaus_restore_persisted: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_RESTORE_PERSISTED", True)
+    )
+    # Ceiling on what is read back. Beyond this the caller is told to narrow the command.
+    agentaus_restore_max_bytes: int = field(
+        default_factory=lambda: _int("AGENTAUS_RESTORE_MAX_BYTES", 400_000)
+    )
+
     # --- Tool ledger -----------------------------------------------------------------
     # Derived from the conversation, never stored, and costs no Agentaus calls. Built
     # from the pre-compaction message list on purpose: the calls that fall out of the
@@ -406,6 +419,13 @@ class Settings:
     # Have the model review its own answer and revise it when defects are found.
     # "What is wrong with this?" is a much easier question for a smaller model than
     # getting it right first time, which is what makes the extra round trip pay.
+    # Check an answer against the tools the turn actually ran. This is the pass ordinary
+    # self-review cannot be - the reviewer sees the ledger of executed calls, so "you
+    # claim this about a file you never opened" is checkable rather than a guess. It runs
+    # on exactly the turns review has to sit out, which is where claims outrun evidence.
+    agentaus_grounding_check: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_GROUNDING_CHECK", True)
+    )
     agentaus_self_review: bool = field(
         default_factory=lambda: _bool("AGENTAUS_SELF_REVIEW", True)
     )

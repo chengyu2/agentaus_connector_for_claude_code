@@ -25,6 +25,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import documents
+from . import persisted
 from . import tools as bridge_tools
 from .augment import (
     ADJUDICATE_INSTRUCTION,
@@ -33,7 +34,11 @@ from .augment import (
     declared_verdict,
     plan_prompt,
     CLASSIFY_REFUSAL_INSTRUCTION,
+    GROUNDING_INSTRUCTION,
+    STRIP_UNGROUNDED_INSTRUCTION,
     could_be_a_refusal,
+    grounding_verdict,
+    worth_grounding_check,
     read_refusal_verdict,
     should_think,
     working_directory,
@@ -46,6 +51,7 @@ from .augment import (
 from .compact import ConversationCompactor
 from .distill import ResultDistiller
 from .gate import hold
+from . import ledger
 from .ledger import with_ledger
 from .tokens import calibrator, has_tokeniser as _has_tokeniser
 from .config import settings
@@ -526,6 +532,53 @@ async def _stream_helper(
     rlog(logging.DEBUG, "helper stream ok in %.1fs (first byte %.1fs, %d chars in)",
          time.monotonic() - started_at, first_byte, len(text))
     return "".join(parts)
+
+
+async def _check_grounding(
+    client: httpx.AsyncClient, body: dict, answer: str
+) -> str:
+    """Check an answer against what the turn actually ran, and strip what it cannot support.
+
+    This is the pass ordinary self-review cannot be: the reviewer is given the ledger of
+    tools actually executed, so "you claim this about a file you never opened" becomes a
+    checkable statement rather than a guess.
+
+    It exists because the ordinary review has to sit out these turns - a reviewer shown
+    only the request and the answer reads a well-grounded reply as an unverified claim -
+    and that left the one kind of turn where claims outrun evidence with nothing watching
+    it at all. Observed: a survey of a repository asserting what was in files it had never
+    read, and citing a policy that does not exist.
+
+    Returns the answer to use. Any failure returns the original: a broken check must never
+    cost a good answer.
+    """
+    ran = ledger.render(body.get("messages") or [], limit=60)
+    if not ran:
+        return answer
+    try:
+        async with hold("grounding check", "background"):
+            reply = await _agentaus_summarise(
+                client,
+                GROUNDING_INSTRUCTION.format(ledger=ran, answer=answer[:12000]),
+            )
+        gaps = grounding_verdict(reply)
+        if not gaps:
+            return answer
+        rlog(logging.WARNING, "grounding check found unsupported claims:\n%s", gaps[:600])
+        async with hold("grounding rewrite", "background"):
+            revised = await _agentaus_summarise(
+                client,
+                STRIP_UNGROUNDED_INSTRUCTION.format(
+                    answer=answer[:12000], gaps=gaps[:4000]
+                ),
+            )
+        if revised and revised.strip():
+            rlog(logging.INFO, "stripped ungrounded claims (%d -> %d chars)",
+                 len(answer), len(revised))
+            return revised.strip()
+    except Exception as exc:
+        rlog(logging.WARNING, "grounding check failed (%s); keeping the answer", exc)
+    return answer
 
 
 async def _self_review(client: httpx.AsyncClient, request_text: str, answer: str) -> str:
@@ -1132,6 +1185,11 @@ async def _handle_agentaus(
         if settings.agentaus_office_extract:
             current = documents.repair_tool_results(current)
 
+        # A preview standing in for a 1.6 MB listing is worse than useless - the model
+        # answers from a fragment and fills the rest in. The client saved the real output
+        # to disk and the bridge is on the same machine, so read it.
+        current = persisted.restore(current)
+
         # Condense oversized tool results BEFORE fitting. Order matters: this is what
         # decides whether compaction is needed at all, and compacting first would
         # summarise output that was about to be condensed anyway.
@@ -1315,6 +1373,21 @@ async def _handle_agentaus(
                 data = {**data, "choices": [{**choice0, "message": msg0}]
                         + list((data.get("choices") or [])[1:])}
 
+        if (
+            settings.agentaus_grounding_check
+            and not msg0.get("tool_calls")
+            and not worth_reviewing_turn(body)
+            and worth_grounding_check(
+                body, msg0.get("content") or "",
+                min_chars=settings.agentaus_review_min_chars,
+            )
+        ):
+            grounded = await _check_grounding(client, body, msg0["content"])
+            if grounded != msg0.get("content"):
+                msg0 = {**msg0, "content": grounded}
+                data = {**data, "choices": [{**choice0, "message": msg0}]
+                        + list((data.get("choices") or [])[1:])}
+
         message = agentaus_response_to_anthropic(
             data,
             model=display_model,
@@ -1407,8 +1480,11 @@ async def _agentaus_event_stream(
     # The plan leads the message, where a native thinking block would. Emitted before
     # the upstream call rather than after it, so the user sees the model's reasoning
     # while the answer is still being generated instead of all at once at the end.
-    if plan and settings.agentaus_thinking_visible:
-        yield builder.thinking(plan)
+    if plan:
+        # Either way the reasoning is visible. A thinking block is the better rendering;
+        # tagged text is the fallback for a client that will not show one.
+        yield (builder.thinking(plan) if settings.agentaus_thinking_visible
+               else builder.plan_as_text(plan))
 
     finish_reason: str | None = None
     usage: dict | None = None
@@ -1660,12 +1736,20 @@ async def _agentaus_event_stream(
 
     answer = "".join(pending)
     if buffering and answer:
-        if (
-            not theirs
-            and worth_reviewing_turn(original)
-            and worth_reviewing(answer, min_chars=settings.agentaus_review_min_chars)
+        if not theirs and worth_reviewing_turn(original) and worth_reviewing(
+            answer, min_chars=settings.agentaus_review_min_chars
         ):
             answer = await _self_review(client, _last_user_text(original), answer)
+        elif (
+            not theirs
+            and settings.agentaus_grounding_check
+            and worth_grounding_check(
+                original, answer, min_chars=settings.agentaus_review_min_chars
+            )
+        ):
+            # The turns review has to sit out are the turns where a claim can outrun the
+            # evidence. This checks against the tools actually run instead of guessing.
+            answer = await _check_grounding(client, original, answer)
         yield builder.text(answer)
 
     for call in theirs:

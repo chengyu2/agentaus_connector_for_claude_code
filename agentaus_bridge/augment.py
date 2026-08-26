@@ -169,6 +169,11 @@ _WHEN_TO_USE = {
     ),
     "agentaus_web_search": "Anything outside this repository.",
     "Grep": "ONLY an exact literal string you can already spell.",
+    "Bash": (
+        "Running things - tests, builds, git, one command with bounded output. NOT for "
+        "searching: `find`, `ls -R` and `grep -r` produce more than this conversation "
+        "can carry, so you are handed a truncated preview and answer from a fragment."
+    ),
     "Glob": (
         "Finding files BY NAME. It cannot see inside a file, so it can never answer a "
         "question about content. Do not use it to hunt for a directory whose path you "
@@ -362,6 +367,104 @@ Nobody is going to paste or upload anything for you. Call the tool.
 Start over and follow the task exactly as it was given.
 </correction>
 """
+
+
+GROUNDING_INSTRUCTION = """\
+An agent answered a question after using tools. Below is what it actually did, and what
+it then said.
+
+<tools_it_actually_ran>
+{ledger}
+</tools_it_actually_ran>
+
+<its_answer>
+{answer}
+</its_answer>
+
+<task>
+Find statements in the answer that the agent could not possibly know from what it ran.
+
+Look for:
+- claims about the CONTENTS of a file it never read
+- comparisons against material it never opened
+- named policies, rules, conventions or standards that appear nowhere in what it ran
+- numbers or counts that contradict each other, or that nothing it ran could produce
+
+A statement is fine if it follows from a tool result, is general knowledge, or is clearly
+offered as a suggestion rather than a finding.
+</task>
+
+<output_format>
+If everything checks out, reply with exactly: GROUNDED
+
+Otherwise reply with GAPS on the first line, then one line per unsupported statement:
+the claim, then what would have been needed to make it. Nothing else.
+</output_format>
+"""
+
+
+STRIP_UNGROUNDED_INSTRUCTION = """\
+Your answer below contains statements you had no basis for. They are listed after it.
+
+<your_answer>
+{answer}
+</your_answer>
+
+<unsupported>
+{gaps}
+</unsupported>
+
+<task>
+Reissue the answer with each unsupported statement either removed, or rewritten as the
+open question it actually is - "the repo may contain X; I did not read it" rather than a
+claim about X.
+
+Change nothing else. Keep every grounded statement, its wording, and the structure and
+formatting of the original. Do not add new material, do not apologise, and do not mention
+this correction.
+</task>
+"""
+
+
+def grounding_verdict(reply: str) -> str:
+    """The listed gaps, or "" when the answer was found grounded.
+
+    Anything unparseable counts as grounded: a check that cannot be read must not be
+    allowed to rewrite an answer, because rewriting a good answer is the more expensive
+    mistake.
+    """
+    text = (reply or "").strip()
+    if not text or text.upper().startswith("GROUNDED"):
+        return ""
+    if not text.upper().startswith("GAPS"):
+        return ""
+    return "\n".join(text.splitlines()[1:]).strip()
+
+
+def worth_grounding_check(body: dict, answer: str, *, min_chars: int = 400) -> bool:
+    """Whether this turn's answer should be checked against what the turn actually did.
+
+    The opposite condition to `worth_reviewing_turn`: a turn that used tools is exactly
+    the turn where a claim can outrun the evidence, and it is the turn ordinary review
+    has to sit out because a reviewer cannot see tool results.
+
+    Observed on a real session: asked to survey a repository, the model ran one `find`,
+    saw a 2 KB preview of a 1.6 MB listing, and then wrote that "the repo's `_notes.md`
+    usually enforces a single consistent fit label" and that no answer breached "the
+    prohibitions live once rule" - a file it never opened and a policy that does not
+    exist. Nothing caught it, because review is disabled on exactly these turns.
+    """
+    if not mid_tool_loop(body) and not _ran_a_tool(body):
+        return False
+    return len((answer or "").strip()) >= min_chars
+
+
+def _ran_a_tool(body: dict) -> bool:
+    for message in body.get("messages") or []:
+        for block in message.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                return True
+    return False
 
 
 def worth_reviewing_turn(body: dict) -> bool:
