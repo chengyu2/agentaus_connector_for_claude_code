@@ -39,6 +39,74 @@ Caller = Callable[[str], Awaitable[str]]
 # A term present in more than this fraction of files is treated as noise for ranking.
 _TERM_UBIQUITY_CEILING = 0.5
 
+# The largest helper prompt this upstream has actually proved it can answer.
+#
+# Agentaus sits behind Cloudflare, which answers 524 when the origin takes too long. How
+# long a prompt takes depends on how busy the origin is, so the safe size is not a
+# constant: 48k tokens answered in 23 seconds when measured alone, then produced 524s
+# under two concurrent searches. Retrying the same oversized prompt just times out again,
+# which is how a batch job burned four retries and reported failure.
+#
+# So the bridge learns it, exactly as it already learns the context window from the error
+# message that announces it. Halve on a capacity failure, recover slowly on success, and
+# never go below a size small enough to be answerable at all.
+_MIN_CHUNK_TOKENS = 3000
+_learned_chunk_ceiling: int | None = None
+
+
+def effective_chunk_tokens() -> int:
+    """The chunk size to actually use: configured, capped by what has been proven."""
+    configured = max(_MIN_CHUNK_TOKENS, settings.agentaus_search_chunk_tokens)
+    if _learned_chunk_ceiling is None:
+        return configured
+    return min(configured, _learned_chunk_ceiling)
+
+
+def note_capacity_failure(prompt_tokens: int) -> None:
+    """Record that a prompt this large was too slow for the upstream right now."""
+    global _learned_chunk_ceiling
+    halved = max(_MIN_CHUNK_TOKENS, prompt_tokens // 2)
+    if _learned_chunk_ceiling is None or halved < _learned_chunk_ceiling:
+        _learned_chunk_ceiling = halved
+        log.warning(
+            "upstream timed out on a %d-token prompt; capping search chunks at %d "
+            "tokens from now on", prompt_tokens, halved,
+        )
+
+
+def note_capacity_success(prompt_tokens: int) -> None:
+    """Let the ceiling drift back up when large prompts are being answered again.
+
+    Recovery is deliberately slower than the backoff: load comes and goes, and a ceiling
+    that snaps straight back re-learns the same failure every time it lifts.
+    """
+    global _learned_chunk_ceiling
+    if _learned_chunk_ceiling is None:
+        return
+    if prompt_tokens >= _learned_chunk_ceiling * 0.8:
+        raised = int(_learned_chunk_ceiling * 1.25)
+        if raised >= settings.agentaus_search_chunk_tokens:
+            _learned_chunk_ceiling = None
+            log.info("upstream is answering full-size prompts again; cap lifted")
+        else:
+            _learned_chunk_ceiling = raised
+
+
+def reset_learned_capacity() -> None:
+    """For tests: module state that would otherwise leak between cases."""
+    global _learned_chunk_ceiling
+    _learned_chunk_ceiling = None
+
+
+def is_capacity_failure(exc: BaseException) -> bool:
+    """Whether a failure means "that prompt was too big for now", not "that was wrong".
+
+    524 is Cloudflare's origin timeout; the bridge's own helper timeout says the same
+    thing from this side of the connection.
+    """
+    text = str(exc).lower()
+    return any(m in text for m in ("524", "522", "504", "timed out", "timeout"))
+
 SEARCH_TOOL = "agentaus_search"
 WEB_SEARCH_TOOL = "agentaus_web_search"
 INVESTIGATE_TOOL = "agentaus_investigate"
@@ -462,9 +530,10 @@ async def run_search(
         # Ranked, so this keeps the files that matched the most distinct terms.
         candidates = candidates[: settings.agentaus_search_max_candidates]
 
+    budget = effective_chunk_tokens()
     chunks: list[tuple[str, int, int, str]] = []
     for candidate in candidates:
-        chunks.extend(chunk_file(candidate, settings.agentaus_search_chunk_tokens))
+        chunks.extend(chunk_file(candidate, budget))
 
     # Rank chunks the same way files were ranked. Shortlisting files is not enough when
     # the corpus is one enormous file: a 434 KB tender document is a single candidate
@@ -502,18 +571,35 @@ async def run_search(
     if not chunks:
         return f"Nothing readable to search under {path}."
 
-    async def look(piece: tuple[str, int, int, str]) -> str:
+    async def look(piece: tuple[str, int, int, str], depth: int = 0) -> str:
         chunk_path, start, end, body = piece
+        prompt = CHUNK_INSTRUCTION.format(
+            path=chunk_path, start=start, end=end, query=query, body=body
+        )
+        size = count_tokens(prompt)
         try:
             async with hold("search chunk"):
-                answer = await call(
-                    CHUNK_INSTRUCTION.format(
-                        path=chunk_path, start=start, end=end, query=query, body=body
-                    )
-                )
+                answer = await call(prompt)
         except Exception as exc:
+            if is_capacity_failure(exc) and depth < 2 and len(body.splitlines()) > 4:
+                # Too big for the upstream as it stands. Halve it and read both halves
+                # rather than dropping the excerpt: retrying the same prompt fails the
+                # same way, and giving up loses evidence that is genuinely there.
+                note_capacity_failure(size)
+                lines = body.splitlines()
+                middle = len(lines) // 2
+                log.warning("search chunk of %d tokens timed out; splitting %s:%d-%d",
+                            size, chunk_path, start, end)
+                halves = await asyncio.gather(
+                    look((chunk_path, start, start + middle - 1,
+                          "\n".join(lines[:middle])), depth + 1),
+                    look((chunk_path, start + middle, end,
+                          "\n".join(lines[middle:])), depth + 1),
+                )
+                return "\n\n".join(h for h in halves if h.strip())
             log.warning("search chunk failed for %s (%s)", chunk_path, exc)
             return ""
+        note_capacity_success(size)
         answer = normalise_identifiers((answer or "").strip())
         if not answer or answer.upper().strip().rstrip(".") == "NONE":
             return ""

@@ -332,3 +332,32 @@ class TestBackoffCurve(unittest.TestCase):
 
         # Without a cap, attempt 20 would be 2**20 seconds - a 12-day wait.
         self.assertLessEqual(_retry_delay(20), 8.0 + 1.0)
+
+
+class TestTimeoutIsTreatedAsTooBig(unittest.TestCase):
+    """A Cloudflare 524 says the origin took too long, not that the prompt was wrong.
+
+    For a large conversation that is the same actionable signal as an explicit
+    over-length rejection: send less. Nothing in the response says so, though, so a
+    plain retry replays the identical payload and times out identically - which is how a
+    turn burned every retry it had and failed anyway.
+    """
+
+    def test_gateway_timeouts_are_recognised(self):
+        from agentaus_bridge.server import _is_too_slow
+        for text in ("Agentaus returned HTTP 524: <!DOCTYPE html>",
+                     "522 connection timed out", "504 Gateway Timeout",
+                     "<title>Gateway time-out</title>"):
+            self.assertTrue(_is_too_slow(text), text)
+
+    def test_other_failures_are_not(self):
+        from agentaus_bridge.server import _is_too_slow
+        for text in ("HTTP 401 unauthorized", "HTTP 400 invalid request",
+                     "the engine prompt length 224662 exceeds the max_model_len 131072"):
+            self.assertFalse(_is_too_slow(text), text)
+
+    def test_an_over_length_error_is_still_recognised_separately(self):
+        from agentaus_bridge.server import _is_over_length, _is_too_slow
+        text = "The engine prompt length 224662 exceeds the max_model_len 131072"
+        self.assertTrue(_is_over_length(text))
+        self.assertFalse(_is_too_slow(text), "the two signals must stay distinguishable")

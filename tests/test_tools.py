@@ -535,3 +535,85 @@ class TestZoomWindowFloor(unittest.TestCase):
             out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2, "", self.stub()))
         nums = [int(l.split()[0]) for l in out.splitlines() if l.strip() and l.split()[0].isdigit()]
         self.assertLessEqual(max(nums), 3)
+
+
+class TestLearnedCapacity(unittest.TestCase):
+    """The safe prompt size is not a constant, so it is learned rather than assumed.
+
+    48k tokens answered in 23 seconds when measured alone, then produced Cloudflare 524s
+    under two concurrent searches. Retrying the same oversized prompt fails the same way -
+    which is how a batch job burned four retries and reported failure with evidence
+    sitting in the file all along.
+    """
+
+    def setUp(self):
+        tools.reset_learned_capacity()
+
+    def tearDown(self):
+        tools.reset_learned_capacity()
+
+    def test_a_timeout_is_recognised_as_a_capacity_problem(self):
+        for message in ("Agentaus returned HTTP 524: <html>", "helper call timed out after 240s",
+                        "HTTP 504 gateway timeout", "read operation timed out"):
+            self.assertTrue(tools.is_capacity_failure(RuntimeError(message)), message)
+
+    def test_a_real_error_is_not_mistaken_for_capacity(self):
+        for message in ("HTTP 401 unauthorized", "summariser produced nothing",
+                        "HTTP 400 invalid request"):
+            self.assertFalse(tools.is_capacity_failure(RuntimeError(message)), message)
+
+    def test_the_ceiling_halves_on_failure_and_is_remembered(self):
+        self.assertEqual(tools.effective_chunk_tokens(),
+                         settings.agentaus_search_chunk_tokens)
+        tools.note_capacity_failure(40_000)
+        self.assertEqual(tools.effective_chunk_tokens(), 20_000)
+        tools.note_capacity_failure(20_000)
+        self.assertEqual(tools.effective_chunk_tokens(), 10_000)
+
+    def test_it_never_drops_below_something_answerable(self):
+        for _ in range(20):
+            tools.note_capacity_failure(tools.effective_chunk_tokens())
+        self.assertGreaterEqual(tools.effective_chunk_tokens(), 3000)
+
+    def test_a_later_failure_that_is_larger_does_not_raise_the_cap(self):
+        tools.note_capacity_failure(8_000)
+        self.assertEqual(tools.effective_chunk_tokens(), 4_000)
+        tools.note_capacity_failure(60_000)
+        self.assertEqual(tools.effective_chunk_tokens(), 4_000)
+
+    def test_success_recovers_the_ceiling_gradually_then_lifts_it(self):
+        tools.note_capacity_failure(16_000)
+        capped = tools.effective_chunk_tokens()
+        self.assertEqual(capped, 8_000)
+        # Only a prompt near the current cap is evidence the upstream has recovered.
+        tools.note_capacity_success(1_000)
+        self.assertEqual(tools.effective_chunk_tokens(), capped)
+        for _ in range(20):
+            tools.note_capacity_success(tools.effective_chunk_tokens())
+        self.assertEqual(tools.effective_chunk_tokens(),
+                         settings.agentaus_search_chunk_tokens,
+                         "the cap never lifted once large prompts were answered again")
+
+    def test_an_oversized_chunk_is_split_rather_than_dropped(self):
+        """The behaviour that matters: evidence in a timed-out chunk is still found."""
+        calls = {"n": 0}
+
+        async def flaky(prompt: str) -> str:
+            if prompt.startswith("A developer is searching") or "list the literal" in prompt.lower():
+                return "SEMAPHORE"
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("Agentaus returned HTTP 524: origin timed out")
+            return "12: found the SEMAPHORE here" if "SEMAPHORE" in prompt else "NONE"
+
+        body = "\n".join(f"line {i}" for i in range(60) ) + "\nthe SEMAPHORE lives here\n"
+        previous = settings.agentaus_search_chunk_tokens
+        settings.agentaus_search_chunk_tokens = 40_000   # one chunk, so it must split
+        try:
+            with _Tree({"big.md": body}) as tree:
+                out = run(tools.run_search("where is the cap", tree.path, None, flaky))
+        finally:
+            settings.agentaus_search_chunk_tokens = previous
+
+        self.assertIn("SEMAPHORE", out, "the timed-out chunk was dropped instead of split")
+        self.assertGreater(calls["n"], 1, "it never retried the halves")

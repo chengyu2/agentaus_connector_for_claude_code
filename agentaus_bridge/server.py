@@ -990,6 +990,19 @@ def _is_over_length(text: str) -> bool:
     return "max_model_len" in lowered or "exceeds" in lowered and "prompt" in lowered
 
 
+def _is_too_slow(text: str) -> bool:
+    """Whether an upstream failure means the prompt took too long, not that it was wrong.
+
+    Agentaus sits behind Cloudflare, which answers 524 when the origin has not replied in
+    time. For a large conversation that is the same actionable signal as an explicit
+    over-length error: send less. The difference is that nothing in the response says so,
+    so a plain retry replays the identical payload and times out identically - which is
+    how a turn burned every retry it had and failed anyway.
+    """
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in ("524", "522", "504", "gateway time"))
+
+
 def _agentaus_headers() -> dict:
     return {
         "Authorization": f"Bearer {settings.agentaus_api_key}",
@@ -1123,8 +1136,10 @@ async def _handle_agentaus(
                 except httpx.HTTPError as exc:
                     return _error_response(502, "api_error", f"Agentaus request failed: {exc}")
 
-                over_length = (
-                    upstream.status_code >= 400 and _is_over_length(upstream.text)
+                # A timeout is treated like an over-length rejection: both mean the
+                # next attempt must send less, and neither is fixed by replaying.
+                over_length = upstream.status_code >= 400 and (
+                    _is_over_length(upstream.text) or _is_too_slow(upstream.text)
                 )
                 if not over_length or fit_attempt == settings.agentaus_fit_attempts:
                     break
