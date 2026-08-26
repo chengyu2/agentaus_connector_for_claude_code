@@ -1025,6 +1025,38 @@ def _is_over_length(text: str) -> bool:
     return "max_model_len" in lowered or "exceeds" in lowered and "prompt" in lowered
 
 
+# Below this share of the window, a timeout cannot be blamed on the prompt. Recompacting
+# a request that occupies a fraction of the context achieves nothing, and the bridge did
+# exactly that: eight minutes of refit-and-retry on a 3,642-token payload while the
+# upstream was timing out on a six-token probe as well. Above it, shrinking is worth a try.
+_REFIT_WORTH_TRYING_ABOVE = 0.25
+
+
+def _worth_refitting(body: dict, limit: int) -> bool:
+    """Whether a timeout could plausibly be about the size of this request.
+
+    Distinguishes "the conversation is too big" from "the upstream is unwell". Both
+    arrive as HTTP 524 and only the first is something the bridge can act on.
+    """
+    if limit <= 0:
+        return False
+    return estimate_request_tokens(body) > limit * _REFIT_WORTH_TRYING_ABOVE
+
+
+def _degraded_upstream_message(tokens: int, limit: int) -> str:
+    """What to tell the user when a small request times out.
+
+    Naming the size is the point: it says plainly that this is not their conversation
+    being too long, so they do not go looking for something to compact.
+    """
+    return (
+        f"Agentaus timed out on a small request ({tokens:,} tokens, against a "
+        f"{limit:,}-token window), which means the service is slow or unavailable rather "
+        f"than your conversation being too long. Nothing here needs compacting. Try "
+        f"again shortly, or switch to a Claude model with /model in the meantime."
+    )
+
+
 def _is_too_slow(text: str) -> bool:
     """Whether an upstream failure means the prompt took too long, not that it was wrong.
 
@@ -1174,7 +1206,8 @@ async def _handle_agentaus(
                 # A timeout is treated like an over-length rejection: both mean the
                 # next attempt must send less, and neither is fixed by replaying.
                 over_length = upstream.status_code >= 400 and (
-                    _is_over_length(upstream.text) or _is_too_slow(upstream.text)
+                    _is_over_length(upstream.text)
+                    or (_is_too_slow(upstream.text) and _worth_refitting(body, limit))
                 )
                 if not over_length or fit_attempt == settings.agentaus_fit_attempts:
                     break

@@ -452,3 +452,35 @@ class TestCapacityFailuresAreNotReplayed(unittest.TestCase):
             settings.retry_backoff_seconds = previous
         self.assertEqual(response.status_code, 200)
         self.assertEqual(client.attempts, 2)
+
+
+class TestSmallRequestTimeoutsAreNotBlamedOnSize(unittest.TestCase):
+    """A 524 on a small request is a sick upstream, not a long conversation.
+
+    Both arrive as HTTP 524 and only one is actionable. The bridge spent eight minutes
+    refitting and replaying a 3,642-token payload against a 131,072-token window, while
+    a six-token probe to the same endpoint was also timing out. Nothing about that
+    request was too big.
+    """
+
+    def test_a_tiny_request_is_not_worth_refitting(self):
+        from agentaus_bridge.server import _worth_refitting
+        body = {"messages": [{"role": "user", "content": "short question"}]}
+        self.assertFalse(_worth_refitting(body, 131072))
+
+    def test_a_request_filling_the_window_is_worth_refitting(self):
+        from agentaus_bridge.server import _worth_refitting
+        body = {"messages": [{"role": "user", "content": "x " * 60_000}]}
+        self.assertTrue(_worth_refitting(body, 131072))
+
+    def test_no_limit_means_nothing_to_refit_against(self):
+        from agentaus_bridge.server import _worth_refitting
+        self.assertFalse(_worth_refitting({"messages": []}, 0))
+
+    def test_the_message_tells_the_user_not_to_go_compacting(self):
+        from agentaus_bridge.server import _degraded_upstream_message
+        text = _degraded_upstream_message(3642, 131072)
+        self.assertIn("3,642", text)
+        self.assertIn("131,072", text)
+        self.assertIn("Nothing here needs compacting", text)
+        self.assertIn("/model", text, "it should offer the escape that actually works")
