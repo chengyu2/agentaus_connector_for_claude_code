@@ -525,6 +525,8 @@ async def _aim_with_outline(
             reply = await call(outline.PICK_INSTRUCTION.format(
                 query=query, outline=toc,
                 limit=settings.agentaus_search_max_sections,
+                budget=(settings.agentaus_search_section_tokens
+                        * settings.agentaus_search_max_sections),
             ))
     except Exception as exc:
         log.warning("outline pick failed (%s); reading every chunk instead", exc)

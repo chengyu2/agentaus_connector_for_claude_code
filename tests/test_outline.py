@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+import re
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -137,9 +138,32 @@ class TestRenderingAndPicking(unittest.TestCase):
     def test_render_is_tagged_and_carries_line_numbers(self):
         files = {"/x/a.py": "def one():\n    pass\n"}
         text = outline.render(["/x/a.py"], read=reader(files))
-        self.assertIn('<file path="/x/a.py">', text)
+        self.assertIn('<file path="/x/a.py"', text)
         self.assertIn('<section line="1"', text)
         self.assertIn("def one()", text)
+
+    def test_every_section_states_its_cost(self):
+        """A choice made without cost visible is not really a choice - and the
+        alternative, a tool the model calls to ask how big something is, spends a round
+        trip on what is already known and depends on it remembering to ask."""
+        files = {"/x/a.py": "def one():\n    return 1\n\ndef two():\n    return 2\n"}
+        text = outline.render(["/x/a.py"], read=reader(files))
+        self.assertIn('tokens="', text)
+        sizes = re.findall(r'<section [^>]*tokens="(\d+)"', text)
+        self.assertEqual(len(sizes), 2)
+        self.assertTrue(all(int(v) > 0 for v in sizes), f"zero-cost sections: {sizes}")
+
+    def test_the_file_states_its_total(self):
+        files = {"/x/a.py": "def one():\n    return 1\n"}
+        text = outline.render(["/x/a.py"], read=reader(files))
+        total = int(re.search(r'<file [^>]*tokens="(\d+)"', text).group(1))
+        self.assertGreater(total, 0)
+
+    def test_the_pick_prompt_states_the_budget(self):
+        prompt = outline.PICK_INSTRUCTION.format(query="q", outline="o", limit=8,
+                                                 budget=24000)
+        self.assertIn("24000", prompt)
+        self.assertIn("Picking too little is the more expensive mistake", prompt)
 
     def test_picks_are_parsed(self):
         picks = outline.read_picks("/x/a.py:12\n/x/b.md:340", ["/x/a.py", "/x/b.md"])

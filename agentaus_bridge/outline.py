@@ -199,15 +199,30 @@ def render(paths: list[str], read=None, *, max_lines: int = 600) -> str:
 
     Line numbers are the point: whatever the model picks, it picks something
     `agentaus_zoom` and the chunk reader can address directly.
+
+    Each section also carries its size in tokens, because a choice made without cost
+    visible is not really a choice. The alternative - a tool the model calls to ask how
+    big something is - costs a round trip to learn what is already known here, and
+    depends on the model remembering to ask. Attaching it to the thing being chosen from
+    costs nothing and cannot be forgotten.
     """
+    from .tokens import count_tokens
+
     out: list[str] = []
     for path in paths:
+        body = (read or (lambda p: ""))(path)
         headings = of_file(path, read)
         if not headings:
             continue
-        out.append(f'<file path="{path}">')
-        for line, depth, title in headings:
-            out.append(f'  <section line="{line}" depth="{depth}">{title}</section>')
+        lines = body.splitlines()
+        total = count_tokens(body)
+        out.append(f'<file path="{path}" tokens="{total}">')
+        for index, (line, depth, title) in enumerate(headings):
+            # A section runs to the next heading, or to the end of the file.
+            end = headings[index + 1][0] - 1 if index + 1 < len(headings) else len(lines)
+            size = count_tokens("\n".join(lines[line - 1:end]))
+            out.append(f'  <section line="{line}" depth="{depth}" tokens="{size}">'
+                       f"{title}</section>")
         out.append("</file>")
         if len(out) >= max_lines:
             out.append(f"<!-- outline truncated at {max_lines} lines -->")
@@ -225,12 +240,17 @@ PICK_INSTRUCTION = """\
 </outline>
 
 <task>
-The outline above is the section structure of some documents - headings and the line each
-one starts at. No content, only structure.
+The outline above is the section structure of some documents - headings, the line each one
+starts at, and its size in tokens. No content, only structure.
 
 Name the sections most likely to answer the question. Judge by what each heading says the
 section is about; a heading that names the subject is a better bet than one that merely
 shares a word with the question.
+
+You have roughly {budget} tokens to spend. The sizes are there so you can choose: a few
+sections that plainly name the subject beat many that only might, and one enormous section
+may be worth more than several small ones - or much less. Picking too little is the more
+expensive mistake, because a section you do not name is not read at all.
 </task>
 
 <output_format>
