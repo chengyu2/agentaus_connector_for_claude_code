@@ -670,11 +670,13 @@ async def run_search(
     # being inside the cap. A thin shortlist is a weak signal, not a wrong one; it goes
     # first, and the rest of the corpus follows it.
     brute_forced = False
+    matched_first = 0
     if len(candidates) < settings.agentaus_search_min_candidates:
         best = list(candidates)
         rest = [f for f in files if f not in set(best)]
         candidates = best + rest
         brute_forced = True
+        matched_first = len(best)
     elif len(candidates) > settings.agentaus_search_max_candidates:
         # Ranked, so this keeps the files that matched the most distinct terms.
         candidates = candidates[: settings.agentaus_search_max_candidates]
@@ -748,8 +750,14 @@ async def run_search(
     log.info(
         "search %r: %d file(s) -> %d candidate(s)%s -> %d of %d chunk(s)%s",
         query[:60], len(files), len(candidates),
-        ("".join([" (shortlist too thin, all files)" if brute_forced else "",
-                  " (aimed by outline)" if aimed else ""])),
+        ("".join([
+            # Saying "all files" alone was true and misleading: it read as "the filter
+            # was discarded", which is what the code used to do and no longer does.
+            (f" (thin shortlist: {matched_first} matched, read first, then the rest)"
+             if brute_forced and matched_first
+             else " (nothing matched, reading everything)" if brute_forced else ""),
+            " (aimed by outline)" if aimed else "",
+        ])),
         len(chunks), total, f", {dropped} over the cap" if dropped else "",
     )
 

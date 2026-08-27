@@ -26,6 +26,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import documents
+from . import harmony
 from . import persisted
 from . import syntax
 from . import schema as tool_schema
@@ -773,6 +774,28 @@ def _openai_calls(data: dict) -> list:
         }
         for call in (message.get("tool_calls") or [])
     ]
+
+
+def _recover_harmony_calls(data: dict) -> tuple:
+    """Pull tool calls the model wrote into its answer text back out of it.
+
+    Returns the response with that markup removed, plus the calls it contained. A call
+    written as prose is still a call the model meant to make, and the alternative is
+    showing the user a line of angle brackets and calling it an answer.
+    """
+    choices = list(data.get("choices") or [])
+    if not choices:
+        return data, []
+    choice = dict(choices[0] or {})
+    message = dict(choice.get("message") or {})
+    text = message.get("content") or ""
+    if not harmony.looks_like_harmony(text):
+        return data, []
+
+    cleaned, calls = harmony.extract(text)
+    message["content"] = cleaned or None
+    choice["message"] = message
+    return {**data, "choices": [choice] + choices[1:]}, calls
 
 
 def _with_forced_answer(data: dict, text: str) -> dict:
@@ -1577,6 +1600,8 @@ async def _handle_agentaus(
 
             known = _known_tool_names(payload)
             calls = _openai_calls(data)
+            if not calls:
+                data, calls = _recover_harmony_calls(data)
             mine, _theirs, invented = _partition_tool_calls(calls, known)
             if invented and corrections < settings.agentaus_correction_rounds:
                 corrections += 1
@@ -1937,6 +1962,11 @@ async def _agentaus_event_stream(
             break
 
         calls = accumulator.drain()
+        if not calls and pending:
+            cleaned, recovered = harmony.extract("".join(pending))
+            if recovered:
+                pending = [cleaned] if cleaned.strip() else []
+                calls = recovered
         known = _known_tool_names(payload)
         mine, theirs, invented = _partition_tool_calls(calls, known)
         if invented and corrections < settings.agentaus_correction_rounds:

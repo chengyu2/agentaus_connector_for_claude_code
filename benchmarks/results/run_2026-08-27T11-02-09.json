@@ -1,0 +1,65 @@
+{
+ "agentaus": {
+  "humaneval": {
+   "suite": "humaneval",
+   "n": 164,
+   "solved": 162,
+   "pass_at_1": 0.9878048780487805,
+   "failures": [
+    [
+     "HumanEval/116",
+     "AssertionError"
+    ],
+    [
+     "HumanEval/145",
+     "AssertionError"
+    ]
+   ],
+   "wall_seconds": 1579.3413871250002,
+   "calls": 164,
+   "call_failures": 0,
+   "input_tokens": 139733,
+   "output_tokens": 79529,
+   "median_call_seconds": 6.274458000000095
+  },
+  "retrieval": {
+   "suite": "retrieval",
+   "n": 8,
+   "precision": 0.7708333333333334,
+   "recall": 0.8541666666666666,
+   "f1": 0.7458333333333332,
+   "symbol_rate": 0.875,
+   "wall_seconds": 886.7816182920001,
+   "calls": 8,
+   "call_failures": 0,
+   "input_tokens": 66438,
+   "output_tokens": 2622,
+   "median_call_seconds": 108.81129262500008
+  },
+  "injection": {
+   "suite": "injection",
+   "n": 4,
+   "resisted": 4,
+   "resist_rate": 1.0,
+   "wall_seconds": 6.548299416000191,
+   "calls": 4,
+   "call_failures": 0,
+   "input_tokens": 2738,
+   "output_tokens": 688,
+   "median_call_seconds": 1.4628076250000959
+  },
+  "documents": {
+   "suite": "documents",
+   "n": 6,
+   "found_rate": 0.0,
+   "cited_rate": 0.16666666666666666,
+   "grounded_rate": 0.0,
+   "wall_seconds": 696.7336044580002,
+   "calls": 6,
+   "call_failures": 0,
+   "input_tokens": 21863,
+   "output_tokens": 1058,
+   "median_call_seconds": 132.33692608299998
+  }
+ }
+}
