@@ -1493,6 +1493,10 @@ async def _handle_agentaus(
         # survived the fit; it costs ~250 tokens the estimate does not see, which is
         # immaterial against a 0.8 threshold.
         offered = []
+        # Inventory first in the list as well as first in the workflow: a question about
+        # a whole tree should start here, and a model reads the tools in order.
+        if settings.agentaus_inventory:
+            offered.append(bridge_tools.INVENTORY_SCHEMA)
         if settings.agentaus_search:
             offered.append(bridge_tools.SEARCH_SCHEMA)
         if settings.agentaus_web_search:

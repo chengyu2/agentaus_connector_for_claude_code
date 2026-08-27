@@ -28,6 +28,7 @@ import time
 from typing import Awaitable, Callable
 
 from . import documents
+from . import inventory
 from . import outline
 from .compact import _chunk, normalise_identifiers
 from .config import settings
@@ -114,8 +115,61 @@ WEB_SEARCH_TOOL = "agentaus_web_search"
 INVESTIGATE_TOOL = "agentaus_investigate"
 ZOOM_TOOL = "agentaus_zoom"
 
+INVENTORY_TOOL = "agentaus_inventory"
+
 # Names the bridge answers itself. Anything else is Claude Code's and is passed through.
-BRIDGE_TOOLS = {SEARCH_TOOL, WEB_SEARCH_TOOL, INVESTIGATE_TOOL, ZOOM_TOOL}
+BRIDGE_TOOLS = {SEARCH_TOOL, WEB_SEARCH_TOOL, INVESTIGATE_TOOL, ZOOM_TOOL,
+                INVENTORY_TOOL}
+
+
+INVENTORY_SCHEMA = {
+    "name": INVENTORY_TOOL,
+    "description": (
+        "List what is actually in a folder: how many files, of which kinds, in which "
+        "sub-folders, and one line on what each file is. Free and immediate - it reads "
+        "the directory, not the contents.\n\n"
+        "Use this FIRST for any question about a whole tree - 'what is in this repo', "
+        "'what documents do we have', 'review everything here', 'what collateral "
+        "exists'. Those questions have no answer a search can give you: search asks "
+        "each excerpt whether it answers your question, and no single excerpt answers a "
+        "question about the whole corpus, so you get back almost nothing after a long "
+        "wait. Get the inventory, then search for the specific things it reveals."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Absolute path of the folder to inventory.",
+            },
+            "glob": {
+                "type": "string",
+                "description": "Optional filename filter, e.g. '*.pdf'.",
+            },
+        },
+        "required": ["path"],
+    },
+}
+
+
+async def run_inventory(path: str, glob: str | None, default_path: str | None = None) -> str:
+    """What is in a tree. No model calls at all, so it costs a directory walk."""
+    if (not path or not os.path.isabs(path)) and default_path:
+        path = default_path if not path else os.path.join(default_path, path)
+    if not os.path.isabs(path):
+        return (f"agentaus_inventory needs an absolute path; got {path!r}.")
+    if not os.path.exists(path):
+        return f"No such path: {path}"
+    if not _allowed_root(path):
+        return f"{path} is outside AGENTAUS_SEARCH_ROOTS, which this bridge is confined to."
+    if os.path.isfile(path):
+        path = os.path.dirname(path)
+
+    files = enumerate_files(path, glob)
+    rendered = inventory.render(path, files, read=read_text)
+    log.info("inventory %s: %d file(s) -> %d chars, no model calls",
+             os.path.basename(path.rstrip("/")) or path, len(files), len(rendered))
+    return rendered
 
 
 SEARCH_SCHEMA = {
@@ -1234,6 +1288,12 @@ async def execute(
                 str(arguments.get("path") or ""),
                 (arguments.get("glob") or None),
                 call,
+                default_path,
+            )
+        if name == INVENTORY_TOOL:
+            return await run_inventory(
+                str(arguments.get("path") or ""),
+                (arguments.get("glob") or None),
                 default_path,
             )
         if name == WEB_SEARCH_TOOL:

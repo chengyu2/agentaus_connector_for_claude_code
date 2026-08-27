@@ -27,9 +27,14 @@ about one thing that is fine. For a question about **all** things it is the whol
 
 ## The script
 
-**1. Write down the ground before you search it.** From `repo-survey`, or one bounded
-count. You cannot know you have finished if you never knew what "all" was. Name the
-number: *"41 markdown, 48 PDF, 12 docx."*
+**1. Write down the ground before you search it.** `agentaus_inventory` on the root —
+it is free and immediate, and it gives you the number. You cannot know you have finished
+if you never knew what "all" was. Name it: *"41 markdown, 48 PDF, 12 docx."*
+
+Do **not** open with a search here. Search asks each excerpt whether it answers your
+question, and no single excerpt answers a question about a whole corpus — so every one
+says no. Measured: two searches over a 312-file folder took 183s and 52s and returned
+116 and 130 characters between them. The inventory returned all 512 files in 0.01s.
 
 **2. Search in rounds, changing the angle each round.** One phrasing finds one
 neighbourhood. Vary it deliberately:

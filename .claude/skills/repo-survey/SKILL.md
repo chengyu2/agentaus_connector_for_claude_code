@@ -25,7 +25,12 @@ failure mode: not a wrong answer, an invented one.
 This skill gets you the **inventory**. If the question then needs every file examined rather than counted, hand off to **`search-exhaustively`** — it owns when a search is finished.
 
 
-**1. Count before you read.** One bounded command, never a bare `find`:
+**1. Count before you read.** `agentaus_inventory` on the root. It returns the file
+count, the breakdown by type, the folders, and one line on what each file is — in well
+under a second, with no model calls. That is the survey; everything after it is
+follow-up.
+
+Failing that, one bounded command — never a bare `find`:
 
 ```bash
 find "<root>" -type f | sed 's/.*\.//' | tr 'A-Z' 'a-z' | sort | uniq -c | sort -rn | head -20

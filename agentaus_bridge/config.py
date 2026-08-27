@@ -440,6 +440,11 @@ class Settings:
     # slurping a giant blob; for these formats it excluded exactly the richest files.
     # Extraction bounds the text on its own and the result is cached, so the raw size is
     # simply not the quantity worth limiting here.
+    # An inventory costs a directory walk and no model calls, so there is no reason to
+    # turn it off except to reproduce the behaviour without it.
+    agentaus_inventory: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_INVENTORY", True)
+    )
     agentaus_search_max_document_bytes: int = field(
         default_factory=lambda: _int("AGENTAUS_SEARCH_MAX_DOCUMENT_BYTES", 25 * 1024 * 1024)
     )

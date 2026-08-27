@@ -1173,6 +1173,7 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_PDF_DPI` | `200` | Rasterisation resolution for OCR |
 | `AGENTAUS_PDF_TIMEOUT` | `120` | Ceiling on one extraction or one OCR page |
 | `AGENTAUS_SEARCH_MAX_DOCUMENT_BYTES` | `25 MiB` | Size ceiling for PDFs and office documents, separate from `AGENTAUS_SEARCH_MAX_FILE_BYTES`. Their size on disk is embedded images, not content — the 1 MiB text cap excluded 27 documents in one corpus, including a 93-page tender response |
+| `AGENTAUS_INVENTORY` | `true` | Offer `agentaus_inventory`, which lists what is in a tree — counts, kinds, folders, one line per file. No model calls |
 | `AGENTAUS_SEARCH` | `true` | Offer `agentaus_search`, the bridge-executed semantic search, and steer `Grep` towards literal lookups |
 | `AGENTAUS_WEB_SEARCH` | `true` | Offer `agentaus_web_search`, which drives Agentaus' own web search. Claude Code's `WebSearch` is dropped in translation, so without this an Agentaus turn cannot search the web at all |
 | `AGENTAUS_SEARCH_CHUNK_TOKENS` | `8000` | File content per search call. Measured: 4000 costs 48s/16 calls, 8000 costs 29s/10, 16000 costs 22s/4 — all find the same facts, but bigger chunks quote less back |
