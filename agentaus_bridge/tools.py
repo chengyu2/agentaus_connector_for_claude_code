@@ -654,11 +654,21 @@ async def run_search(
     ranked = shortlist(files, terms)
     candidates = [p for p, _ in ranked]
 
-    # A thin shortlist means the words are simply not there - which is the case a
-    # keyword search gets wrong, not a sign that nothing matches. Read everything.
+    # A thin shortlist means the words are simply not there - which is the case a keyword
+    # search gets wrong, not a sign that nothing matches. So everything gets read.
+    #
+    # But the shortlist is not discarded to do it. It used to be, and that was strictly
+    # worse than either option on its own: searching `SC-NFR-11` - a unique identifier
+    # appearing in exactly one file of 485 - matched that one file, decided one was too
+    # few to trust, replaced it with all 485, produced 566 chunks and read the first 120.
+    # The one file that certainly held the answer was demoted to a 1-in-485 chance of
+    # being inside the cap. A thin shortlist is a weak signal, not a wrong one; it goes
+    # first, and the rest of the corpus follows it.
     brute_forced = False
     if len(candidates) < settings.agentaus_search_min_candidates:
-        candidates = files
+        best = list(candidates)
+        rest = [f for f in files if f not in set(best)]
+        candidates = best + rest
         brute_forced = True
     elif len(candidates) > settings.agentaus_search_max_candidates:
         # Ranked, so this keeps the files that matched the most distinct terms.
@@ -714,11 +724,17 @@ async def run_search(
             hits = sum(1 for term in selective if term in body)
             if hits:
                 scored.append((hits, piece))
-        # Same reasoning as the file shortlist: too few hits means the words are absent,
-        # not the answer, so read everything rather than trusting the filter.
+        # Same reasoning as the file shortlist, and the same correction: a filter that
+        # matched too little is still evidence about what matched. Ranked chunks go
+        # first either way; when there are too few to trust alone, the unmatched chunks
+        # follow them rather than replacing them.
+        scored.sort(key=lambda pair: -pair[0])
+        ranked_chunks = [piece for _hits, piece in scored]
         if len(scored) >= settings.agentaus_search_min_candidates:
-            scored.sort(key=lambda pair: -pair[0])
-            chunks = [piece for _hits, piece in scored]
+            chunks = ranked_chunks
+        elif ranked_chunks:
+            matched = {id(piece) for piece in ranked_chunks}
+            chunks = ranked_chunks + [c for c in chunks if id(c) not in matched]
 
     cap = settings.agentaus_search_max_chunks
     dropped = max(0, len(chunks) - cap)

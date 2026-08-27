@@ -95,6 +95,32 @@ class TestSearchFindsWhatRegexCannot(unittest.TestCase):
         chunk_prompts = [p for p in call.seen if "<excerpt file=" in p]
         self.assertEqual(len(chunk_prompts), 2, "brute force did not read every file")
 
+    def test_a_thin_shortlist_is_read_first_rather_than_thrown_away(self):
+        """The bug that made a unique identifier unfindable in a large corpus.
+
+        Searching `SC-NFR-11` - present in exactly one file of 485 - matched that one
+        file, decided one was too few to trust, replaced the shortlist with all 485,
+        produced 566 chunks and read the first 120. The file that certainly held the
+        answer became a 1-in-485 chance of landing inside the cap, and the live
+        benchmark scored it found=n.
+
+        Reading everything is still right. Discarding what matched to do it is not.
+        """
+        files = {f"filler{n}.py": f"def f{n}():\n    return {n}\n" for n in range(12)}
+        files["needle.py"] = "MARKER_SCNFR11 = 'the answer'\n"
+        with _Tree(files) as tree:
+            call = responder(terms="MARKER_SCNFR11", hit_on="needle.py",
+                             answer="1: MARKER_SCNFR11 = 'the answer'")
+            out = run(tools.run_search("what is the marker", tree.path, None, call))
+
+        chunk_prompts = [p for p in call.seen if "<excerpt file=" in p]
+        self.assertTrue(chunk_prompts, "no chunks were read at all")
+        self.assertIn("needle.py", chunk_prompts[0],
+                      "the one file that matched must be read first, not buried")
+        self.assertGreater(len(chunk_prompts), 1,
+                           "the rest of the corpus must still follow it")
+        self.assertIn("needle.py", out)
+
 
 class TestResultsAreReportedHonestly(unittest.TestCase):
     def test_none_answers_are_dropped(self):
