@@ -11,6 +11,7 @@ models in one session instead of replacing them.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import json
 import logging
@@ -343,6 +344,44 @@ async def _sleep_before_retry(attempt: int, why: str) -> None:
 _CAPACITY_STATUS = {504, 520, 522, 524}
 
 
+@contextlib.asynccontextmanager
+async def _watching_for_stall(label: str):
+    """Log, at intervals, that an upstream call has not come back yet.
+
+    Without this a stall is indistinguishable from silence. A request was observed
+    received, never forwarded upstream, and never answered - and the only evidence was
+    that the log had stopped, which is not evidence anyone finds while it is happening.
+    The call is not interrupted: reporting a stall and causing one are different jobs,
+    and the timeout already owns the second.
+    """
+    interval = settings.stall_warning_seconds
+    if interval <= 0:                                   # 0 disables, as elsewhere here
+        yield
+        return
+
+    started = time.monotonic()
+
+    async def announce():
+        # The task inherits the current context, so the request id is the one that
+        # started the call rather than whatever is current when the warning fires.
+        waited = 0.0
+        while True:
+            await asyncio.sleep(interval)
+            waited += interval
+            rlog(logging.WARNING,
+                 "%s still waiting after %.1fs - upstream has not responded",
+                 label, waited)
+
+    watcher = asyncio.ensure_future(announce())
+    try:
+        yield
+    finally:
+        watcher.cancel()
+        elapsed = time.monotonic() - started
+        if elapsed > interval:
+            rlog(logging.INFO, "%s completed after %.1fs", label, elapsed)
+
+
 async def _post_with_retry(
     client: httpx.AsyncClient,
     url: str,
@@ -363,7 +402,8 @@ async def _post_with_retry(
     last_exc: Exception | None = None
     for attempt in range(settings.max_retries + 1):
         try:
-            response = await client.post(url, json=json_body, headers=headers)
+            async with _watching_for_stall(f"upstream POST (attempt {attempt + 1})"):
+                response = await client.post(url, json=json_body, headers=headers)
         except httpx.HTTPError as exc:
             last_exc = exc
             if not _is_retryable_exception(exc) or attempt == settings.max_retries:
@@ -1705,7 +1745,7 @@ async def _agentaus_event_stream(
 
             try:
                 if payload.get("stream"):
-                    async with client.stream(
+                    async with _watching_for_stall("upstream stream"), client.stream(
                         "POST", settings.agentaus_url, json=payload, headers=_agentaus_headers()
                     ) as upstream:
                         if upstream.status_code >= 400:

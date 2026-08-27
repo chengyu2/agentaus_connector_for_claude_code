@@ -102,7 +102,20 @@ class Settings:
 
     # --- timeouts -----------------------------------------------------------------
     connect_timeout: float = field(default_factory=lambda: float(_int("BRIDGE_CONNECT_TIMEOUT", 30)))
-    read_timeout: float = field(default_factory=lambda: float(_int("BRIDGE_READ_TIMEOUT", 1800)))
+    # 1800 was half an hour of silence. A dead upstream connection - observed live,
+    # while the upstream itself was healthy and answering in under a second - held a
+    # benchmark run for 26 minutes without a single log line, because nothing times out
+    # and nothing reports waiting. This is a per-read budget, not a per-turn one:
+    # streaming resets it on every token, and a buffered call that has produced nothing
+    # for five minutes is not slow, it is broken.
+    read_timeout: float = field(default_factory=lambda: float(_int("BRIDGE_READ_TIMEOUT", 300)))
+
+    # How long an upstream call may run before the log says it is still waiting. A stall
+    # that is merely slow and a stall that will never end look identical until something
+    # says how long it has been.
+    stall_warning_seconds: float = field(
+        default_factory=lambda: float(_int("BRIDGE_STALL_WARNING", 45))
+    )
 
     # --- retries ------------------------------------------------------------------
     # Transient upstream failures (DNS blips, connection resets, 502/503/504 from a
