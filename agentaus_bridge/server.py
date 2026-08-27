@@ -53,6 +53,7 @@ from .augment import (
     REFUSAL_CORRECTION,
 )
 from .compact import ConversationCompactor
+from .text import normalise_for_display
 from .distill import ResultDistiller
 from .gate import hold
 from . import ledger
@@ -2075,7 +2076,9 @@ async def _agentaus_event_stream(
                 ]
         break
 
-    answer = "".join(pending)
+    # Same repair as the buffered path: a non-breaking hyphen in a filename looks
+    # exactly like a hyphen and cannot be copied, clicked or searched for.
+    answer = normalise_for_display("".join(pending))
     if buffering and not answer and not theirs and not accumulator.pending():
         # Agentaus sometimes answers HTTP 200 with no content at all - observed as
         # "200 in 94.8s in=0 out=0" on a question it had every means to answer. An empty

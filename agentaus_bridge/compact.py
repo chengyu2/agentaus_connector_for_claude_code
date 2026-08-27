@@ -34,6 +34,8 @@ from typing import Awaitable, Callable
 
 from .gate import hold
 from .translate import estimate_request_tokens, estimate_tokens
+# Re-exported: these lived here first and several modules import them from here.
+from .text import normalise_for_display, normalise_identifiers  # noqa: F401
 
 log = logging.getLogger("agentaus-bridge")
 
@@ -111,25 +113,6 @@ Summariser = Callable[[str], Awaitable[str]]
 # on, it is corruption: a region code or file path carrying a typographic hyphen looks
 # correct and is not, which is worse than it being missing. Normalising deterministically
 # is more reliable than asking the model not to do it.
-_TYPOGRAPHIC = {
-    "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-",
-    "\u2212": "-", "\u00a0": " ", "\u202f": " ",
-    "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
-}
-
-_MATH_WRAPPED = re.compile(r"\$\$\s*([^$\n]{1,120}?)\s*\$\$")
-
-
-def normalise_identifiers(text: str) -> str:
-    """Undo typographic substitutions so identifiers survive verbatim."""
-    if not text:
-        return text
-    text = unicodedata.normalize("NFKC", text)
-    for fancy, plain in _TYPOGRAPHIC.items():
-        text = text.replace(fancy, plain)
-    return _MATH_WRAPPED.sub(r"`\1`", text)
-
-
 def _clean_turn_start(message: dict) -> bool:
     """Whether the conversation may validly begin at this message.
 

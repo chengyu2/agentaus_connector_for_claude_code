@@ -13,6 +13,7 @@ import base64
 import hashlib
 import json
 
+from .text import normalise_for_display
 from .tokens import calibrator, count_tokens
 import uuid
 from typing import Any, Iterable
@@ -410,7 +411,10 @@ def agentaus_response_to_anthropic(
     content: list[dict] = []
     if thinking and thinking.strip():
         content.append({"type": "thinking", "thinking": thinking.strip()})
-    text = message.get("content") or message.get("refusal") or ""
+    # Repaired here because this is the single point every buffered answer passes
+    # through on its way to the client.
+    text = normalise_for_display(
+        message.get("content") or message.get("refusal") or "")
     if text:
         content.append({"type": "text", "text": text})
 

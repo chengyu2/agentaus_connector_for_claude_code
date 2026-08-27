@@ -1,0 +1,31 @@
+{
+ "agentaus": {
+  "coverage": {
+   "suite": "coverage",
+   "n": 3,
+   "bare_cited": 0.0,
+   "skill_cited": 11.333333333333334,
+   "delta": 11.333333333333334,
+   "one_file_answers": 4,
+   "wall_seconds": 855.922179291,
+   "calls": 6,
+   "call_failures": 0,
+   "input_tokens": 78826,
+   "output_tokens": 17521,
+   "median_call_seconds": 162.469488666
+  },
+  "documents": {
+   "suite": "documents",
+   "n": 6,
+   "found_rate": 0.6666666666666666,
+   "cited_rate": 0.5,
+   "grounded_rate": 0.5,
+   "wall_seconds": 605.373765875,
+   "calls": 6,
+   "call_failures": 0,
+   "input_tokens": 67039,
+   "output_tokens": 2325,
+   "median_call_seconds": 115.50482404200011
+  }
+ }
+}
