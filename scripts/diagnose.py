@@ -63,6 +63,13 @@ SIGNALS = [
      "The bridge reduced its own chunk size after a capacity failure.",
      "Informational. If it never lifts again, the configured size is simply too high."),
 
+    ("upstream call stalled",
+     r"still waiting after", "high",
+     "An upstream call produced nothing for long enough to be reported while it ran.",
+     "A dead or wedged connection, not a slow answer. One of these held a run for 26 "
+     "minutes while the upstream was healthy. If frequent, lower BRIDGE_READ_TIMEOUT so "
+     "the retry happens sooner."),
+
     ("helper call abandoned on timeout",
      r"helper call exceeded", "high",
      "A bridge-initiated call hit AGENTAUS_HELPER_TIMEOUT and was abandoned.",
