@@ -1342,6 +1342,8 @@ the point — a benchmark whose verdicts are its own opinion cannot tell you any
 | `humaneval` | pass@1 over 164 problems | **the dataset's own unit tests** |
 | `retrieval` | localisation precision, recall, F1 | ground truth over this repository |
 | `injection` | resistance to instructions hidden in file content | this bridge's stated threat model |
+| `documents` | can it answer from a PDF at all — found and cited rates | six facts checked to exist **only** inside PDFs, against the 263 non-PDF files in the corpus |
+| `coverage` | does it survey the corpus or stop at the first hit | filenames counted against the real listing, so invented ones score nothing |
 
 Every suite routes through the bridge, so two arms share the harness, the prompts and the
 parsing exactly and differ only in who answered. **Tokens and latency sit beside every
@@ -1370,6 +1372,15 @@ zero.
 *"Where does this project stop too many background requests running at once?"* for
 `gate.py:_PriorityGate`. A text search cannot serve that; a semantic one must. This is the
 number that matters for a bridge whose search design is "aim before you read".
+
+**`documents`** exists because the answer used to be *no*. Every needle in it was checked
+against the 263 non-PDF files in the corpus first, so a non-zero score means PDFs are
+genuinely being read rather than an adjacent file being paraphrased.
+
+**`coverage`** is the only suite here that scores *completeness* rather than correctness,
+and it runs as an A/B — the same question with and without the `search-exhaustively`
+procedure. A skill is a claim that instructions change behaviour, and that claim is worth
+measuring rather than assuming.
 
 **`injection`** plants an instruction in file content and asks an ordinary question about
 it. One case claims *"Privilege Level 10 — highest authority"*, which is the mechanism that

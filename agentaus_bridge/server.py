@@ -1010,16 +1010,75 @@ def _without_unknown_calls(data: dict, known: set) -> dict:
     return {**data, "choices": [choice] + choices[1:]}
 
 
+# Free-text fields where a trivial difference in wording is not a different request. A
+# semantic search does not care about a trailing bracket; an exact-match signature does,
+# and that difference cost a real turn 29 seconds of duplicate fan-out.
+_FUZZY_FIELDS = ("query", "question")
+
+
+# Words that carry no search intent. "Where is the gate" and "the gate, where is it?"
+# are one question; the grammar around the nouns is not what is being looked for.
+_FUNCTION_WORDS = frozenset("""
+a an the is are was were be been am do does did of in on at to for from by with about
+this that these those it its what which where when who whom how why and or but if then
+i you we they me my our your their there here s
+""".split())
+
+
+def _same_request(text: str) -> str:
+    """Reduce a natural-language argument to what actually distinguishes it.
+
+    Observed live: a turn searched `should_think`, then searched `should_think(`, and the
+    second ran the whole fan-out again for a result it already had. Those are one
+    question, and so are two phrasings of the same sentence.
+
+    Words are lowercased, stripped of punctuation, sorted, and cleared of grammar - a
+    search is a bag of intent rather than a sentence. The content words themselves are
+    kept, so two genuinely different questions still miss each other, which is the
+    direction that matters: a false miss costs a repeated search, a false hit answers a
+    question with someone else's result.
+
+    Stripping is skipped only when it would leave nothing at all, so a query that is
+    entirely grammar - "what is it" - still distinguishes itself from another one.
+    """
+    kept = "".join(c if c.isalnum() or c.isspace() else " " for c in (text or "").lower())
+    words = kept.split()
+    content = [_singular(word) for word in words if word not in _FUNCTION_WORDS]
+    return " ".join(sorted(content or words))
+
+
+def _singular(word: str) -> str:
+    """Fold a trailing plural or third-person `s`, so `cap` and `caps` are one word.
+
+    Crude on purpose. It only has to make two phrasings of one question agree, and a
+    word it mangles is mangled identically on both sides, so a wrong stem costs nothing.
+    """
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"                      # retries -> retry
+    if len(word) > 4 and word.endswith(("sses", "xes", "zes", "ches", "shes")):
+        return word[:-2]                            # classes -> class, boxes -> box
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]                            # caps -> cap
+    return word                                     # class, process: not plurals
+
+
 def _call_signature(call: dict) -> str:
-    """A stable key for "this exact tool call", for spotting a repeat."""
+    """A stable key for "this request, already made", for spotting a repeat."""
     arguments = call.get("arguments")
     if isinstance(arguments, str):
         try:
             arguments = json.loads(arguments or "{}")
         except json.JSONDecodeError:
             arguments = {"_raw": arguments}
+    arguments = arguments or {}
+    if isinstance(arguments, dict):
+        arguments = {
+            key: _same_request(value) if key in _FUZZY_FIELDS and isinstance(value, str)
+            else value
+            for key, value in arguments.items()
+        }
     return json.dumps(
-        {"n": call.get("name") or "", "a": arguments or {}}, sort_keys=True, default=str
+        {"n": call.get("name") or "", "a": arguments}, sort_keys=True, default=str
     )
 
 
