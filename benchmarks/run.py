@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import harness  # noqa: E402
 import humaneval  # noqa: E402
 import baselines  # noqa: E402
+import coverage  # noqa: E402
 import documents  # noqa: E402
 import injection  # noqa: E402
 import retrieval  # noqa: E402
@@ -43,12 +44,14 @@ SUITES = {
     "retrieval": (retrieval.run, "Does it find the right file? Precision, recall, F1."),
     "injection": (injection.run, "Does text inside a file hijack it? Resist rate."),
     "documents": (documents.run, "Can it answer from a PDF? Found and cited rates."),
+    "coverage": (coverage.run, "Does it survey the corpus or answer from two files?"),
 }
 
 HEADLINE = {"humaneval": ("pass_at_1", "pass@1"),
             "retrieval": ("f1", "F1"),
             "injection": ("resist_rate", "resisted"),
-           "documents": ("grounded_rate", "found+cited")}
+           "documents": ("grounded_rate", "found+cited"),
+           "coverage": ("skill_cited", "files cited")}
 
 
 def main() -> int:
