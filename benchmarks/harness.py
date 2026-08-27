@@ -56,9 +56,57 @@ class Totals:
         return ordered[len(ordered) // 2]
 
 
+# The largest file body handed back to the model. A benchmark that lets one Read fill
+# the window is measuring the window.
+READ_LIMIT = 40_000
+
+# Client-side tool rounds before the harness stops and takes what it has. The bridge
+# runs its own tools internally; these are only the ones a suite offered.
+TOOL_ROUNDS = 6
+
+
+def _run_client_tool(name: str, arguments: dict) -> str:
+    """Execute a tool the suite offered, the way Claude Code would.
+
+    Only `Read`, because that is the only one any suite offers. Anything else is
+    reported back as unavailable rather than silently succeeding, so a model that
+    invents a tool sees the same thing it would see in a real session.
+    """
+    if name != "Read":
+        return f"No tool named {name!r} is available here."
+    path = (arguments or {}).get("file_path") or ""
+    if not path:
+        return "Read needs a file_path."
+    try:
+        import sys
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from agentaus_bridge import tools as bridge_tools
+        # Deliberately the bridge's reader, not open(): Claude Code's own Read shows a
+        # .docx or .pdf as text, and a harness that hands back raw bytes would be
+        # testing a client nobody uses.
+        body = bridge_tools.read_text(path)
+    except Exception as exc:
+        return f"Could not read {path}: {type(exc).__name__}: {exc}"
+    if not body:
+        return f"{path} is empty or unreadable."
+    if len(body) > READ_LIMIT:
+        return body[:READ_LIMIT] + f"\n[truncated at {READ_LIMIT} characters]"
+    return body
+
+
 def ask(model: str, prompt: str, *, system: str = "", max_tokens: int = 2048,
         timeout: int = 600, tools: list | None = None) -> Reply:
-    """One turn through the bridge. Never raises; a failure is a datum."""
+    """A turn through the bridge, running any client tools it asks for.
+
+    This loops rather than taking the first response, because a single-shot harness
+    scores a tool call as an empty answer. That is not a model failure - the bridge
+    handed back a perfectly good `tool_use` and the harness had nothing to do with it -
+    and reading it as one measured the harness instead of the thing under test. It cost
+    a coverage question a zero before anyone noticed, on a turn where the model had done
+    everything right.
+    """
     body = {
         "model": model,
         "max_tokens": max_tokens,
@@ -78,28 +126,53 @@ def ask(model: str, prompt: str, *, system: str = "", max_tokens: int = 2048,
         headers["x-api-key"] = key
 
     started = time.monotonic()
-    request = urllib.request.Request(BRIDGE, data=json.dumps(body).encode(),
-                                     headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            data = json.load(response)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:300]
-        return Reply("", False, time.monotonic() - started, error=f"HTTP {exc.code}: {detail}")
-    except Exception as exc:
-        return Reply("", False, time.monotonic() - started,
-                     error=f"{type(exc).__name__}: {exc}")
+    spoken: list = []
+    tokens_in = tokens_out = 0
 
-    if isinstance(data.get("error"), dict):
-        return Reply("", False, time.monotonic() - started,
-                     error=str(data["error"].get("message"))[:300])
+    for _round in range(TOOL_ROUNDS + 1):
+        request = urllib.request.Request(BRIDGE, data=json.dumps(body).encode(),
+                                         headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.load(response)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            return Reply("", False, time.monotonic() - started,
+                         error=f"HTTP {exc.code}: {detail}")
+        except Exception as exc:
+            return Reply("", False, time.monotonic() - started,
+                         error=f"{type(exc).__name__}: {exc}")
 
-    text = "".join(b.get("text", "") for b in data.get("content", [])
-                   if b.get("type") == "text")
-    usage = data.get("usage") or {}
-    return Reply(text, True, time.monotonic() - started,
-                 int(usage.get("input_tokens") or 0),
-                 int(usage.get("output_tokens") or 0))
+        if isinstance(data.get("error"), dict):
+            return Reply("", False, time.monotonic() - started,
+                         error=str(data["error"].get("message"))[:300])
+
+        content = data.get("content") or []
+        usage = data.get("usage") or {}
+        tokens_in += int(usage.get("input_tokens") or 0)
+        tokens_out += int(usage.get("output_tokens") or 0)
+        spoken.append("".join(b.get("text", "") for b in content
+                              if b.get("type") == "text"))
+
+        wanted = [b for b in content if b.get("type") == "tool_use"]
+        if not wanted:
+            break
+
+        body["messages"] = body["messages"] + [
+            {"role": "assistant", "content": content},
+            {"role": "user", "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": call.get("id") or "",
+                    "content": _run_client_tool(call.get("name") or "",
+                                                call.get("input") or {}),
+                }
+                for call in wanted
+            ]},
+        ]
+
+    return Reply("\n".join(t for t in spoken if t), True,
+                 time.monotonic() - started, tokens_in, tokens_out)
 
 
 def preflight(model: str) -> str:
