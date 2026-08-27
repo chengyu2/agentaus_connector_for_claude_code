@@ -433,6 +433,16 @@ class Settings:
     agentaus_search_max_file_bytes: int = field(
         default_factory=lambda: _int("AGENTAUS_SEARCH_MAX_FILE_BYTES", 1024 * 1024)
     )
+    # The same cap is wrong for documents, because their size on disk is mostly images.
+    # Measured on one corpus: 27 documents were excluded for being "too large", among
+    # them a 93-page tender response of 1.3 MB whose text is 244k characters, and a
+    # 16.7 MB PowerPoint holding a few thousand. The byte cap exists to stop the bridge
+    # slurping a giant blob; for these formats it excluded exactly the richest files.
+    # Extraction bounds the text on its own and the result is cached, so the raw size is
+    # simply not the quantity worth limiting here.
+    agentaus_search_max_document_bytes: int = field(
+        default_factory=lambda: _int("AGENTAUS_SEARCH_MAX_DOCUMENT_BYTES", 25 * 1024 * 1024)
+    )
     # Colon-separated directories the search may read. Empty means any absolute path the
     # model names, which matches what Claude Code's own Read tool would allow. Set it to
     # confine the bridge to specific trees.

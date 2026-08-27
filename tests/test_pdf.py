@@ -130,6 +130,51 @@ class Routing(unittest.TestCase):
         self.assertTrue(documents.is_office_document("/x/report.pdf"))
         self.assertNotIn(".pdf", documents.OFFICE_SUFFIXES)
 
+    def test_a_document_is_not_measured_by_its_size_on_disk(self):
+        """27 documents in one corpus were excluded for being "too large".
+
+        Among them a 93-page tender response: 1.3 MB on disk, 244,805 characters of
+        text, and the only file containing the identifier being searched for. A .pptx
+        of 16.7 MB held a few thousand characters. Size on disk is embedded images, not
+        content, so it is the wrong quantity to cap these on.
+        """
+        import os
+        import tempfile
+
+        from agentaus_bridge import tools
+        from agentaus_bridge.config import settings
+
+        with tempfile.TemporaryDirectory() as root:
+            big = settings.agentaus_search_max_file_bytes + 4096
+            for name in ("report.pdf", "deck.pptx", "notes.md", "module.py"):
+                with open(os.path.join(root, name), "wb") as handle:
+                    handle.write(b"x" * big)
+
+            found = {os.path.basename(f) for f in tools.enumerate_files(root)}
+            self.assertIn("report.pdf", found, "an oversized PDF must still be a candidate")
+            self.assertIn("deck.pptx", found)
+            self.assertNotIn("notes.md", found, "a 1MB text file really is too large")
+            self.assertNotIn("module.py", found)
+
+    def test_documents_are_still_capped_somewhere(self):
+        """Raised, not removed. A genuinely enormous file is still skipped."""
+        import os
+        import tempfile
+
+        from agentaus_bridge import tools
+        from agentaus_bridge.config import settings
+
+        original = settings.agentaus_search_max_document_bytes
+        settings.agentaus_search_max_document_bytes = 2048
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                with open(os.path.join(root, "huge.pdf"), "wb") as handle:
+                    handle.write(b"x" * 8192)
+                found = {os.path.basename(f) for f in tools.enumerate_files(root)}
+                self.assertNotIn("huge.pdf", found)
+        finally:
+            settings.agentaus_search_max_document_bytes = original
+
     def test_availability_is_asked_per_format(self):
         """poppler without LibreOffice reads PDFs and not .docx, and vice versa."""
         self.assertIsInstance(documents.available("/x/a.pdf"), bool)

@@ -342,8 +342,13 @@ def enumerate_files(path: str, glob: str | None = None) -> list[str]:
             if glob and not fnmatch.fnmatch(name, glob):
                 continue
             full = os.path.join(directory, name)
+            # Documents are measured on a different scale: a .pptx is mostly embedded
+            # images, so its size on disk says nothing about how much text it holds.
+            limit = (settings.agentaus_search_max_document_bytes
+                     if documents.is_office_document(full)
+                     else settings.agentaus_search_max_file_bytes)
             try:
-                if os.path.getsize(full) > settings.agentaus_search_max_file_bytes:
+                if os.path.getsize(full) > limit:
                     continue
             except OSError:
                 continue
