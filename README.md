@@ -928,6 +928,49 @@ invocations otherwise fight over the shared one and a run silently produces noth
 
 ---
 
+## PDFs
+
+Every PDF used to be skipped outright. `.pdf` sat in the search tool's binary-suffix
+list, so `enumerate_files` returned nothing for one and `read_text` returned megabytes
+of noise. In the corpus this was built against that hid **48 documents** — which is a
+large part of why a question about "the whole repo" came back answered from two files.
+
+They do **not** go through LibreOffice. Its importer opens a PDF as a drawing to be
+edited: converting one real eight-page document produced 112 characters of stylesheet and
+a hundred GIFs. I read that as "this PDF is an image-only scan" and was wrong — it was a
+conclusion about LibreOffice's PDF filter mistaken for a conclusion about the file.
+`pypdf` reads the same document fine.
+
+So PDFs get a ladder instead. Extractors are tried in order, each result is checked **per
+page**, and only the pages that came back blank or garbled are escalated to OCR — a
+twenty-page report with two scanned pages costs two OCR calls, not twenty.
+
+| Tier | Needs | Why it is where it is |
+| --- | --- | --- |
+| `pdftotext -layout` | `brew install poppler` | Won on **all 48** files, often by 2–3×, and ran 10–30× faster. `-layout` keeps the column and table geometry the others flatten |
+| `pdfminer.six` | pip | Pure Python fallback. Slower, loses columns |
+| `pypdf` | pip | Last resort. Fastest of the two, extracts least |
+| **macOS Vision** | pyobjc | Neural OCR built into the OS. No model download, ~0.5s/page, rasterises through Quartz so it adds no imaging dependency |
+| **tesseract** | `brew install tesseract` | Cross-platform OCR tier |
+
+Every tier is optional and the ladder degrades: with no system binaries and no OCR at
+all, an ordinary text-layer PDF still reads.
+
+### One bug worth recording
+
+A form feed *separates* pages and is also emitted after the last one, so splitting on it
+invents an empty final page. That phantom page failed the readability gate, which
+disqualified the best extractor on most of the corpus and silently handed the job to the
+worst — the failure looked like success, because text still came back. Fixing it took one
+tender PDF from 17,771 characters to 23,344.
+
+All 48 now extract: **1,120,798 characters in 11 seconds.**
+
+Extracted text carries `[page N]` markers, because a page number is the only coordinate a
+PDF has and a quote from a 93-page tender cannot be checked without one.
+
+---
+
 ## When a claim outruns the evidence
 
 The self-review pass has to sit out tool-derived turns — a reviewer shown only the request
@@ -1076,11 +1119,27 @@ the wrong approach, and an approach is exactly what a skill supplies.
 | `read-documents` | A regex flatten of a `.docx` lost **2,695 characters** across 12 rows and could not see the compliance column |
 | `tender-evidence` | Four rows of 43 proposed additions asserting real certifications **with no quote behind them** |
 | `bridge-diagnose` | 63 timeouts and 1236 slot waits read as separate faults when they were one |
+| `search-exhaustively` | Asked to go through hundreds of documents, answered from **one or two** — because the stopping condition was "I have something to say" rather than "there is nothing left to find" |
+| `investigate` | A single pass produces one story about the evidence, and a fluent story is indistinguishable from a correct one once written down |
+| `research` | Current facts answered from memory with no source, and web claims blended into repository claims with no way back |
 
 Each names the failure it prevents, with the measurement, because a rule whose reason is
 stated is followed more reliably than one asserted. They are deliberately short — every
 token of instruction is one less for the conversation, and a long list of rules is itself
 something a smaller model handles badly.
+
+### Keeping them from doubling up with the tools
+
+A tool is a **capability**; a skill is **when to reach for it and how to know you are
+finished**. No skill re-explains what a tool does. `find-in-code` is the router and hands
+off; each specialist owns one tool; `search-exhaustively` names no tool at all, because a
+stopping criterion is not a capability.
+
+That boundary had to be enforced, not just stated. `find-in-code` carried the rule *"one
+search, then at most two zooms, then answer"* — correct for locating one thing, and
+precisely the wrong instruction for *"go through the whole repo"*, which is the question
+that kept producing two-file answers. One skill was quietly arguing with another. It is
+now scoped to single-target lookups and points at `search-exhaustively` for the rest.
 
 Nothing about them is Agentaus-specific. They are ordinary Claude Code skills and work on
 any model; they simply matter more where the model needs the script.
@@ -1107,6 +1166,12 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_OFFICE_EXTRACT` | `true` | Read `.docx`, `.xlsx`, `.pptx` and friends via LibreOffice, tables intact. `false` skips them as binary |
 | `AGENTAUS_SOFFICE_PATH` | *(auto)* | Path to `soffice`. Empty searches the usual locations, then `$PATH` |
 | `AGENTAUS_OFFICE_TIMEOUT` | `120` | Ceiling on one conversion |
+| `AGENTAUS_PDF_EXTRACT` | `true` | Read PDFs via the extractor ladder. `false` skips them as binary |
+| `AGENTAUS_PDF_OCR` | `true` | OCR the pages that came back blank or garbled. macOS Vision first, then tesseract |
+| `AGENTAUS_PDF_MIN_CHARS_PER_PAGE` | `80` | Below this a page counts as having no text layer. Real text pages run 500+; cover pages run tens |
+| `AGENTAUS_PDF_OCR_MAX_PAGES` | `40` | Cap on OCR pages per document. Exceeding it is logged, never silent |
+| `AGENTAUS_PDF_DPI` | `200` | Rasterisation resolution for OCR |
+| `AGENTAUS_PDF_TIMEOUT` | `120` | Ceiling on one extraction or one OCR page |
 | `AGENTAUS_SEARCH` | `true` | Offer `agentaus_search`, the bridge-executed semantic search, and steer `Grep` towards literal lookups |
 | `AGENTAUS_WEB_SEARCH` | `true` | Offer `agentaus_web_search`, which drives Agentaus' own web search. Claude Code's `WebSearch` is dropped in translation, so without this an Agentaus turn cannot search the web at all |
 | `AGENTAUS_SEARCH_CHUNK_TOKENS` | `8000` | File content per search call. Measured: 4000 costs 48s/16 calls, 8000 costs 29s/10, 16000 costs 22s/4 — all find the same facts, but bigger chunks quote less back |
@@ -1140,7 +1205,8 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `BRIDGE_PING_INTERVAL` | `10` | Seconds between keep-alive pings while Agentaus is silent |
 | `BRIDGE_CHUNK_CHARS` | `60` | Re-chunk buffered replies into smaller deltas; `0` disables |
 | `BRIDGE_CONNECT_TIMEOUT` | `15` | Connect timeout (seconds) |
-| `BRIDGE_READ_TIMEOUT` | `600` | Read timeout (seconds) |
+| `BRIDGE_READ_TIMEOUT` | `300` | Per-read budget upstream. Streaming resets it on every token, so it only bounds waiting on *nothing*. Was 1800, which turned a dead connection into 30 minutes of silence |
+| `BRIDGE_STALL_WARNING` | `45` | Log that an upstream call is still waiting, and for how long. `0` disables |
 | `BRIDGE_MAX_RETRIES` | `2` | Extra attempts after a transient upstream failure |
 | `BRIDGE_RETRY_BACKOFF` | `0.5` | Base backoff in seconds; doubles per attempt, plus jitter |
 | `BRIDGE_RETRY_MAX_DELAY` | `8` | Ceiling on a single backoff wait |
