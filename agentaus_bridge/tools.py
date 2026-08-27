@@ -266,11 +266,39 @@ _NEVER_READ = (
 _NEVER_READ_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".keystore", ".jks")
 
 
+# Names that are a private key whatever is appended to them. `id_rsa.bak` and
+# `id_rsa.old` are the same key as `id_rsa`; matching the full name alone missed both.
+_NEVER_READ_STEMS = ("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_xmss")
+
+# `credentials` is the awkward one. `credentials.json` is a cloud service account and
+# must never be read; `Credentials.pdf` in a tender folder is a capability statement and
+# must be. So the extension decides, rather than blocking a word that means two things.
+_SECRET_CONFIG_SUFFIXES = (".json", ".yml", ".yaml", ".ini", ".cfg", ".conf",
+                           ".toml", ".env", ".csv", ".txt", ".xml", ".properties")
+_SECRET_STEMS_IN_CONFIG = ("credentials", "credential", "secrets", "secret",
+                           "service-account", "service_account", "apikey", "api_key")
+
+
 def _is_secret(name: str) -> bool:
+    """Whether a file must never be read, however the search happened to match it.
+
+    These reads never reach Claude Code's permission prompts, so this is the only thing
+    standing between a search term that happens to appear in a key file and that key
+    ending up in a transcript.
+
+    Matching the whole filename was not enough: it let through `credentials.json`, which
+    is a Google service account, and `id_rsa.bak`, which is a private key with four
+    characters after it.
+    """
     lowered = name.lower()
     if lowered.startswith(".env"):
         return True
-    return lowered in _NEVER_READ or lowered.endswith(_NEVER_READ_SUFFIXES)
+    if lowered in _NEVER_READ or lowered.endswith(_NEVER_READ_SUFFIXES):
+        return True
+    stem = lowered.rsplit(".", 1)[0] if "." in lowered else lowered
+    if stem in _NEVER_READ_STEMS:
+        return True
+    return stem in _SECRET_STEMS_IN_CONFIG and lowered.endswith(_SECRET_CONFIG_SUFFIXES)
 
 
 def _allowed_root(path: str) -> bool:
@@ -329,7 +357,15 @@ def read_text(path: str) -> str:
     One entry point for every reader in this module, so search, zoom and the file
     shortlist all see a .docx the same way: as its text, with table rows on one line and
     cells separated by ` | `.
+
+    Secrets are refused here as well as during enumeration. Every current caller reaches
+    this through `enumerate_files`, which already excludes them, so this guard is
+    redundant today - which is the point. It is one line, it costs nothing, and it means
+    a future caller that reads a path the model supplied cannot become a key disclosure.
     """
+    if _is_secret(os.path.basename(path)):
+        log.warning("refused to read %s: excluded as a secret", os.path.basename(path))
+        return ""
     if documents.is_office_document(path) and documents.available(path):
         return documents.extract(path)
     try:
