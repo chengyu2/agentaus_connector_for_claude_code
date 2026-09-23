@@ -320,9 +320,12 @@ def review_says_ok(review: str) -> bool:
 # that was offered tools, called none of them, and produced a short answer. Only then is
 # there anything to classify, and only then is a call worth making.
 
-# A real answer to a substantive question is long. Below this a turn is either an
-# acknowledgement or an excuse, and worth a look; above it, it is an answer.
-_REFUSAL_LENGTH_CEILING = 1200
+# Replies up to this long are judged. It was 1,200, on the theory that a long reply is an
+# answer - and the benchmark found the long failure that theory misses: asked to write
+# and run pareto.R, the model printed the whole script in its reply and stopped. With
+# the request in front of it the judge tells that apart from a real long answer, so the
+# ceiling now only bounds the prompt.
+_REFUSAL_LENGTH_CEILING = 20000
 
 CLASSIFY_REFUSAL_INSTRUCTION = Template("""\
 An AI agent was given tools that act on the local machine - reading and writing files,
@@ -344,10 +347,12 @@ REFUSAL - the agent declines to act: it claims it cannot read files or has no ac
 the filesystem, or asks the human to paste, upload or run something it could have done
 itself with its tools.
 
-STALLED - the agent says what it will do next, or is part-way through its reasoning,
-but stopped without doing it: "We will write the file now", "Next I'll run the tests",
-"Let me check the output". The task is not finished and nothing it needs from the human
-is missing.
+STALLED - the agent stopped before the task was done, and nothing it needs from the
+human is missing. Either it says what it will do next without doing it ("We will write
+the file now", "Next I'll run the tests", "We need to write answers.json"), or its reply
+is a fragment of its own reasoning, or it put the deliverable in the reply instead of
+doing what the request asked for with it - printing a file's contents when the request
+said to write the file, showing a command when the request said to run it.
 
 ANSWER - a genuine final answer or result, or a legitimate statement about something it
 really cannot know or do, or a question the human genuinely has to answer.
@@ -414,10 +419,11 @@ Start over and follow the task exactly as it was given.
 # ended with the task undone.
 STALLED_CORRECTION = Template("""\
 <correction>
-You said what you would do next, then stopped without doing it. Nothing was done.
+You stopped before the task was done. Saying what you will do, or showing what a file
+should contain, does not do it - nothing was written or run.
 
 Do it now: call the tool. Carry the task through to the end - every file it asks for,
-written; every command it needs, run.
+written with Write; every command it needs, run with Bash.
 
 If the task really is complete, reply with the final result instead.
 </correction>

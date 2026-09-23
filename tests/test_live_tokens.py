@@ -262,3 +262,109 @@ class UtilityCallsAreNotRewritten(unittest.TestCase):
                            "input_schema": {"type": "object", "properties": {}}}])
         self.assertTrue(any("Review the ANSWER" in c["messages"][-1]["content"]
                             for c in UTILITY_CALLS), "agent turns must keep their review")
+
+
+# --------------------------------------------------------------------------------------
+# The plan streams too, and the response starts before planning does
+# --------------------------------------------------------------------------------------
+
+PLAN_PORT = 9955
+PLAN_PIECES = ["1. Read ", "the file. ", "2. Fix ", "the bug."]
+
+
+class _PlanThenAnswer(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0) or 0)))
+        planning = "Plan the turn below" in json.dumps(body)
+        pieces = PLAN_PIECES if planning else ["Fixed ", "it."]
+        if not body.get("stream"):
+            data = json.dumps({"choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant", "content": "".join(pieces)}}]}).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+        for piece in pieces:
+            chunk = {"choices": [{"index": 0, "delta": {"content": piece}}]}
+            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+            self.wfile.flush()
+            time.sleep(GAP)
+        self.wfile.write(b"data: [DONE]\n\n")
+
+    def log_message(self, *args):
+        pass
+
+
+class ThePlanStreamsLive(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        HTTPServer.allow_reuse_address = True
+        cls.stub = HTTPServer(("127.0.0.1", PLAN_PORT), _PlanThenAnswer)
+        threading.Thread(target=cls.stub.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.stub.shutdown()
+        cls.stub.server_close()
+
+    def setUp(self):
+        names = ("agentaus_base_url", "agentaus_api_key", "agentaus_self_review",
+                 "agentaus_thinking", "agentaus_thinking_visible", "agentaus_live_draft",
+                 "agentaus_grounding_check", "agentaus_syntax_check", "agentaus_search",
+                 "agentaus_web_search", "agentaus_inventory", "agentaus_zoom",
+                 "agentaus_investigate")
+        self._saved = {n: getattr(settings, n) for n in names}
+        settings.agentaus_base_url = f"http://127.0.0.1:{PLAN_PORT}"
+        settings.agentaus_api_key = "test-key"
+        settings.agentaus_self_review = False
+        settings.agentaus_thinking = settings.agentaus_thinking_visible = True
+        settings.agentaus_live_draft = True
+        for n in ("agentaus_grounding_check", "agentaus_syntax_check", "agentaus_search",
+                  "agentaus_web_search", "agentaus_inventory", "agentaus_zoom",
+                  "agentaus_investigate"):
+            setattr(settings, n, False)
+
+    def tearDown(self):
+        for n, v in self._saved.items():
+            setattr(settings, n, v)
+
+    def test_plan_tokens_arrive_while_planning_is_still_running(self):
+        from starlette.requests import Request
+
+        async def go():
+            server.app.state.client = httpx.AsyncClient()
+            try:
+                request = Request({"type": "http", "app": server.app, "headers": []})
+                body = {"model": "agentaus", "stream": True, "max_tokens": 100,
+                        "messages": [{"role": "user", "content": "fix the bug"}],
+                        "tools": [{"name": "Read", "input_schema": {"type": "object"}}]}
+                started = time.monotonic()
+                response = await server._handle_agentaus(request, body, "agentaus", True)
+                seen = []
+                async for chunk in response.body_iterator:
+                    for e in events(chunk if isinstance(chunk, bytes) else chunk.encode()):
+                        seen.append((time.monotonic() - started, e))
+                return seen
+            finally:
+                await server.app.state.client.aclose()
+
+        seen = run(go())
+        kinds = [e["type"] for _, e in seen]
+        self.assertEqual(kinds.count("message_start"), 1)
+        self.assertLess(seen[0][0], GAP, "the response must start before planning finishes")
+        thinking = [(t, e["delta"]["thinking"]) for t, e in seen
+                    if e.get("delta", {}).get("type") == "thinking_delta"]
+        plan_times = [t for t, text in thinking if any(p in text for p in PLAN_PIECES)]
+        self.assertTrue(plan_times, "the plan was not streamed")
+        planning_done = len(PLAN_PIECES) * GAP
+        self.assertLess(plan_times[0], planning_done - GAP,
+                        "the first plan piece must arrive before the plan is finished")
+        answer = "".join(e["delta"]["text"] for _, e in seen
+                         if e.get("delta", {}).get("type") == "text_delta")
+        self.assertEqual(answer, "Fixed it.")

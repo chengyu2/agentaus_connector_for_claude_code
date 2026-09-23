@@ -504,7 +504,9 @@ HELPER_SYSTEM = (
 )
 
 
-async def _agentaus_summarise(client: httpx.AsyncClient, text: str) -> str:
+async def _agentaus_summarise(
+    client: httpx.AsyncClient, text: str, *, on_piece=None, stream: bool | None = None
+) -> str:
     """Ask Agentaus to compact a slice of the conversation.
 
     Deliberately delegated to the model rather than to heuristics here: what is worth
@@ -519,7 +521,7 @@ async def _agentaus_summarise(client: httpx.AsyncClient, text: str) -> str:
         # plan, review, search chunk, compaction - paid that and carried the persona.
         "messages": [{"role": "system", "content": HELPER_SYSTEM},
                      {"role": "user", "content": text}],
-        "stream": settings.agentaus_stream_helpers,
+        "stream": settings.agentaus_stream_helpers if stream is None else stream,
         "system_prompt_overwrite": True,
     }
     started_at = time.monotonic()
@@ -528,16 +530,16 @@ async def _agentaus_summarise(client: httpx.AsyncClient, text: str) -> str:
     if limit > 0:
         try:
             return await asyncio.wait_for(
-                _helper_call(client, payload, text, started_at), timeout=limit
+                _helper_call(client, payload, text, started_at, on_piece), timeout=limit
             )
         except asyncio.TimeoutError:
             rlog(logging.WARNING, "helper call exceeded %.0fs and was abandoned", limit)
             raise RuntimeError(f"helper call timed out after {limit:.0f}s")
-    return await _helper_call(client, payload, text, started_at)
+    return await _helper_call(client, payload, text, started_at, on_piece)
 
 
 async def _helper_call(
-    client: httpx.AsyncClient, payload: dict, text: str, started_at: float
+    client: httpx.AsyncClient, payload: dict, text: str, started_at: float, on_piece=None
 ) -> str:
     """One helper call, streamed or buffered. Bounded by the caller."""
     if payload["stream"]:
@@ -547,7 +549,7 @@ async def _helper_call(
         # progress at all. Streaming returns the first bytes as they are generated, so a
         # slow reply stops looking like a dead one and the connection drains sooner.
         try:
-            return await _stream_helper(client, payload, text, started_at)
+            return await _stream_helper(client, payload, text, started_at, on_piece)
         except (httpx.HTTPError, RuntimeError) as exc:
             # Falling back rather than failing: a streaming fault must not cost the
             # caller its summary when the buffered path still works.
@@ -572,7 +574,7 @@ async def _helper_call(
 
 
 async def _stream_helper(
-    client: httpx.AsyncClient, payload: dict, text: str, started_at: float
+    client: httpx.AsyncClient, payload: dict, text: str, started_at: float, on_piece=None
 ) -> str:
     """Consume a streamed helper reply and return the assembled content."""
     parts: list[str] = []
@@ -607,6 +609,8 @@ async def _stream_helper(
                     if not parts:
                         first_byte = time.monotonic() - started_at
                     parts.append(piece)
+                    if on_piece is not None:
+                        on_piece(piece)
     rlog(logging.DEBUG, "helper stream ok in %.1fs (first byte %.1fs, %d chars in)",
          time.monotonic() - started_at, first_byte, len(text))
     return "".join(parts)
@@ -774,7 +778,7 @@ async def _self_review(client: httpx.AsyncClient, request_text: str, answer: str
     return answer
 
 
-async def _plan_turn(client: httpx.AsyncClient, body: dict) -> str:
+async def _plan_turn(client: httpx.AsyncClient, body: dict, on_piece=None) -> str:
     """Ask Agentaus to plan this turn before it answers it.
 
     Agentaus has no native thinking mode, so left alone it answers from the first thing
@@ -787,8 +791,11 @@ async def _plan_turn(client: httpx.AsyncClient, body: dict) -> str:
     """
     try:
         async with hold("planning", "urgent"):
+            # Streamed when someone is watching it form, so the plan appears as it is
+            # written rather than all at once after five to fifteen silent seconds.
             plan = await _agentaus_summarise(
-                client, plan_prompt(_last_user_text(body), body)
+                client, plan_prompt(_last_user_text(body), body),
+                on_piece=on_piece, stream=True if on_piece is not None else None,
             )
     except Exception as exc:
         rlog(logging.WARNING, "planning pass failed (%s); answering unplanned", exc)
@@ -1205,6 +1212,13 @@ async def _run_bridge_tools(
     return _with_tool_results(payload, calls, results)
 
 
+def _head_and_tail(text: str, head: int, tail: int) -> str:
+    """The start and end of a long reply - where it says what it is, and how it ends."""
+    if len(text) <= head + tail:
+        return text
+    return text[:head] + f"\n[... {len(text) - head - tail} characters ...]\n" + text[-tail:]
+
+
 def _last_user_text(body: dict) -> str:
     """The most recent user message, as the request the review judges against."""
     for message in reversed(body.get("messages") or []):
@@ -1496,7 +1510,9 @@ async def _handle_agentaus(
     # re-planning it would pay for the same call again to get the same plan.
     plan_holder: dict = {"text": None}
 
-    async def prepare(current: dict, scale: float = 1.0) -> tuple[dict, dict]:
+    async def prepare(
+        current: dict, scale: float = 1.0, on_plan_piece=None, on_note=None
+    ) -> tuple[dict, dict]:
         """Fit to the window, add the guidance and the plan, and build the payload.
 
         Returns (body, payload). Compaction can take a minute or more on a long
@@ -1535,6 +1551,9 @@ async def _handle_agentaus(
 
         before = estimate_request_tokens(current)
         if before + reserved > int(limit * settings.agentaus_compact_threshold):
+            if on_note is not None:
+                on_note(f"compacting the earlier conversation to fit Agentaus' "
+                        f"{limit:,}-token window (~{before:,} tokens now)")
             with _Phase("compaction", f"est {before:,} tok, target {limit:,}"):
                 fitted = await _fit_to_window(
                     request, current, limit=limit, reserve=reserved, scale=scale
@@ -1585,7 +1604,7 @@ async def _handle_agentaus(
         if settings.agentaus_thinking and should_think(fitted):
             if plan_holder["text"] is None:
                 with _Phase("planning"):
-                    plan_holder["text"] = await _plan_turn(client, fitted)
+                    plan_holder["text"] = await _plan_turn(client, fitted, on_plan_piece)
             fitted = {**fitted, "system": with_plan(fitted.get("system"), plan_holder["text"])}
 
         built = anthropic_request_to_agentaus(
@@ -1801,7 +1820,48 @@ async def _handle_agentaus(
     # flow while the summarising happens.
     async def stream_with_compaction() -> AsyncIterator[bytes]:
         try:
-            prepared_body, prepared_payload = await prepare(body)
+            builder = None
+            streamed_plan = False
+            if settings.agentaus_live_draft and settings.agentaus_thinking_visible:
+                # The response starts NOW, and what preparation produces - the plan as it
+                # is written, a note when compaction starts - streams into a live
+                # thinking block. Before this the client saw nothing but pings until
+                # planning finished, so its token counter sat at zero for 5-15 seconds
+                # on every agent turn.
+                builder = AnthropicStreamBuilder(
+                    display_model, input_tokens=estimate_request_tokens(body),
+                    chunk_chars=settings.chunk_chars,
+                )
+                yield builder.start()
+                pieces: asyncio.Queue = asyncio.Queue()
+                seen_plan = []
+
+                def on_plan_piece(text: str) -> None:
+                    seen_plan.append(text)
+                    pieces.put_nowait(text)
+
+                def on_note(text: str) -> None:
+                    pieces.put_nowait(f"_{text}_\n\n")
+
+                work = asyncio.ensure_future(prepare(body, 1.0, on_plan_piece, on_note))
+                try:
+                    while not (work.done() and pieces.empty()):
+                        try:
+                            piece = await asyncio.wait_for(pieces.get(), timeout=0.25)
+                        except asyncio.TimeoutError:
+                            continue
+                        yield builder.live_thinking(piece)
+                finally:
+                    if not work.done():
+                        work.cancel()
+                prepared_body, prepared_payload = work.result()
+                streamed_plan = bool(seen_plan)
+                if plan_holder["text"] and not streamed_plan:
+                    # Planned, but the stream fell back to a buffered call: show it whole.
+                    yield builder.live_thinking(plan_holder["text"])
+                    streamed_plan = True
+            else:
+                prepared_body, prepared_payload = await prepare(body)
 
             async def refit(scale: float) -> dict:
                 _, rebuilt = await prepare(prepared_body, scale)
@@ -1811,7 +1871,7 @@ async def _handle_agentaus(
                  estimate_request_tokens(prepared_body))
             async for chunk in _agentaus_event_stream(
                 client, prepared_payload, prepared_body, display_model, started, refit,
-                plan=plan_holder["text"],
+                plan=None if streamed_plan else plan_holder["text"], builder=builder,
             ):
                 yield chunk
         except asyncio.CancelledError:
@@ -1849,14 +1909,20 @@ async def _agentaus_event_stream(
     started: float,
     refit=None,
     plan: str | None = None,
+    builder: AnthropicStreamBuilder | None = None,
 ) -> AsyncIterator[bytes]:
-    """Produce a valid Anthropic SSE stream from an Agentaus response."""
-    builder = AnthropicStreamBuilder(
-        model,
-        input_tokens=estimate_request_tokens(original),
-        chunk_chars=settings.chunk_chars,
-    )
-    yield builder.start()
+    """Produce a valid Anthropic SSE stream from an Agentaus response.
+
+    `builder` is passed when the response has already started - message_start sent and
+    the plan streamed live - so this continues it rather than beginning a second one.
+    """
+    if builder is None:
+        builder = AnthropicStreamBuilder(
+            model,
+            input_tokens=estimate_request_tokens(original),
+            chunk_chars=settings.chunk_chars,
+        )
+        yield builder.start()
 
     # The plan leads the message, where a native thinking block would. Emitted before
     # the upstream call rather than after it, so the user sees the model's reasoning
@@ -1892,7 +1958,8 @@ async def _agentaus_event_stream(
             return b""
         if not live_started:
             live_started = True
-            text = "_Live draft from Agentaus. The checked answer follows._\n\n" + text
+            lead = "\n\n" if builder.open_kind == "thinking" else ""
+            text = lead + "_Live draft from Agentaus. The checked answer follows._\n\n" + text
         return builder.live_thinking(text)
 
     def progress(note: str) -> bytes:
@@ -2140,7 +2207,7 @@ async def _agentaus_event_stream(
                     verdict = await _agentaus_summarise(
                         client, CLASSIFY_REFUSAL_INSTRUCTION.format(
                             request=_last_user_text(original)[:4000],
-                            answer=answer_so_far[:4000])
+                            answer=_head_and_tail(answer_so_far, 2500, 1500))
                     )
                 turn_verdict = read_turn_verdict(verdict)
                 is_refusal = turn_verdict == "refusal"

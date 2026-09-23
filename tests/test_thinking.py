@@ -761,10 +761,17 @@ class TestRefusalClassification(unittest.TestCase):
             "ability to search local file system paths.",
             tools_offered=True, called_a_tool=False))
 
-    def test_a_long_answer_is_an_answer(self):
-        """No call is spent on something that is evidently a real reply."""
-        self.assertFalse(self.gate("Here are the headings. " * 200,
+    def test_a_very_long_answer_is_an_answer(self):
+        """No call is spent on something that is evidently a real reply. The line used to
+        sit at 1,200 characters; the benchmark found a turn that printed a whole R script
+        instead of writing and running it, which a length gate cannot tell from an answer
+        and a judge shown the request can. So only the truly enormous skip it now."""
+        self.assertFalse(self.gate("Here are the headings. " * 1000,
                                    tools_offered=True, called_a_tool=False))
+
+    def test_a_script_printed_instead_of_written_is_judged(self):
+        printed = "**pareto.R**\n\n```r\nlibrary(readxl)\n" + "x <- 1\n" * 400 + "```"
+        self.assertTrue(self.gate(printed, tools_offered=True, called_a_tool=False))
 
     def test_an_empty_reply_is_not_classified(self):
         self.assertFalse(self.gate("", tools_offered=True, called_a_tool=False))
