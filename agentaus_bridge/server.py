@@ -29,6 +29,7 @@ from . import documents
 from . import harmony
 from . import persisted
 from . import prompt_style
+from . import repair
 from . import syntax
 from . import schema as tool_schema
 from . import tools as bridge_tools
@@ -42,16 +43,20 @@ from .augment import (
     GROUNDING_INSTRUCTION,
     STRIP_UNGROUNDED_INSTRUCTION,
     could_be_a_refusal,
+    focus_tools,
     grounding_verdict,
     worth_grounding_check,
     read_refusal_verdict,
+    read_turn_verdict,
     should_think,
     working_directory,
+    working_directory_of,
     with_guidance,
     with_plan,
     worth_reviewing,
     worth_reviewing_turn,
     REFUSAL_CORRECTION,
+    STALLED_CORRECTION,
 )
 from .compact import ConversationCompactor
 from .text import normalise_for_display
@@ -911,13 +916,14 @@ def _partition_tool_calls(calls: list, known: set | None = None) -> tuple[list, 
     for call in calls:
         name = call.get("name") or ""
         if known:
-            resolved = _canonical(name, known | set(bridge_tools.BRIDGE_TOOLS))
+            pool = known | set(bridge_tools.BRIDGE_TOOLS)
+            resolved = _canonical(name, pool) or repair.resolve(name, pool)
             if resolved is None:
                 invented.append(call)
                 continue
             if resolved != name:
                 rlog(logging.INFO, "tool name %r resolved to %r", name, resolved)
-                call = {**call, "name": resolved}
+                call = {**call, "name": resolved, "asked_as": name}
                 name = resolved
         if name in bridge_tools.BRIDGE_TOOLS:
             mine.append(call)
@@ -952,7 +958,7 @@ def _tool_schemas(payload: dict) -> dict:
     return schemas
 
 
-def _validate_tool_calls(calls: list, schemas: dict) -> list:
+def _validate_tool_calls(calls: list, schemas: dict, cwd: str | None = None) -> list:
     """Fix what is unambiguously fixable; report what is not.
 
     Coerced arguments are written back onto the call, so a double-encoded payload is
@@ -965,6 +971,10 @@ def _validate_tool_calls(calls: list, schemas: dict) -> list:
         schema = schemas.get(call.get("name") or "")
         if not schema:
             continue
+        # Unambiguous slips first - a field under another name, a relative path - so
+        # they cost nothing rather than a correction round. See repair.py.
+        call["arguments"] = repair.repair(
+            call, call.get("asked_as") or call.get("name") or "", schema, cwd)["arguments"]
         fixed, problems = tool_schema.validate(call.get("arguments"), schema)
         if problems:
             broken.append((call, tool_schema.correction_for(
@@ -983,7 +993,8 @@ def _with_coerced_calls(data: dict, calls: list) -> dict:
     The streaming path emits from the call dicts themselves, so writing back is enough
     there. This path emits from `data`, which the call dicts were only copied out of.
     """
-    repaired = {call.get("id"): call.get("arguments") for call in calls if call.get("id")}
+    # Names too: a call resolved from `read` to `Read` must reach the client as `Read`.
+    repaired = {call.get("id"): call for call in calls if call.get("id")}
     if not repaired:
         return data
     choices = list(data.get("choices") or [])
@@ -995,7 +1006,8 @@ def _with_coerced_calls(data: dict, calls: list) -> dict:
     for call in message.get("tool_calls") or []:
         if call.get("id") in repaired:
             function = dict(call.get("function") or {})
-            function["arguments"] = repaired[call["id"]]
+            function["arguments"] = repaired[call["id"]].get("arguments")
+            function["name"] = repaired[call["id"]].get("name") or function.get("name")
             call = {**call, "function": function}
         rebuilt.append(call)
     message["tool_calls"] = rebuilt
@@ -1537,6 +1549,12 @@ async def _handle_agentaus(
         # here rather than before compaction so the tool list travels with whatever
         # survived the fit; it costs ~250 tokens the estimate does not see, which is
         # immaterial against a 0.8 threshold.
+        if settings.agentaus_tool_focus:
+            fitted, dropped = focus_tools(fitted)
+            if dropped:
+                rlog(logging.INFO, "tool focus: offering %d tool(s), holding back %d (%s)",
+                     len(fitted.get("tools") or []), len(dropped), ", ".join(dropped)[:200])
+
         offered = []
         # Inventory first in the list as well as first in the workflow: a question about
         # a whole tree should start here, and a model reads the tools in order.
@@ -1659,7 +1677,8 @@ async def _handle_agentaus(
                 payload = _with_tool_results(
                     payload, invented, [_correction_for(c, known) for c in invented])
                 continue
-            broken = _validate_tool_calls(mine + _theirs, _tool_schemas(payload))
+            broken = _validate_tool_calls(mine + _theirs, _tool_schemas(payload),
+                                          working_directory_of(body))
             if broken and corrections < settings.agentaus_correction_rounds:
                 corrections += 1
                 rlog(logging.WARNING, "%d malformed tool call(s): %s; correcting",
@@ -1670,7 +1689,7 @@ async def _handle_agentaus(
             if broken:
                 rlog(logging.WARNING, "forwarding %d malformed tool call(s) - out of "
                      "rounds to correct them", len(broken))
-            data = _with_coerced_calls(data, calls)
+            data = _with_coerced_calls(data, mine + _theirs)
             if not mine:
                 if invented:
                     rlog(logging.WARNING, "dropping %d invented tool call(s) - out of "
@@ -1681,7 +1700,7 @@ async def _handle_agentaus(
                 rlog(logging.INFO, "running %d bridge tool call(s): %s",
                      len(mine), ", ".join(c["name"] for c in mine))
                 payload = await _run_bridge_tools(
-                    client, payload, mine, working_directory(body.get("system")), ran)
+                    client, payload, mine, working_directory_of(body), ran)
                 continue
             # Out of rounds with a bridge tool still pending. It must not reach Claude
             # Code, which has never heard of it and would fail the tool_use outright.
@@ -2058,6 +2077,8 @@ async def _agentaus_event_stream(
             corrections += 1
             rlog(logging.WARNING, "model invented %d tool name(s): %s; correcting",
                  len(invented), ", ".join(c["name"] for c in invented))
+            rlog(logging.INFO, "invented call(s) as sent: %s",
+                 "; ".join(f"{c['name']}({str(c.get('arguments'))[:200]})" for c in invented))
             yield progress("correcting a call to a tool that does not exist")
             payload = _with_tool_results(
                 payload, invented, [_correction_for(c, known) for c in invented])
@@ -2069,11 +2090,14 @@ async def _agentaus_event_stream(
         # A well-named call with malformed arguments is rejected by the client with a
         # wall of validator internals, which costs the turn and tells the model nothing.
         # Same budget as an invented name: it is the same class of mistake.
-        broken = _validate_tool_calls(mine + theirs, _tool_schemas(payload))
+        broken = _validate_tool_calls(mine + theirs, _tool_schemas(payload),
+                                      working_directory_of(original))
         if broken and corrections < settings.agentaus_correction_rounds:
             corrections += 1
             rlog(logging.WARNING, "%d malformed tool call(s): %s; correcting",
                  len(broken), "; ".join(m for _, m in broken)[:300])
+            rlog(logging.INFO, "malformed call(s) as sent: %s",
+                 "; ".join(f"{c['name']}({str(c.get('arguments'))[:200]})" for c, _ in broken))
             payload = _with_tool_results(
                 payload, [c for c, _ in broken], [m for _, m in broken])
             pending = []
@@ -2087,7 +2111,7 @@ async def _agentaus_event_stream(
                  len(mine), ", ".join(c["name"] for c in mine))
             yield progress("running " + ", ".join(c["name"] for c in mine))
             payload = await _run_bridge_tools(
-                client, payload, mine, working_directory(original.get("system")), ran)
+                client, payload, mine, working_directory_of(original), ran)
             # Whatever the model said on its way to calling the tool is superseded by
             # the answer it is about to give with the result in hand, so it is dropped
             # rather than shown - otherwise the user reads "let me search..." followed
@@ -2102,6 +2126,7 @@ async def _agentaus_event_stream(
         # structural gate, so the call only happens when there is something to judge.
         answer_so_far = "".join(pending)
         is_refusal = False
+        turn_verdict = "answer"
         if (
             corrections < settings.agentaus_correction_rounds
             and could_be_a_refusal(
@@ -2114,22 +2139,31 @@ async def _agentaus_event_stream(
                 async with hold("refusal check", "urgent"):
                     verdict = await _agentaus_summarise(
                         client, CLASSIFY_REFUSAL_INSTRUCTION.format(
+                            request=_last_user_text(original)[:4000],
                             answer=answer_so_far[:4000])
                     )
-                is_refusal = read_refusal_verdict(verdict)
+                turn_verdict = read_turn_verdict(verdict)
+                is_refusal = turn_verdict == "refusal"
             except Exception as exc:
                 # Cannot classify it, so forward it. Re-asking a good answer is worse
                 # than letting a bad one through: the user can repeat a turn.
                 rlog(logging.WARNING, "refusal check failed (%s); forwarding the answer",
                      exc)
 
-        if is_refusal:
+        if is_refusal or turn_verdict == "stalled":
             corrections += 1
-            rlog(logging.WARNING,
-                 "model refused to use tools it has; correcting and re-asking")
+            if is_refusal:
+                rlog(logging.WARNING,
+                     "model refused to use tools it has; correcting and re-asking")
+            else:
+                rlog(logging.WARNING,
+                     "model announced a step and stopped; asking it to take the step")
+            yield progress("re-asking: the reply " + (
+                "declined to use its tools" if is_refusal else "announced a step it did not take"))
+            correction = (REFUSAL_CORRECTION if is_refusal else STALLED_CORRECTION).format()
             payload = {**payload, "messages": list(payload.get("messages") or []) + [
                 {"role": "assistant", "content": "".join(pending)[:2000]},
-                {"role": "user", "content": REFUSAL_CORRECTION.format()},
+                {"role": "user", "content": correction},
             ]}
             pending = []
             continue

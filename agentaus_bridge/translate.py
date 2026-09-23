@@ -106,6 +106,23 @@ def _tool_result_payload(block: dict, tool_name: str = "") -> str:
     )
 
 
+def system_notes(body: dict) -> list:
+    """The text of every `system`-role entry in `messages`, in order."""
+    notes = []
+    for message in body.get("messages") or []:
+        if message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            text = content
+        else:
+            text = "\n".join(b.get("text", "") for b in content or []
+                             if isinstance(b, dict) and b.get("type") == "text")
+        if text.strip():
+            notes.append(text.strip())
+    return notes
+
+
 def anthropic_request_to_agentaus(
     body: dict,
     *,
@@ -115,7 +132,15 @@ def anthropic_request_to_agentaus(
     """Convert one Anthropic /v1/messages body into an Agentaus chat-completions body."""
     messages: list[dict] = []
 
-    system_text = _system_to_text(body.get("system"))
+    # Claude Code also sends `system`-role entries inside `messages` - the environment
+    # block with the working directory, and connector instructions that arrive once an
+    # MCP server connects. Passed through, they land AFTER the user's request, and the
+    # conversation then ends on a system note the model answers instead: observed, a
+    # finished task replied to with "I have not read the Claude Docs workflow you
+    # shared". They are context, so they join the system prompt, and the turn always
+    # ends on what the user actually said.
+    system_text = "\n\n".join(t for t in [_system_to_text(body.get("system"))]
+                               + system_notes(body) if t)
     if system_text:
         messages.append({"role": "system", "content": system_text})
 
@@ -129,6 +154,8 @@ def anthropic_request_to_agentaus(
     for message in body.get("messages", []) or []:
         role = message.get("role", "user")
         content = message.get("content")
+        if role == "system":
+            continue                    # hoisted into the system prompt above
 
         if isinstance(content, str):
             if content.strip():

@@ -325,26 +325,39 @@ def review_says_ok(review: str) -> bool:
 _REFUSAL_LENGTH_CEILING = 1200
 
 CLASSIFY_REFUSAL_INSTRUCTION = Template("""\
-An AI agent was given tools that read the local filesystem, and a task that needed them.
-It called no tools and replied with the text below.
+An AI agent was given tools that act on the local machine - reading and writing files,
+running commands - and the task below. Its turn ended with this reply, and it called no
+tool.
+
+<request>
+{request}
+</request>
 
 <reply>
 {answer}
 </reply>
 
 <question>
-Is that reply the agent DECLINING to act - claiming it cannot read files, has no access
-to the filesystem, or asking the human to paste or upload something it could have
-fetched itself?
+Which one is the reply?
 
-Or is it a genuine answer, or a legitimate statement about something it really cannot
-know (a future event, a private system, a fact absent from the material)?
+REFUSAL - the agent declines to act: it claims it cannot read files or has no access to
+the filesystem, or asks the human to paste, upload or run something it could have done
+itself with its tools.
+
+STALLED - the agent says what it will do next, or is part-way through its reasoning,
+but stopped without doing it: "We will write the file now", "Next I'll run the tests",
+"Let me check the output". The task is not finished and nothing it needs from the human
+is missing.
+
+ANSWER - a genuine final answer or result, or a legitimate statement about something it
+really cannot know or do, or a question the human genuinely has to answer.
 </question>
 
 <output_format>
-Exactly one word: REFUSAL or ANSWER. Nothing else.
+Exactly one word: REFUSAL, STALLED or ANSWER. Nothing else.
 </output_format>
 """)
+
 
 
 def could_be_a_refusal(answer: str, *, tools_offered: bool, called_a_tool: bool) -> bool:
@@ -357,6 +370,17 @@ def could_be_a_refusal(answer: str, *, tools_offered: bool, called_a_tool: bool)
         return False
     text = (answer or "").strip()
     return 0 < len(text) <= _REFUSAL_LENGTH_CEILING
+
+
+def read_turn_verdict(verdict: str) -> str:
+    """"refusal", "stalled" or "answer". Anything unrecognised is an answer, for the same
+    reason as `read_refusal_verdict`: re-asking a good answer is the worse mistake."""
+    word = (verdict or "").strip().upper().lstrip("*`_ ")
+    if word.startswith("REFUSAL"):
+        return "refusal"
+    if word.startswith("STALLED"):
+        return "stalled"
+    return "answer"
 
 
 def read_refusal_verdict(verdict: str) -> bool:
@@ -380,6 +404,22 @@ absolute path you were given is real and readable.
 Nobody is going to paste or upload anything for you. Call the tool.
 
 Start over and follow the task exactly as it was given.
+</correction>
+""")
+
+
+# The small-model failure the refusal check was not built for: the turn ends on an
+# announcement. Observed on the benchmark pilot - after one correction round, the reply
+# was "We will write file at same directory." and nothing was written, so the session
+# ended with the task undone.
+STALLED_CORRECTION = Template("""\
+<correction>
+You said what you would do next, then stopped without doing it. Nothing was done.
+
+Do it now: call the tool. Carry the task through to the end - every file it asks for,
+written; every command it needs, run.
+
+If the task really is complete, reply with the final result instead.
 </correction>
 """)
 
@@ -608,6 +648,20 @@ _CWD_PATTERNS = (
 )
 
 
+def working_directory_of(body: dict) -> str | None:
+    """The working directory, wherever this client version put it.
+
+    Claude Code 2.1.278 no longer states it in `system`: the environment block arrives as
+    a `system`-role entry in `messages`. Reading `system` alone found nothing, so the
+    planner, search path defaults and relative-path repair all silently lost the repo.
+    """
+    from .translate import system_notes
+    found = working_directory((body or {}).get("system"))
+    if found:
+        return found
+    return working_directory("\n".join(system_notes(body or {})))
+
+
 def working_directory(system) -> str | None:
     """The repository path Claude Code named in its system prompt, if it named one."""
     if isinstance(system, list):
@@ -653,7 +707,7 @@ def plan_prompt(request: str, body: dict | None = None) -> str:
     """
     body = body or {}
     lines = []
-    cwd = working_directory(body.get("system"))
+    cwd = working_directory_of(body)
     if cwd:
         where = (f"## Working directory\n\n`{cwd}`\n\n" if prompt_style.markdown()
                  else f"<working_directory>\n{cwd}\n</working_directory>\n")
@@ -708,3 +762,74 @@ def with_plan(system, plan: str) -> object:
     if isinstance(system, list):
         return list(system) + [{"type": "text", "text": notice.strip()}]
     return system
+
+
+# --------------------------------------------------------------------------------------
+# Tool focus
+# --------------------------------------------------------------------------------------
+
+# What a coding agent needs on every turn. Measured: Claude Code 2.1.278 sends 26 tools
+# carrying 120 KB of schemas - about 30,000 tokens a call, a quarter of Agentaus'
+# window - and the largest are Artifact (34 KB), ArtifactData, DesignSync and Monitor,
+# none of which a coding turn uses. A strong model shrugs that off. A smaller one pays
+# for it twice: in window, and in choosing among 26 names, which is where the invented
+# and misspelt calls come from.
+CORE_TOOLS = {
+    "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput",
+    "KillShell", "KillBash", "Glob", "Grep", "LS", "WebFetch", "WebSearch", "TodoWrite",
+    "TodoRead", "Skill", "Agent", "Task", "AskUserQuestion", "ToolSearch",
+    "EnterPlanMode", "ExitPlanMode",
+}
+
+
+def _tools_used(body: dict) -> set:
+    used = set()
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name"):
+                    used.add(block["name"])
+    return used
+
+
+def _last_user_words(body: dict) -> str:
+    for message in reversed(body.get("messages") or []):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = [b.get("text", "") for b in content
+                     if isinstance(b, dict) and b.get("type") == "text"]
+            if any(t.strip() for t in texts):
+                return "\n".join(texts)
+    return ""
+
+
+def focus_tools(body: dict) -> tuple[dict, list]:
+    """Offer the coding tools, plus any tool the user names or the conversation used.
+
+    Nothing the user asks for goes missing: a tool named in their message, or already
+    called in this conversation, stays on the wire. Returns (body, dropped names).
+    """
+    tools = body.get("tools") or []
+    if not tools:
+        return body, []
+    asked = _last_user_words(body)
+    used = _tools_used(body)
+    kept, dropped = [], []
+    for tool in tools:
+        name = (tool or {}).get("name") or ""
+        server = name.split("__")[1] if name.startswith("mcp__") and "__" in name[5:] else ""
+        if (name in CORE_TOOLS or name in used
+                or (name and re.search(rf"\b{re.escape(name)}\b", asked))
+                or (server and re.search(rf"\b{re.escape(server)}\b", asked, re.I))):
+            kept.append(tool)
+        else:
+            dropped.append(name)
+    if not dropped:
+        return body, []
+    return {**body, "tools": kept}, dropped
+

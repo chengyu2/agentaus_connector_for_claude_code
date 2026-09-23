@@ -201,13 +201,22 @@ class TestBridgeToolsNeverReachTheClient(unittest.TestCase):
         `open_file`, which nobody had offered it. Passing that to Claude Code fails a
         tool_use for a tool that does not exist, and the turn dies looking like a
         bridge fault."""
+        # `open_file` itself is now resolved to `Read` (repair.py), so the made-up
+        # name here is one that cannot mean any offered tool.
         mine, theirs, invented = _partition_tool_calls([
-            {"id": "1", "name": "open_file", "arguments": "{}"},
+            {"id": "1", "name": "summon_the_oracle", "arguments": "{}"},
             {"id": "2", "name": "Read", "arguments": "{}"},
         ], {"Read", tools.SEARCH_TOOL})
         self.assertEqual(mine, [])
         self.assertEqual([c["id"] for c in theirs], ["2"])
         self.assertEqual([c["id"] for c in invented], ["1"])
+
+    def test_a_name_that_can_only_mean_one_offered_tool_is_resolved(self):
+        mine, theirs, invented = _partition_tool_calls([
+            {"id": "1", "name": "open_file", "arguments": "{}"},
+        ], {"Read", tools.SEARCH_TOOL})
+        self.assertEqual(invented, [])
+        self.assertEqual([c["name"] for c in theirs], ["Read"])
 
     def test_nothing_is_called_invented_when_the_offered_set_is_unknown(self):
         """Without the list actually sent upstream, nothing can be judged invented -

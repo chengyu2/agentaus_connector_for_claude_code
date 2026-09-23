@@ -114,6 +114,12 @@ class Settings:
         default_factory=lambda: _bool("AGENTAUS_LIVE_DRAFT", True)
     )
 
+    # Offer Agentaus the coding tools plus anything the user names or already used,
+    # rather than every tool the client sends (26, ~30k tokens, in Claude Code 2.1.278).
+    agentaus_tool_focus: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_TOOL_FOCUS", True)
+    )
+
     # --- timeouts -----------------------------------------------------------------
     connect_timeout: float = field(default_factory=lambda: float(_int("BRIDGE_CONNECT_TIMEOUT", 30)))
     # 1800 was half an hour of silence. A dead upstream connection - observed live,
