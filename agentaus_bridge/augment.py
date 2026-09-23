@@ -336,12 +336,18 @@ tool.
 {request}
 </request>
 
+<tools_it_ran>
+{ran}
+</tools_it_ran>
+
 <reply>
 {answer}
 </reply>
 
 <question>
-Which one is the reply?
+Which one is the reply? Judge against the request and what the agent already ran: if
+the tools it ran have already done what the request asks - the file written, the command
+run - a reply saying so is an ANSWER, however short.
 
 REFUSAL - the agent declines to act: it claims it cannot read files or has no access to
 the filesystem, or asks the human to paste, upload or run something it could have done
@@ -419,11 +425,12 @@ Start over and follow the task exactly as it was given.
 # ended with the task undone.
 STALLED_CORRECTION = Template("""\
 <correction>
-You stopped before the task was done. Saying what you will do, or showing what a file
-should contain, does not do it - nothing was written or run.
+You stopped before the task the user gave you was done. Saying what you will do, or
+showing what a file should contain, does not do it - nothing was written or run.
 
-Do it now: call the tool. Carry the task through to the end - every file it asks for,
-written with Write; every command it needs, run with Bash.
+Do the remaining step of THAT task now: call the tool. Write only the files the user's
+task asks for, and run only what it needs. Do not write notes, memories, summaries or
+anything else the task did not ask for.
 
 If the task really is complete, reply with the final result instead.
 </correction>

@@ -13,12 +13,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import hashlib
 import json
 import logging
 import random
 import re
 import time
 import uuid
+from collections import OrderedDict
 from typing import AsyncIterator, Callable
 
 import httpx
@@ -1219,20 +1221,74 @@ def _head_and_tail(text: str, head: int, tail: int) -> str:
     return text[:head] + f"\n[... {len(text) - head - tail} characters ...]\n" + text[-tail:]
 
 
-def _last_user_text(body: dict) -> str:
-    """The most recent user message, as the request the review judges against."""
-    for message in reversed(body.get("messages") or []):
+_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+
+
+def _without_reminders(text: str) -> str:
+    """The user's words, without Claude Code's <system-reminder> blocks.
+
+    Claude Code puts its own notes - the account email, commit attribution rules, which
+    tools have loaded - in the user message beside what the user typed. Handed to the
+    planner, reviewer or turn judge as "the request", they were read as part of the task.
+    """
+    return _REMINDER.sub("", text or "").strip()
+
+
+def _user_texts(body: dict) -> list:
+    out = []
+    for message in body.get("messages") or []:
         if message.get("role") != "user":
             continue
         content = message.get("content")
         if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = [b.get("text", "") for b in content
-                     if isinstance(b, dict) and b.get("type") == "text"]
-            if parts:
-                return "\n".join(parts)
-    return ""
+            text = _without_reminders(content)
+        elif isinstance(content, list):
+            text = _without_reminders("\n".join(
+                b.get("text", "") for b in content
+                if isinstance(b, dict) and b.get("type") == "text"))
+        else:
+            text = ""
+        if text:
+            out.append(text)
+    return out
+
+
+def _last_user_text(body: dict) -> str:
+    """The most recent thing the user actually said, as the request a pass judges against."""
+    texts = _user_texts(body)
+    return texts[-1] if texts else ""
+
+
+def _original_request(body: dict) -> str:
+    """What the conversation was started to do - the first thing the user said."""
+    texts = _user_texts(body)
+    return texts[0] if texts else ""
+
+
+# STALLED re-asks per conversation, across requests. The correction budget is per
+# request, and Claude Code sends a fresh request after every tool call - so a judge that
+# kept calling a finished turn stalled kept it going until the client's turn cap.
+# Observed: 76 re-asks in one benchmark run, and a session that had finished its task
+# pushed into writing notes into the user's Claude memory folder.
+_STALL_REASKS: "OrderedDict[str, int]" = OrderedDict()
+_STALL_REASK_LIMIT = 2
+
+
+def _stall_key(body: dict) -> str:
+    return hashlib.sha256((_original_request(body) + "\x00"
+                           + (working_directory_of(body) or "")).encode()).hexdigest()
+
+
+def _may_reask_stalled(body: dict) -> bool:
+    key = _stall_key(body)
+    used = _STALL_REASKS.get(key, 0)
+    if used >= _STALL_REASK_LIMIT:
+        return False
+    _STALL_REASKS[key] = used + 1
+    _STALL_REASKS.move_to_end(key)
+    while len(_STALL_REASKS) > 512:
+        _STALL_REASKS.popitem(last=False)
+    return True
 
 
 def _get_compactor(request: Request) -> ConversationCompactor:
@@ -2206,7 +2262,9 @@ async def _agentaus_event_stream(
                 async with hold("refusal check", "urgent"):
                     verdict = await _agentaus_summarise(
                         client, CLASSIFY_REFUSAL_INSTRUCTION.format(
-                            request=_last_user_text(original)[:4000],
+                            request=_original_request(original)[:4000],
+                            ran=ledger.render(original.get("messages") or [], limit=40)
+                            or "(nothing yet)",
                             answer=_head_and_tail(answer_so_far, 2500, 1500))
                     )
                 turn_verdict = read_turn_verdict(verdict)
@@ -2217,6 +2275,10 @@ async def _agentaus_event_stream(
                 rlog(logging.WARNING, "refusal check failed (%s); forwarding the answer",
                      exc)
 
+        if turn_verdict == "stalled" and not _may_reask_stalled(original):
+            rlog(logging.WARNING, "judged stalled again, but this conversation has used "
+                 "its %d re-asks; forwarding the reply", _STALL_REASK_LIMIT)
+            turn_verdict = "answer"
         if is_refusal or turn_verdict == "stalled":
             corrections += 1
             if is_refusal:

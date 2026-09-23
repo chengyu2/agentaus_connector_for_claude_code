@@ -137,11 +137,38 @@ class StalledTurns(unittest.TestCase):
         self.assertEqual(augment.read_turn_verdict("ANSWER"), "answer")
         self.assertEqual(augment.read_turn_verdict("maybe?"), "answer")
 
-    def test_the_judge_sees_the_request(self):
+    def test_the_judge_sees_the_request_and_what_already_ran(self):
         prompt = augment.CLASSIFY_REFUSAL_INSTRUCTION.format(
-            request="write answers.json", answer="We will write file at same directory.")
+            request="write answers.json", ran="Write answers.json -> ok",
+            answer="We will write file at same directory.")
         self.assertIn("write answers.json", prompt)
+        self.assertIn("Write answers.json -> ok", prompt)
         self.assertIn("STALLED", prompt)
+
+    def test_the_request_is_what_the_user_typed(self):
+        from agentaus_bridge.server import _last_user_text, _original_request
+        body = {"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "<system-reminder>\nuserEmail: x@y\n</system-reminder>"},
+                {"type": "text", "text": "Answer the questions in questions.json"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Read",
+                                               "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t",
+                                          "content": "..."},
+                                         {"type": "text", "text": "<system-reminder>todo</system-reminder>"}]},
+        ]}
+        self.assertEqual(_original_request(body), "Answer the questions in questions.json")
+        self.assertEqual(_last_user_text(body), "Answer the questions in questions.json")
+
+    def test_a_conversation_gets_two_stalled_reasks_at_most(self):
+        from agentaus_bridge import server
+        server._STALL_REASKS.clear()
+        body = {"messages": [{"role": "user", "content": "do the task"}]}
+        self.assertEqual([server._may_reask_stalled(body) for _ in range(4)],
+                         [True, True, False, False])
+        other = {"messages": [{"role": "user", "content": "a different task"}]}
+        self.assertTrue(server._may_reask_stalled(other))
+        server._STALL_REASKS.clear()
 
 
 if __name__ == "__main__":
