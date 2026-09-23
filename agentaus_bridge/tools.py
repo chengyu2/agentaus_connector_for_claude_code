@@ -163,6 +163,10 @@ async def run_inventory(path: str, glob: str | None, default_path: str | None = 
         return (f"agentaus_inventory needs an absolute path; got {path!r}.")
     if not os.path.exists(path):
         return f"No such path: {path}"
+    if whole_disk(path):
+        return (f"{path} is the whole disk, not a project. Pass the absolute path of the "
+                f"project or folder to search - the working directory, if you do not know "
+                f"which.")
     if not _allowed_root(path):
         return f"{path} is outside AGENTAUS_SEARCH_ROOTS, which this bridge is confined to."
     if os.path.isfile(path):
@@ -416,7 +420,17 @@ _SKIP_DIR_SUFFIXES = (
 )
 
 
+# Operating-system trees. Never the user's material, and far too large to walk: a search
+# handed "/" by a model that did not know its working directory walked into
+# /Library/Apple and read installer receipts.
+_SYSTEM_DIRS = {"/System", "/Library", "/private", "/usr", "/bin", "/sbin", "/dev",
+                "/cores", "/opt", "/Volumes", "/etc", "/var", "/tmp", "/Applications",
+                "/proc", "/sys", "/boot", "/lib", "/lib64", "/snap", "/run"}
+
+
 def _skip_dir(directory: str, name: str) -> bool:
+    if os.path.join(directory, name) in _SYSTEM_DIRS and directory == "/":
+        return True
     if name in _SKIP_DIRS or name.startswith(".cache") or name == ".Trash":
         return True
     if name.lower().endswith(_SKIP_DIR_SUFFIXES):
@@ -438,6 +452,10 @@ def _truncation_note(count: int) -> str:
 def enumerate_files(path: str, glob: str | None = None) -> list[str]:
     """Readable text files under `path`, in a stable order."""
     return enumerate_files_bounded(path, glob)[0]
+
+
+def whole_disk(path: str) -> bool:
+    return os.path.realpath(path) in ("/", os.path.realpath(os.path.expanduser("~/..")))
 
 
 def enumerate_files_bounded(path: str, glob: str | None = None) -> tuple[list[str], bool]:
@@ -470,6 +488,8 @@ def enumerate_files_bounded(path: str, glob: str | None = None) -> tuple[list[st
             if glob and not fnmatch.fnmatch(name, glob):
                 continue
             full = os.path.join(directory, name)
+            if not documents.is_office_document(full) and looks_binary(full):
+                continue
             # Documents are measured on a different scale: a .pptx is mostly embedded
             # images, so its size on disk says nothing about how much text it holds.
             limit = (settings.agentaus_search_max_document_bytes
@@ -482,6 +502,22 @@ def enumerate_files_bounded(path: str, glob: str | None = None) -> tuple[list[st
                 continue
             found.append(full)
     return found, False
+
+
+def looks_binary(path: str) -> bool:
+    """Whether a file is binary whatever its name says.
+
+    The suffix list cannot know every binary format. Observed: a search that reached
+    /Library read macOS installer receipts (`.bom`) as text and sent the replacement
+    characters to Agentaus, which rejected each chunk with HTTP 400. A NUL byte in the
+    first 8 KB is the test `grep` and `git` use. Office documents and PDFs are read by
+    their extractors, so they never get here.
+    """
+    try:
+        with open(path, "rb") as handle:
+            return b"\x00" in handle.read(8192)
+    except OSError:
+        return False
 
 
 def read_text(path: str) -> str:
@@ -505,6 +541,8 @@ def read_text(path: str) -> str:
         return ""
     if documents.is_office_document(path) and documents.available(path):
         return documents.extract(path)
+    if looks_binary(path):
+        return ""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             return handle.read()
@@ -846,6 +884,10 @@ async def run_search(
                 f"Pass the repository's absolute path as `path`.")
     if not os.path.exists(path):
         return f"No such path: {path}"
+    if whole_disk(path):
+        return (f"{path} is the whole disk, not a project. Pass the absolute path of the "
+                f"project or folder to search - the working directory, if you do not know "
+                f"which.")
     if not _allowed_root(path):
         return (
             f"{path} is outside AGENTAUS_SEARCH_ROOTS, which this bridge is confined to."

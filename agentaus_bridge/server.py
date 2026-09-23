@@ -447,6 +447,17 @@ async def _post_with_retry(
             await response.aread()  # release the connection before sleeping
             await _sleep_before_retry(attempt, f"HTTP {response.status_code}")
             continue
+        if response.status_code == 200 and attempt < settings.max_retries:
+            # An HTTP 200 carrying an error object: retry it when it is the upstream's own
+            # transport failing rather than anything about this request.
+            try:
+                in_band = response.json().get("error")
+            except (ValueError, AttributeError):
+                in_band = None
+            if isinstance(in_band, dict) and _is_transient(str(in_band.get("message") or "")):
+                await _sleep_before_retry(
+                    attempt, f"in-band: {str(in_band.get('message'))[:60]}")
+                continue
         return response
 
     raise last_exc if last_exc else RuntimeError("retry loop exited without a response")
@@ -1459,6 +1470,24 @@ async def _fit_to_window(
     return body
 
 
+# Failures Agentaus reports INSIDE a 200 response - an error chunk in the stream, or an
+# error object in the JSON - that say nothing about the request: its own backend
+# dropped. Observed 20 times in one benchmark day as "peer closed connection without
+# sending complete message body (incomplete chunked read)". Treated as final, each one
+# ended the turn with an error; Claude Code recovered only by falling back to a
+# non-streaming retry of the whole request.
+_TRANSIENT_IN_BAND = re.compile(
+    r"peer closed connection|incomplete chunked read|connection (?:reset|aborted|closed)|"
+    r"server disconnected|remote ?protocol|temporarily unavailable|overloaded|"
+    r"upstream connect error|timed? ?out|\b(?:502|503|504|520|521|522|523|524)\b",
+    re.I,
+)
+
+
+def _is_transient(text: str) -> bool:
+    return bool(_TRANSIENT_IN_BAND.search(text or "")) and not _is_over_length(text)
+
+
 def _is_over_length(text: str) -> bool:
     """Whether an upstream error is Agentaus reporting the prompt as too long."""
     lowered = (text or "").lower()
@@ -2096,6 +2125,25 @@ async def _agentaus_event_stream(
                                 # without this branch the error is skipped and the turn
                                 # ends as an empty, successful-looking message.
                                 if isinstance(chunk.get("error"), dict):
+                                    message = str(chunk["error"].get("message") or "")
+                                    # Nothing final has reached the client yet, so both
+                                    # of these can be replayed invisibly.
+                                    if (not emitted and _is_transient(message)
+                                            and attempt < settings.max_retries):
+                                        rlog(logging.WARNING, "agentaus in-band transient "
+                                             "error, retrying: %s", message[:200])
+                                        retry_reason = f"upstream dropped ({message[:60]})"
+                                        break
+                                    if (not emitted and _is_over_length(message)
+                                            and refit is not None
+                                            and fit_attempt < settings.agentaus_fit_attempts):
+                                        _learn_limit_from(message)
+                                        fit_attempt += 1
+                                        fit_scale *= settings.agentaus_fit_shrink
+                                        payload = await refit(fit_scale)
+                                        retry_reason = (f"prompt too long (in-band), "
+                                                        f"refitting to {fit_scale:.0%}")
+                                        break
                                     yield builder.error(
                                         _agentaus_error_text(chunk["error"]),
                                         chunk["error"].get("type") or "api_error",
