@@ -94,15 +94,6 @@ Repeating a call you have already made wastes the turn and loses context.
 
 9. For anything beyond a one-line change, state the plan in two or three lines, then
 carry it out. Finish each part before starting the next.
-
-10. Run what you write before you call it done. After writing or changing code, execute
-it with Bash against the examples in the task and the edge cases you listed in step 1,
-and read the output. If anything fails, fix it and run it again. A change you have not
-run is a guess.
-
-11. Finish by doing, not describing. If the task says to write a file, the file must be
-written with Write; if it says to run something, run it. Putting the content in your
-reply instead leaves the task undone.
 """
 
 # Kept for callers that want everything regardless of context.
