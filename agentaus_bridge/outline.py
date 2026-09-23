@@ -35,6 +35,8 @@ import re
 
 from . import documents
 from . import symbols
+from . import prompt_style
+from .prompt_style import Template
 
 log = logging.getLogger("agentaus-bridge")
 
@@ -216,21 +218,28 @@ def render(paths: list[str], read=None, *, max_lines: int = 600) -> str:
             continue
         lines = body.splitlines()
         total = count_tokens(body)
-        out.append(f'<file path="{path}" tokens="{total}">')
+        md = prompt_style.markdown()
+        out.append(f"- `{path}` ({total} tokens)" if md
+                   else f'<file path="{path}" tokens="{total}">')
         for index, (line, depth, title) in enumerate(headings):
             # A section runs to the next heading, or to the end of the file.
             end = headings[index + 1][0] - 1 if index + 1 < len(headings) else len(lines)
             size = count_tokens("\n".join(lines[line - 1:end]))
-            out.append(f'  <section line="{line}" depth="{depth}" tokens="{size}">'
-                       f"{title}</section>")
-        out.append("</file>")
+            if md:
+                out.append(f"  - line {line}, depth {depth}, {size} tokens: {title}")
+            else:
+                out.append(f'  <section line="{line}" depth="{depth}" tokens="{size}">'
+                           f"{title}</section>")
+        if not md:
+            out.append("</file>")
         if len(out) >= max_lines:
-            out.append(f"<!-- outline truncated at {max_lines} lines -->")
+            out.append(f"(outline truncated at {max_lines} lines)" if md
+                       else f"<!-- outline truncated at {max_lines} lines -->")
             break
     return "\n".join(out)
 
 
-PICK_INSTRUCTION = """\
+PICK_INSTRUCTION = Template("""\
 <question>
 {query}
 </question>
@@ -258,7 +267,7 @@ One per line, exactly: <path>:<line>
 At most {limit} lines. Nothing else - no commentary, no explanation.
 If the outline tells you nothing useful, output exactly: NONE
 </output_format>
-"""
+""")
 
 
 def read_picks(reply: str, known: list[str]) -> list[tuple[str, int]]:

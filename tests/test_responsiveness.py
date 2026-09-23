@@ -123,7 +123,7 @@ class ToolsDoNotBlockTheLoop(unittest.TestCase):
 
         with _SlowDocuments(0.3):
             ticks, result = run(scenario())
-        self.assertIn("<passage", result)
+        self.assertRegex(result, r"(?i)passage")
         self.assertGreater(ticks, 5)
 
 

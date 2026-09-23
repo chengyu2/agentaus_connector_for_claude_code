@@ -22,6 +22,7 @@ from __future__ import annotations
 import ast
 import logging
 import re
+from .prompt_style import Template
 
 log = logging.getLogger("agentaus-bridge")
 
@@ -66,7 +67,7 @@ def first_error(text: str) -> str:
     return ""
 
 
-FIX_INSTRUCTION = """\
+FIX_INSTRUCTION = Template("""\
 The code you produced does not parse.
 
 <error>
@@ -84,4 +85,4 @@ always one character.
 
 Reissue the whole answer in the same shape as before.
 </task>
-"""
+""")

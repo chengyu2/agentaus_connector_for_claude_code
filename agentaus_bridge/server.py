@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import documents
 from . import harmony
 from . import persisted
+from . import prompt_style
 from . import syntax
 from . import schema as tool_schema
 from . import tools as bridge_tools
@@ -491,6 +492,13 @@ def _context_limit() -> int:
     return _learned_limit or settings.agentaus_max_input_tokens
 
 
+HELPER_SYSTEM = (
+    "You are a precise assistant working inside a software engineering tool. Do exactly "
+    "what the message asks, in exactly the output format it asks for. No preamble, no "
+    "commentary, no questions back."
+)
+
+
 async def _agentaus_summarise(client: httpx.AsyncClient, text: str) -> str:
     """Ask Agentaus to compact a slice of the conversation.
 
@@ -499,7 +507,13 @@ async def _agentaus_summarise(client: httpx.AsyncClient, text: str) -> str:
     better placed to make it than any rule the bridge could hard-code.
     """
     payload = {
-        "messages": [{"role": "user", "content": text}],
+        # A system message is what `system_prompt_overwrite` overwrites WITH. Sent without
+        # one, Agentaus keeps its own ~2,200-token general-assistant persona: measured,
+        # "Say hi" cost 2,442 input tokens bare and 207 with a one-line system message,
+        # and with tools offered the bare form refused to use them. Every helper call -
+        # plan, review, search chunk, compaction - paid that and carried the persona.
+        "messages": [{"role": "system", "content": HELPER_SYSTEM},
+                     {"role": "user", "content": text}],
         "stream": settings.agentaus_stream_helpers,
         "system_prompt_overwrite": True,
     }
@@ -606,11 +620,12 @@ async def _answer_without_tools(client: httpx.AsyncClient, payload: dict) -> str
     messages = list(stripped.get("messages") or [])
     messages.append({
         "role": "user",
-        "content": (
-            "<task>\nAnswer now, from what is already above. You have no tools for this "
+        "content": prompt_style.section(
+            "task",
+            "Answer now, from what is already above. You have no tools for this "
             "turn.\n\nIf what you gathered is enough, give the answer in the format "
             "originally asked for. If it genuinely is not, say in one line what is "
-            "missing - do not describe your search.\n</task>"
+            "missing - do not describe your search.",
         ),
     })
     stripped["messages"] = messages
@@ -1436,6 +1451,17 @@ def _agentaus_headers() -> dict:
     }
 
 
+def _checks_apply(body: dict) -> bool:
+    """Whether the bridge's answer-rewriting passes may touch this request at all.
+
+    Only agent turns, which always carry tools. A tool-less request is Claude Code
+    talking to the model for its own purposes - classifying whether a turn is blocked,
+    naming the session - and the answer's exact shape is the point. See
+    AGENTAUS_REVIEW_TOOLLESS.
+    """
+    return bool(body.get("tools")) or settings.agentaus_review_toolless
+
+
 async def _handle_agentaus(
     request: Request, body: dict, model: str, wants_stream: bool
 ) -> Response:
@@ -1693,6 +1719,7 @@ async def _handle_agentaus(
         # rewriting it would break the tool_use the client is waiting on.
         if (
             settings.agentaus_self_review
+            and _checks_apply(body)
             and not msg0.get("tool_calls")
             and worth_reviewing_turn(body)
             and worth_reviewing(msg0.get("content") or "",
@@ -1706,6 +1733,7 @@ async def _handle_agentaus(
 
         if (
             settings.agentaus_grounding_check
+            and _checks_apply(body)
             and not msg0.get("tool_calls")
             and not worth_reviewing_turn(body)
             and worth_grounding_check(
@@ -1830,8 +1858,28 @@ async def _agentaus_event_stream(
     # stream to fail-fast from that point on.
     # Buffer the answer when it may need revising. Tool turns are never buffered:
     # they carry no prose to review and the client is waiting on the tool_use.
-    buffering = settings.agentaus_self_review
+    # Held back only when a check may rewrite it; anything else streams as it arrives.
+    buffering = settings.agentaus_self_review and _checks_apply(original)
     pending: list[str] = []
+
+    # While the answer is held back, its tokens still go to the client as they arrive,
+    # in a thinking block - see AnthropicStreamBuilder.live_thinking.
+    live = buffering and settings.agentaus_live_draft
+    live_started = False
+
+    def draft(text: str) -> bytes:
+        nonlocal live_started
+        if not live or not text:
+            return b""
+        if not live_started:
+            live_started = True
+            text = "_Live draft from Agentaus. The checked answer follows._\n\n" + text
+        return builder.live_thinking(text)
+
+    def progress(note: str) -> bytes:
+        # A line in the draft saying what the bridge is doing between upstream calls, so
+        # a long search reads as work in progress rather than a stalled turn.
+        return draft(f"\n\n_{note}_\n\n") if live else b""
 
     # Tracks recompaction attempts driven by Agentaus rejecting the prompt as too long.
     fit_attempt = 0
@@ -1923,10 +1971,12 @@ async def _agentaus_event_stream(
                                     if text:
                                         if buffering:
                                             # Held back rather than streamed: an answer
-                                            # already on screen cannot be revised. Agentaus
-                                            # sends its reply in one piece anyway, so this
-                                            # costs little in practice.
+                                            # already on screen cannot be revised. Its
+                                            # tokens are still shown live, as a draft.
                                             pending.append(text)
+                                            live_bytes = draft(text)
+                                            if live_bytes:
+                                                yield live_bytes
                                         else:
                                             emitted = True
                                             yield builder.text(text)
@@ -1964,6 +2014,9 @@ async def _agentaus_event_stream(
                     if message.get("content"):
                         if buffering:
                             pending.append(message["content"])
+                            live_bytes = draft(message["content"])
+                            if live_bytes:
+                                yield live_bytes
                         else:
                             emitted = True
                             yield builder.text(message["content"])
@@ -1982,6 +2035,8 @@ async def _agentaus_event_stream(
                 retry_reason = _describe(exc)
 
             if retry_reason:
+                if live_started:
+                    yield progress(f"retrying: {retry_reason}")
                 await _sleep_before_retry(attempt, retry_reason)
                 attempt += 1
                 continue
@@ -2003,6 +2058,7 @@ async def _agentaus_event_stream(
             corrections += 1
             rlog(logging.WARNING, "model invented %d tool name(s): %s; correcting",
                  len(invented), ", ".join(c["name"] for c in invented))
+            yield progress("correcting a call to a tool that does not exist")
             payload = _with_tool_results(
                 payload, invented, [_correction_for(c, known) for c in invented])
             pending = []
@@ -2029,6 +2085,7 @@ async def _agentaus_event_stream(
             tool_round += 1
             rlog(logging.INFO, "running %d bridge tool call(s): %s",
                  len(mine), ", ".join(c["name"] for c in mine))
+            yield progress("running " + ", ".join(c["name"] for c in mine))
             payload = await _run_bridge_tools(
                 client, payload, mine, working_directory(original.get("system")), ran)
             # Whatever the model said on its way to calling the tool is superseded by
@@ -2072,7 +2129,7 @@ async def _agentaus_event_stream(
                  "model refused to use tools it has; correcting and re-asking")
             payload = {**payload, "messages": list(payload.get("messages") or []) + [
                 {"role": "assistant", "content": "".join(pending)[:2000]},
-                {"role": "user", "content": REFUSAL_CORRECTION},
+                {"role": "user", "content": REFUSAL_CORRECTION.format()},
             ]}
             pending = []
             continue
@@ -2115,6 +2172,8 @@ async def _agentaus_event_stream(
         pending = [answer]
 
     if buffering and answer:
+        if live_started and not theirs:
+            yield progress("checking the answer")
         if not theirs and worth_reviewing_turn(original) and worth_reviewing(
             answer, min_chars=settings.agentaus_review_min_chars
         ):

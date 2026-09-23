@@ -23,6 +23,9 @@ from __future__ import annotations
 import re
 import textwrap
 
+from . import prompt_style
+from .prompt_style import Template
+
 # Appended to Claude Code's own system prompt, not a replacement for it. Kept short:
 # every token here is one less available for the conversation, and a long list of
 # instructions is itself something a smaller model handles badly.
@@ -100,7 +103,7 @@ AGENTAUS_GUIDANCE = CORE_GUIDANCE + TOOL_GUIDANCE
 # Used for the optional review pass. Asking "what is wrong with this" is a markedly
 # easier question for a smaller model than getting it right first time, which is what
 # makes a second pass worth its latency.
-REVIEW_INSTRUCTION = """\
+REVIEW_INSTRUCTION = Template("""\
 Review the ANSWER below against the REQUEST. You are looking only for real defects:
 
 - Code that is wrong, will not run, or mishandles an edge case (empty, zero, negative, \
@@ -127,9 +130,9 @@ Say OK when the answer is sound - do not invent a defect to seem thorough.
 <answer>
 {answer}
 </answer>
-"""
+""")
 
-REVISE_INSTRUCTION = """\
+REVISE_INSTRUCTION = Template("""\
 Your previous answer to the request below was reviewed and these defects were found. \
 Produce a corrected answer.
 
@@ -147,7 +150,7 @@ changed, no mention of the review.
 <defects_found>
 {defects}
 </defects_found>
-"""
+""")
 
 
 # When to reach for each tool the bridge itself provides. Keyed by tool name so the
@@ -199,6 +202,20 @@ def tool_selection(body: dict) -> str:
     if not described:
         return ""
 
+    closing = (
+        "If you planned to use a tool, use THAT tool. Do not substitute the one you are "
+        "more\nfamiliar with. Listing directories to find your bearings is not progress "
+        "- if you\nwere given a path, use it. Every name above is exact; do not invent "
+        "others."
+    )
+    if prompt_style.markdown():
+        # A real list: one bullet per tool, rather than columns aligned with spaces,
+        # which Markdown collapses.
+        lines = [f"- `{name}` - {advice}" for name, advice in described]
+        return ("\n" + prompt_style.section(
+            "tool_selection", "Finding things:\n\n" + "\n".join(lines) + "\n\n" + closing
+        ) + "\n")
+
     width = max(len(n) for n, _ in described) + 2
     lines = []
     for name, advice in described:
@@ -210,10 +227,7 @@ def tool_selection(body: dict) -> str:
     return (
         "\n<tool_selection>\nFinding things:\n"
         + "\n".join(lines)
-        + "\n\nIf you planned to use a tool, use THAT tool. Do not substitute the one "
-        "you are more\nfamiliar with. Listing directories to find your bearings is not "
-        "progress - if you\nwere given a path, use it. Every name above is exact; do not "
-        "invent others.\n</tool_selection>\n"
+        + "\n\n" + closing + "\n</tool_selection>\n"
     )
 
 
@@ -225,8 +239,9 @@ def guidance_for(body: dict) -> str:
     parts that do apply.
     """
     if body.get("tools"):
-        return CORE_GUIDANCE + TOOL_GUIDANCE + tool_selection(body)
-    return CORE_GUIDANCE
+        return (prompt_style.headings(CORE_GUIDANCE + TOOL_GUIDANCE)
+                + tool_selection(body))
+    return prompt_style.headings(CORE_GUIDANCE)
 
 
 def with_guidance(system, body: dict | None = None) -> object:
@@ -243,7 +258,7 @@ def with_guidance(system, body: dict | None = None) -> object:
 
 VERDICT_LINE = "VERDICT:"
 
-ADJUDICATE_INSTRUCTION = """\
+ADJUDICATE_INSTRUCTION = Template("""\
 Does the review below report any actual defect that needs fixing?
 
 Answer with exactly one word: YES or NO.
@@ -251,7 +266,7 @@ Answer with exactly one word: YES or NO.
 <review>
 {review}
 </review>
-"""
+""")
 
 
 def declared_verdict(review: str) -> bool | None:
@@ -309,7 +324,7 @@ def review_says_ok(review: str) -> bool:
 # acknowledgement or an excuse, and worth a look; above it, it is an answer.
 _REFUSAL_LENGTH_CEILING = 1200
 
-CLASSIFY_REFUSAL_INSTRUCTION = """\
+CLASSIFY_REFUSAL_INSTRUCTION = Template("""\
 An AI agent was given tools that read the local filesystem, and a task that needed them.
 It called no tools and replied with the text below.
 
@@ -329,7 +344,7 @@ know (a future event, a private system, a fact absent from the material)?
 <output_format>
 Exactly one word: REFUSAL or ANSWER. Nothing else.
 </output_format>
-"""
+""")
 
 
 def could_be_a_refusal(answer: str, *, tools_offered: bool, called_a_tool: bool) -> bool:
@@ -354,7 +369,7 @@ def read_refusal_verdict(verdict: str) -> bool:
     return (verdict or "").strip().upper().startswith("REFUSAL")
 
 
-REFUSAL_CORRECTION = """\
+REFUSAL_CORRECTION = Template("""\
 <correction>
 That is not true, and it was not the question.
 
@@ -366,10 +381,10 @@ Nobody is going to paste or upload anything for you. Call the tool.
 
 Start over and follow the task exactly as it was given.
 </correction>
-"""
+""")
 
 
-GROUNDING_INSTRUCTION = """\
+GROUNDING_INSTRUCTION = Template("""\
 An agent answered a question after using tools. Below is what it actually did, and what
 it then said.
 
@@ -400,10 +415,10 @@ If everything checks out, reply with exactly: GROUNDED
 Otherwise reply with GAPS on the first line, then one line per unsupported statement:
 the claim, then what would have been needed to make it. Nothing else.
 </output_format>
-"""
+""")
 
 
-STRIP_UNGROUNDED_INSTRUCTION = """\
+STRIP_UNGROUNDED_INSTRUCTION = Template("""\
 Your answer below contains statements you had no basis for. They are listed after it.
 
 <your_answer>
@@ -423,7 +438,7 @@ Change nothing else. Keep every grounded statement, its wording, and the structu
 formatting of the original. Do not add new material, do not apologise, and do not mention
 this correction.
 </task>
-"""
+""")
 
 
 def grounding_verdict(reply: str) -> str:
@@ -504,7 +519,7 @@ def worth_reviewing(text: str, *, min_chars: int = 200) -> bool:
 # affordance by asking for the plan as its own turn, then handing that plan back as
 # context for the real one. Two cheap passes beat one expensive one on a smaller model,
 # the same reason the review pass exists.
-PLAN_INSTRUCTION = """\
+PLAN_INSTRUCTION = Template("""\
 You are an agent working inside a code repository. Plan the turn below before you act.
 
 This is your own private working. Nobody reads it and nobody answers it, so a plan that \
@@ -536,7 +551,7 @@ where the code is. You already know.
 <request>
 {request}
 </request>
-"""
+""")
 
 
 def mid_tool_loop(body: dict) -> bool:
@@ -640,10 +655,11 @@ def plan_prompt(request: str, body: dict | None = None) -> str:
     lines = []
     cwd = working_directory(body.get("system"))
     if cwd:
+        where = (f"## Working directory\n\n`{cwd}`\n\n" if prompt_style.markdown()
+                 else f"<working_directory>\n{cwd}\n</working_directory>\n")
         lines.append(
-            f"<working_directory>\n{cwd}\n</working_directory>\n"
-            f"That is the repository. Pass it as the `path` argument to any tool "
-            f"needing one."
+            where + "That is the repository. Pass it as the `path` argument to any tool "
+            "needing one."
         )
 
     # Names alone are not enough. Given a bare list, the planner picks the tool it knows
@@ -654,10 +670,18 @@ def plan_prompt(request: str, body: dict | None = None) -> str:
     for tool in body.get("tools") or []:
         if not (isinstance(tool, dict) and tool.get("name")):
             continue
-        entries.append(f"  <tool name=\"{tool['name']}\">{_one_line(tool.get('description'))}</tool>")
+        if prompt_style.markdown():
+            entries.append(f"- `{tool['name']}` - {_one_line(tool.get('description'))}")
+        else:
+            entries.append(
+                f"  <tool name=\"{tool['name']}\">{_one_line(tool.get('description'))}</tool>")
     if entries:
-        lines.append("<tools_available>\n" + "\n".join(entries)
-                     + "\n</tools_available>\nUse these exact names and no others.")
+        if prompt_style.markdown():
+            lines.append("## Tools available\n\n" + "\n".join(entries)
+                         + "\n\nUse these exact names and no others.")
+        else:
+            lines.append("<tools_available>\n" + "\n".join(entries)
+                         + "\n</tools_available>\nUse these exact names and no others.")
 
     context = ("\n\n".join(lines) + "\n\n") if lines else ""
     return PLAN_INSTRUCTION.format(context=context, request=request[:12000])
