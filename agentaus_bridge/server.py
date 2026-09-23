@@ -97,6 +97,20 @@ async def _startup() -> None:
         limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
         follow_redirects=False,
     )
+    # Claude traffic gets its own pool. Sharing one meant a burst of bridge helper calls
+    # - a search fan-out, a cold compaction - could hold every connection, and a Claude
+    # turn then queued for a slot behind Agentaus work it has nothing to do with.
+    app.state.anthropic_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(
+            settings.read_timeout,
+            connect=settings.connect_timeout,
+            read=settings.read_timeout,
+            write=settings.connect_timeout,
+            pool=settings.connect_timeout,
+        ),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=32),
+        follow_redirects=False,
+    )
     log.info(
         "bridge ready  agentaus=%s  passthrough=%s -> %s  markers=%s",
         settings.agentaus_url,
@@ -111,6 +125,7 @@ async def _startup() -> None:
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     await app.state.client.aclose()
+    await app.state.anthropic_client.aclose()
 
 
 # --------------------------------------------------------------------------------------
@@ -1454,13 +1469,16 @@ async def _handle_agentaus(
         # that tool runs on the client and a `.docx` is a zip. Fix it before anything
         # else looks at it - distillation would otherwise spend model calls condensing
         # binary, and the model would answer from nothing.
+        #
+        # Both of these read files - the first may run LibreOffice - so they run in a
+        # worker thread. On the event loop they would stall every other request.
         if settings.agentaus_office_extract:
-            current = documents.repair_tool_results(current)
+            current = await asyncio.to_thread(documents.repair_tool_results, current)
 
         # A preview standing in for a 1.6 MB listing is worse than useless - the model
         # answers from a fragment and fills the rest in. The client saved the real output
         # to disk and the bridge is on the same machine, so read it.
-        current = persisted.restore(current)
+        current = await asyncio.to_thread(persisted.restore, current)
 
         # Condense oversized tool results BEFORE fitting. Order matters: this is what
         # decides whether compaction is needed at all, and compacting first would
@@ -1752,9 +1770,11 @@ async def _handle_agentaus(
         except asyncio.CancelledError:
             # The client hung up. Worth a line of its own: previously this produced
             # no log at all, so a turn the user abandoned looked identical to one
-            # still in flight.
-            rlog(logging.WARNING, "client disconnected after %.1fs",
-                 time.monotonic() - started)
+            # still in flight. The turn deadline cancels through here too, and has
+            # already logged its own line.
+            elapsed = time.monotonic() - started
+            if not (0 < settings.turn_timeout_seconds <= elapsed):
+                rlog(logging.WARNING, "client disconnected after %.1fs", elapsed)
             raise
         except GeneratorExit:
             rlog(logging.WARNING, "stream closed early after %.1fs",
@@ -1765,6 +1785,7 @@ async def _handle_agentaus(
         stream_with_compaction(),
         settings.ping_interval_seconds,
         AnthropicStreamBuilder.ping,
+        deadline=settings.turn_timeout_seconds,
     )
     return StreamingResponse(
         generator,
@@ -2125,16 +2146,25 @@ async def _agentaus_event_stream(
 
 
 async def _keepalive(
-    source: AsyncIterator[bytes], interval: float, make_ping: Callable[[], bytes]
+    source: AsyncIterator[bytes],
+    interval: float,
+    make_ping: Callable[[], bytes],
+    deadline: float = 0,
 ) -> AsyncIterator[bytes]:
     """Emit ping events while `source` is silent.
 
     Claude Code aborts any stream that sends no bytes for 300 seconds, and Agentaus
     sends nothing at all until the whole completion is ready. Without these pings a
     long generation looks like a dead connection.
+
+    The pings are also why `deadline` exists. They defeat the client's idle timeout by
+    design, so a turn wedged inside the bridge would otherwise keep the connection alive,
+    and the VS Code spinner turning, forever. Past `deadline` seconds the stream ends
+    with an error event the client can show. 0 disables it.
     """
     queue: asyncio.Queue = asyncio.Queue()
     sentinel = object()
+    started = time.monotonic()
 
     async def pump() -> None:
         try:
@@ -2151,8 +2181,23 @@ async def _keepalive(
         while True:
             if getter is None:
                 getter = asyncio.ensure_future(queue.get())
-            done, _ = await asyncio.wait({getter}, timeout=interval)
+            wait = interval
+            if deadline > 0:
+                remaining = deadline - (time.monotonic() - started)
+                if remaining <= 0:
+                    rlog(logging.WARNING,
+                         "turn exceeded BRIDGE_TURN_TIMEOUT (%.0fs); ending it", deadline)
+                    yield AnthropicStreamBuilder.error(
+                        f"The Agentaus turn ran for more than {deadline:.0f}s without "
+                        "finishing, so the bridge ended it (BRIDGE_TURN_TIMEOUT). Retry, "
+                        "or narrow the request.", "api_error",
+                    )
+                    return
+                wait = min(interval, remaining)
+            done, _ = await asyncio.wait({getter}, timeout=wait)
             if not done:
+                if deadline > 0 and time.monotonic() - started >= deadline:
+                    continue            # the deadline branch above reports it
                 yield make_ping()
                 continue
             item = getter.result()
@@ -2188,7 +2233,9 @@ async def _passthrough(request: Request, raw: bytes) -> Response:
             "Passthrough is disabled; only Agentaus models are available on this bridge.",
         )
 
-    client: httpx.AsyncClient = request.app.state.client
+    client: httpx.AsyncClient = (
+        getattr(request.app.state, "anthropic_client", None) or request.app.state.client
+    )
     url = f"{settings.anthropic_base_url}{request.url.path}"
     if request.url.query:
         url = f"{url}?{request.url.query}"
@@ -2232,6 +2279,8 @@ async def _passthrough(request: Request, raw: bytes) -> Response:
         if key.lower() not in _STRIP_RESPONSE_HEADERS
     }
 
+    is_event_stream = "text/event-stream" in (upstream.headers.get("content-type") or "")
+
     async def body_iterator() -> AsyncIterator[bytes]:
         try:
             # aiter_bytes() decompresses as it streams. aiter_raw() would hand back the
@@ -2241,6 +2290,18 @@ async def _passthrough(request: Request, raw: bytes) -> Response:
             # the larger ones - which is why this looked intermittent.
             async for chunk in upstream.aiter_bytes():
                 yield chunk
+        except httpx.HTTPError as exc:
+            # Mid-stream, so it cannot be retried: bytes have already gone to the client.
+            # Letting it escape crashed the ASGI app with a traceback and dropped the
+            # socket without a terminating chunk. An SSE error event ends the stream in a
+            # form Claude Code reports and recovers from.
+            rlog(logging.WARNING, "passthrough stream failed mid-response: %s",
+                 _describe(exc))
+            if is_event_stream:
+                yield AnthropicStreamBuilder.error(
+                    f"Connection to Anthropic failed mid-response ({_describe(exc)}). "
+                    "Retry the turn.", "api_error",
+                )
         finally:
             await upstream.aclose()
 

@@ -620,6 +620,35 @@ log says so.
 
 ---
 
+## Nothing one turn does may freeze the others
+
+The bridge is one process on one event loop, serving every Claude Code request — both
+providers, every open window. So anything that blocks that loop blocks all of it: the
+pings for the turn doing the work, every other Agentaus turn, and every Claude turn going
+through passthrough. From VS Code that looks exactly like Claude Code hanging.
+
+It happened. One `agentaus_search` was pointed at a tree that reached into application
+bundles, and converted everything inside them — LibreOffice's own sample spreadsheets,
+installer RTFs, two licence agreements through OCR. Every conversion ran synchronously on
+the loop. For **90 minutes the bridge received nothing**; a `claude-opus-5` request that
+arrived at the start of it was never forwarded.
+
+Four things stop that now:
+
+| Guard | What it does |
+| --- | --- |
+| **Worker threads** | Every walk, file read, document conversion and OCR pass runs in a thread. Measured with real LibreOffice on seven files: the loop was frozen for 10.2s before, and never more than 0.1s after |
+| **A tool deadline** | `AGENTAUS_TOOL_TIMEOUT` (480s; the slowest real tool took 256s). The model gets a result telling it to narrow the path. The deadline also reaches the worker thread, which cancellation cannot, so an abandoned search stops converting files |
+| **A bounded walk** | `.app`, `.framework` and other macOS bundles are never entered, nor `~/Library`, and one walk returns at most `AGENTAUS_SEARCH_MAX_FILES` files — said so in the result |
+| **A turn deadline** | `BRIDGE_TURN_TIMEOUT` (900s; the slowest real turn took 277s). Pings exist to defeat Claude Code's idle timeout, which means nothing else could end a wedged turn. Past the deadline the stream ends with an error the user can retry |
+
+Claude passthrough also has its own connection pool now, so a burst of Agentaus helper
+calls cannot take every connection while a Claude turn waits for one. And a Claude stream
+that dies mid-response ends with an SSE error event instead of an ASGI traceback and a
+dropped socket.
+
+---
+
 ## What the live model taught us
 
 Everything in the bridge was written against unit tests first. Driving real turns at
@@ -1181,6 +1210,9 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_SEARCH_MIN_CANDIDATES` | `3` | Below this many shortlisted files, distrust the shortlist and read everything |
 | `AGENTAUS_SEARCH_MAX_FILE_BYTES` | `1048576` | Skip files larger than this |
 | `AGENTAUS_SEARCH_ROOTS` | *(empty)* | Colon-separated directories search may read. Empty allows any absolute path, matching Claude Code's own `Read` |
+| `AGENTAUS_SEARCH_MAX_FILES` | `5000` | Ceiling on files one search or inventory walk returns. Hitting it is stated in the result |
+| `AGENTAUS_TOOL_TIMEOUT` | `480` | Wall-clock ceiling on one bridge tool call. The model gets a result saying it was stopped, and the worker thread stops too. `0` disables |
+| `AGENTAUS_DOCUMENT_CACHE_CHARS` | `67108864` | Converted document text kept in memory, least recently used evicted first |
 | `AGENTAUS_TOOL_ROUNDS` | `12` | How many rounds of bridge-executed tool calls one turn may run before the answer has to stand |
 | `AGENTAUS_CORRECTION_ROUNDS` | `3` | Rounds spent telling the model a tool it named does not exist. Separate from tool rounds, so being corrected does not consume the budget for real work |
 | `AGENTAUS_SEARCH_OUTLINE_FIRST` | `true` | Build a free structural outline and spend one call choosing sections, instead of a call per chunk |
@@ -1209,6 +1241,7 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `BRIDGE_CONNECT_TIMEOUT` | `15` | Connect timeout (seconds) |
 | `BRIDGE_READ_TIMEOUT` | `300` | Per-read budget upstream. Streaming resets it on every token, so it only bounds waiting on *nothing*. Was 1800, which turned a dead connection into 30 minutes of silence |
 | `BRIDGE_STALL_WARNING` | `45` | Log that an upstream call is still waiting, and for how long. `0` disables |
+| `BRIDGE_TURN_TIMEOUT` | `900` | Wall-clock ceiling on one streamed Agentaus turn. Pings defeat Claude Code's idle timeout, so without this a wedged turn spins forever. `0` disables |
 | `BRIDGE_MAX_RETRIES` | `2` | Extra attempts after a transient upstream failure |
 | `BRIDGE_RETRY_BACKOFF` | `0.5` | Base backoff in seconds; doubles per attempt, plus jitter |
 | `BRIDGE_RETRY_MAX_DELAY` | `8` | Ceiling on a single backoff wait |

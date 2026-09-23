@@ -28,6 +28,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
+from collections import OrderedDict
 from pathlib import Path
 
 from .config import settings
@@ -135,7 +137,36 @@ def install_hint(path: str = "") -> str:
 # Converted text, keyed by path plus mtime plus size. A conversion is expensive and a
 # document does not change while a search is reading it, but it MUST be re-read when the
 # file changes - a stale extract is worse than a slow one.
-_cache: dict[str, str] = {}
+#
+# Bounded, least recently used first, by AGENTAUS_DOCUMENT_CACHE_CHARS. Reads happen on
+# worker threads, several at once, so every access goes through the lock.
+_cache: "OrderedDict[str, str]" = OrderedDict()
+_cache_chars = 0
+_cache_lock = threading.Lock()
+
+
+def _cached(key: str) -> str | None:
+    with _cache_lock:
+        text = _cache.get(key)
+        if text is not None:
+            _cache.move_to_end(key)
+        return text
+
+
+def _remember(key: str, text: str) -> None:
+    global _cache_chars
+    limit = settings.agentaus_document_cache_chars
+    with _cache_lock:
+        previous = _cache.pop(key, None)
+        if previous is not None:
+            _cache_chars -= len(previous)
+        if limit > 0 and len(text) > limit:
+            return                      # larger than the whole cache: do not evict for it
+        _cache[key] = text
+        _cache_chars += len(text)
+        while limit > 0 and _cache_chars > limit and _cache:
+            _old, dropped = _cache.popitem(last=False)
+            _cache_chars -= len(dropped)
 
 
 def _key(path: str) -> str:
@@ -193,14 +224,14 @@ def extract(path: str) -> str:
     nothing readable in it, not fail the turn that touched it.
     """
     key = _key(path)
-    cached = _cache.get(key)
+    cached = _cached(key)
     if cached is not None:
         return cached
 
     if is_pdf(path):
         from . import pdf as _pdf
         text = _pdf.extract(path)
-        _cache[key] = text
+        _remember(key, text)
         return text
 
     if not available():
@@ -226,28 +257,31 @@ def extract(path: str) -> str:
             )
         except subprocess.TimeoutExpired:
             log.warning("LibreOffice timed out converting %s", path)
-            _cache[key] = ""
+            _remember(key, "")
             return ""
         except (subprocess.CalledProcessError, OSError) as exc:
             log.warning("LibreOffice could not convert %s (%s)", path, exc)
-            _cache[key] = ""
+            _remember(key, "")
             return ""
 
         produced = sorted(Path(workdir).glob("*.htm*"), key=lambda p: -p.stat().st_size)
         if not produced:
             log.warning("LibreOffice produced no output for %s", path)
-            _cache[key] = ""
+            _remember(key, "")
             return ""
         text = html_to_text(produced[0].read_text(errors="replace"))
 
     log.info("read %s via LibreOffice: %d chars of text", os.path.basename(path), len(text))
-    _cache[key] = text
+    _remember(key, text)
     return text
 
 
 def reset_cache() -> None:
     """For tests, and for a caller that knows a document changed under it."""
-    _cache.clear()
+    global _cache_chars
+    with _cache_lock:
+        _cache.clear()
+        _cache_chars = 0
 
 
 # Fields a client tool uses to name the file it read. Claude Code's `Read` uses

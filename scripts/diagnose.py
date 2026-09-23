@@ -70,6 +70,28 @@ SIGNALS = [
      "minutes while the upstream was healthy. If frequent, lower BRIDGE_READ_TIMEOUT so "
      "the retry happens sooner."),
 
+    ("bridge tool stopped at its deadline",
+     r"bridge tool \S+ exceeded", "high",
+     "A search, inventory or zoom ran past AGENTAUS_TOOL_TIMEOUT and was stopped.",
+     "Usually a path that is far too broad - a home directory, /Applications. The model "
+     "was told to narrow it. If it fires on sensible paths, raise AGENTAUS_TOOL_TIMEOUT."),
+
+    ("turn ended at BRIDGE_TURN_TIMEOUT",
+     r"turn exceeded BRIDGE_TURN_TIMEOUT", "high",
+     "A streamed Agentaus turn ran past its wall-clock ceiling and was ended with an error.",
+     "Something inside the turn wedged - look at the phases logged for that request id."),
+
+    ("file walk hit its cap",
+     r"stopped at \d+ files \(AGENTAUS_SEARCH_MAX_FILES\)", "medium",
+     "A search or inventory tree held more files than AGENTAUS_SEARCH_MAX_FILES.",
+     "The result said so. Frequent hits mean the model is pointing tools at trees that "
+     "are too broad."),
+
+    ("passthrough stream died mid-response",
+     r"passthrough stream failed mid-response", "medium",
+     "A Claude response from Anthropic was cut off after it had started.",
+     "Network or upstream, not the bridge. The client got an error event and can retry."),
+
     ("helper call abandoned on timeout",
      r"helper call exceeded", "high",
      "A bridge-initiated call hit AGENTAUS_HELPER_TIMEOUT and was abandoned.",

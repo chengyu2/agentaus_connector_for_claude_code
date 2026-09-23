@@ -117,6 +117,14 @@ class Settings:
         default_factory=lambda: float(_int("BRIDGE_STALL_WARNING", 45))
     )
 
+    # Wall-clock ceiling on one whole Agentaus turn, streamed. Keepalive pings stop
+    # Claude Code's own idle timeout from ever firing, so without this a turn wedged in
+    # the bridge shows a spinner forever. Real turns measured p99 220s, max 277s. When it
+    # fires the client receives an error event and the user can retry. 0 disables.
+    turn_timeout_seconds: float = field(
+        default_factory=lambda: _float("BRIDGE_TURN_TIMEOUT", 900.0)
+    )
+
     # --- retries ------------------------------------------------------------------
     # Transient upstream failures (DNS blips, connection resets, 502/503/504 from a
     # gateway) otherwise surface in Claude Code as a hard "API Error 502" that kills
@@ -453,6 +461,25 @@ class Settings:
     # confine the bridge to specific trees.
     agentaus_search_roots: str = field(
         default_factory=lambda: os.environ.get("AGENTAUS_SEARCH_ROOTS", "").strip()
+    )
+    # Ceiling on how many files one walk may return. A search pointed at a home directory
+    # or /Applications otherwise enumerates every document inside every app bundle, and
+    # each one is a LibreOffice or OCR conversion. Observed: one search spent 90 minutes
+    # converting installer RTFs and licence PDFs. The cap is announced in the result.
+    agentaus_search_max_files: int = field(
+        default_factory=lambda: _int("AGENTAUS_SEARCH_MAX_FILES", 5000)
+    )
+    # Wall-clock ceiling on ONE bridge-executed tool call (search, inventory, zoom,
+    # investigate, web search). Measured tools run 8s median and 256s at worst; this is
+    # set well above that so it only fires on a runaway. When it fires the model gets a
+    # tool result saying so, and the turn carries on. 0 disables.
+    agentaus_tool_timeout_seconds: float = field(
+        default_factory=lambda: _float("AGENTAUS_TOOL_TIMEOUT", 480.0)
+    )
+    # Converted document text kept in memory, in characters. Least recently used goes
+    # first. Unbounded, a walk over a large tree held every document it ever touched.
+    agentaus_document_cache_chars: int = field(
+        default_factory=lambda: _int("AGENTAUS_DOCUMENT_CACHE_CHARS", 64 * 1024 * 1024)
     )
     # How many rounds of bridge-executed tool calls one turn may run before the answer
     # has to stand. Stops a model that keeps searching from never replying.

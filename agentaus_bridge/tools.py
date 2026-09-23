@@ -20,6 +20,7 @@ never have to appear in the answer.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import fnmatch
 import logging
 import os
@@ -165,10 +166,19 @@ async def run_inventory(path: str, glob: str | None, default_path: str | None = 
     if os.path.isfile(path):
         path = os.path.dirname(path)
 
-    files = enumerate_files(path, glob)
+    # A walk plus a headline read per file, and a headline read of a document is a
+    # LibreOffice or PDF conversion. Off the event loop, or every other request the
+    # bridge is serving - Claude passthrough included - waits for it.
+    return await asyncio.to_thread(_inventory_sync, path, glob)
+
+
+def _inventory_sync(path: str, glob: str | None) -> str:
+    files, truncated = enumerate_files_bounded(path, glob)
     rendered = inventory.render(path, files, read=read_text)
     log.info("inventory %s: %d file(s) -> %d chars, no model calls",
              os.path.basename(path.rstrip("/")) or path, len(files), len(rendered))
+    if truncated:
+        rendered = _truncation_note(len(files)) + rendered
     return rendered
 
 
@@ -372,22 +382,84 @@ def _allowed_root(path: str) -> bool:
     )
 
 
+class ToolDeadline(Exception):
+    """A bridge tool ran past AGENTAUS_TOOL_TIMEOUT.
+
+    Raised from inside the worker thread doing the file walk and reads. Cancelling the
+    coroutine that awaits a thread does not stop the thread, so without a check it can
+    reach, an abandoned search keeps converting documents long after its turn ended.
+    """
+
+
+# Set by `execute` for the duration of one tool call. `asyncio.to_thread` copies the
+# context, so the worker thread sees the same deadline as the coroutine that started it.
+_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "bridge_tool_deadline", default=None
+)
+
+
+def _check_deadline() -> None:
+    deadline = _deadline.get()
+    if deadline is not None and time.monotonic() > deadline:
+        raise ToolDeadline()
+
+
+# macOS packages: directories that Finder shows as one file. An .app holds its own
+# localised RTFs, icon PDFs and bundled sample documents, and none of it is the user's
+# material. Observed: a search that reached /Applications converted LibreOffice's test
+# spreadsheets and OCR'd two licence agreements before anything else could run.
+_SKIP_DIR_SUFFIXES = (
+    ".app", ".appex", ".framework", ".bundle", ".plugin", ".kext", ".xpc",
+    ".photoslibrary", ".musiclibrary", ".xcarchive", ".dsym",
+)
+
+
+def _skip_dir(directory: str, name: str) -> bool:
+    if name in _SKIP_DIRS or name.startswith(".cache") or name == ".Trash":
+        return True
+    if name.lower().endswith(_SKIP_DIR_SUFFIXES):
+        return True
+    # ~/Library is application state - caches, mail stores, containers - and walking it
+    # from a search of the home directory is how a turn comes to read the whole disk.
+    return name == "Library" and directory == os.path.expanduser("~")
+
+
+def _truncation_note(count: int) -> str:
+    """Said out loud, because a silent cap reads as full coverage."""
+    return (
+        f"[Stopped listing at {count} files (AGENTAUS_SEARCH_MAX_FILES). This tree is "
+        f"larger than that, so what follows is NOT everything. Narrow `path` to the "
+        f"folder that matters, or pass a `glob`.]\n\n"
+    )
+
+
 def enumerate_files(path: str, glob: str | None = None) -> list[str]:
     """Readable text files under `path`, in a stable order."""
+    return enumerate_files_bounded(path, glob)[0]
+
+
+def enumerate_files_bounded(path: str, glob: str | None = None) -> tuple[list[str], bool]:
+    """Readable text files under `path`, and whether the file cap cut the walk short."""
     if os.path.isfile(path):
         name = os.path.basename(path).lower()
         # Naming a binary explicitly does not make it readable as text, so the same
         # exclusions apply to a direct path as to a walked one.
         if _is_secret(name) or any(name.endswith(s) for s in _skipped_suffixes()):
-            return []
-        return [path]
+            return [], False
+        return [path], False
 
     skipped = _skipped_suffixes()
+    cap = settings.agentaus_search_max_files
     found: list[str] = []
     for directory, subdirs, names in os.walk(path):
+        _check_deadline()
         # Pruned in place so os.walk does not descend into them at all.
-        subdirs[:] = sorted(d for d in subdirs if d not in _SKIP_DIRS and not d.startswith(".cache"))
+        subdirs[:] = sorted(d for d in subdirs if not _skip_dir(directory, d))
         for name in sorted(names):
+            if cap > 0 and len(found) >= cap:
+                log.warning("walk of %s stopped at %d files (AGENTAUS_SEARCH_MAX_FILES)",
+                            path, cap)
+                return found, True
             if _is_secret(name):
                 continue
             lowered = name.lower()
@@ -407,7 +479,7 @@ def enumerate_files(path: str, glob: str | None = None) -> list[str]:
             except OSError:
                 continue
             found.append(full)
-    return found
+    return found, False
 
 
 def read_text(path: str) -> str:
@@ -421,7 +493,11 @@ def read_text(path: str) -> str:
     this through `enumerate_files`, which already excludes them, so this guard is
     redundant today - which is the point. It is one line, it costs nothing, and it means
     a future caller that reads a path the model supplied cannot become a key disclosure.
+
+    Also where a tool that has run out of time stops: every reader passes through here,
+    and each read may be a multi-second document conversion.
     """
+    _check_deadline()
     if _is_secret(os.path.basename(path)):
         log.warning("refused to read %s: excluded as a secret", os.path.basename(path))
         return ""
@@ -620,7 +696,7 @@ async def _aim_with_outline(
     Returns [] on anything unexpected, which falls back to reading every chunk. Aiming is
     an optimisation; missing the answer is not an acceptable price for it.
     """
-    toc = outline.render(candidates, read=read_text)
+    toc = await asyncio.to_thread(outline.render, candidates, read=read_text)
     if not toc.strip():
         return []
     try:
@@ -681,75 +757,24 @@ def sections_around(path: str, lines: list[int], section_tokens: int = 0) -> lis
     return out
 
 
-async def run_search(
-    query: str, path: str, glob: str | None, call: Caller, default_path: str | None = None
-) -> str:
-    """Execute one `agentaus_search` call and return text for the tool result.
+def _collect_chunks(
+    picks: list, candidates: list[str], budget: int, terms: list[str]
+) -> tuple[list[tuple[str, int, int, str]], bool, int]:
+    """The excerpts a search will read, in the order worth reading them.
 
-    A missing or relative `path` falls back to the repository Claude Code named in its
-    system prompt. Refusing instead would spend a whole tool round teaching the model
-    something the bridge already knows.
+    Returns (chunks, aimed, total before ranking). Synchronous and disk-bound, so the
+    caller runs it in a worker thread.
     """
-    if (not path or not os.path.isabs(path)) and default_path:
-        resolved = default_path if not path else os.path.join(default_path, path)
-        log.info("search path %r resolved against the working directory -> %s",
-                 path, resolved)
-        path = resolved
-    if not os.path.isabs(path):
-        return (f"agentaus_search needs an absolute path; got {path!r}. "
-                f"Pass the repository's absolute path as `path`.")
-    if not os.path.exists(path):
-        return f"No such path: {path}"
-    if not _allowed_root(path):
-        return (
-            f"{path} is outside AGENTAUS_SEARCH_ROOTS, which this bridge is confined to."
-        )
-
-    files = enumerate_files(path, glob)
-    if not files:
-        return f"No readable files under {path}" + (f" matching {glob}" if glob else "") + "."
-
-    terms = await expand_query(query, call)
-    ranked = shortlist(files, terms)
-    candidates = [p for p, _ in ranked]
-
-    # A thin shortlist means the words are simply not there - which is the case a keyword
-    # search gets wrong, not a sign that nothing matches. So everything gets read.
-    #
-    # But the shortlist is not discarded to do it. It used to be, and that was strictly
-    # worse than either option on its own: searching `SC-NFR-11` - a unique identifier
-    # appearing in exactly one file of 485 - matched that one file, decided one was too
-    # few to trust, replaced it with all 485, produced 566 chunks and read the first 120.
-    # The one file that certainly held the answer was demoted to a 1-in-485 chance of
-    # being inside the cap. A thin shortlist is a weak signal, not a wrong one; it goes
-    # first, and the rest of the corpus follows it.
-    brute_forced = False
-    matched_first = 0
-    if len(candidates) < settings.agentaus_search_min_candidates:
-        best = list(candidates)
-        rest = [f for f in files if f not in set(best)]
-        candidates = best + rest
-        brute_forced = True
-        matched_first = len(best)
-    elif len(candidates) > settings.agentaus_search_max_candidates:
-        # Ranked, so this keeps the files that matched the most distinct terms.
-        candidates = candidates[: settings.agentaus_search_max_candidates]
-
-    budget = effective_chunk_tokens()
-
-    # Aim before reading. One call over a free table of contents, then read only the
-    # sections it names - instead of a call per chunk over everything.
+    # The sections the outline pick named, when it named any.
     aimed = False
     chunks: list[tuple[str, int, int, str]] = []
-    if settings.agentaus_search_outline_first and len(candidates) > 1:
-        picks = await _aim_with_outline(query, candidates, call)
-        if picks:
-            by_file: dict = {}
-            for path, line in picks:
-                by_file.setdefault(path, []).append(line)
-            for path, lines in by_file.items():
-                chunks.extend(sections_around(path, lines))
-            aimed = bool(chunks)
+    if picks:
+        by_file: dict = {}
+        for picked, line in picks:
+            by_file.setdefault(picked, []).append(line)
+        for picked, lines in by_file.items():
+            chunks.extend(sections_around(picked, lines))
+        aimed = bool(chunks)
 
     # A handful of picked sections is a NARROWER read than no aiming at all, and the
     # point of aiming is precision, not less evidence. Below a floor the sections are
@@ -796,6 +821,78 @@ async def run_search(
         elif ranked_chunks:
             matched = {id(piece) for piece in ranked_chunks}
             chunks = ranked_chunks + [c for c in chunks if id(c) not in matched]
+
+    return chunks, aimed, total
+
+
+async def run_search(
+    query: str, path: str, glob: str | None, call: Caller, default_path: str | None = None
+) -> str:
+    """Execute one `agentaus_search` call and return text for the tool result.
+
+    A missing or relative `path` falls back to the repository Claude Code named in its
+    system prompt. Refusing instead would spend a whole tool round teaching the model
+    something the bridge already knows.
+    """
+    if (not path or not os.path.isabs(path)) and default_path:
+        resolved = default_path if not path else os.path.join(default_path, path)
+        log.info("search path %r resolved against the working directory -> %s",
+                 path, resolved)
+        path = resolved
+    if not os.path.isabs(path):
+        return (f"agentaus_search needs an absolute path; got {path!r}. "
+                f"Pass the repository's absolute path as `path`.")
+    if not os.path.exists(path):
+        return f"No such path: {path}"
+    if not _allowed_root(path):
+        return (
+            f"{path} is outside AGENTAUS_SEARCH_ROOTS, which this bridge is confined to."
+        )
+
+    # Every step that touches the disk runs in a worker thread. They read every file in
+    # the tree, and reading a document is a LibreOffice or PDF conversion; done on the
+    # event loop, one search over a large tree froze the whole bridge - pings, other
+    # turns and Claude passthrough - for 90 minutes.
+    files, truncated = await asyncio.to_thread(enumerate_files_bounded, path, glob)
+    if not files:
+        return f"No readable files under {path}" + (f" matching {glob}" if glob else "") + "."
+
+    terms = await expand_query(query, call)
+    ranked = await asyncio.to_thread(shortlist, files, terms)
+    candidates = [p for p, _ in ranked]
+
+    # A thin shortlist means the words are simply not there - which is the case a keyword
+    # search gets wrong, not a sign that nothing matches. So everything gets read.
+    #
+    # But the shortlist is not discarded to do it. It used to be, and that was strictly
+    # worse than either option on its own: searching `SC-NFR-11` - a unique identifier
+    # appearing in exactly one file of 485 - matched that one file, decided one was too
+    # few to trust, replaced it with all 485, produced 566 chunks and read the first 120.
+    # The one file that certainly held the answer was demoted to a 1-in-485 chance of
+    # being inside the cap. A thin shortlist is a weak signal, not a wrong one; it goes
+    # first, and the rest of the corpus follows it.
+    brute_forced = False
+    matched_first = 0
+    if len(candidates) < settings.agentaus_search_min_candidates:
+        best = list(candidates)
+        rest = [f for f in files if f not in set(best)]
+        candidates = best + rest
+        brute_forced = True
+        matched_first = len(best)
+    elif len(candidates) > settings.agentaus_search_max_candidates:
+        # Ranked, so this keeps the files that matched the most distinct terms.
+        candidates = candidates[: settings.agentaus_search_max_candidates]
+
+    budget = effective_chunk_tokens()
+
+    # Aim before reading. One call over a free table of contents, then read only the
+    # sections it names - instead of a call per chunk over everything.
+    picks: list = []
+    if settings.agentaus_search_outline_first and len(candidates) > 1:
+        picks = await _aim_with_outline(query, candidates, call)
+    chunks, aimed, total = await asyncio.to_thread(
+        _collect_chunks, picks, candidates, budget, terms
+    )
 
     cap = settings.agentaus_search_max_chunks
     dropped = max(0, len(chunks) - cap)
@@ -855,10 +952,10 @@ async def run_search(
     results = await asyncio.gather(*[look(piece) for piece in chunks])
     hits = [r for r in results if r.strip()]
 
-    header = ""
+    header = _truncation_note(len(files)) if truncated else ""
     if dropped:
         # Said out loud, because a silent cap reads as full coverage.
-        header = (
+        header += (
             f"[Searched {len(chunks)} of {len(chunks) + dropped} excerpts - the rest "
             f"were over the {cap}-excerpt limit. Narrow `path` or set a `glob` to cover "
             f"everything.]\n\n"
@@ -1176,6 +1273,20 @@ async def run_zoom(
 ) -> str:
     """Return a cited passage widened to its section, with line numbers preserved.
 
+    The work is a file read - possibly a document conversion - so it runs in a worker
+    thread rather than on the event loop the rest of the bridge shares.
+    """
+    return await asyncio.to_thread(_zoom, file_path, start_line, end_line, default_path)
+
+
+def _zoom(
+    file_path: str,
+    start_line: int,
+    end_line: int | None,
+    default_path: str | None = None,
+) -> str:
+    """Synchronous body of `run_zoom`.
+
     Reads a file. Nothing else - no model call, in any circumstance.
 
     It used to condense a passage that exceeded the return budget, and that was wrong
@@ -1277,10 +1388,43 @@ async def run_zoom(
     )
 
 
+def _ran_out_of_time(name: str, limit: float) -> str:
+    return (
+        f"[bridge] {name} stopped after {limit:.0f}s without finishing "
+        f"(AGENTAUS_TOOL_TIMEOUT). The tree is too large, or the upstream too slow, to "
+        f"cover in one call. Do not repeat the same call: narrow `path` to the folder "
+        f"that matters, pass a `glob`, or answer from what you already have."
+    )
+
+
 async def execute(
     name: str, arguments: dict, call: Caller, default_path: str | None = None
 ) -> str:
-    """Run one bridge-owned tool call. Never raises - a failure becomes tool output."""
+    """Run one bridge-owned tool call. Never raises - a failure becomes tool output.
+
+    Bounded by AGENTAUS_TOOL_TIMEOUT. The deadline is enforced twice, because one
+    mechanism cannot do both jobs: `wait_for` stops the coroutine and any model calls it
+    is waiting on, and the context variable stops the worker thread, which cancellation
+    cannot reach.
+    """
+    limit = settings.agentaus_tool_timeout_seconds
+    if limit <= 0:
+        return await _execute(name, arguments, call, default_path, limit)
+    token = _deadline.set(time.monotonic() + limit)
+    try:
+        return await asyncio.wait_for(
+            _execute(name, arguments, call, default_path, limit), timeout=limit
+        )
+    except asyncio.TimeoutError:
+        log.warning("bridge tool %s exceeded %.0fs and was stopped", name, limit)
+        return _ran_out_of_time(name, limit)
+    finally:
+        _deadline.reset(token)
+
+
+async def _execute(
+    name: str, arguments: dict, call: Caller, default_path: str | None, limit: float
+) -> str:
     try:
         if name == SEARCH_TOOL:
             return await run_search(
@@ -1313,6 +1457,9 @@ async def execute(
                 default_path,
             )
         return f"[bridge] Unknown tool {name!r}."
+    except ToolDeadline:
+        log.warning("bridge tool %s exceeded %.0fs and was stopped", name, limit)
+        return _ran_out_of_time(name, limit)
     except Exception as exc:  # a broken tool must not end the turn
         log.warning("bridge tool %s failed: %s", name, exc)
         return f"[bridge] {name} failed: {exc}"
