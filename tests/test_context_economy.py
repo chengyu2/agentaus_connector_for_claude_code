@@ -78,6 +78,64 @@ class TestTheLedger(unittest.TestCase):
         self.assertLess(len(text.splitlines()[-1]), 140)
 
 
+class TestEvidenceForTheGroundingCheck(unittest.TestCase):
+    """`render` says a call happened; `render_evidence` says what it returned.
+
+    The grounding check was given the first and asked a question only the second can
+    answer, and it destroyed correct work: shown `Bash(python fit.py) -> ok` beside an
+    answer stating a regression coefficient, it replied "would need the actual output
+    from fit.py" and the rewrite turned 0.8493 into "may be 0.849; I have not read the
+    source" - while the right number sat in the file the turn had just written.
+    """
+
+    def test_the_output_a_call_returned_is_shown(self):
+        text = ledger.render_evidence([
+            call("a", "Bash", command="python fit.py"),
+            result("a", "coef=0.8492778865371\nse=0.9584713297165"),
+        ])
+        self.assertIn("coef=0.8492778865371", text)
+        self.assertIn("se=0.9584713297165", text)
+
+    def test_the_plain_ledger_still_carries_no_output(self):
+        """The two callers want opposite things, and the cheap one must stay cheap."""
+        messages = [call("a", "Bash", command="python fit.py"), result("a", "coef=0.849")]
+        self.assertNotIn("coef=0.849", ledger.render(messages))
+
+    def test_a_long_result_keeps_both_ends(self):
+        """A traceback says what broke on its last line; a table says what it holds on
+        its first. The middle of either is padding."""
+        body = "FIRST\n" + ("filler\n" * 4000) + "LAST"
+        text = ledger.render_evidence([call("a", "Bash", command="run"), result("a", body)])
+        self.assertIn("FIRST", text)
+        self.assertIn("LAST", text)
+        self.assertIn("characters omitted", text)
+
+    def test_the_total_is_bounded(self):
+        messages = []
+        for i in range(40):
+            messages += [call(f"c{i}", "Read", file_path=f"f{i}.py"), result(f"c{i}", "z" * 5000)]
+        text = ledger.render_evidence(messages)
+        self.assertLess(len(text), 40000)
+
+    def test_the_newest_call_keeps_its_output_when_the_budget_runs_out(self):
+        """An answer is written from what the turn found last."""
+        messages = []
+        for i in range(40):
+            messages += [call(f"c{i}", "Bash", command=f"step{i}"),
+                         result(f"c{i}", f"MARKER{i} " + "z" * 4000)]
+        text = ledger.render_evidence(messages)
+        self.assertIn("MARKER39", text)
+
+    def test_it_costs_nothing_when_no_tools_have_run(self):
+        self.assertEqual(ledger.render_evidence([{"role": "user", "content": "hi"}]), "")
+
+    def test_a_pending_call_has_nothing_to_show(self):
+        text = ledger.render_evidence([call("a", "Bash", command="python fit.py")])
+        body = text.split("]\n", 1)[1]          # past the explanatory header
+        self.assertIn("-> pending", body)
+        self.assertNotIn("<output>", body)
+
+
 class TestDistillation(unittest.TestCase):
     BIG = "def handler(x):\n    return x.strip()\n" * 900
 
@@ -238,3 +296,72 @@ class TestInvestigate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def todo(id_: str, items) -> dict:
+    return {"role": "assistant", "content": [{"type": "tool_use", "id": id_,
+            "name": "TodoWrite", "input": {"todos": items}}]}
+
+
+class TestTheTaskListIsReflectedBack(unittest.TestCase):
+    """Claude Code re-injects the todo list after tool use so the objective stays in
+    view across a long loop. The bridge did not know the tool existed, so on an Agentaus
+    turn the list was written once and never referred to again - on exactly the model
+    where losing the thread is the documented failure.
+
+    Derived, like the rest of this module: it restates what the model itself recorded and
+    costs no upstream call.
+    """
+
+    ITEMS = [
+        {"content": "Load the ATO spreadsheet", "status": "completed"},
+        {"content": "Compute the concentration shares", "status": "in_progress"},
+        {"content": "Write findings.md", "status": "pending"},
+    ]
+
+    def test_the_list_comes_back_with_its_statuses(self):
+        text = ledger.render_todos([todo("a", self.ITEMS)])
+        self.assertIn("[x] Load the ATO spreadsheet", text)
+        self.assertIn("[>] Compute the concentration shares", text)
+        self.assertIn("[ ] Write findings.md", text)
+        self.assertIn("1/3 complete", text)
+
+    def test_it_names_the_next_thing_to_do(self):
+        text = ledger.render_todos([todo("a", self.ITEMS)])
+        self.assertIn("Next: Compute the concentration shares", text)
+
+    def test_the_next_item_falls_through_to_the_first_unfinished_one(self):
+        """Nothing is in_progress, so the next pending item is what is next."""
+        items = [{"content": "one", "status": "completed"},
+                 {"content": "two", "status": "pending"}]
+        self.assertIn("Next: two", ledger.render_todos([todo("a", items)]))
+
+    def test_a_finished_list_says_so_rather_than_inventing_a_next_step(self):
+        items = [{"content": "one", "status": "completed"}]
+        text = ledger.render_todos([todo("a", items)])
+        self.assertIn("Every item is complete", text)
+        self.assertNotIn("Next:", text)
+
+    def test_only_the_most_recent_list_is_used(self):
+        """TodoWrite replaces the whole list, so an earlier call is a stale snapshot."""
+        old = [{"content": "stale item", "status": "pending"}]
+        new = [{"content": "current item", "status": "pending"}]
+        text = ledger.render_todos([todo("a", old), todo("b", new)])
+        self.assertIn("current item", text)
+        self.assertNotIn("stale item", text)
+
+    def test_it_costs_nothing_when_no_list_was_written(self):
+        self.assertEqual(ledger.render_todos([call("a", "Read", file_path="x.py")]), "")
+        self.assertEqual(ledger.render_todos([]), "")
+
+    def test_the_system_prompt_carries_both_the_ledger_and_the_list(self):
+        messages = [call("a", "Read", file_path="d.csv"), result("a", "rows"),
+                    todo("b", self.ITEMS)]
+        text = ledger.with_ledger("SYS", messages)
+        self.assertIn("SYS", text)
+        self.assertIn("Read(d.csv) -> ok", text)
+        self.assertIn("Next: Compute the concentration shares", text)
+
+    def test_a_malformed_list_is_ignored_rather_than_crashing(self):
+        self.assertEqual(ledger.render_todos([todo("a", "not a list")]), "")
+        self.assertEqual(ledger.render_todos([todo("a", [None, 3])]), "")

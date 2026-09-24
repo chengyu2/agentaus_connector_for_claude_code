@@ -680,7 +680,7 @@ async def _check_grounding(
     Returns the answer to use. Any failure returns the original: a broken check must never
     cost a good answer.
     """
-    ran = ledger.render(body.get("messages") or [], limit=60)
+    ran = ledger.render_evidence(body.get("messages") or [], limit=60)
     if not ran:
         return answer
     try:

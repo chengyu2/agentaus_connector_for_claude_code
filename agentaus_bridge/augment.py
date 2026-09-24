@@ -23,6 +23,8 @@ from __future__ import annotations
 import re
 import textwrap
 
+from . import skills
+
 # Appended to Claude Code's own system prompt, not a replacement for it. Kept short:
 # every token here is one less available for the conversation, and a long list of
 # instructions is itself something a smaller model handles badly.
@@ -92,6 +94,40 @@ Repeating a call you have already made wastes the turn and loses context.
 9. For anything beyond a one-line change, state the plan in two or three lines, then
 carry it out. Finish each part before starting the next.
 """
+
+ANALYSIS_GUIDANCE = """\
+
+--- Reporting an analysis ---
+
+This turn ran code over data. Rule 6 above asks for no summary; on a turn like this one
+the summary IS the deliverable, so it does not apply here. Measured on identical tasks
+with identical correct results: the useful reply ran 1,800-2,300 characters, the thin one
+ran 119 - the same numbers, with nothing a reader could act on.
+
+10. State the numbers plainly. You ran the code and the run is your evidence, so do not
+hedge a value you computed - never "the coefficient may be 0.849". A figure you did not
+see printed is one you are about to state from memory: print it, then quote it.
+
+11. Report the value the library produced. Do not re-derive a statistic by hand. A
+p-value from a normal approximation where the library used a t-distribution on 10 degrees
+of freedom was wrong in the second decimal and looked entirely plausible.
+
+12. Say what the analysis actually used: which rows, which column, which interpreter, and
+how many observations remained after dropping missing values.
+
+13. Say what it means, in the units of the data, and whether it is distinguishable from
+zero. A small sample with a weak fit means "this data cannot tell you", which is a
+finding - not a reason to go looking for a specification that produces a star.
+
+14. Say what would change it. A file often is not the population you were asked about:
+rows from another period, a column that supersedes the one you used, sentinel or zero
+values. Name each one with the number it moves and by how much, so a reader can judge
+whether it matters. If you did not check, say that instead of implying you did.
+
+15. Confirm an artefact exists rather than assuming it. A chart reported as written, from
+a call that raised after the figure was built, is a file that is not there.
+"""
+
 
 # Kept for callers that want everything regardless of context.
 AGENTAUS_GUIDANCE = CORE_GUIDANCE + TOOL_GUIDANCE
@@ -174,6 +210,21 @@ _WHEN_TO_USE = {
         "searching: `find`, `ls -R` and `grep -r` produce more than this conversation "
         "can carry, so you are handed a truncated preview and answer from a fragment."
     ),
+    "Skill": (
+        "Procedures written for this project: how to do a kind of task, and how to know "
+        "you have finished it. CHECK THIS FIRST on anything non-trivial - analysing "
+        "data, reading documents, surveying a repository, searching exhaustively - "
+        "because a procedure that exists and was not loaded is the most common reason a "
+        "capable attempt still produces the wrong shape of answer. Loading one costs a "
+        "single call."
+    ),
+    "TodoWrite": (
+        "Use it FIRST on anything needing more than about three steps, and update it as "
+        "you go. It is how you keep the objective in view across a long task: the list "
+        "you write is shown back to you on every later turn, so a step recorded is a "
+        "step you cannot lose track of. Mark one item in_progress at a time, and finish "
+        "it before starting the next."
+    ),
     "Glob": (
         "Finding files BY NAME. It cannot see inside a file, so it can never answer a "
         "question about content. Do not use it to hunt for a directory whose path you "
@@ -198,6 +249,11 @@ def tool_selection(body: dict) -> str:
     described = [(n, _WHEN_TO_USE[n]) for n in names if n in _WHEN_TO_USE]
     if not described:
         return ""
+    # TodoWrite leads, whatever order the client sent. The same finding that put Grep's
+    # restriction at the front of its description applies to the list itself: position
+    # decides what gets picked, and the tool to reach for first should be read first.
+    _LEADS = {"Skill": 0, "TodoWrite": 1}
+    described.sort(key=lambda pair: _LEADS.get(pair[0], 2))
 
     width = max(len(n) for n, _ in described) + 2
     lines = []
@@ -208,7 +264,7 @@ def tool_selection(body: dict) -> str:
         lines.extend(" " * (width + 5) + part for part in wrapped[1:])
 
     return (
-        "\n<tool_selection>\nFinding things:\n"
+        "\n<tool_selection>\nWhich tool, and when:\n"
         + "\n".join(lines)
         + "\n\nIf you planned to use a tool, use THAT tool. Do not substitute the one "
         "you are more\nfamiliar with. Listing directories to find your bearings is not "
@@ -217,21 +273,157 @@ def tool_selection(body: dict) -> str:
     )
 
 
-def guidance_for(body: dict) -> str:
+# Two independent signals, both required. Either alone is a false positive: `pytest -q`
+# and `python3 manage.py migrate` execute code and analyse nothing, while a `Read` of a
+# CSV is data with no computation over it.
+_EXECUTES = re.compile(
+    r"(?:^|[\s;|&/])(?:python[23]?|ipython|jupyter|papermill|Rscript|julia|stata|"
+    r"octave|duckdb)\b|\.(?:R|r|ipynb|jl)\b",
+    re.IGNORECASE,
+)
+
+# A tabular file, or a library whose whole purpose is computing over one.
+_TOUCHES_DATA = re.compile(
+    r"\.(?:csv|tsv|xlsx?|xlsm|parquet|feather|dta|sav|sas7bdat|json)\b|"
+    r"\b(?:pandas|polars|numpy|scipy|statsmodels|sklearn|matplotlib|seaborn|plotly|"
+    r"altair|pyarrow|ggplot2|dplyr|tidyverse|data\.table|read_csv|read_excel|"
+    r"DataFrame)\b",
+    re.IGNORECASE,
+)
+
+_ANALYSIS_TOOLS = ("Bash", "Write", "Edit", "NotebookEdit", "MultiEdit")
+_ANALYSIS_FIELDS = ("command", "file_path", "notebook_path", "content", "new_string")
+
+
+def ran_an_analysis(body: dict) -> bool:
+    """Whether this turn has executed code over data.
+
+    A structural gate, in the sense the README means: it reads what the turn *did*, costs
+    nothing, and never guesses intent from the user's wording. Keyword matching on the
+    request would read "model the retry budget" as an analysis and a bare "how many rows
+    are in this?" as not one.
+
+    Both signals must appear, though not necessarily in the same call - the script that
+    imports pandas is usually written by one call and run by the next.
+
+    Tool *inputs* only, never results: a `Read` of a file that happens to mention numpy
+    is not a turn that computed anything.
+    """
+    # The user naming a dataset is evidence this is data work, and it is often the only
+    # evidence there is: a model that writes `analyze.py` with a heredoc and runs it
+    # leaves no library name in any tool input the scan can see. Measured before this:
+    # `python3 -c "import pandas"` fired, `python3 analyze.py` did not - so whether the
+    # reporting contract arrived depended on how the model happened to create the file.
+    executes = False
+    touches_data = bool(_TOUCHES_DATA.search(_conversation_text(body)))
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            if block.get("name") not in _ANALYSIS_TOOLS:
+                continue
+            payload = block.get("input")
+            if not isinstance(payload, dict):
+                continue
+            text = " ".join(
+                str(payload.get(k) or "") for k in _ANALYSIS_FIELDS
+            )[:8000]
+            executes = executes or bool(_EXECUTES.search(text))
+            touches_data = touches_data or bool(_TOUCHES_DATA.search(text))
+            if executes and touches_data:
+                return True
+    return False
+
+
+# A tabular file named anywhere in the conversation - the user's own words, an attached
+# path, or a tool input. Extension matching, not intent guessing: the same structural
+# test the bridge already uses to decide what is worth reading.
+_DATA_FILE = re.compile(
+    r"\.(?:csv|tsv|xlsx?|xlsm|parquet|feather|dta|sav|sas7bdat)\b", re.IGNORECASE
+)
+
+# A numbered sequence, and only that. Bullets were included once and it was wrong:
+# T2 asks for a two-panel chart and lists two JSON keys as bullets, which totalled four
+# and pulled the long-task procedure onto a single-chart job. A bulleted list of output
+# fields is a specification; a numbered list is an order of work.
+_MANY_STEPS = re.compile(r"^\s*\d+[.)]\s+\S", re.M)
+_MANY_STEPS_MIN = 5
+
+
+def _conversation_text(body: dict, limit: int = 20000) -> str:
+    parts: list[str] = []
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(str(block.get("text") or ""))
+        if sum(len(p) for p in parts) > limit:
+            break
+    return "\n".join(parts)[:limit]
+
+
+def skills_for(body: dict) -> list[str]:
+    """Which documented procedures apply to this turn.
+
+    Structural gates, costing nothing, in the sense the README means - and they have to
+    be, because the model will not make this choice itself. Measured: `Skill` offered
+    among 28 tools and named first in the guidance, and Agentaus never called it once
+    in five runs, while Opus called it on the same prompt in the same directory.
+    """
+    wanted: list[str] = []
+    text = _conversation_text(body)
+    if ran_an_analysis(body) or _DATA_FILE.search(text):
+        wanted.append("analyse-data")
+    if len(_MANY_STEPS.findall(text)) >= _MANY_STEPS_MIN:
+        wanted.append("multi-step-work")
+    return wanted
+
+
+def guidance_for(body: dict, *, covered_by_skill: tuple = ()) -> str:
     """The notes that apply to this request.
 
     Tool discipline is included only when the request actually offers tools. Sending it
     to a plain code-generation turn wastes tokens on unusable advice and dilutes the
     parts that do apply.
+
+    The reporting contract is added only once the turn has actually run something over
+    data, for the same reason and on the same evidence: it is the turn that writes up a
+    result, and on every other turn it is advice that cannot be followed.
     """
-    if body.get("tools"):
-        return CORE_GUIDANCE + TOOL_GUIDANCE + tool_selection(body)
-    return CORE_GUIDANCE
+    if not body.get("tools"):
+        return CORE_GUIDANCE
+    notes = CORE_GUIDANCE + TOOL_GUIDANCE
+    # The reporting contract and the `analyse-data` skill say largely the same things.
+    # Sending both is the failure the README records between two skills - "one was
+    # quietly arguing with another" - and this model handles a long list of rules badly.
+    # The skill is the more specific of the two, so the inline notes stand down for it.
+    if ran_an_analysis(body) and "analyse-data" not in covered_by_skill:
+        notes += ANALYSIS_GUIDANCE
+    return notes + tool_selection(body)
 
 
 def with_guidance(system, body: dict | None = None) -> object:
-    """Append the applicable operating notes to the system prompt being sent."""
-    notes = guidance_for(body or {})
+    """Append the applicable operating notes, and any documented procedure, to the prompt.
+
+    The procedure is injected rather than offered. See `agentaus_bridge.skills` for the
+    measurement that forced it: this model does not call the `Skill` tool.
+    """
+    body = body or {}
+    # Which procedures this project actually has, not merely which ones apply. A skill
+    # that is wanted but absent must not silence the inline notes that cover the same
+    # ground, or a project without it would be handed neither.
+    wanted = skills_for(body)
+    root = skills.locate(system, body) if wanted else None
+    present = tuple(n for n in wanted if n in skills.available(root)) if root else ()
+    notes = guidance_for(body, covered_by_skill=present)
+    if present:
+        notes += skills.render(root, list(present))
     if system is None:
         return notes.strip()
     if isinstance(system, str):
@@ -370,8 +562,8 @@ Start over and follow the task exactly as it was given.
 
 
 GROUNDING_INSTRUCTION = """\
-An agent answered a question after using tools. Below is what it actually did, and what
-it then said.
+An agent answered a question after using tools. Below is what it actually did, what
+each call returned, and what it then said.
 
 <tools_it_actually_ran>
 {ledger}
@@ -392,6 +584,12 @@ Look for:
 
 A statement is fine if it follows from a tool result, is general knowledge, or is clearly
 offered as a suggestion rather than a finding.
+
+A value a command computed and printed is SUPPORTED by that command having run. Do not
+ask for a figure to be re-derived, re-read or cited from somewhere else: the run is the
+evidence. Only flag a number that CONTRADICTS an output shown below, or that no call
+made could have produced. An output may be excerpted - a value consistent with what a
+command of that kind returns is supported, not unsupported.
 </task>
 
 <output_format>

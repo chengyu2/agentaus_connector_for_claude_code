@@ -1030,6 +1030,52 @@ answer + <tools_it_actually_ran>  →  GROUNDED
 An unreadable verdict counts as grounded. Rewriting a good answer is the more expensive
 mistake, and this pass exists because the last one made it.
 
+
+### The ledger says a call happened, not what it returned
+
+That design has a blind spot, and on analytical work it destroys exactly what it was
+built to protect. The ledger renders a call as one line:
+
+```
+- Bash(cd /w && python3 fit.py) -> ok
+```
+
+Asked whether an answer could know the coefficient it just reported, a checker holding
+that line can only say no. Verbatim, on a fitted regression:
+
+> GAPS
+> the specific numeric results (n = 12, coefficient = 0.8493, standard error = 0.9585,
+> R-squared = 0.0728, p-value = 0.3964) - **would need the actual output from fit.py
+> showing these values.**
+
+The output *was* in the conversation. The ledger simply does not carry it. The rewrite
+then turned every correct figure into *"the coefficient may be 0.849; I have not read the
+source"* - an answer contradicting itself while the right numbers sat in the file the turn
+had just written to disk. This is the README's own rule biting the pass that was written
+to enforce it: **a helper pass must never judge what it cannot see.**
+
+So the grounding check is given `render_evidence` instead - the same ledger, plus a
+bounded excerpt of what each call returned, newest first, head and tail of anything long.
+A traceback says what broke on its last line and a table says what it holds on its first;
+the middle of either is padding.
+
+Same turn, after:
+
+```
+GROUNDED
+```
+
+And the failure it exists for still fails: given one `find` and an answer asserting the
+contents of four files it never opened, all four were caught, plus a policy that does not
+exist. The distinction it now draws is between *a number a command printed* - supported,
+because the run is the evidence - and *a claim about a file nothing opened*.
+
+It costs about 2,700 extra input tokens on a grounding call, bounded at roughly 6,000.
+That is the price of not shredding correct arithmetic.
+
+**It does not fire on short answers.** `worth_grounding_check` has a 400-character floor,
+and a turn that replies with a JSON object clears neither it nor any need for it.
+
 ---
 
 ## Truncated tool output is read back from disk
@@ -1156,6 +1202,50 @@ Each names the failure it prevents, with the measurement, because a rule whose r
 stated is followed more reliably than one asserted. They are deliberately short — every
 token of instruction is one less for the conversation, and a long list of rules is itself
 something a smaller model handles badly.
+
+### The model has to call `Skill`, and this one does not
+
+Everything above assumes the model loads a skill when its description matches. Claude Code
+offers `Skill` as an ordinary tool and expects it to be called. Measured on the same
+prompt, in the same directory, with the same skills present and `Skill` among the 28 tools
+on the wire:
+
+```
+opus      ['Bash', 'Bash', 'Skill', 'Bash', 'Bash', ...]   invoked Skill: True
+agentaus  ['Read']                                         invoked Skill: False   (x5)
+```
+
+Naming `Skill` first in the generated `<tool_selection>` block did not move it: still
+`['Read']`. So the procedures written to compensate for this model were not reaching it,
+and the table above described a mechanism that worked on the model that needed it least.
+
+The fix is the one the rest of the bridge already applies here: **do not ask it to choose,
+hand it the thing.** A skill whose gate fires is injected into the system prompt as
+`<applicable_procedures>`; `Skill` stays on the wire for everything no gate covers.
+
+The gates are structural and cost nothing - a tabular file named anywhere in the turn
+selects `analyse-data`, five or more numbered steps selects `multi-step-work`. Both had to
+be narrowed after measurement. The first version counted bulleted lines as steps, so a
+two-panel chart task listing two panels and two JSON keys totalled four, drew in the
+long-task procedure on top of the analysis one, and the run that followed answered *"We
+will write the script `generate_rnd_plot.py` in the working directory, then run it"* and
+stopped - one turn, no tool calls, nothing on disk, against 6/6 for the same task without
+it. Restricting steps to numbered lines and raising the threshold took it back to 6/6.
+
+That is this repository's own rule turned on itself: skills are **deliberately short**,
+and a long list of rules is itself something a smaller model handles badly. Injecting two
+of them at once is a long list of rules.
+
+Finding the skills directory is done by asking the filesystem, not by parsing the prompt.
+The bridge used to read the working directory out of a labelled line in Claude Code's
+system prompt; that label is absent in 2.1.278, so the parse returned `None` and every
+lookup silently found nothing. Candidate paths are now taken from the request, walked
+upward, and the one with a `.claude/skills` directory wins. A label can be renamed; a
+directory either has the folder or it does not.
+
+Parsed skills are cached against the skills directory's mtime. This is disk work on the
+request path, and the commit that moved search into worker threads established that such
+work must not block the event loop - 0.22ms for ten skills, 0.005ms once cached.
 
 ### Keeping them from doubling up with the tools
 
