@@ -977,17 +977,23 @@ def with_plan(system, plan: str) -> object:
 # Tool focus
 # --------------------------------------------------------------------------------------
 
-# What a coding agent needs on every turn. Measured: Claude Code 2.1.278 sends 26 tools
-# carrying 120 KB of schemas - about 30,000 tokens a call, a quarter of Agentaus'
-# window - and the largest are Artifact (34 KB), ArtifactData, DesignSync and Monitor,
-# none of which a coding turn uses. A strong model shrugs that off. A smaller one pays
-# for it twice: in window, and in choosing among 26 names, which is where the invented
-# and misspelt calls come from.
-CORE_TOOLS = {
-    "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput",
-    "KillShell", "KillBash", "Glob", "Grep", "LS", "WebFetch", "WebSearch", "TodoWrite",
-    "TodoRead", "Skill", "Agent", "Task", "AskUserQuestion", "ToolSearch",
-    "EnterPlanMode", "ExitPlanMode",
+# Claude Code's own harness tools that a coding turn does not use. Measured: Claude Code
+# 2.1.278 sends 26 tools carrying 120 KB of schemas - about 30,000 tokens a call, a
+# quarter of Agentaus' window - and the largest are Artifact (34 KB), ArtifactData,
+# DesignSync and Monitor. A strong model shrugs that off. A smaller one pays for it
+# twice: in window, and in choosing among 26 names, which is where the invented and
+# misspelt calls come from.
+#
+# A deny-list, not an allow-list. The first version kept only a list of coding tools and
+# so hid every tool it had not heard of - the smoke test's custom `get_exchange_rate`
+# vanished and the model answered from memory, and a user's MCP tools would have gone
+# the same way. Only tools named here are held back; anything unrecognised stays.
+HELD_BACK_TOOLS = {
+    "Artifact", "ArtifactComments", "ArtifactData", "DesignSync", "Monitor",
+    "CronCreate", "CronDelete", "CronList", "EnterWorktree", "ExitWorktree",
+    "ListAgents", "SendMessage", "TaskStop", "Workflow", "ScheduleWakeup",
+    "RemoteTrigger", "ReportFindings", "PushNotification", "ShareOnboardingGuide",
+    "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool",
 }
 
 
@@ -1018,10 +1024,11 @@ def _last_user_words(body: dict) -> str:
 
 
 def focus_tools(body: dict) -> tuple[dict, list]:
-    """Offer the coding tools, plus any tool the user names or the conversation used.
+    """Hold back Claude Code's non-coding harness tools, unless named or already used.
 
-    Nothing the user asks for goes missing: a tool named in their message, or already
-    called in this conversation, stays on the wire. Returns (body, dropped names).
+    Nothing the user asks for goes missing: a held-back tool named in their message, or
+    already called in this conversation, stays on the wire, and a tool not on the
+    held-back list is never touched. Returns (body, dropped names).
     """
     tools = body.get("tools") or []
     if not tools:
@@ -1032,7 +1039,7 @@ def focus_tools(body: dict) -> tuple[dict, list]:
     for tool in tools:
         name = (tool or {}).get("name") or ""
         server = name.split("__")[1] if name.startswith("mcp__") and "__" in name[5:] else ""
-        if (name in CORE_TOOLS or name in used
+        if (name not in HELD_BACK_TOOLS or name in used
                 or (name and re.search(rf"\b{re.escape(name)}\b", asked))
                 or (server and re.search(rf"\b{re.escape(server)}\b", asked, re.I))):
             kept.append(tool)

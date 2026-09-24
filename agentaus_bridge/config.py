@@ -114,8 +114,9 @@ class Settings:
         default_factory=lambda: _bool("AGENTAUS_LIVE_DRAFT", True)
     )
 
-    # Offer Agentaus the coding tools plus anything the user names or already used,
-    # rather than every tool the client sends (26, ~30k tokens, in Claude Code 2.1.278).
+    # Hold back Claude Code's non-coding harness tools (Artifact, Cron, DesignSync...)
+    # unless named or already used - 26 tools, ~30k tokens, in Claude Code 2.1.278.
+    # A deny-list: custom and MCP tools are never hidden. See augment.HELD_BACK_TOOLS.
     agentaus_tool_focus: bool = field(
         default_factory=lambda: _bool("AGENTAUS_TOOL_FOCUS", True)
     )

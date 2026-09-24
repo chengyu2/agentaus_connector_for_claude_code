@@ -100,6 +100,16 @@ class Focus(unittest.TestCase):
         self.assertEqual([t["name"] for t in focused["tools"]], ["Read", "Bash"])
         self.assertEqual(sorted(dropped), ["Artifact", "CronCreate"])
 
+    def test_a_tool_it_does_not_know_is_never_hidden(self):
+        """The first version hid the smoke test's custom tool and the model answered
+        from memory; a user's MCP tools would have vanished the same way."""
+        focused, dropped = augment.focus_tools(self.body(
+            "what is the AUD rate", "Read", "get_exchange_rate", "mcp__slack__send", "Artifact"))
+        names = [t["name"] for t in focused["tools"]]
+        self.assertIn("get_exchange_rate", names)
+        self.assertIn("mcp__slack__send", names)
+        self.assertEqual(dropped, ["Artifact"])
+
     def test_a_tool_the_user_names_stays(self):
         focused, _ = augment.focus_tools(self.body("publish it as an Artifact", "Read", "Artifact"))
         self.assertIn("Artifact", [t["name"] for t in focused["tools"]])

@@ -662,7 +662,7 @@ all of it invisible from the settings file:
 
 | What arrives | Why it hurt Agentaus | What the bridge does |
 | --- | --- | --- |
-| **26 tools, 120 KB of schemas** (~30,000 tokens a call). `Artifact` alone is 34 KB | A quarter of the window gone before the conversation starts, and 26 names to choose from - where the invented and misspelt calls come from | **Tool focus**: the coding tools, plus any tool the user names or the conversation already used. 13 KB. `AGENTAUS_TOOL_FOCUS=false` sends everything |
+| **26 tools, 120 KB of schemas** (~30,000 tokens a call). `Artifact` alone is 34 KB | A quarter of the window gone before the conversation starts, and 26 names to choose from - where the invented and misspelt calls come from | **Tool focus**: Claude Code's non-coding harness tools are held back unless the user names them or the conversation already used them - 13 KB. A deny-list, so custom and MCP tools are never hidden. `AGENTAUS_TOOL_FOCUS=false` sends everything |
 | The environment block - **including the working directory** - as a `system`-role entry *inside `messages`*, and connector instructions the same way | Forwarded as-is it became the *last* message, after the user's request, and Agentaus answered it: a finished R task replied to with "I have not read the Claude Docs workflow you shared" | Every `system`-role entry joins the system prompt, so the turn ends on what the user said. The working-directory lookup reads them too - it had silently been finding nothing |
 | `<system-reminder>` blocks beside what the user typed: account email, commit attribution, which tools loaded | Handed to the planner, reviewer and turn judge as part of "the request" | Stripped wherever the bridge reads the request |
 | After every turn, **utility calls** with no tools: the end-of-turn state classifier (done / working / blocked / failed, which drives the "come back" notification) and session titles | The self-review pass rewrote the classifier's one-word verdict into a 4,322-character essay, twice - **39 seconds added to every Agentaus turn**, and a garbled notification state | Review and grounding run on agent turns only - requests that offer tools. `AGENTAUS_REVIEW_TOOLLESS=true` restores the old behaviour for a bare-prompt harness |
@@ -1438,7 +1438,7 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `BRIDGE_STALL_WARNING` | `45` | Log that an upstream call is still waiting, and for how long. `0` disables |
 | `AGENTAUS_PROMPT_STYLE` | `markdown` | How the bridge lays out what it writes for Agentaus: `markdown` or `xml` |
 | `AGENTAUS_LIVE_DRAFT` | `true` | Stream tokens into a thinking block while the answer is held for checks |
-| `AGENTAUS_TOOL_FOCUS` | `true` | Offer the coding tools plus anything named or used, not all 26 |
+| `AGENTAUS_TOOL_FOCUS` | `true` | Hold back Claude Code's non-coding harness tools (Artifact, Cron, DesignSync...) unless named or used. Custom and MCP tools are never hidden |
 | `AGENTAUS_REVIEW_TOOLLESS` | `false` | Also review tool-less requests - Claude Code's own utility calls. For bare-prompt harnesses only |
 | `BRIDGE_TURN_TIMEOUT` | `900` | Wall-clock ceiling on one streamed Agentaus turn. Pings defeat Claude Code's idle timeout, so without this a wedged turn spins forever. `0` disables |
 | `BRIDGE_MAX_RETRIES` | `2` | Extra attempts after a transient upstream failure |
