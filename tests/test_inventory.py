@@ -13,6 +13,7 @@ import asyncio
 import os
 import tempfile
 import unittest
+from xml_style import setUpModule, tearDownModule  # noqa: E402,F401
 
 from agentaus_bridge import inventory, tools
 

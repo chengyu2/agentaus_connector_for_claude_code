@@ -23,7 +23,9 @@ from __future__ import annotations
 import re
 import textwrap
 
+from . import prompt_style
 from . import skills
+from .prompt_style import Template
 
 # Appended to Claude Code's own system prompt, not a replacement for it. Kept short:
 # every token here is one less available for the conversation, and a long list of
@@ -136,7 +138,7 @@ AGENTAUS_GUIDANCE = CORE_GUIDANCE + TOOL_GUIDANCE
 # Used for the optional review pass. Asking "what is wrong with this" is a markedly
 # easier question for a smaller model than getting it right first time, which is what
 # makes a second pass worth its latency.
-REVIEW_INSTRUCTION = """\
+REVIEW_INSTRUCTION = Template("""\
 Review the ANSWER below against the REQUEST. You are looking only for real defects:
 
 - Code that is wrong, will not run, or mishandles an edge case (empty, zero, negative, \
@@ -163,9 +165,9 @@ Say OK when the answer is sound - do not invent a defect to seem thorough.
 <answer>
 {answer}
 </answer>
-"""
+""")
 
-REVISE_INSTRUCTION = """\
+REVISE_INSTRUCTION = Template("""\
 Your previous answer to the request below was reviewed and these defects were found. \
 Produce a corrected answer.
 
@@ -183,7 +185,7 @@ changed, no mention of the review.
 <defects_found>
 {defects}
 </defects_found>
-"""
+""")
 
 
 # When to reach for each tool the bridge itself provides. Keyed by tool name so the
@@ -255,6 +257,20 @@ def tool_selection(body: dict) -> str:
     _LEADS = {"Skill": 0, "TodoWrite": 1}
     described.sort(key=lambda pair: _LEADS.get(pair[0], 2))
 
+    closing = (
+        "If you planned to use a tool, use THAT tool. Do not substitute the one you are "
+        "more\nfamiliar with. Listing directories to find your bearings is not progress "
+        "- if you\nwere given a path, use it. Every name above is exact; do not invent "
+        "others."
+    )
+    if prompt_style.markdown():
+        # A real list: one bullet per tool, rather than columns aligned with spaces,
+        # which Markdown collapses.
+        lines = [f"- `{name}` - {advice}" for name, advice in described]
+        return ("\n" + prompt_style.section(
+            "tool_selection", "Which tool, and when:\n\n" + "\n".join(lines) + "\n\n" + closing
+        ) + "\n")
+
     width = max(len(n) for n, _ in described) + 2
     lines = []
     for name, advice in described:
@@ -266,10 +282,7 @@ def tool_selection(body: dict) -> str:
     return (
         "\n<tool_selection>\nWhich tool, and when:\n"
         + "\n".join(lines)
-        + "\n\nIf you planned to use a tool, use THAT tool. Do not substitute the one "
-        "you are more\nfamiliar with. Listing directories to find your bearings is not "
-        "progress - if you\nwere given a path, use it. Every name above is exact; do not "
-        "invent others.\n</tool_selection>\n"
+        + "\n\n" + closing + "\n</tool_selection>\n"
     )
 
 
@@ -397,7 +410,7 @@ def guidance_for(body: dict, *, covered_by_skill: tuple = ()) -> str:
     result, and on every other turn it is advice that cannot be followed.
     """
     if not body.get("tools"):
-        return CORE_GUIDANCE
+        return prompt_style.headings(CORE_GUIDANCE)
     notes = CORE_GUIDANCE + TOOL_GUIDANCE
     # The reporting contract and the `analyse-data` skill say largely the same things.
     # Sending both is the failure the README records between two skills - "one was
@@ -405,7 +418,7 @@ def guidance_for(body: dict, *, covered_by_skill: tuple = ()) -> str:
     # The skill is the more specific of the two, so the inline notes stand down for it.
     if ran_an_analysis(body) and "analyse-data" not in covered_by_skill:
         notes += ANALYSIS_GUIDANCE
-    return notes + tool_selection(body)
+    return prompt_style.headings(notes) + tool_selection(body)
 
 
 def with_guidance(system, body: dict | None = None) -> object:
@@ -435,7 +448,7 @@ def with_guidance(system, body: dict | None = None) -> object:
 
 VERDICT_LINE = "VERDICT:"
 
-ADJUDICATE_INSTRUCTION = """\
+ADJUDICATE_INSTRUCTION = Template("""\
 Does the review below report any actual defect that needs fixing?
 
 Answer with exactly one word: YES or NO.
@@ -443,7 +456,7 @@ Answer with exactly one word: YES or NO.
 <review>
 {review}
 </review>
-"""
+""")
 
 
 def declared_verdict(review: str) -> bool | None:
@@ -497,31 +510,55 @@ def review_says_ok(review: str) -> bool:
 # that was offered tools, called none of them, and produced a short answer. Only then is
 # there anything to classify, and only then is a call worth making.
 
-# A real answer to a substantive question is long. Below this a turn is either an
-# acknowledgement or an excuse, and worth a look; above it, it is an answer.
-_REFUSAL_LENGTH_CEILING = 1200
+# Replies up to this long are judged. It was 1,200, on the theory that a long reply is an
+# answer - and the benchmark found the long failure that theory misses: asked to write
+# and run pareto.R, the model printed the whole script in its reply and stopped. With
+# the request in front of it the judge tells that apart from a real long answer, so the
+# ceiling now only bounds the prompt.
+_REFUSAL_LENGTH_CEILING = 20000
 
-CLASSIFY_REFUSAL_INSTRUCTION = """\
-An AI agent was given tools that read the local filesystem, and a task that needed them.
-It called no tools and replied with the text below.
+CLASSIFY_REFUSAL_INSTRUCTION = Template("""\
+An AI agent was given tools that act on the local machine - reading and writing files,
+running commands - and the task below. Its turn ended with this reply, and it called no
+tool.
+
+<request>
+{request}
+</request>
+
+<tools_it_ran>
+{ran}
+</tools_it_ran>
 
 <reply>
 {answer}
 </reply>
 
 <question>
-Is that reply the agent DECLINING to act - claiming it cannot read files, has no access
-to the filesystem, or asking the human to paste or upload something it could have
-fetched itself?
+Which one is the reply? Judge against the request and what the agent already ran: if
+the tools it ran have already done what the request asks - the file written, the command
+run - a reply saying so is an ANSWER, however short.
 
-Or is it a genuine answer, or a legitimate statement about something it really cannot
-know (a future event, a private system, a fact absent from the material)?
+REFUSAL - the agent declines to act: it claims it cannot read files or has no access to
+the filesystem, or asks the human to paste, upload or run something it could have done
+itself with its tools.
+
+STALLED - the agent stopped before the task was done, and nothing it needs from the
+human is missing. Either it says what it will do next without doing it ("We will write
+the file now", "Next I'll run the tests", "We need to write answers.json"), or its reply
+is a fragment of its own reasoning, or it put the deliverable in the reply instead of
+doing what the request asked for with it - printing a file's contents when the request
+said to write the file, showing a command when the request said to run it.
+
+ANSWER - a genuine final answer or result, or a legitimate statement about something it
+really cannot know or do, or a question the human genuinely has to answer.
 </question>
 
 <output_format>
-Exactly one word: REFUSAL or ANSWER. Nothing else.
+Exactly one word: REFUSAL, STALLED or ANSWER. Nothing else.
 </output_format>
-"""
+""")
+
 
 
 def could_be_a_refusal(answer: str, *, tools_offered: bool, called_a_tool: bool) -> bool:
@@ -536,6 +573,17 @@ def could_be_a_refusal(answer: str, *, tools_offered: bool, called_a_tool: bool)
     return 0 < len(text) <= _REFUSAL_LENGTH_CEILING
 
 
+def read_turn_verdict(verdict: str) -> str:
+    """"refusal", "stalled" or "answer". Anything unrecognised is an answer, for the same
+    reason as `read_refusal_verdict`: re-asking a good answer is the worse mistake."""
+    word = (verdict or "").strip().upper().lstrip("*`_ ")
+    if word.startswith("REFUSAL"):
+        return "refusal"
+    if word.startswith("STALLED"):
+        return "stalled"
+    return "answer"
+
+
 def read_refusal_verdict(verdict: str) -> bool:
     """Read the one-word answer. Anything unrecognised is treated as a real answer.
 
@@ -546,7 +594,7 @@ def read_refusal_verdict(verdict: str) -> bool:
     return (verdict or "").strip().upper().startswith("REFUSAL")
 
 
-REFUSAL_CORRECTION = """\
+REFUSAL_CORRECTION = Template("""\
 <correction>
 That is not true, and it was not the question.
 
@@ -558,10 +606,28 @@ Nobody is going to paste or upload anything for you. Call the tool.
 
 Start over and follow the task exactly as it was given.
 </correction>
-"""
+""")
 
 
-GROUNDING_INSTRUCTION = """\
+# The small-model failure the refusal check was not built for: the turn ends on an
+# announcement. Observed on the benchmark pilot - after one correction round, the reply
+# was "We will write file at same directory." and nothing was written, so the session
+# ended with the task undone.
+STALLED_CORRECTION = Template("""\
+<correction>
+You stopped before the task the user gave you was done. Saying what you will do, or
+showing what a file should contain, does not do it - nothing was written or run.
+
+Do the remaining step of THAT task now: call the tool. Write only the files the user's
+task asks for, and run only what it needs. Do not write notes, memories, summaries or
+anything else the task did not ask for.
+
+If the task really is complete, reply with the final result instead.
+</correction>
+""")
+
+
+GROUNDING_INSTRUCTION = Template("""\
 An agent answered a question after using tools. Below is what it actually did, what
 each call returned, and what it then said.
 
@@ -598,10 +664,10 @@ If everything checks out, reply with exactly: GROUNDED
 Otherwise reply with GAPS on the first line, then one line per unsupported statement:
 the claim, then what would have been needed to make it. Nothing else.
 </output_format>
-"""
+""")
 
 
-STRIP_UNGROUNDED_INSTRUCTION = """\
+STRIP_UNGROUNDED_INSTRUCTION = Template("""\
 Your answer below contains statements you had no basis for. They are listed after it.
 
 <your_answer>
@@ -621,7 +687,7 @@ Change nothing else. Keep every grounded statement, its wording, and the structu
 formatting of the original. Do not add new material, do not apologise, and do not mention
 this correction.
 </task>
-"""
+""")
 
 
 def grounding_verdict(reply: str) -> str:
@@ -702,7 +768,7 @@ def worth_reviewing(text: str, *, min_chars: int = 200) -> bool:
 # affordance by asking for the plan as its own turn, then handing that plan back as
 # context for the real one. Two cheap passes beat one expensive one on a smaller model,
 # the same reason the review pass exists.
-PLAN_INSTRUCTION = """\
+PLAN_INSTRUCTION = Template("""\
 You are an agent working inside a code repository. Plan the turn below before you act.
 
 This is your own private working. Nobody reads it and nobody answers it, so a plan that \
@@ -734,7 +800,7 @@ where the code is. You already know.
 <request>
 {request}
 </request>
-"""
+""")
 
 
 def mid_tool_loop(body: dict) -> bool:
@@ -791,6 +857,20 @@ _CWD_PATTERNS = (
 )
 
 
+def working_directory_of(body: dict) -> str | None:
+    """The working directory, wherever this client version put it.
+
+    Claude Code 2.1.278 no longer states it in `system`: the environment block arrives as
+    a `system`-role entry in `messages`. Reading `system` alone found nothing, so the
+    planner, search path defaults and relative-path repair all silently lost the repo.
+    """
+    from .translate import system_notes
+    found = working_directory((body or {}).get("system"))
+    if found:
+        return found
+    return working_directory("\n".join(system_notes(body or {})))
+
+
 def working_directory(system) -> str | None:
     """The repository path Claude Code named in its system prompt, if it named one."""
     if isinstance(system, list):
@@ -836,12 +916,13 @@ def plan_prompt(request: str, body: dict | None = None) -> str:
     """
     body = body or {}
     lines = []
-    cwd = working_directory(body.get("system"))
+    cwd = working_directory_of(body)
     if cwd:
+        where = (f"## Working directory\n\n`{cwd}`\n\n" if prompt_style.markdown()
+                 else f"<working_directory>\n{cwd}\n</working_directory>\n")
         lines.append(
-            f"<working_directory>\n{cwd}\n</working_directory>\n"
-            f"That is the repository. Pass it as the `path` argument to any tool "
-            f"needing one."
+            where + "That is the repository. Pass it as the `path` argument to any tool "
+            "needing one."
         )
 
     # Names alone are not enough. Given a bare list, the planner picks the tool it knows
@@ -852,10 +933,18 @@ def plan_prompt(request: str, body: dict | None = None) -> str:
     for tool in body.get("tools") or []:
         if not (isinstance(tool, dict) and tool.get("name")):
             continue
-        entries.append(f"  <tool name=\"{tool['name']}\">{_one_line(tool.get('description'))}</tool>")
+        if prompt_style.markdown():
+            entries.append(f"- `{tool['name']}` - {_one_line(tool.get('description'))}")
+        else:
+            entries.append(
+                f"  <tool name=\"{tool['name']}\">{_one_line(tool.get('description'))}</tool>")
     if entries:
-        lines.append("<tools_available>\n" + "\n".join(entries)
-                     + "\n</tools_available>\nUse these exact names and no others.")
+        if prompt_style.markdown():
+            lines.append("## Tools available\n\n" + "\n".join(entries)
+                         + "\n\nUse these exact names and no others.")
+        else:
+            lines.append("<tools_available>\n" + "\n".join(entries)
+                         + "\n</tools_available>\nUse these exact names and no others.")
 
     context = ("\n\n".join(lines) + "\n\n") if lines else ""
     return PLAN_INSTRUCTION.format(context=context, request=request[:12000])
@@ -882,3 +971,74 @@ def with_plan(system, plan: str) -> object:
     if isinstance(system, list):
         return list(system) + [{"type": "text", "text": notice.strip()}]
     return system
+
+
+# --------------------------------------------------------------------------------------
+# Tool focus
+# --------------------------------------------------------------------------------------
+
+# What a coding agent needs on every turn. Measured: Claude Code 2.1.278 sends 26 tools
+# carrying 120 KB of schemas - about 30,000 tokens a call, a quarter of Agentaus'
+# window - and the largest are Artifact (34 KB), ArtifactData, DesignSync and Monitor,
+# none of which a coding turn uses. A strong model shrugs that off. A smaller one pays
+# for it twice: in window, and in choosing among 26 names, which is where the invented
+# and misspelt calls come from.
+CORE_TOOLS = {
+    "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput",
+    "KillShell", "KillBash", "Glob", "Grep", "LS", "WebFetch", "WebSearch", "TodoWrite",
+    "TodoRead", "Skill", "Agent", "Task", "AskUserQuestion", "ToolSearch",
+    "EnterPlanMode", "ExitPlanMode",
+}
+
+
+def _tools_used(body: dict) -> set:
+    used = set()
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name"):
+                    used.add(block["name"])
+    return used
+
+
+def _last_user_words(body: dict) -> str:
+    for message in reversed(body.get("messages") or []):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = [b.get("text", "") for b in content
+                     if isinstance(b, dict) and b.get("type") == "text"]
+            if any(t.strip() for t in texts):
+                return "\n".join(texts)
+    return ""
+
+
+def focus_tools(body: dict) -> tuple[dict, list]:
+    """Offer the coding tools, plus any tool the user names or the conversation used.
+
+    Nothing the user asks for goes missing: a tool named in their message, or already
+    called in this conversation, stays on the wire. Returns (body, dropped names).
+    """
+    tools = body.get("tools") or []
+    if not tools:
+        return body, []
+    asked = _last_user_words(body)
+    used = _tools_used(body)
+    kept, dropped = [], []
+    for tool in tools:
+        name = (tool or {}).get("name") or ""
+        server = name.split("__")[1] if name.startswith("mcp__") and "__" in name[5:] else ""
+        if (name in CORE_TOOLS or name in used
+                or (name and re.search(rf"\b{re.escape(name)}\b", asked))
+                or (server and re.search(rf"\b{re.escape(server)}\b", asked, re.I))):
+            kept.append(tool)
+        else:
+            dropped.append(name)
+    if not dropped:
+        return body, []
+    return {**body, "tools": kept}, dropped
+

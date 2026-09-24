@@ -13,12 +13,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import hashlib
 import json
 import logging
 import random
 import re
 import time
 import uuid
+from collections import OrderedDict
 from typing import AsyncIterator, Callable
 
 import httpx
@@ -28,6 +30,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import documents
 from . import harmony
 from . import persisted
+from . import prompt_style
+from . import repair
 from . import syntax
 from . import schema as tool_schema
 from . import tools as bridge_tools
@@ -41,16 +45,20 @@ from .augment import (
     GROUNDING_INSTRUCTION,
     STRIP_UNGROUNDED_INSTRUCTION,
     could_be_a_refusal,
+    focus_tools,
     grounding_verdict,
     worth_grounding_check,
     read_refusal_verdict,
+    read_turn_verdict,
     should_think,
     working_directory,
+    working_directory_of,
     with_guidance,
     with_plan,
     worth_reviewing,
     worth_reviewing_turn,
     REFUSAL_CORRECTION,
+    STALLED_CORRECTION,
 )
 from .compact import ConversationCompactor
 from .text import normalise_for_display
@@ -439,6 +447,17 @@ async def _post_with_retry(
             await response.aread()  # release the connection before sleeping
             await _sleep_before_retry(attempt, f"HTTP {response.status_code}")
             continue
+        if response.status_code == 200 and attempt < settings.max_retries:
+            # An HTTP 200 carrying an error object: retry it when it is the upstream's own
+            # transport failing rather than anything about this request.
+            try:
+                in_band = response.json().get("error")
+            except (ValueError, AttributeError):
+                in_band = None
+            if isinstance(in_band, dict) and _is_transient(str(in_band.get("message") or "")):
+                await _sleep_before_retry(
+                    attempt, f"in-band: {str(in_band.get('message'))[:60]}")
+                continue
         return response
 
     raise last_exc if last_exc else RuntimeError("retry loop exited without a response")
@@ -491,7 +510,16 @@ def _context_limit() -> int:
     return _learned_limit or settings.agentaus_max_input_tokens
 
 
-async def _agentaus_summarise(client: httpx.AsyncClient, text: str) -> str:
+HELPER_SYSTEM = (
+    "You are a precise assistant working inside a software engineering tool. Do exactly "
+    "what the message asks, in exactly the output format it asks for. No preamble, no "
+    "commentary, no questions back."
+)
+
+
+async def _agentaus_summarise(
+    client: httpx.AsyncClient, text: str, *, on_piece=None, stream: bool | None = None
+) -> str:
     """Ask Agentaus to compact a slice of the conversation.
 
     Deliberately delegated to the model rather than to heuristics here: what is worth
@@ -499,8 +527,14 @@ async def _agentaus_summarise(client: httpx.AsyncClient, text: str) -> str:
     better placed to make it than any rule the bridge could hard-code.
     """
     payload = {
-        "messages": [{"role": "user", "content": text}],
-        "stream": settings.agentaus_stream_helpers,
+        # A system message is what `system_prompt_overwrite` overwrites WITH. Sent without
+        # one, Agentaus keeps its own ~2,200-token general-assistant persona: measured,
+        # "Say hi" cost 2,442 input tokens bare and 207 with a one-line system message,
+        # and with tools offered the bare form refused to use them. Every helper call -
+        # plan, review, search chunk, compaction - paid that and carried the persona.
+        "messages": [{"role": "system", "content": HELPER_SYSTEM},
+                     {"role": "user", "content": text}],
+        "stream": settings.agentaus_stream_helpers if stream is None else stream,
         "system_prompt_overwrite": True,
     }
     started_at = time.monotonic()
@@ -509,16 +543,16 @@ async def _agentaus_summarise(client: httpx.AsyncClient, text: str) -> str:
     if limit > 0:
         try:
             return await asyncio.wait_for(
-                _helper_call(client, payload, text, started_at), timeout=limit
+                _helper_call(client, payload, text, started_at, on_piece), timeout=limit
             )
         except asyncio.TimeoutError:
             rlog(logging.WARNING, "helper call exceeded %.0fs and was abandoned", limit)
             raise RuntimeError(f"helper call timed out after {limit:.0f}s")
-    return await _helper_call(client, payload, text, started_at)
+    return await _helper_call(client, payload, text, started_at, on_piece)
 
 
 async def _helper_call(
-    client: httpx.AsyncClient, payload: dict, text: str, started_at: float
+    client: httpx.AsyncClient, payload: dict, text: str, started_at: float, on_piece=None
 ) -> str:
     """One helper call, streamed or buffered. Bounded by the caller."""
     if payload["stream"]:
@@ -528,7 +562,7 @@ async def _helper_call(
         # progress at all. Streaming returns the first bytes as they are generated, so a
         # slow reply stops looking like a dead one and the connection drains sooner.
         try:
-            return await _stream_helper(client, payload, text, started_at)
+            return await _stream_helper(client, payload, text, started_at, on_piece)
         except (httpx.HTTPError, RuntimeError) as exc:
             # Falling back rather than failing: a streaming fault must not cost the
             # caller its summary when the buffered path still works.
@@ -553,7 +587,7 @@ async def _helper_call(
 
 
 async def _stream_helper(
-    client: httpx.AsyncClient, payload: dict, text: str, started_at: float
+    client: httpx.AsyncClient, payload: dict, text: str, started_at: float, on_piece=None
 ) -> str:
     """Consume a streamed helper reply and return the assembled content."""
     parts: list[str] = []
@@ -588,6 +622,8 @@ async def _stream_helper(
                     if not parts:
                         first_byte = time.monotonic() - started_at
                     parts.append(piece)
+                    if on_piece is not None:
+                        on_piece(piece)
     rlog(logging.DEBUG, "helper stream ok in %.1fs (first byte %.1fs, %d chars in)",
          time.monotonic() - started_at, first_byte, len(text))
     return "".join(parts)
@@ -606,11 +642,12 @@ async def _answer_without_tools(client: httpx.AsyncClient, payload: dict) -> str
     messages = list(stripped.get("messages") or [])
     messages.append({
         "role": "user",
-        "content": (
-            "<task>\nAnswer now, from what is already above. You have no tools for this "
+        "content": prompt_style.section(
+            "task",
+            "Answer now, from what is already above. You have no tools for this "
             "turn.\n\nIf what you gathered is enough, give the answer in the format "
             "originally asked for. If it genuinely is not, say in one line what is "
-            "missing - do not describe your search.\n</task>"
+            "missing - do not describe your search.",
         ),
     })
     stripped["messages"] = messages
@@ -754,7 +791,7 @@ async def _self_review(client: httpx.AsyncClient, request_text: str, answer: str
     return answer
 
 
-async def _plan_turn(client: httpx.AsyncClient, body: dict) -> str:
+async def _plan_turn(client: httpx.AsyncClient, body: dict, on_piece=None) -> str:
     """Ask Agentaus to plan this turn before it answers it.
 
     Agentaus has no native thinking mode, so left alone it answers from the first thing
@@ -767,8 +804,11 @@ async def _plan_turn(client: httpx.AsyncClient, body: dict) -> str:
     """
     try:
         async with hold("planning", "urgent"):
+            # Streamed when someone is watching it form, so the plan appears as it is
+            # written rather than all at once after five to fifteen silent seconds.
             plan = await _agentaus_summarise(
-                client, plan_prompt(_last_user_text(body), body)
+                client, plan_prompt(_last_user_text(body), body),
+                on_piece=on_piece, stream=True if on_piece is not None else None,
             )
     except Exception as exc:
         rlog(logging.WARNING, "planning pass failed (%s); answering unplanned", exc)
@@ -896,13 +936,14 @@ def _partition_tool_calls(calls: list, known: set | None = None) -> tuple[list, 
     for call in calls:
         name = call.get("name") or ""
         if known:
-            resolved = _canonical(name, known | set(bridge_tools.BRIDGE_TOOLS))
+            pool = known | set(bridge_tools.BRIDGE_TOOLS)
+            resolved = _canonical(name, pool) or repair.resolve(name, pool)
             if resolved is None:
                 invented.append(call)
                 continue
             if resolved != name:
                 rlog(logging.INFO, "tool name %r resolved to %r", name, resolved)
-                call = {**call, "name": resolved}
+                call = {**call, "name": resolved, "asked_as": name}
                 name = resolved
         if name in bridge_tools.BRIDGE_TOOLS:
             mine.append(call)
@@ -937,7 +978,7 @@ def _tool_schemas(payload: dict) -> dict:
     return schemas
 
 
-def _validate_tool_calls(calls: list, schemas: dict) -> list:
+def _validate_tool_calls(calls: list, schemas: dict, cwd: str | None = None) -> list:
     """Fix what is unambiguously fixable; report what is not.
 
     Coerced arguments are written back onto the call, so a double-encoded payload is
@@ -950,6 +991,10 @@ def _validate_tool_calls(calls: list, schemas: dict) -> list:
         schema = schemas.get(call.get("name") or "")
         if not schema:
             continue
+        # Unambiguous slips first - a field under another name, a relative path - so
+        # they cost nothing rather than a correction round. See repair.py.
+        call["arguments"] = repair.repair(
+            call, call.get("asked_as") or call.get("name") or "", schema, cwd)["arguments"]
         fixed, problems = tool_schema.validate(call.get("arguments"), schema)
         if problems:
             broken.append((call, tool_schema.correction_for(
@@ -968,7 +1013,8 @@ def _with_coerced_calls(data: dict, calls: list) -> dict:
     The streaming path emits from the call dicts themselves, so writing back is enough
     there. This path emits from `data`, which the call dicts were only copied out of.
     """
-    repaired = {call.get("id"): call.get("arguments") for call in calls if call.get("id")}
+    # Names too: a call resolved from `read` to `Read` must reach the client as `Read`.
+    repaired = {call.get("id"): call for call in calls if call.get("id")}
     if not repaired:
         return data
     choices = list(data.get("choices") or [])
@@ -980,7 +1026,8 @@ def _with_coerced_calls(data: dict, calls: list) -> dict:
     for call in message.get("tool_calls") or []:
         if call.get("id") in repaired:
             function = dict(call.get("function") or {})
-            function["arguments"] = repaired[call["id"]]
+            function["arguments"] = repaired[call["id"]].get("arguments")
+            function["name"] = repaired[call["id"]].get("name") or function.get("name")
             call = {**call, "function": function}
         rebuilt.append(call)
     message["tool_calls"] = rebuilt
@@ -1178,20 +1225,81 @@ async def _run_bridge_tools(
     return _with_tool_results(payload, calls, results)
 
 
-def _last_user_text(body: dict) -> str:
-    """The most recent user message, as the request the review judges against."""
-    for message in reversed(body.get("messages") or []):
+def _head_and_tail(text: str, head: int, tail: int) -> str:
+    """The start and end of a long reply - where it says what it is, and how it ends."""
+    if len(text) <= head + tail:
+        return text
+    return text[:head] + f"\n[... {len(text) - head - tail} characters ...]\n" + text[-tail:]
+
+
+_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+
+
+def _without_reminders(text: str) -> str:
+    """The user's words, without Claude Code's <system-reminder> blocks.
+
+    Claude Code puts its own notes - the account email, commit attribution rules, which
+    tools have loaded - in the user message beside what the user typed. Handed to the
+    planner, reviewer or turn judge as "the request", they were read as part of the task.
+    """
+    return _REMINDER.sub("", text or "").strip()
+
+
+def _user_texts(body: dict) -> list:
+    out = []
+    for message in body.get("messages") or []:
         if message.get("role") != "user":
             continue
         content = message.get("content")
         if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = [b.get("text", "") for b in content
-                     if isinstance(b, dict) and b.get("type") == "text"]
-            if parts:
-                return "\n".join(parts)
-    return ""
+            text = _without_reminders(content)
+        elif isinstance(content, list):
+            text = _without_reminders("\n".join(
+                b.get("text", "") for b in content
+                if isinstance(b, dict) and b.get("type") == "text"))
+        else:
+            text = ""
+        if text:
+            out.append(text)
+    return out
+
+
+def _last_user_text(body: dict) -> str:
+    """The most recent thing the user actually said, as the request a pass judges against."""
+    texts = _user_texts(body)
+    return texts[-1] if texts else ""
+
+
+def _original_request(body: dict) -> str:
+    """What the conversation was started to do - the first thing the user said."""
+    texts = _user_texts(body)
+    return texts[0] if texts else ""
+
+
+# STALLED re-asks per conversation, across requests. The correction budget is per
+# request, and Claude Code sends a fresh request after every tool call - so a judge that
+# kept calling a finished turn stalled kept it going until the client's turn cap.
+# Observed: 76 re-asks in one benchmark run, and a session that had finished its task
+# pushed into writing notes into the user's Claude memory folder.
+_STALL_REASKS: "OrderedDict[str, int]" = OrderedDict()
+_STALL_REASK_LIMIT = 2
+
+
+def _stall_key(body: dict) -> str:
+    return hashlib.sha256((_original_request(body) + "\x00"
+                           + (working_directory_of(body) or "")).encode()).hexdigest()
+
+
+def _may_reask_stalled(body: dict) -> bool:
+    key = _stall_key(body)
+    used = _STALL_REASKS.get(key, 0)
+    if used >= _STALL_REASK_LIMIT:
+        return False
+    _STALL_REASKS[key] = used + 1
+    _STALL_REASKS.move_to_end(key)
+    while len(_STALL_REASKS) > 512:
+        _STALL_REASKS.popitem(last=False)
+    return True
 
 
 def _get_compactor(request: Request) -> ConversationCompactor:
@@ -1362,6 +1470,24 @@ async def _fit_to_window(
     return body
 
 
+# Failures Agentaus reports INSIDE a 200 response - an error chunk in the stream, or an
+# error object in the JSON - that say nothing about the request: its own backend
+# dropped. Observed 20 times in one benchmark day as "peer closed connection without
+# sending complete message body (incomplete chunked read)". Treated as final, each one
+# ended the turn with an error; Claude Code recovered only by falling back to a
+# non-streaming retry of the whole request.
+_TRANSIENT_IN_BAND = re.compile(
+    r"peer closed connection|incomplete chunked read|connection (?:reset|aborted|closed)|"
+    r"server disconnected|remote ?protocol|temporarily unavailable|overloaded|"
+    r"upstream connect error|timed? ?out|\b(?:502|503|504|520|521|522|523|524)\b",
+    re.I,
+)
+
+
+def _is_transient(text: str) -> bool:
+    return bool(_TRANSIENT_IN_BAND.search(text or "")) and not _is_over_length(text)
+
+
 def _is_over_length(text: str) -> bool:
     """Whether an upstream error is Agentaus reporting the prompt as too long."""
     lowered = (text or "").lower()
@@ -1436,6 +1562,17 @@ def _agentaus_headers() -> dict:
     }
 
 
+def _checks_apply(body: dict) -> bool:
+    """Whether the bridge's answer-rewriting passes may touch this request at all.
+
+    Only agent turns, which always carry tools. A tool-less request is Claude Code
+    talking to the model for its own purposes - classifying whether a turn is blocked,
+    naming the session - and the answer's exact shape is the point. See
+    AGENTAUS_REVIEW_TOOLLESS.
+    """
+    return bool(body.get("tools")) or settings.agentaus_review_toolless
+
+
 async def _handle_agentaus(
     request: Request, body: dict, model: str, wants_stream: bool
 ) -> Response:
@@ -1458,7 +1595,9 @@ async def _handle_agentaus(
     # re-planning it would pay for the same call again to get the same plan.
     plan_holder: dict = {"text": None}
 
-    async def prepare(current: dict, scale: float = 1.0) -> tuple[dict, dict]:
+    async def prepare(
+        current: dict, scale: float = 1.0, on_plan_piece=None, on_note=None
+    ) -> tuple[dict, dict]:
         """Fit to the window, add the guidance and the plan, and build the payload.
 
         Returns (body, payload). Compaction can take a minute or more on a long
@@ -1497,6 +1636,9 @@ async def _handle_agentaus(
 
         before = estimate_request_tokens(current)
         if before + reserved > int(limit * settings.agentaus_compact_threshold):
+            if on_note is not None:
+                on_note(f"compacting the earlier conversation to fit Agentaus' "
+                        f"{limit:,}-token window (~{before:,} tokens now)")
             with _Phase("compaction", f"est {before:,} tok, target {limit:,}"):
                 fitted = await _fit_to_window(
                     request, current, limit=limit, reserve=reserved, scale=scale
@@ -1511,6 +1653,12 @@ async def _handle_agentaus(
         # here rather than before compaction so the tool list travels with whatever
         # survived the fit; it costs ~250 tokens the estimate does not see, which is
         # immaterial against a 0.8 threshold.
+        if settings.agentaus_tool_focus:
+            fitted, dropped = focus_tools(fitted)
+            if dropped:
+                rlog(logging.INFO, "tool focus: offering %d tool(s), holding back %d (%s)",
+                     len(fitted.get("tools") or []), len(dropped), ", ".join(dropped)[:200])
+
         offered = []
         # Inventory first in the list as well as first in the workflow: a question about
         # a whole tree should start here, and a model reads the tools in order.
@@ -1541,7 +1689,7 @@ async def _handle_agentaus(
         if settings.agentaus_thinking and should_think(fitted):
             if plan_holder["text"] is None:
                 with _Phase("planning"):
-                    plan_holder["text"] = await _plan_turn(client, fitted)
+                    plan_holder["text"] = await _plan_turn(client, fitted, on_plan_piece)
             fitted = {**fitted, "system": with_plan(fitted.get("system"), plan_holder["text"])}
 
         built = anthropic_request_to_agentaus(
@@ -1633,7 +1781,8 @@ async def _handle_agentaus(
                 payload = _with_tool_results(
                     payload, invented, [_correction_for(c, known) for c in invented])
                 continue
-            broken = _validate_tool_calls(mine + _theirs, _tool_schemas(payload))
+            broken = _validate_tool_calls(mine + _theirs, _tool_schemas(payload),
+                                          working_directory_of(body))
             if broken and corrections < settings.agentaus_correction_rounds:
                 corrections += 1
                 rlog(logging.WARNING, "%d malformed tool call(s): %s; correcting",
@@ -1644,7 +1793,7 @@ async def _handle_agentaus(
             if broken:
                 rlog(logging.WARNING, "forwarding %d malformed tool call(s) - out of "
                      "rounds to correct them", len(broken))
-            data = _with_coerced_calls(data, calls)
+            data = _with_coerced_calls(data, mine + _theirs)
             if not mine:
                 if invented:
                     rlog(logging.WARNING, "dropping %d invented tool call(s) - out of "
@@ -1655,7 +1804,7 @@ async def _handle_agentaus(
                 rlog(logging.INFO, "running %d bridge tool call(s): %s",
                      len(mine), ", ".join(c["name"] for c in mine))
                 payload = await _run_bridge_tools(
-                    client, payload, mine, working_directory(body.get("system")), ran)
+                    client, payload, mine, working_directory_of(body), ran)
                 continue
             # Out of rounds with a bridge tool still pending. It must not reach Claude
             # Code, which has never heard of it and would fail the tool_use outright.
@@ -1693,6 +1842,7 @@ async def _handle_agentaus(
         # rewriting it would break the tool_use the client is waiting on.
         if (
             settings.agentaus_self_review
+            and _checks_apply(body)
             and not msg0.get("tool_calls")
             and worth_reviewing_turn(body)
             and worth_reviewing(msg0.get("content") or "",
@@ -1706,6 +1856,7 @@ async def _handle_agentaus(
 
         if (
             settings.agentaus_grounding_check
+            and _checks_apply(body)
             and not msg0.get("tool_calls")
             and not worth_reviewing_turn(body)
             and worth_grounding_check(
@@ -1754,7 +1905,48 @@ async def _handle_agentaus(
     # flow while the summarising happens.
     async def stream_with_compaction() -> AsyncIterator[bytes]:
         try:
-            prepared_body, prepared_payload = await prepare(body)
+            builder = None
+            streamed_plan = False
+            if settings.agentaus_live_draft and settings.agentaus_thinking_visible:
+                # The response starts NOW, and what preparation produces - the plan as it
+                # is written, a note when compaction starts - streams into a live
+                # thinking block. Before this the client saw nothing but pings until
+                # planning finished, so its token counter sat at zero for 5-15 seconds
+                # on every agent turn.
+                builder = AnthropicStreamBuilder(
+                    display_model, input_tokens=estimate_request_tokens(body),
+                    chunk_chars=settings.chunk_chars,
+                )
+                yield builder.start()
+                pieces: asyncio.Queue = asyncio.Queue()
+                seen_plan = []
+
+                def on_plan_piece(text: str) -> None:
+                    seen_plan.append(text)
+                    pieces.put_nowait(text)
+
+                def on_note(text: str) -> None:
+                    pieces.put_nowait(f"_{text}_\n\n")
+
+                work = asyncio.ensure_future(prepare(body, 1.0, on_plan_piece, on_note))
+                try:
+                    while not (work.done() and pieces.empty()):
+                        try:
+                            piece = await asyncio.wait_for(pieces.get(), timeout=0.25)
+                        except asyncio.TimeoutError:
+                            continue
+                        yield builder.live_thinking(piece)
+                finally:
+                    if not work.done():
+                        work.cancel()
+                prepared_body, prepared_payload = work.result()
+                streamed_plan = bool(seen_plan)
+                if plan_holder["text"] and not streamed_plan:
+                    # Planned, but the stream fell back to a buffered call: show it whole.
+                    yield builder.live_thinking(plan_holder["text"])
+                    streamed_plan = True
+            else:
+                prepared_body, prepared_payload = await prepare(body)
 
             async def refit(scale: float) -> dict:
                 _, rebuilt = await prepare(prepared_body, scale)
@@ -1764,7 +1956,7 @@ async def _handle_agentaus(
                  estimate_request_tokens(prepared_body))
             async for chunk in _agentaus_event_stream(
                 client, prepared_payload, prepared_body, display_model, started, refit,
-                plan=plan_holder["text"],
+                plan=None if streamed_plan else plan_holder["text"], builder=builder,
             ):
                 yield chunk
         except asyncio.CancelledError:
@@ -1802,14 +1994,20 @@ async def _agentaus_event_stream(
     started: float,
     refit=None,
     plan: str | None = None,
+    builder: AnthropicStreamBuilder | None = None,
 ) -> AsyncIterator[bytes]:
-    """Produce a valid Anthropic SSE stream from an Agentaus response."""
-    builder = AnthropicStreamBuilder(
-        model,
-        input_tokens=estimate_request_tokens(original),
-        chunk_chars=settings.chunk_chars,
-    )
-    yield builder.start()
+    """Produce a valid Anthropic SSE stream from an Agentaus response.
+
+    `builder` is passed when the response has already started - message_start sent and
+    the plan streamed live - so this continues it rather than beginning a second one.
+    """
+    if builder is None:
+        builder = AnthropicStreamBuilder(
+            model,
+            input_tokens=estimate_request_tokens(original),
+            chunk_chars=settings.chunk_chars,
+        )
+        yield builder.start()
 
     # The plan leads the message, where a native thinking block would. Emitted before
     # the upstream call rather than after it, so the user sees the model's reasoning
@@ -1830,8 +2028,29 @@ async def _agentaus_event_stream(
     # stream to fail-fast from that point on.
     # Buffer the answer when it may need revising. Tool turns are never buffered:
     # they carry no prose to review and the client is waiting on the tool_use.
-    buffering = settings.agentaus_self_review
+    # Held back only when a check may rewrite it; anything else streams as it arrives.
+    buffering = settings.agentaus_self_review and _checks_apply(original)
     pending: list[str] = []
+
+    # While the answer is held back, its tokens still go to the client as they arrive,
+    # in a thinking block - see AnthropicStreamBuilder.live_thinking.
+    live = buffering and settings.agentaus_live_draft
+    live_started = False
+
+    def draft(text: str) -> bytes:
+        nonlocal live_started
+        if not live or not text:
+            return b""
+        if not live_started:
+            live_started = True
+            lead = "\n\n" if builder.open_kind == "thinking" else ""
+            text = lead + "_Live draft from Agentaus. The checked answer follows._\n\n" + text
+        return builder.live_thinking(text)
+
+    def progress(note: str) -> bytes:
+        # A line in the draft saying what the bridge is doing between upstream calls, so
+        # a long search reads as work in progress rather than a stalled turn.
+        return draft(f"\n\n_{note}_\n\n") if live else b""
 
     # Tracks recompaction attempts driven by Agentaus rejecting the prompt as too long.
     fit_attempt = 0
@@ -1906,6 +2125,25 @@ async def _agentaus_event_stream(
                                 # without this branch the error is skipped and the turn
                                 # ends as an empty, successful-looking message.
                                 if isinstance(chunk.get("error"), dict):
+                                    message = str(chunk["error"].get("message") or "")
+                                    # Nothing final has reached the client yet, so both
+                                    # of these can be replayed invisibly.
+                                    if (not emitted and _is_transient(message)
+                                            and attempt < settings.max_retries):
+                                        rlog(logging.WARNING, "agentaus in-band transient "
+                                             "error, retrying: %s", message[:200])
+                                        retry_reason = f"upstream dropped ({message[:60]})"
+                                        break
+                                    if (not emitted and _is_over_length(message)
+                                            and refit is not None
+                                            and fit_attempt < settings.agentaus_fit_attempts):
+                                        _learn_limit_from(message)
+                                        fit_attempt += 1
+                                        fit_scale *= settings.agentaus_fit_shrink
+                                        payload = await refit(fit_scale)
+                                        retry_reason = (f"prompt too long (in-band), "
+                                                        f"refitting to {fit_scale:.0%}")
+                                        break
                                     yield builder.error(
                                         _agentaus_error_text(chunk["error"]),
                                         chunk["error"].get("type") or "api_error",
@@ -1923,10 +2161,12 @@ async def _agentaus_event_stream(
                                     if text:
                                         if buffering:
                                             # Held back rather than streamed: an answer
-                                            # already on screen cannot be revised. Agentaus
-                                            # sends its reply in one piece anyway, so this
-                                            # costs little in practice.
+                                            # already on screen cannot be revised. Its
+                                            # tokens are still shown live, as a draft.
                                             pending.append(text)
+                                            live_bytes = draft(text)
+                                            if live_bytes:
+                                                yield live_bytes
                                         else:
                                             emitted = True
                                             yield builder.text(text)
@@ -1964,6 +2204,9 @@ async def _agentaus_event_stream(
                     if message.get("content"):
                         if buffering:
                             pending.append(message["content"])
+                            live_bytes = draft(message["content"])
+                            if live_bytes:
+                                yield live_bytes
                         else:
                             emitted = True
                             yield builder.text(message["content"])
@@ -1982,6 +2225,8 @@ async def _agentaus_event_stream(
                 retry_reason = _describe(exc)
 
             if retry_reason:
+                if live_started:
+                    yield progress(f"retrying: {retry_reason}")
                 await _sleep_before_retry(attempt, retry_reason)
                 attempt += 1
                 continue
@@ -2003,6 +2248,9 @@ async def _agentaus_event_stream(
             corrections += 1
             rlog(logging.WARNING, "model invented %d tool name(s): %s; correcting",
                  len(invented), ", ".join(c["name"] for c in invented))
+            rlog(logging.INFO, "invented call(s) as sent: %s",
+                 "; ".join(f"{c['name']}({str(c.get('arguments'))[:200]})" for c in invented))
+            yield progress("correcting a call to a tool that does not exist")
             payload = _with_tool_results(
                 payload, invented, [_correction_for(c, known) for c in invented])
             pending = []
@@ -2013,11 +2261,14 @@ async def _agentaus_event_stream(
         # A well-named call with malformed arguments is rejected by the client with a
         # wall of validator internals, which costs the turn and tells the model nothing.
         # Same budget as an invented name: it is the same class of mistake.
-        broken = _validate_tool_calls(mine + theirs, _tool_schemas(payload))
+        broken = _validate_tool_calls(mine + theirs, _tool_schemas(payload),
+                                      working_directory_of(original))
         if broken and corrections < settings.agentaus_correction_rounds:
             corrections += 1
             rlog(logging.WARNING, "%d malformed tool call(s): %s; correcting",
                  len(broken), "; ".join(m for _, m in broken)[:300])
+            rlog(logging.INFO, "malformed call(s) as sent: %s",
+                 "; ".join(f"{c['name']}({str(c.get('arguments'))[:200]})" for c, _ in broken))
             payload = _with_tool_results(
                 payload, [c for c, _ in broken], [m for _, m in broken])
             pending = []
@@ -2029,8 +2280,9 @@ async def _agentaus_event_stream(
             tool_round += 1
             rlog(logging.INFO, "running %d bridge tool call(s): %s",
                  len(mine), ", ".join(c["name"] for c in mine))
+            yield progress("running " + ", ".join(c["name"] for c in mine))
             payload = await _run_bridge_tools(
-                client, payload, mine, working_directory(original.get("system")), ran)
+                client, payload, mine, working_directory_of(original), ran)
             # Whatever the model said on its way to calling the tool is superseded by
             # the answer it is about to give with the result in hand, so it is dropped
             # rather than shown - otherwise the user reads "let me search..." followed
@@ -2045,6 +2297,7 @@ async def _agentaus_event_stream(
         # structural gate, so the call only happens when there is something to judge.
         answer_so_far = "".join(pending)
         is_refusal = False
+        turn_verdict = "answer"
         if (
             corrections < settings.agentaus_correction_rounds
             and could_be_a_refusal(
@@ -2057,22 +2310,37 @@ async def _agentaus_event_stream(
                 async with hold("refusal check", "urgent"):
                     verdict = await _agentaus_summarise(
                         client, CLASSIFY_REFUSAL_INSTRUCTION.format(
-                            answer=answer_so_far[:4000])
+                            request=_original_request(original)[:4000],
+                            ran=ledger.render(original.get("messages") or [], limit=40)
+                            or "(nothing yet)",
+                            answer=_head_and_tail(answer_so_far, 2500, 1500))
                     )
-                is_refusal = read_refusal_verdict(verdict)
+                turn_verdict = read_turn_verdict(verdict)
+                is_refusal = turn_verdict == "refusal"
             except Exception as exc:
                 # Cannot classify it, so forward it. Re-asking a good answer is worse
                 # than letting a bad one through: the user can repeat a turn.
                 rlog(logging.WARNING, "refusal check failed (%s); forwarding the answer",
                      exc)
 
-        if is_refusal:
+        if turn_verdict == "stalled" and not _may_reask_stalled(original):
+            rlog(logging.WARNING, "judged stalled again, but this conversation has used "
+                 "its %d re-asks; forwarding the reply", _STALL_REASK_LIMIT)
+            turn_verdict = "answer"
+        if is_refusal or turn_verdict == "stalled":
             corrections += 1
-            rlog(logging.WARNING,
-                 "model refused to use tools it has; correcting and re-asking")
+            if is_refusal:
+                rlog(logging.WARNING,
+                     "model refused to use tools it has; correcting and re-asking")
+            else:
+                rlog(logging.WARNING,
+                     "model announced a step and stopped; asking it to take the step")
+            yield progress("re-asking: the reply " + (
+                "declined to use its tools" if is_refusal else "announced a step it did not take"))
+            correction = (REFUSAL_CORRECTION if is_refusal else STALLED_CORRECTION).format()
             payload = {**payload, "messages": list(payload.get("messages") or []) + [
                 {"role": "assistant", "content": "".join(pending)[:2000]},
-                {"role": "user", "content": REFUSAL_CORRECTION},
+                {"role": "user", "content": correction},
             ]}
             pending = []
             continue
@@ -2115,6 +2383,8 @@ async def _agentaus_event_stream(
         pending = [answer]
 
     if buffering and answer:
+        if live_started and not theirs:
+            yield progress("checking the answer")
         if not theirs and worth_reviewing_turn(original) and worth_reviewing(
             answer, min_chars=settings.agentaus_review_min_chars
         ):

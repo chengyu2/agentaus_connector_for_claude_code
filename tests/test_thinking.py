@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import unittest
+from xml_style import setUpModule, tearDownModule  # noqa: E402,F401
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -200,13 +201,22 @@ class TestBridgeToolsNeverReachTheClient(unittest.TestCase):
         `open_file`, which nobody had offered it. Passing that to Claude Code fails a
         tool_use for a tool that does not exist, and the turn dies looking like a
         bridge fault."""
+        # `open_file` itself is now resolved to `Read` (repair.py), so the made-up
+        # name here is one that cannot mean any offered tool.
         mine, theirs, invented = _partition_tool_calls([
-            {"id": "1", "name": "open_file", "arguments": "{}"},
+            {"id": "1", "name": "summon_the_oracle", "arguments": "{}"},
             {"id": "2", "name": "Read", "arguments": "{}"},
         ], {"Read", tools.SEARCH_TOOL})
         self.assertEqual(mine, [])
         self.assertEqual([c["id"] for c in theirs], ["2"])
         self.assertEqual([c["id"] for c in invented], ["1"])
+
+    def test_a_name_that_can_only_mean_one_offered_tool_is_resolved(self):
+        mine, theirs, invented = _partition_tool_calls([
+            {"id": "1", "name": "open_file", "arguments": "{}"},
+        ], {"Read", tools.SEARCH_TOOL})
+        self.assertEqual(invented, [])
+        self.assertEqual([c["name"] for c in theirs], ["Read"])
 
     def test_nothing_is_called_invented_when_the_offered_set_is_unknown(self):
         """Without the list actually sent upstream, nothing can be judged invented -
@@ -751,10 +761,17 @@ class TestRefusalClassification(unittest.TestCase):
             "ability to search local file system paths.",
             tools_offered=True, called_a_tool=False))
 
-    def test_a_long_answer_is_an_answer(self):
-        """No call is spent on something that is evidently a real reply."""
-        self.assertFalse(self.gate("Here are the headings. " * 200,
+    def test_a_very_long_answer_is_an_answer(self):
+        """No call is spent on something that is evidently a real reply. The line used to
+        sit at 1,200 characters; the benchmark found a turn that printed a whole R script
+        instead of writing and running it, which a length gate cannot tell from an answer
+        and a judge shown the request can. So only the truly enormous skip it now."""
+        self.assertFalse(self.gate("Here are the headings. " * 1000,
                                    tools_offered=True, called_a_tool=False))
+
+    def test_a_script_printed_instead_of_written_is_judged(self):
+        printed = "**pareto.R**\n\n```r\nlibrary(readxl)\n" + "x <- 1\n" * 400 + "```"
+        self.assertTrue(self.gate(printed, tools_offered=True, called_a_tool=False))
 
     def test_an_empty_reply_is_not_classified(self):
         self.assertFalse(self.gate("", tools_offered=True, called_a_tool=False))

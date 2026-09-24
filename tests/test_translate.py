@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import unittest
+from xml_style import setUpModule, tearDownModule  # noqa: E402,F401
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

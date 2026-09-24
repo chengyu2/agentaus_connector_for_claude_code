@@ -100,6 +100,26 @@ class Settings:
     # Re-chunk buffered text so the terminal renders progressively. 0 disables.
     chunk_chars: int = field(default_factory=lambda: _int("BRIDGE_CHUNK_CHARS", 60))
 
+    # How the bridge lays out the prompts it writes for Agentaus: "markdown" (headings,
+    # lists, fenced blocks) or "xml" (the tagged layout it used before). See
+    # prompt_style.py. Claude turns are never touched either way.
+    agentaus_prompt_style: str = field(
+        default_factory=lambda: os.environ.get("AGENTAUS_PROMPT_STYLE", "markdown").strip().lower()
+    )
+
+    # Stream Agentaus' tokens to the client as they arrive, in a thinking block, while
+    # the bridge holds the answer back for its checks. Without it the client's token
+    # counter sits still for the whole generation and the checked answer lands at once.
+    agentaus_live_draft: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_LIVE_DRAFT", True)
+    )
+
+    # Offer Agentaus the coding tools plus anything the user names or already used,
+    # rather than every tool the client sends (26, ~30k tokens, in Claude Code 2.1.278).
+    agentaus_tool_focus: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_TOOL_FOCUS", True)
+    )
+
     # --- timeouts -----------------------------------------------------------------
     connect_timeout: float = field(default_factory=lambda: float(_int("BRIDGE_CONNECT_TIMEOUT", 30)))
     # 1800 was half an hour of silence. A dead upstream connection - observed live,
@@ -539,6 +559,15 @@ class Settings:
     )
     agentaus_self_review: bool = field(
         default_factory=lambda: _bool("AGENTAUS_SELF_REVIEW", True)
+    )
+    # Review and grounding run on agent turns only - requests that offer tools. Claude
+    # Code's own utility calls offer none: the end-of-turn classifier that decides
+    # whether to notify you, title and summary generation. Each wants a short answer in
+    # an exact shape, and the review pass was observed rewriting the classifier's
+    # one-word verdict into a 3,951-character essay, twice, for 38 seconds a turn.
+    # true restores reviewing tool-less requests, for a harness that sends bare prompts.
+    agentaus_review_toolless: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_REVIEW_TOOLLESS", False)
     )
     # Answers shorter than this skip the review: they are usually acknowledgements.
     agentaus_review_min_chars: int = field(

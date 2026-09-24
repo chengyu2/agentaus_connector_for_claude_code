@@ -28,6 +28,8 @@ import logging
 import os
 import re
 
+from . import prompt_style
+
 log = logging.getLogger("agentaus-bridge")
 
 _FRONT_MATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.S)
@@ -121,14 +123,20 @@ def render(cwd: str | None, wanted: list[str]) -> str:
     if not chosen:
         return ""
     log.info("injecting skill(s): %s", ", ".join(n for n, _ in chosen))
+    lead = ("This project documents how work of this kind is done here. Follow it for this "
+            "turn; it is more specific than your general habits and it was written because "
+            "the obvious approach failed.")
+    if prompt_style.markdown():
+        # A skill is instructions written for the model, in Markdown already - so it goes
+        # in under headings, not fenced like data that must not be read as structure.
+        blocks = [f"### Skill: {name}\n\n{body}" for name, body in chosen]
+        return "\n\n## Applicable procedures\n\n" + lead + "\n\n" + "\n\n".join(blocks) + "\n"
     blocks = [
         f"<skill name=\"{name}\">\n{body}\n</skill>" for name, body in chosen
     ]
     return (
         "\n\n<applicable_procedures>\n"
-        "This project documents how work of this kind is done here. Follow it for this "
-        "turn; it is more specific than your general habits and it was written because "
-        "the obvious approach failed.\n\n"
+        + lead + "\n\n"
         + "\n\n".join(blocks)
         + "\n</applicable_procedures>\n"
     )
