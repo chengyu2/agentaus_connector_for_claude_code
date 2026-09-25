@@ -193,6 +193,12 @@ def html_to_text(html: str) -> str:
     line number still identifies it - while leaving the cell boundaries the regex flatten
     destroyed.
     """
+    # LibreOffice writes a <style> block into <head>; kept, it became the first 18 lines of
+    # every converted document - 1,845 characters of CSS around 150 of content in a
+    # three-row table - and went into every search chunk, citation and inventory
+    # headline taken from an office file.
+    html = re.sub(r"<(head|style|script)\b[^>]*>.*?</\1\s*>", "", html, flags=re.I | re.S)
+    html = re.sub(r"<!--.*?-->", "", html, flags=re.S)
     out: list[str] = []
     position = 0
     for table in re.finditer(r"<table[^>]*>(.*?)</table>", html, re.I | re.S):

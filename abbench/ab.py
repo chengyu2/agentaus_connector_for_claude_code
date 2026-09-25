@@ -49,8 +49,19 @@ DATA = HERE / "data"
 # Claude memory for the connector repo.
 RUNS = Path("/Users/cheng/agentaus_ab_runs")
 PEER_DATA = Path("/Users/cheng/agentaus-bench/data")      # read-only; files are copied
-CC = ("/Users/cheng/.vscode/extensions/anthropic.claude-code-2.1.278-darwin-arm64/"
-      "resources/native-binary/claude")
+def _newest_claude_code() -> str:
+    """The binary the installed VS Code extension ships - the newest one, since VS Code
+    updates the extension in place and leaves older versions behind."""
+    import glob
+    found = sorted(glob.glob(os.path.expanduser(
+        "~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude")),
+        key=lambda p: [int(x) for x in re.findall(r"claude-code-(\d+)\.(\d+)\.(\d+)", p)[0]])
+    if not found:
+        raise SystemExit("No Claude Code VS Code extension found under ~/.vscode/extensions")
+    return found[-1]
+
+
+CC = _newest_claude_code()
 PY = "/Users/cheng/agentaus_connector_for_claude_code/.venv/bin/python"
 
 ARMS = {
