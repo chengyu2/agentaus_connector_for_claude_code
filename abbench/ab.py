@@ -69,6 +69,10 @@ ARMS = {
     "agentaus_base": ("agentaus", 8795),
     "agentaus_tuned": ("agentaus", 8796),
     "agentaus_next": ("agentaus", 8797),    # frozen snapshot in /Users/cheng/agentaus_ab_snap
+    # Skills A/B: main as committed (a detached checkout in /Users/cheng/agentaus_ab_head)
+    # against the working tree with the skill listing restored.
+    "agentaus_head": ("agentaus", 8796),
+    "agentaus_skills": ("agentaus", 8797),
 }
 
 NETWORK = re.compile(r"\b(curl|wget|urllib|requests\.get|httpx|huggingface|github\.com|"

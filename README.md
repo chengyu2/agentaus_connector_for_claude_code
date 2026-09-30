@@ -305,6 +305,30 @@ for the main loop but send cheap background calls to Agentaus:
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="agentaus"
 ```
 
+### Subagents follow their session
+
+A subagent started from an Agentaus session did **not** run on Agentaus. Claude Code cannot
+"inherit" a custom model id for a subagent, so it asks for its default Claude model
+instead. Measured on 2.1.281: the main loop on `agentaus`, the Explore subagent it started
+on `claude-opus-5-5`, forwarded to Anthropic. The subagent's work and your Claude quota
+went to the model you had switched away from, and nothing said so.
+
+Claude Code marks a subagent's requests - an `x-claude-code-agent-id` header, and
+`cc_is_subagent=true` in the billing line of its system prompt - and every request carries
+`x-claude-code-session-id`, shared by a session and its subagents. So the bridge remembers
+which model each session's main loop used last and sends that session's subagents the same
+way:
+
+| Session's main loop | Its subagents go to |
+| --- | --- |
+| `/model agentaus` | Agentaus |
+| `/model opus` (or any Claude model) | Anthropic, exactly as before |
+
+Switching mid-session moves the subagents with you, so the toggle is untouched. Only a
+main-loop turn (tools offered, no agent id) records the session's model: a title or summary
+call cannot flip it. The log says `route=agentaus (subagent of an Agentaus session)` when
+it applies. Turn it off with `AGENTAUS_SUBAGENTS_FOLLOW_SESSION=false`.
+
 ---
 
 ## What happens when a conversation outgrows Agentaus
@@ -1181,6 +1205,25 @@ That is the price of not shredding correct arithmetic.
 **It does not fire on short answers.** `worth_grounding_check` has a 400-character floor,
 and a turn that replies with a JSON object clears neither it nor any need for it.
 
+### The bridge's own tools are evidence too
+
+The same rule was broken a second time, by a blind spot in where the evidence came from.
+The ledger is built from the message list Claude Code sends, and **bridge tool calls never
+enter that list** - `agentaus_search`, `agentaus_zoom` and the rest run inside the turn.
+Two passes judged answers without seeing them:
+
+- **Grounding stripped a correct fact.** An answer stating `CACHE_TTL_SECONDS = 600` in
+  `src/config.py`, read by `agentaus_zoom` a minute earlier, was judged to *"need a tool read
+  of src/config.py"* and rewritten to *"I have not read it"*. The live draft had been right.
+- **Self-review invented an answer.** A turn that used only bridge tools looked like a
+  prose turn, so it went to self-review, which sees only the request and the answer. An
+  answer citing `src/retry.py` lines 7-9, just zoomed, was "revised" into a description of
+  urllib3's `Retry.get_backoff_time()` - from memory, in a project with no urllib3 in it.
+
+Both are fixed the same way. Every bridge tool result from the turn (already kept to catch
+repeated calls) is rendered into the evidence alongside the ledger. A turn that used any
+bridge tool goes to the grounding check, never to the evidence-blind self-review.
+
 ---
 
 ## Truncated tool output is read back from disk
@@ -1352,6 +1395,61 @@ Parsed skills are cached against the skills directory's mtime. This is disk work
 request path, and the commit that moved search into worker threads established that such
 work must not block the event loop - 0.22ms for ten skills, 0.005ms once cached.
 
+### Routing: "if this, use that"
+
+Why the model would not choose was found on Claude Code 2.1.281, which sends a **project**
+skill as a bare name - `- find-in-code`, no description - for every model. Opus picks the
+right skill from the name alone. Agentaus cannot choose between names it has no purpose
+for, and restoring the descriptions inside Claude Code's list did not move it either: the
+list is the last thing in a long system prompt, and the planner never saw it at all.
+
+So the bridge now does three things when `Skill` or `Agent` is on the wire
+(`AGENTAUS_SKILL_ROUTING`, on by default):
+
+1. **Descriptions go back into the listing**, read from each skill's own front matter.
+2. **A "Skills and subagents" section is added to the guidance**: one line per skill and
+   agent type, built from the description's own *"Use when ..."* clause:
+
+   ```
+   - If a question involves a .docx, .xlsx, .pptx or .pdf ... → `Skill` with `skill: "read-documents"`
+   - If answering means sweeping many files ... → `Agent` with `subagent_type: "Explore"`
+   - If none of these fits → no skill or subagent; use your tools directly
+   ```
+
+   It opens with the budget: **there is no API or token limit on this model**, so loading a
+   skill or starting a subagent costs nothing that matters.
+3. **The planner gets the same lines and must begin with its choice** - `Skill: <name>` or
+   `Skill: none`, and `Agent: <type>` or `Agent: none` - so the decision is made, not
+   skipped.
+
+A loaded skill needed one more fix. Claude Code's tool result says only *"Launching skill:
+read-documents"* and the procedure follows as a plain message. Agentaus passed a `.docx`
+path as the skill's argument, expected the document back, got instructions, did not follow
+them, and loaded the same skill three more times. The bridge now heads a loaded skill
+*"Procedure to follow now"* and says it is instructions, not a result; a repeat load is told
+it is already in the conversation.
+
+### The bridge's own skill library
+
+`agentaus_bridge/skill_library/` holds skills adapted from Anthropic's Apache-2.0
+plugins (attribution in its `NOTICE`), rewritten for this model in annotated Markdown:
+
+| Skill | Adapted from |
+| --- | --- |
+| `thorough-code-review` | `code-review`, and `pr-review-toolkit`'s six review lenses as parallel subagents |
+| `feature-development` | `feature-dev`: explore, design, build, review, with subagents per phase |
+| `simplify-code` | `code-simplifier` |
+| `secure-coding` | `security-guidance`'s dangerous-pattern catalogue, with a scanner script |
+| `git-commit-and-pr` | `commit-commands` |
+| `math-reasoning` | `math-olympiad`, refocused on everyday quantitative questions |
+| `skill-authoring` | `skill-creator` and `plugin-dev`, with a spec validator script |
+
+Claude Code has never heard of them, so the bridge serves them itself
+(`AGENTAUS_SKILL_LIBRARY`, on by default). It adds them to the listing, after the project's
+own skills and before Claude Code's bundled ones, and runs any `Skill` call that names one
+like its own tools. They reach every project, including one with no `.claude/skills`, and
+Claude sessions never see them. A project skill with the same name stays the project's.
+
 ### Keeping them from doubling up with the tools
 
 A tool is a **capability**; a skill is **when to reach for it and how to know you are
@@ -1428,6 +1526,9 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_RESTORE_MAX_BYTES` | `400000` | Ceiling on what is read back |
 | `AGENTAUS_THINKING` | `true` | Plan the turn in a separate call before answering it |
 | `AGENTAUS_THINKING_VISIBLE` | `true` | Show that plan as a thinking block. `false` still uses it, but does not display it |
+| `AGENTAUS_SKILL_ROUTING` | `true` | Restore project skill descriptions, add the "if this, use that" section for skills and agent types, and have the planner name its choice. See [Routing](#routing-if-this-use-that) |
+| `AGENTAUS_SKILL_LIBRARY` | `true` | Offer the bridge's own skill library to Agentaus in every project and answer `Skill` calls for it |
+| `AGENTAUS_SUBAGENTS_FOLLOW_SESSION` | `true` | A subagent runs on the model its session's main loop is on. Off, an Agentaus session's subagents go to Claude |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | `127.0.0.1` / `8787` | Listen address |
 | `BRIDGE_PASSTHROUGH` | `true` | Forward non-Agentaus models to Anthropic; `false` answers them with Agentaus instead |
 | `ANTHROPIC_UPSTREAM_BASE_URL` | `https://api.anthropic.com` | Passthrough target |

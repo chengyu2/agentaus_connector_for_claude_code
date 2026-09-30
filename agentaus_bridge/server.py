@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import documents
 from . import harmony
 from . import persisted
+from . import sessions
 from . import prompt_style
 from . import repair
 from . import syntax
@@ -46,6 +47,8 @@ from .augment import (
     STRIP_UNGROUNDED_INSTRUCTION,
     could_be_a_refusal,
     focus_tools,
+    with_library_skills,
+    with_skill_descriptions,
     grounding_verdict,
     worth_grounding_check,
     read_refusal_verdict,
@@ -204,6 +207,27 @@ def _client_authorised(request: Request) -> bool:
 # Main entrypoint
 # --------------------------------------------------------------------------------------
 
+def _route(request: Request, body: dict, model: str, *, main_loop: bool) -> tuple[bool, bool]:
+    """(send to Agentaus, because it is a subagent following its session).
+
+    By model id, as always - plus a subagent goes wherever its session's main loop last
+    went. See `agentaus_bridge.sessions` for why the model id alone sent Agentaus
+    sessions' subagents to Claude. Only a main-loop turn (tools offered, no agent id)
+    records the session's model: a title or summary call must not flip it.
+    """
+    by_model = settings.routes_to_agentaus(model) or not settings.passthrough_enabled
+    if not settings.agentaus_subagents_follow_session:
+        return by_model, False
+    session = sessions.session_of(request.headers)
+    if sessions.is_subagent(request.headers, body):
+        if not by_model and sessions.main_loop_on_agentaus(session):
+            return True, True
+        return by_model, False
+    if main_loop and body.get("tools"):
+        sessions.note_main_loop(session, by_model)
+    return by_model, False
+
+
 @app.post("/v1/messages")
 async def messages(request: Request) -> Response:
     if not _client_authorised(request):
@@ -217,7 +241,7 @@ async def messages(request: Request) -> Response:
 
     model = body.get("model") or ""
     wants_stream = bool(body.get("stream"))
-    to_agentaus = settings.routes_to_agentaus(model) or not settings.passthrough_enabled
+    to_agentaus, inherited = _route(request, body, model, main_loop=True)
 
     _request_id.set(_new_request_id())
     messages_in = len(body.get("messages") or [])
@@ -225,7 +249,8 @@ async def messages(request: Request) -> Response:
         logging.INFO,
         "recv model=%s route=%s stream=%s msgs=%d est=%d bytes=%d",
         model or "(none)",
-        "agentaus" if to_agentaus else "anthropic",
+        ("agentaus (subagent of an Agentaus session)" if inherited
+         else "agentaus" if to_agentaus else "anthropic"),
         wants_stream,
         messages_in,
         estimate_request_tokens(body),
@@ -248,7 +273,7 @@ async def count_tokens(request: Request) -> Response:
     except json.JSONDecodeError:
         body = {}
     model = body.get("model") or ""
-    if settings.routes_to_agentaus(model) or not settings.passthrough_enabled:
+    if _route(request, body, model, main_loop=False)[0]:
         # Agentaus exposes no tokenizer, so this is a char/4 estimate. It only feeds
         # Claude Code's context meter and auto-compact trigger, not billing.
         return JSONResponse({"input_tokens": estimate_request_tokens(body)})
@@ -699,8 +724,60 @@ async def _fix_syntax(client: httpx.AsyncClient, answer: str) -> str:
     return fixed.strip()
 
 
+def _grounding_applies(body: dict, answer: str, ran: dict | None) -> bool:
+    """Whether to check this answer against the evidence rather than self-review it.
+
+    A turn whose facts came from the bridge's own tools is a tool turn, even though no
+    client tool appears in the message list. Treated as a prose turn, it went to the
+    self-review, which sees only the request and the answer. Observed: an answer citing
+    `src/retry.py` lines 7-9, just read by `agentaus_zoom`, was "revised" into a
+    description of urllib3's `Retry.get_backoff_time()` - from memory, in a project that
+    does not contain urllib3.
+    """
+    minimum = settings.agentaus_review_min_chars
+    if ran:
+        return len((answer or "").strip()) >= minimum
+    return worth_grounding_check(body, answer, min_chars=minimum)
+
+
+def _bridge_evidence(ran: dict | None, *, result_chars: int = 2500,
+                     budget: int = 24000) -> str:
+    """What the bridge's own tools returned this turn, in the evidence ledger's shape.
+
+    The ledger is built from the message list Claude Code sent, and bridge tool calls
+    never enter it - they run inside the turn. So a fact found by `agentaus_search` or
+    read with `agentaus_zoom` looked unsupported. Observed: an answer stating
+    `CACHE_TTL_SECONDS = 600` in `src/config.py`, read by `agentaus_zoom` a minute
+    earlier, was judged to "need a tool read of src/config.py" and rewritten to "I have
+    not read it" - a correct, evidenced answer destroyed by the pass meant to protect it.
+    """
+    if not ran:
+        return ""
+    blocks: list[str] = []
+    spent = 0
+    for signature, result in reversed(list(ran.items())):
+        try:
+            key = json.loads(signature)
+        except ValueError:
+            key = {}
+        name = key.get("n") or "bridge tool"
+        args = json.dumps(key.get("a") or {}, default=str, ensure_ascii=False)[:200]
+        room = min(result_chars, max(0, budget - spent))
+        body = ledger.excerpt(result, room) if room and (result or "").strip() else ""
+        spent += len(body)
+        head = f"- {name}({args}) -> ok"
+        blocks.append(f"{head}\n  <output>\n{body}\n  </output>" if body else head)
+    blocks.reverse()
+    return (
+        f"\n[{len(ran)} bridge tool call(s) ran inside this turn on the agent's behalf - "
+        "searches and file reads. Each is followed by what it returned. A value that "
+        "appears in an <output> below IS supported: the agent read it there.]\n"
+        + "\n".join(blocks)
+    )
+
+
 async def _check_grounding(
-    client: httpx.AsyncClient, body: dict, answer: str
+    client: httpx.AsyncClient, body: dict, answer: str, bridge_ran: dict | None = None
 ) -> str:
     """Check an answer against what the turn actually ran, and strip what it cannot support.
 
@@ -717,7 +794,10 @@ async def _check_grounding(
     Returns the answer to use. Any failure returns the original: a broken check must never
     cost a good answer.
     """
-    ran = ledger.render_evidence(body.get("messages") or [], limit=60)
+    ran = "\n".join(part for part in (
+        ledger.render_evidence(body.get("messages") or [], limit=60),
+        _bridge_evidence(bridge_ran),
+    ) if part)
     if not ran:
         return answer
     try:
@@ -807,7 +887,8 @@ async def _plan_turn(client: httpx.AsyncClient, body: dict, on_piece=None) -> st
             # Streamed when someone is watching it form, so the plan appears as it is
             # written rather than all at once after five to fifteen silent seconds.
             plan = await _agentaus_summarise(
-                client, plan_prompt(_last_user_text(body), body),
+                client, plan_prompt(_last_user_text(body), body,
+                                    routing=settings.agentaus_skill_routing),
                 on_piece=on_piece, stream=True if on_piece is not None else None,
             )
     except Exception as exc:
@@ -920,7 +1001,9 @@ def _canonical(name: str, known: set) -> str | None:
     return None
 
 
-def _partition_tool_calls(calls: list, known: set | None = None) -> tuple[list, list, list]:
+def _partition_tool_calls(
+    calls: list, known: set | None = None, library: frozenset = frozenset()
+) -> tuple[list, list, list]:
     """Split tool calls into (bridge-owned, client-owned, invented).
 
     The third bucket is not defensive programming - it is a failure observed on the
@@ -945,11 +1028,30 @@ def _partition_tool_calls(calls: list, known: set | None = None) -> tuple[list, 
                 rlog(logging.INFO, "tool name %r resolved to %r", name, resolved)
                 call = {**call, "name": resolved, "asked_as": name}
                 name = resolved
-        if name in bridge_tools.BRIDGE_TOOLS:
+        if name in bridge_tools.BRIDGE_TOOLS or _is_library_skill_call(name, call, library):
             mine.append(call)
         else:
             theirs.append(call)
     return mine, theirs, invented
+
+
+def _is_library_skill_call(name: str, call: dict, library: frozenset) -> bool:
+    """A `Skill` call naming one of the library skills this request's listing was given.
+
+    Those are the bridge's to answer: Claude Code has never heard of them and would fail
+    the call. `library` is passed in, not read from a context variable - the streaming
+    path runs `prepare` as its own task, so a variable it set never reached this check.
+    """
+    if name != "Skill" or not library:
+        return False
+    arguments = call.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments or "{}")
+        except json.JSONDecodeError:
+            return False
+    skill = str((arguments or {}).get("skill") or "").strip()
+    return bool(skill) and skill in library
 
 
 def _correction_for(call: dict, known: set) -> str:
@@ -1594,6 +1696,8 @@ async def _handle_agentaus(
     # Written once and reused across refits: a refit recompacts the same turn, and
     # re-planning it would pay for the same call again to get the same plan.
     plan_holder: dict = {"text": None}
+    # The library skills prepare() offered - the calls the bridge must answer itself.
+    library_holder: dict = {"names": frozenset()}
 
     async def prepare(
         current: dict, scale: float = 1.0, on_plan_piece=None, on_note=None
@@ -1618,6 +1722,19 @@ async def _handle_agentaus(
         # answers from a fragment and fills the rest in. The client saved the real output
         # to disk and the bridge is on the same machine, so read it.
         current = await asyncio.to_thread(persisted.restore, current)
+
+        # Claude Code lists project skills by bare name; put back what each is for, so
+        # the model - and the planner, which reads the same listing - can choose one.
+        # Before fitting, so the window estimate counts the descriptions.
+        if settings.agentaus_skill_routing:
+            current, described = with_skill_descriptions(current)
+            if described:
+                rlog(logging.INFO, "skill listing: described %d project skill(s)", described)
+        if settings.agentaus_skill_library:
+            current, served = with_library_skills(current)
+            library_holder["names"] = served
+            if served:
+                rlog(logging.INFO, "skill listing: offered %d library skill(s)", len(served))
 
         # Condense oversized tool results BEFORE fitting. Order matters: this is what
         # decides whether compaction is needed at all, and compacting first would
@@ -1684,7 +1801,8 @@ async def _handle_agentaus(
         # Supplement the system prompt for Agentaus only. Claude turns never reach
         # here - they are forwarded untouched by _passthrough.
         if settings.agentaus_guidance:
-            fitted = {**fitted, "system": with_guidance(fitted.get("system"), fitted)}
+            fitted = {**fitted, "system": with_guidance(
+                fitted.get("system"), fitted, routing=settings.agentaus_skill_routing)}
 
         if settings.agentaus_thinking and should_think(fitted):
             if plan_holder["text"] is None:
@@ -1773,7 +1891,8 @@ async def _handle_agentaus(
             calls = _openai_calls(data)
             if not calls:
                 data, calls = _recover_harmony_calls(data)
-            mine, _theirs, invented = _partition_tool_calls(calls, known)
+            mine, _theirs, invented = _partition_tool_calls(
+                calls, known, library_holder["names"])
             if invented and corrections < settings.agentaus_correction_rounds:
                 corrections += 1
                 rlog(logging.WARNING, "model invented %d tool name(s): %s; correcting",
@@ -1844,6 +1963,7 @@ async def _handle_agentaus(
             settings.agentaus_self_review
             and _checks_apply(body)
             and not msg0.get("tool_calls")
+            and not ran
             and worth_reviewing_turn(body)
             and worth_reviewing(msg0.get("content") or "",
                                 min_chars=settings.agentaus_review_min_chars)
@@ -1858,13 +1978,10 @@ async def _handle_agentaus(
             settings.agentaus_grounding_check
             and _checks_apply(body)
             and not msg0.get("tool_calls")
-            and not worth_reviewing_turn(body)
-            and worth_grounding_check(
-                body, msg0.get("content") or "",
-                min_chars=settings.agentaus_review_min_chars,
-            )
+            and (ran or not worth_reviewing_turn(body))
+            and _grounding_applies(body, msg0.get("content") or "", ran)
         ):
-            grounded = await _check_grounding(client, body, msg0["content"])
+            grounded = await _check_grounding(client, body, msg0["content"], ran)
             if grounded != msg0.get("content"):
                 msg0 = {**msg0, "content": grounded}
                 data = {**data, "choices": [{**choice0, "message": msg0}]
@@ -1957,6 +2074,7 @@ async def _handle_agentaus(
             async for chunk in _agentaus_event_stream(
                 client, prepared_payload, prepared_body, display_model, started, refit,
                 plan=None if streamed_plan else plan_holder["text"], builder=builder,
+                library=library_holder["names"],
             ):
                 yield chunk
         except asyncio.CancelledError:
@@ -1995,6 +2113,7 @@ async def _agentaus_event_stream(
     refit=None,
     plan: str | None = None,
     builder: AnthropicStreamBuilder | None = None,
+    library: frozenset = frozenset(),
 ) -> AsyncIterator[bytes]:
     """Produce a valid Anthropic SSE stream from an Agentaus response.
 
@@ -2239,7 +2358,7 @@ async def _agentaus_event_stream(
                 pending = [cleaned] if cleaned.strip() else []
                 calls = recovered
         known = _known_tool_names(payload)
-        mine, theirs, invented = _partition_tool_calls(calls, known)
+        mine, theirs, invented = _partition_tool_calls(calls, known, library)
         if invented and corrections < settings.agentaus_correction_rounds:
             # Correct it and ask again rather than failing a tool the client cannot run.
             # Deliberately NOT charged to tool_round: a correction is the bridge fixing
@@ -2385,20 +2504,18 @@ async def _agentaus_event_stream(
     if buffering and answer:
         if live_started and not theirs:
             yield progress("checking the answer")
-        if not theirs and worth_reviewing_turn(original) and worth_reviewing(
+        if not theirs and not ran and worth_reviewing_turn(original) and worth_reviewing(
             answer, min_chars=settings.agentaus_review_min_chars
         ):
             answer = await _self_review(client, _last_user_text(original), answer)
         elif (
             not theirs
             and settings.agentaus_grounding_check
-            and worth_grounding_check(
-                original, answer, min_chars=settings.agentaus_review_min_chars
-            )
+            and _grounding_applies(original, answer, ran)
         ):
             # The turns review has to sit out are the turns where a claim can outrun the
             # evidence. This checks against the tools actually run instead of guessing.
-            answer = await _check_grounding(client, original, answer)
+            answer = await _check_grounding(client, original, answer, ran)
         yield builder.text(answer)
 
     for call in theirs:

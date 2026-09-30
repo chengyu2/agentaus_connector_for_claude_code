@@ -153,7 +153,7 @@ def _result_text(block: dict) -> str:
     return json.dumps(content, default=str) if content is not None else ""
 
 
-def _excerpt(text: str, budget: int) -> str:
+def excerpt(text: str, budget: int) -> str:
     text = (text or "").strip()
     if len(text) <= budget:
         return text
@@ -229,7 +229,7 @@ def render_evidence(
     for name, digest, outcome, output in reversed(shown):
         head = f"- {name}({digest}) -> {outcome}"
         room = min(result_chars, max(0, budget - spent))
-        body = _excerpt(output, room) if (output or "").strip() and room else ""
+        body = excerpt(output, room) if (output or "").strip() and room else ""
         if body:
             spent += len(body)
             blocks.append(f"{head}\n  <output>\n{body}\n  </output>")

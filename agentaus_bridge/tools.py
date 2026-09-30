@@ -124,6 +124,10 @@ INVENTORY_TOOL = "agentaus_inventory"
 BRIDGE_TOOLS = {SEARCH_TOOL, WEB_SEARCH_TOOL, INVESTIGATE_TOOL, ZOOM_TOOL,
                 INVENTORY_TOOL}
 
+# Claude Code's own tool name. A call to it is the bridge's only when it names a skill
+# from the bridge's library - see `skills.serve` and `server._is_library_skill_call`.
+LIBRARY_SKILL_TOOL = "Skill"
+
 
 INVENTORY_SCHEMA = {
     "name": INVENTORY_TOOL,
@@ -381,6 +385,8 @@ def _allowed_root(path: str) -> bool:
     roots = [r for r in settings.agentaus_search_roots.split(":") if r.strip()]
     if not roots:
         return True
+    from .skills import LIBRARY
+    roots.append(LIBRARY)       # the bridge's own skills are always readable
     resolved = os.path.realpath(path)
     return any(
         resolved == os.path.realpath(r) or resolved.startswith(os.path.realpath(r) + os.sep)
@@ -1471,6 +1477,10 @@ async def _execute(
     name: str, arguments: dict, call: Caller, default_path: str | None, limit: float
 ) -> str:
     try:
+        if name == LIBRARY_SKILL_TOOL:
+            from . import skills
+            from .translate import frame_skill_text
+            return frame_skill_text(skills.serve(str(arguments.get("skill") or "")))
         if name == SEARCH_TOOL:
             return await run_search(
                 str(arguments.get("query") or ""),

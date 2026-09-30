@@ -541,6 +541,26 @@ class Settings:
     agentaus_guidance: bool = field(
         default_factory=lambda: _bool("AGENTAUS_GUIDANCE", True)
     )
+    # Skill and subagent routing: put each project skill's description back into the
+    # listing (Claude Code 2.1.281 sends project skills by bare name), add a Markdown
+    # "if this -> use that" section for every skill and agent type offered, and have the
+    # planner name the skill it will load. Opus picks skills from bare names; Agentaus
+    # did not load one in any baseline run.
+    agentaus_skill_routing: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_SKILL_ROUTING", True)
+    )
+    # A subagent follows its session: started from an Agentaus session it runs on Agentaus,
+    # from a Claude session on Claude. Off, a subagent goes by the model id Claude Code
+    # gives it - which, for a session on `agentaus`, is a Claude model.
+    # Offer the bridge's own skill library (agentaus_bridge/skill_library, adapted from
+    # Anthropic's Apache-2.0 plugins) to Agentaus in every project, and answer `Skill`
+    # calls for it in the bridge. Claude sessions never see these.
+    agentaus_skill_library: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_SKILL_LIBRARY", True)
+    )
+    agentaus_subagents_follow_session: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_SUBAGENTS_FOLLOW_SESSION", True)
+    )
     # Have the model review its own answer and revise it when defects are found.
     # "What is wrong with this?" is a much easier question for a smaller model than
     # getting it right first time, which is what makes the extra round trip pay.

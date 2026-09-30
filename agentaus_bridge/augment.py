@@ -20,6 +20,7 @@ applying it where there is no gap would only add latency and noise.
 
 from __future__ import annotations
 
+import os
 import re
 import textwrap
 
@@ -213,12 +214,15 @@ _WHEN_TO_USE = {
         "can carry, so you are handed a truncated preview and answer from a fragment."
     ),
     "Skill": (
-        "Procedures written for this project: how to do a kind of task, and how to know "
-        "you have finished it. CHECK THIS FIRST on anything non-trivial - analysing "
-        "data, reading documents, surveying a repository, searching exhaustively - "
-        "because a procedure that exists and was not loaded is the most common reason a "
-        "capable attempt still produces the wrong shape of answer. Loading one costs a "
-        "single call."
+        "Loads a written procedure for one kind of task. Check the \"Skills and "
+        "subagents\" section FIRST and load the skill it points to before any other tool. "
+        "It returns instructions, not results: then carry out its steps with your tools."
+    ),
+    "Agent": (
+        "Starts a subagent in a fresh context that returns only its conclusion - for a "
+        "broad sweep across many files, or independent parts of a task run in parallel. "
+        "Not for one lookup you can do in a single call. Leave `isolation` unset for "
+        "read-only work: a worktree is a clean checkout without the uncommitted changes."
     ),
     "TodoWrite": (
         "Use it FIRST on anything needing more than about three steps, and update it as "
@@ -254,7 +258,7 @@ def tool_selection(body: dict) -> str:
     # TodoWrite leads, whatever order the client sent. The same finding that put Grep's
     # restriction at the front of its description applies to the list itself: position
     # decides what gets picked, and the tool to reach for first should be read first.
-    _LEADS = {"Skill": 0, "TodoWrite": 1}
+    _LEADS = {"Skill": 0, "Agent": 1, "TodoWrite": 2}
     described.sort(key=lambda pair: _LEADS.get(pair[0], 2))
 
     closing = (
@@ -369,16 +373,29 @@ _MANY_STEPS_MIN = 5
 def _conversation_text(body: dict, limit: int = 20000) -> str:
     parts: list[str] = []
     for message in body.get("messages") or []:
+        # Claude Code's own notes are not the conversation. Since the skill listing
+        # carries descriptions, a note mentioning "CSV" fired the data gate on a question
+        # about retry code.
+        if message.get("role") == "system":
+            continue
         content = message.get("content")
-        if isinstance(content, str):
-            parts.append(content)
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(str(block.get("text") or ""))
+        texts = [content] if isinstance(content, str) else [
+            str(block.get("text") or "") for block in content or []
+            if isinstance(block, dict) and block.get("type") == "text"
+        ] if isinstance(content, list) else []
+        for text in texts:
+            # A loaded skill is not the conversation either: `read-documents` mentions
+            # `.xlsx`, and once loaded it fired the data gate on a question about a .docx.
+            if text.startswith("Base directory for this skill:"):
+                continue
+            parts.append(_REMINDERS.sub("", text))
         if sum(len(p) for p in parts) > limit:
             break
     return "\n".join(parts)[:limit]
+
+
+# Claude Code's reminders carry CLAUDE.md, memory and context - not what was asked.
+_REMINDERS = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 
 
 def skills_for(body: dict) -> list[str]:
@@ -398,7 +415,7 @@ def skills_for(body: dict) -> list[str]:
     return wanted
 
 
-def guidance_for(body: dict, *, covered_by_skill: tuple = ()) -> str:
+def guidance_for(body: dict, *, covered_by_skill: tuple = (), routing: bool = True) -> str:
     """The notes that apply to this request.
 
     Tool discipline is included only when the request actually offers tools. Sending it
@@ -418,10 +435,207 @@ def guidance_for(body: dict, *, covered_by_skill: tuple = ()) -> str:
     # The skill is the more specific of the two, so the inline notes stand down for it.
     if ran_an_analysis(body) and "analyse-data" not in covered_by_skill:
         notes += ANALYSIS_GUIDANCE
-    return prompt_style.headings(notes) + tool_selection(body)
+    routed = routing_section(body) if routing else ""
+    return prompt_style.headings(notes) + routed + tool_selection(body)
 
 
-def with_guidance(system, body: dict | None = None) -> object:
+def with_skill_descriptions(body: dict) -> tuple[dict, int]:
+    """`body` with every bare project-skill entry in its skill listing described.
+
+    The listing sits wherever this client version put it - `system`, or a `system`-role
+    entry in `messages` - so both are rewritten. Returns (body, entries filled).
+    """
+    from .translate import system_notes
+    cwd = working_directory_of(body)
+    root = cwd if cwd and os.path.isdir(os.path.join(cwd, ".claude", "skills")) else None
+    if root is None:
+        probe = "\n".join([_as_text(body.get("system"))] + system_notes(body))
+        root = skills.locate(probe, body)
+    descriptions = skills.described(root) if root else {}
+    if not descriptions:
+        return body, 0
+
+    filled = 0
+
+    def fix(text: str) -> str:
+        nonlocal filled
+        text, n = skills.describe_listing(text, descriptions)
+        filled += n
+        return text
+
+    def fix_content(content):
+        if isinstance(content, str):
+            return fix(content)
+        if isinstance(content, list):
+            return [{**b, "text": fix(b["text"])}
+                    if isinstance(b, dict) and isinstance(b.get("text"), str) else b
+                    for b in content]
+        return content
+
+    out = dict(body)
+    if "system" in body:
+        out["system"] = fix_content(body["system"])
+    out["messages"] = [{**m, "content": fix_content(m.get("content"))}
+                       if m.get("role") == "system" else m
+                       for m in body.get("messages") or []]
+    return (out, filled) if filled else (body, 0)
+
+
+def with_library_skills(body: dict) -> tuple[dict, frozenset]:
+    """`body` with the bridge's library skills added to its skill listing.
+
+    Returns (body, the names added). Only those names are the bridge's to answer: a name
+    the client listed itself - a project skill of the same name - stays the client's.
+    Nothing is added when `Skill` is not on the wire, since nothing could load one.
+    """
+    offered = {t.get("name") for t in body.get("tools") or [] if isinstance(t, dict)}
+    library = skills.library()
+    if "Skill" not in offered or not library:
+        return body, frozenset()
+    listed = {name for name, _ in skill_listing(body)}
+    entries = [(name, about) for name, about in sorted(library.items()) if name not in listed]
+    if not entries:
+        return body, frozenset()
+    root = working_directory_of(body)
+    project = set(skills.described(root)) if root else set()
+    added: list[int] = []
+
+    def fix(text: str) -> str:
+        if added:
+            return text
+        text, n = skills.add_entries(text, entries, project)
+        if n:
+            added.append(n)
+        return text
+
+    def fix_content(content):
+        if isinstance(content, str):
+            return fix(content)
+        if isinstance(content, list):
+            return [{**b, "text": fix(b["text"])}
+                    if isinstance(b, dict) and isinstance(b.get("text"), str) else b
+                    for b in content]
+        return content
+
+    out = dict(body)
+    if "system" in body:
+        out["system"] = fix_content(body["system"])
+    out["messages"] = [{**m, "content": fix_content(m.get("content"))}
+                       if m.get("role") == "system" else m
+                       for m in body.get("messages") or []]
+    if not added:
+        return body, frozenset()
+    return out, frozenset(name for name, _ in entries)
+
+
+def _as_text(system) -> str:
+    if isinstance(system, str):
+        return system
+    return "\n".join(b.get("text", "") for b in system or []
+                     if isinstance(b, dict) and isinstance(b.get("text"), str))
+
+
+_AGENTS_HEAD = "Available agent types for the Agent tool:"
+_AGENT_ENTRY = re.compile(r"^- ([\w:.-]+):\s*(.*)$")
+
+# The part of a description that says WHEN, which is what a choice rests on.
+_USE_WHEN = re.compile(
+    r"(?:\bUse (?:this (?:skill|agent) |it )?(?:when(?:ever)?|if)\b|\bTriggers on\b|[\u2014;]\s*when\b)"
+    r"[:,]?\s*(.+)", re.I)
+
+# Most listed, fewest words: this is read before every turn by a model that handles a
+# long list of rules badly, so each entry is one line and the list is capped.
+_MAX_ROUTES_SKILLS = 28
+_MAX_ROUTES_AGENTS = 5
+_ROUTE_CHARS = 230
+
+
+def agent_listing(body: dict) -> list[tuple[str, str]]:
+    """The agent types this request offers, (name, description), in listed order."""
+    from .translate import system_notes
+    for text in [_as_text(body.get("system"))] + system_notes(body):
+        at = text.find(_AGENTS_HEAD)
+        if at < 0:
+            continue
+        entries, started = [], False
+        for line in text[at + len(_AGENTS_HEAD):].split("\n"):
+            entry = _AGENT_ENTRY.match(line)
+            if not entry:
+                if started and line.strip():
+                    break
+                continue
+            started = True
+            about = re.sub(r"\s*\(Tools:[^)]*\)\s*$", "", entry.group(2)).strip()
+            entries.append((entry.group(1), about))
+        if entries:
+            return entries
+    return []
+
+
+def _when(description: str) -> str:
+    """"asked where X is", from "... Use when asked where X is. ..." - the IF of a route."""
+    text = " ".join(description.split())
+    found = _USE_WHEN.search(text)
+    clause = found.group(1) if found else text
+    end = re.search(r"\.(?:\s|$)", clause)
+    clause = (clause[: end.start()] if end else clause).strip().rstrip(".")
+    if len(clause) > _ROUTE_CHARS:
+        clause = clause[:_ROUTE_CHARS].rsplit(" ", 1)[0] + " …"
+    if not found:
+        purpose = re.match(r"(?i)use (?:this (?:skill|agent) )?to\s+(.+)", clause)
+        if purpose:
+            return f"you need to {purpose.group(1)}"
+        return f"the task needs: {clause[:1].lower()}{clause[1:]}"
+    return clause
+
+
+def routes(body: dict) -> list[str]:
+    """One "If this -> use that" line per skill and agent type the request offers."""
+    offered = {t.get("name") for t in body.get("tools") or [] if isinstance(t, dict)}
+    lines = []
+    if "Skill" in offered:
+        for name, about in skill_listing(body)[:_MAX_ROUTES_SKILLS]:
+            if about:
+                lines.append(f"- If {_when(about)} \u2192 `Skill` with `skill: \"{name}\"`")
+    if "Agent" in offered:
+        for name, about in agent_listing(body)[:_MAX_ROUTES_AGENTS]:
+            if about:
+                lines.append(f"- If {_when(about)} \u2192 `Agent` with "
+                             f"`subagent_type: \"{name}\"`")
+        lines.append("- If the task splits into independent parts \u2192 one `Agent` call "
+                     "per part, all in the same turn, so they run in parallel")
+    return lines
+
+
+ROUTING_LEAD = """**Budget:** there is no API or token limit on this model. Loading a skill, starting a subagent, or running one more check costs nothing that matters here - so do it whenever it can make the result better. Only the quality of the result counts.
+
+- `Skill` loads a written procedure for one kind of task. It returns instructions, not results: once it is loaded, carry out its steps with your tools.
+- `Agent` starts a subagent in a fresh context. It returns only its conclusion, which keeps your own context free for the work.
+
+Before your first tool call, go down this list. If a line matches the request, do what it says first. If none matches, work directly with your tools."""
+
+
+def routing_section(body: dict) -> str:
+    """The "Skills and subagents" section: which skill or subagent a request calls for."""
+    lines = routes(body)
+    if not lines:
+        return ""
+    lines.append("- If none of these fits \u2192 no skill or subagent; use your tools directly")
+    return "\n" + prompt_style.section(
+        "skills_and_subagents", ROUTING_LEAD + "\n\n" + "\n".join(lines)) + "\n"
+
+
+def skill_listing(body: dict) -> list[tuple[str, str]]:
+    """The skills this request offers, (name, description), as the listing states them."""
+    from .translate import system_notes
+    for text in [_as_text(body.get("system"))] + system_notes(body):
+        entries = skills.listing(text)
+        if entries:
+            return entries
+    return []
+
+
+def with_guidance(system, body: dict | None = None, *, routing: bool = True) -> object:
     """Append the applicable operating notes, and any documented procedure, to the prompt.
 
     The procedure is injected rather than offered. See `agentaus_bridge.skills` for the
@@ -434,7 +648,7 @@ def with_guidance(system, body: dict | None = None) -> object:
     wanted = skills_for(body)
     root = skills.locate(system, body) if wanted else None
     present = tuple(n for n in wanted if n in skills.available(root)) if root else ()
-    notes = guidance_for(body, covered_by_skill=present)
+    notes = guidance_for(body, covered_by_skill=present, routing=routing)
     if present:
         notes += skills.render(root, list(present))
     if system is None:
@@ -908,7 +1122,7 @@ def _one_line(description) -> str:
     return (cut[: stop + 1] if stop > 80 else cut).rstrip() + " …"
 
 
-def plan_prompt(request: str, body: dict | None = None) -> str:
+def plan_prompt(request: str, body: dict | None = None, *, routing: bool = True) -> str:
     """The planning prompt for this turn, naming the tools that are actually available.
 
     The tool list is not decoration: a planner shown no tools plans to ask questions,
@@ -946,8 +1160,26 @@ def plan_prompt(request: str, body: dict | None = None) -> str:
             lines.append("<tools_available>\n" + "\n".join(entries)
                          + "\n</tools_available>\nUse these exact names and no others.")
 
+    # The skills, when `Skill` is on the wire. A planner that cannot see them plans the
+    # work from scratch, and the answer call then follows the plan rather than the
+    # procedure the project wrote for exactly this.
+    listed = routes(body) if routing else []
+    if listed:
+        lines.append(prompt_style.section(
+            "skills_and_subagents",
+            "If this \u2192 use that:\n\n" + "\n".join(listed) + "\n\n" + _SKILL_STEP))
+
     context = ("\n\n".join(lines) + "\n\n") if lines else ""
     return PLAN_INSTRUCTION.format(context=context, request=request[:12000])
+
+
+_SKILL_STEP = ("Begin the plan with these two lines, before anything else:\n\n"
+               "- `Skill: <name>` for the skill whose line matches the request, or "
+               "`Skill: none`\n"
+               "- `Agent: <type>` if part of the work should go to a subagent, or "
+               "`Agent: none`\n\n"
+               "A named skill is step 1 of the plan. There is no API or token limit, so "
+               "choose one whenever it fits.")
 
 
 def with_plan(system, plan: str) -> object:

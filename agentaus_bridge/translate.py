@@ -12,6 +12,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import re
 
 from .text import normalise_for_display
 from .tokens import calibrator, count_tokens
@@ -106,6 +108,36 @@ def _tool_result_payload(block: dict, tool_name: str = "") -> str:
     )
 
 
+# How Claude Code hands over a skill: the tool result says only "Launching skill: x", and
+# the procedure follows as a plain user message. Observed on Agentaus: it passed a .docx
+# path as the skill's argument, expecting the document back, got a procedure instead,
+# did not follow it, and called the same skill twice more. Nothing in the message says
+# the text is instructions to carry out - so the bridge says it.
+_SKILL_LOADED = re.compile(r"\ABase directory for this skill: (\S+)")
+_SKILL_AGAIN = re.compile(r"\ASkill /?([\w:.-]+) is already loaded above")
+
+
+def frame_skill_text(text: str) -> str:
+    """A loaded skill's text, labelled as a procedure to carry out now."""
+    if not isinstance(text, str):
+        return text
+    again = _SKILL_AGAIN.match(text)
+    if again:
+        return (text + f"\n\nThe `{again.group(1)}` procedure is already in this "
+                "conversation. Do not call `Skill` for it again: carry out its next step "
+                "with your tools.")
+    loaded = _SKILL_LOADED.match(text)
+    if not loaded:
+        return text
+    name = os.path.basename(loaded.group(1).rstrip("/"))
+    lead = (f"The `{name}` skill is loaded. What follows is its procedure: instructions "
+            "for you, not a result. Loading it did none of the work. Carry out its steps "
+            "now, with your tools, starting with the first, and do not load it again.")
+    if prompt_style.markdown():
+        return f"## Procedure to follow now: {name}\n\n{lead}\n\n{text}"
+    return f"<skill_procedure name=\"{name}\">\n{lead}\n\n{text}\n</skill_procedure>"
+
+
 def system_notes(body: dict) -> list:
     """The text of every `system`-role entry in `messages`, in order."""
     notes = []
@@ -175,7 +207,7 @@ def anthropic_request_to_agentaus(
             btype = block.get("type")
 
             if btype == "text":
-                text_parts.append(block.get("text", ""))
+                text_parts.append(frame_skill_text(block.get("text", "")))
             elif btype == "tool_use":
                 tool_calls.append(
                     {
