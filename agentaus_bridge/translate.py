@@ -12,10 +12,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import re
 
 from .text import normalise_for_display
 from .tokens import calibrator, count_tokens
 import uuid
+from . import prompt_style
 from typing import Any, Iterable
 
 # Anthropic stop_reason values keyed by the OpenAI finish_reason we receive.
@@ -94,15 +97,62 @@ def _tool_result_payload(block: dict, tool_name: str = "") -> str:
 
     if block.get("is_error"):
         return (
-            f'<tool_error tool="{tool_name or "unknown"}">\n{text}\n</tool_error>\n'
+            prompt_style.data("tool_error", text, tool=tool_name or "unknown") + "\n"
             f"That call failed. Do not treat its output as an answer."
         )
     return (
-        f'<tool_result tool="{tool_name or "unknown"}">\n{text}\n</tool_result>\n'
+        prompt_style.data("tool_result", text, tool=tool_name or "unknown") + "\n"
         f"The content above is the real output of your own {tool_name or 'tool'} call. "
         f"It is already here - use it to answer now, and never ask for it to be "
         f"provided, pasted or uploaded."
     )
+
+
+# How Claude Code hands over a skill: the tool result says only "Launching skill: x", and
+# the procedure follows as a plain user message. Observed on Agentaus: it passed a .docx
+# path as the skill's argument, expecting the document back, got a procedure instead,
+# did not follow it, and called the same skill twice more. Nothing in the message says
+# the text is instructions to carry out - so the bridge says it.
+_SKILL_LOADED = re.compile(r"\ABase directory for this skill: (\S+)")
+_SKILL_AGAIN = re.compile(r"\ASkill /?([\w:.-]+) is already loaded above")
+
+
+def frame_skill_text(text: str) -> str:
+    """A loaded skill's text, labelled as a procedure to carry out now."""
+    if not isinstance(text, str):
+        return text
+    again = _SKILL_AGAIN.match(text)
+    if again:
+        return (text + f"\n\nThe `{again.group(1)}` procedure is already in this "
+                "conversation. Do not call `Skill` for it again: carry out its next step "
+                "with your tools.")
+    loaded = _SKILL_LOADED.match(text)
+    if not loaded:
+        return text
+    name = os.path.basename(loaded.group(1).rstrip("/"))
+    lead = (f"The `{name}` skill is loaded. What follows is its procedure: instructions "
+            "for you, not a result. Loading it did none of the work. Carry out its steps "
+            "now, with your tools, starting with the first, and do not load it again.")
+    if prompt_style.markdown():
+        return f"## Procedure to follow now: {name}\n\n{lead}\n\n{text}"
+    return f"<skill_procedure name=\"{name}\">\n{lead}\n\n{text}\n</skill_procedure>"
+
+
+def system_notes(body: dict) -> list:
+    """The text of every `system`-role entry in `messages`, in order."""
+    notes = []
+    for message in body.get("messages") or []:
+        if message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            text = content
+        else:
+            text = "\n".join(b.get("text", "") for b in content or []
+                             if isinstance(b, dict) and b.get("type") == "text")
+        if text.strip():
+            notes.append(text.strip())
+    return notes
 
 
 def anthropic_request_to_agentaus(
@@ -114,7 +164,15 @@ def anthropic_request_to_agentaus(
     """Convert one Anthropic /v1/messages body into an Agentaus chat-completions body."""
     messages: list[dict] = []
 
-    system_text = _system_to_text(body.get("system"))
+    # Claude Code also sends `system`-role entries inside `messages` - the environment
+    # block with the working directory, and connector instructions that arrive once an
+    # MCP server connects. Passed through, they land AFTER the user's request, and the
+    # conversation then ends on a system note the model answers instead: observed, a
+    # finished task replied to with "I have not read the Claude Docs workflow you
+    # shared". They are context, so they join the system prompt, and the turn always
+    # ends on what the user actually said.
+    system_text = "\n\n".join(t for t in [_system_to_text(body.get("system"))]
+                               + system_notes(body) if t)
     if system_text:
         messages.append({"role": "system", "content": system_text})
 
@@ -128,6 +186,8 @@ def anthropic_request_to_agentaus(
     for message in body.get("messages", []) or []:
         role = message.get("role", "user")
         content = message.get("content")
+        if role == "system":
+            continue                    # hoisted into the system prompt above
 
         if isinstance(content, str):
             if content.strip():
@@ -147,7 +207,7 @@ def anthropic_request_to_agentaus(
             btype = block.get("type")
 
             if btype == "text":
-                text_parts.append(block.get("text", ""))
+                text_parts.append(frame_skill_text(block.get("text", "")))
             elif btype == "tool_use":
                 tool_calls.append(
                     {
@@ -480,6 +540,10 @@ class AnthropicStreamBuilder:
         self.chunk_chars = chunk_chars
         self.index = -1
         self.open_block = False
+        # What the open block is. A live draft is a thinking block that stays open while
+        # tokens arrive, so closing it needs a signature a text block does not.
+        self.open_kind: str | None = None
+        self._live: list[str] = []
         self.output_tokens = 0
         self.stop_reason = "end_turn"
         self._started = False
@@ -511,7 +575,44 @@ class AnthropicStreamBuilder:
         if not self.open_block:
             return b""
         self.open_block = False
-        return sse("content_block_stop", {"type": "content_block_stop", "index": self.index})
+        out = b""
+        if self.open_kind == "thinking":
+            out += sse("content_block_delta", {
+                "type": "content_block_delta", "index": self.index,
+                "delta": {"type": "signature_delta",
+                          "signature": _plan_signature("".join(self._live))},
+            })
+            self._live = []
+        self.open_kind = None
+        return out + sse("content_block_stop", {"type": "content_block_stop", "index": self.index})
+
+    def live_thinking(self, text: str) -> bytes:
+        """Stream `text` into a thinking block that stays open for more.
+
+        This is what makes the client's token counter move. The bridge holds an answer
+        back until its checks have run - review, grounding, syntax, tool-call repair - and
+        an answer already on screen cannot be revised. So the tokens stream here as they
+        arrive from Agentaus, visibly and immediately, and the checked answer follows as
+        ordinary text. Display only: nothing replays thinking blocks.
+        """
+        if not text:
+            return b""
+        out = b""
+        if not (self.open_block and self.open_kind == "thinking"):
+            out += self._close_open_block()
+            self.index += 1
+            self.open_block, self.open_kind = True, "thinking"
+            out += sse("content_block_start", {
+                "type": "content_block_start", "index": self.index,
+                "content_block": {"type": "thinking", "thinking": ""},
+            })
+        self._live.append(text)
+        out += sse("content_block_delta", {
+            "type": "content_block_delta", "index": self.index,
+            "delta": {"type": "thinking_delta", "thinking": text},
+        })
+        self.output_tokens += estimate_tokens(text)
+        return out
 
     def thinking(self, text: str) -> bytes:
         """Emit a complete thinking block: start, thinking_delta, signature, stop.
@@ -576,6 +677,8 @@ class AnthropicStreamBuilder:
         """
         if not text or not text.strip():
             return b""
+        if prompt_style.markdown():
+            return self.text(f"**Plan**\n\n{text.strip()}\n\n---\n\n")
         return self.text(f"<plan>\n{text.strip()}\n</plan>\n\n")
 
     def text(self, text: str) -> bytes:
@@ -583,9 +686,10 @@ class AnthropicStreamBuilder:
         if not text:
             return b""
         out = b""
-        if not self.open_block:
+        if not self.open_block or self.open_kind != "text":
+            out += self._close_open_block()
             self.index += 1
-            self.open_block = True
+            self.open_block, self.open_kind = True, "text"
             out += sse(
                 "content_block_start",
                 {

@@ -123,7 +123,7 @@ class ToolsDoNotBlockTheLoop(unittest.TestCase):
 
         with _SlowDocuments(0.3):
             ticks, result = run(scenario())
-        self.assertIn("<passage", result)
+        self.assertRegex(result, r"(?i)passage")
         self.assertGreater(ticks, 5)
 
 
@@ -136,14 +136,16 @@ class ToolDeadline(unittest.TestCase):
         settings.agentaus_tool_timeout_seconds = self._saved
 
     def test_a_runaway_tool_returns_a_result_saying_so(self):
+        # 40 files at 0.2s is 8s unstopped; the bound leaves room for a loaded machine
+        # without letting a tool that ignored its 0.3s deadline pass.
         root = _tree(40)
-        with _SlowDocuments(0.05):
+        with _SlowDocuments(0.2):
             started = time.monotonic()
             result = run(tools.execute("agentaus_inventory", {"path": root}, _no_model))
             elapsed = time.monotonic() - started
         self.assertIn("stopped after", result)
         self.assertIn("narrow `path`", result)
-        self.assertLess(elapsed, 1.5)
+        self.assertLess(elapsed, 3.0)
 
     def test_the_worker_thread_stops_too(self):
         # Cancelling the awaiting coroutine cannot stop a thread. Without the deadline

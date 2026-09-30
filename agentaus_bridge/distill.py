@@ -39,13 +39,14 @@ from typing import Awaitable, Callable
 from .compact import _chunk, normalise_identifiers
 from .gate import hold
 from .translate import estimate_tokens
+from .prompt_style import Template
 
 log = logging.getLogger("agentaus-bridge")
 
 Summariser = Callable[[str], Awaitable[str]]
 
 
-DISTIL_INSTRUCTION = """\
+DISTIL_INSTRUCTION = Template("""\
 <tool_call>
 name: {tool}
 input: {input}
@@ -84,10 +85,10 @@ ones, and never wrap an identifier in $$. Put identifiers in backticks.
 <output_format>
 The condensed output only. No tags.
 </output_format>
-"""
+""")
 
 
-MERGE_INSTRUCTION = """\
+MERGE_INSTRUCTION = Template("""\
 <pieces>
 {body}
 </pieces>
@@ -103,7 +104,7 @@ Add nothing.
 <output_format>
 The joined record only. No tags.
 </output_format>
-"""
+""")
 
 
 def _text_of(content) -> str:

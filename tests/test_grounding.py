@@ -182,3 +182,59 @@ class TestBashIsRestrictedForSearching(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestBridgeToolsCountAsEvidence(unittest.TestCase):
+    """Bridge tools run inside the turn and never enter the message list the ledger reads.
+    Observed: `CACHE_TTL_SECONDS = 600`, read by `agentaus_zoom` a minute earlier, judged
+    to "need a tool read of src/config.py" - and the correct answer rewritten to "I have
+    not read it". The check must see what the bridge's own tools returned."""
+
+    def _run(self, bridge_ran):
+        import asyncio
+        import json
+        from agentaus_bridge import server
+
+        prompts = []
+
+        async def fake_summarise(_client, prompt, **_kw):
+            prompts.append(prompt)
+            return "VERDICT: GROUNDED"
+
+        saved = server._agentaus_summarise
+        server._agentaus_summarise = fake_summarise
+        try:
+            body = {"messages": [{"role": "user", "content": "Is the TTL really 300s?"}]}
+            answer = asyncio.new_event_loop().run_until_complete(server._check_grounding(
+                None, body, "The TTL is 600 seconds (CACHE_TTL_SECONDS in src/config.py).",
+                bridge_ran))
+        finally:
+            server._agentaus_summarise = saved
+        return answer, prompts, json
+
+    def test_what_a_bridge_tool_read_reaches_the_checker(self):
+        import json
+        ran = {json.dumps({"n": "agentaus_zoom", "a": {"file_path": "src/config.py"}},
+                          sort_keys=True): "1\tCACHE_TTL_SECONDS = 600\n2\tREQUEST_TIMEOUT = 20"}
+        answer, prompts, _ = self._run(ran)
+        self.assertEqual(len(prompts), 1, "with bridge evidence alone, the check must still run")
+        self.assertIn("agentaus_zoom", prompts[0])
+        self.assertIn("CACHE_TTL_SECONDS = 600", prompts[0])
+        self.assertIn("600 seconds", answer)
+
+    def test_no_evidence_at_all_skips_the_check(self):
+        _, prompts, _ = self._run({})
+        self.assertEqual(prompts, [])
+
+
+class TestABridgeToolTurnIsNotSelfReviewed(unittest.TestCase):
+    """Observed: an answer citing `src/retry.py`, just read by `agentaus_zoom`, sent to the
+    evidence-blind self-review and "revised" into urllib3's backoff - from memory."""
+
+    def test_bridge_evidence_sends_the_answer_to_the_grounding_check(self):
+        from agentaus_bridge import server
+        prose_turn = {"messages": [{"role": "user", "content": "where is the backoff?"}]}
+        long_answer = "x" * (settings.agentaus_review_min_chars + 10)
+        self.assertTrue(server._grounding_applies(prose_turn, long_answer, {"k": "v"}))
+        self.assertFalse(server._grounding_applies(prose_turn, long_answer, {}))
+        self.assertFalse(server._grounding_applies(prose_turn, "short", {"k": "v"}))

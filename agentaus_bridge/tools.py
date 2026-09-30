@@ -31,6 +31,8 @@ from typing import Awaitable, Callable
 from . import documents
 from . import inventory
 from . import outline
+from . import prompt_style
+from .prompt_style import Template
 from .compact import _chunk, normalise_identifiers
 from .config import settings
 from .gate import hold
@@ -122,6 +124,10 @@ INVENTORY_TOOL = "agentaus_inventory"
 BRIDGE_TOOLS = {SEARCH_TOOL, WEB_SEARCH_TOOL, INVESTIGATE_TOOL, ZOOM_TOOL,
                 INVENTORY_TOOL}
 
+# Claude Code's own tool name. A call to it is the bridge's only when it names a skill
+# from the bridge's library - see `skills.serve` and `server._is_library_skill_call`.
+LIBRARY_SKILL_TOOL = "Skill"
+
 
 INVENTORY_SCHEMA = {
     "name": INVENTORY_TOOL,
@@ -161,6 +167,10 @@ async def run_inventory(path: str, glob: str | None, default_path: str | None = 
         return (f"agentaus_inventory needs an absolute path; got {path!r}.")
     if not os.path.exists(path):
         return f"No such path: {path}"
+    if whole_disk(path):
+        return (f"{path} is the whole disk, not a project. Pass the absolute path of the "
+                f"project or folder to search - the working directory, if you do not know "
+                f"which.")
     if not _allowed_root(path):
         return f"{path} is outside AGENTAUS_SEARCH_ROOTS, which this bridge is confined to."
     if os.path.isfile(path):
@@ -246,7 +256,7 @@ WEB_SEARCH_SCHEMA = {
 # Wrapping it in a tool turns a prompt convention into something the loop can call
 # deliberately, see the output of, and cite. The search itself still runs inside
 # Agentaus, so nothing leaves the sovereign path to answer it.
-WEB_SEARCH_INSTRUCTION = """\
+WEB_SEARCH_INSTRUCTION = Template("""\
 web search this: {query}
 
 <task>
@@ -259,7 +269,7 @@ this search was run to avoid.
 <output_format>
 Terse. Markdown. Each fact followed by its source URL. No preamble, no tags.
 </output_format>
-"""
+""")
 
 
 async def run_web_search(query: str, call: Caller) -> str:
@@ -375,6 +385,8 @@ def _allowed_root(path: str) -> bool:
     roots = [r for r in settings.agentaus_search_roots.split(":") if r.strip()]
     if not roots:
         return True
+    from .skills import LIBRARY
+    roots.append(LIBRARY)       # the bridge's own skills are always readable
     resolved = os.path.realpath(path)
     return any(
         resolved == os.path.realpath(r) or resolved.startswith(os.path.realpath(r) + os.sep)
@@ -414,7 +426,17 @@ _SKIP_DIR_SUFFIXES = (
 )
 
 
+# Operating-system trees. Never the user's material, and far too large to walk: a search
+# handed "/" by a model that did not know its working directory walked into
+# /Library/Apple and read installer receipts.
+_SYSTEM_DIRS = {"/System", "/Library", "/private", "/usr", "/bin", "/sbin", "/dev",
+                "/cores", "/opt", "/Volumes", "/etc", "/var", "/tmp", "/Applications",
+                "/proc", "/sys", "/boot", "/lib", "/lib64", "/snap", "/run"}
+
+
 def _skip_dir(directory: str, name: str) -> bool:
+    if os.path.join(directory, name) in _SYSTEM_DIRS and directory == "/":
+        return True
     if name in _SKIP_DIRS or name.startswith(".cache") or name == ".Trash":
         return True
     if name.lower().endswith(_SKIP_DIR_SUFFIXES):
@@ -436,6 +458,10 @@ def _truncation_note(count: int) -> str:
 def enumerate_files(path: str, glob: str | None = None) -> list[str]:
     """Readable text files under `path`, in a stable order."""
     return enumerate_files_bounded(path, glob)[0]
+
+
+def whole_disk(path: str) -> bool:
+    return os.path.realpath(path) in ("/", os.path.realpath(os.path.expanduser("~/..")))
 
 
 def enumerate_files_bounded(path: str, glob: str | None = None) -> tuple[list[str], bool]:
@@ -468,6 +494,8 @@ def enumerate_files_bounded(path: str, glob: str | None = None) -> tuple[list[st
             if glob and not fnmatch.fnmatch(name, glob):
                 continue
             full = os.path.join(directory, name)
+            if not documents.is_office_document(full) and looks_binary(full):
+                continue
             # Documents are measured on a different scale: a .pptx is mostly embedded
             # images, so its size on disk says nothing about how much text it holds.
             limit = (settings.agentaus_search_max_document_bytes
@@ -480,6 +508,22 @@ def enumerate_files_bounded(path: str, glob: str | None = None) -> tuple[list[st
                 continue
             found.append(full)
     return found, False
+
+
+def looks_binary(path: str) -> bool:
+    """Whether a file is binary whatever its name says.
+
+    The suffix list cannot know every binary format. Observed: a search that reached
+    /Library read macOS installer receipts (`.bom`) as text and sent the replacement
+    characters to Agentaus, which rejected each chunk with HTTP 400. A NUL byte in the
+    first 8 KB is the test `grep` and `git` use. Office documents and PDFs are read by
+    their extractors, so they never get here.
+    """
+    try:
+        with open(path, "rb") as handle:
+            return b"\x00" in handle.read(8192)
+    except OSError:
+        return False
 
 
 def read_text(path: str) -> str:
@@ -503,6 +547,8 @@ def read_text(path: str) -> str:
         return ""
     if documents.is_office_document(path) and documents.available(path):
         return documents.extract(path)
+    if looks_binary(path):
+        return ""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             return handle.read()
@@ -510,7 +556,7 @@ def read_text(path: str) -> str:
         return ""
 
 
-EXPAND_INSTRUCTION = """\
+EXPAND_INSTRUCTION = Template("""\
 A developer is searching a codebase for the answer to the question below.
 
 <question>
@@ -529,10 +575,10 @@ every file of every codebase and tells the search nothing.
 <output_format>
 5 to 10 terms, one per line, nothing else. No numbering, no explanation, no tags.
 </output_format>
-"""
+""")
 
 
-CHUNK_INSTRUCTION = """\
+CHUNK_INSTRUCTION = Template("""\
 <question>
 {query}
 </question>
@@ -554,10 +600,10 @@ If it does not: reply with exactly NONE and nothing else.
 <output_format>
 Either the quoted lines, or the single word NONE. No tags, no preamble.
 </output_format>
-"""
+""")
 
 
-MERGE_HITS_INSTRUCTION = """\
+MERGE_HITS_INSTRUCTION = Template("""\
 <question>
 {query}
 </question>
@@ -577,7 +623,7 @@ Add nothing that is not above.
 <output_format>
 The combined answer. No tags, no preamble.
 </output_format>
-"""
+""")
 
 
 async def expand_query(query: str, call: Caller) -> list[str]:
@@ -712,7 +758,7 @@ async def _aim_with_outline(
         return []
     picks = outline.read_picks(reply, candidates)
     log.info("outline: %d section(s) offered -> %d picked",
-             toc.count("<section "), len(picks))
+             toc.count("<section ") + toc.count("  - line "), len(picks))
     return picks[: settings.agentaus_search_max_sections]
 
 
@@ -844,6 +890,10 @@ async def run_search(
                 f"Pass the repository's absolute path as `path`.")
     if not os.path.exists(path):
         return f"No such path: {path}"
+    if whole_disk(path):
+        return (f"{path} is the whole disk, not a project. Pass the absolute path of the "
+                f"project or folder to search - the working directory, if you do not know "
+                f"which.")
     if not _allowed_root(path):
         return (
             f"{path} is outside AGENTAUS_SEARCH_ROOTS, which this bridge is confined to."
@@ -1029,7 +1079,7 @@ INVESTIGATE_LENSES = (
 )
 
 
-CORROBORATE_INSTRUCTION = """\
+CORROBORATE_INSTRUCTION = Template("""\
 Three independent searches were run over the same codebase to answer one question. Each \
 looked from a different angle and did not see the others' results.
 
@@ -1063,7 +1113,7 @@ Rules:
 <output_format>
 Markdown, with the two headings above. No tags.
 </output_format>
-"""
+""")
 
 
 async def run_investigate(
@@ -1375,11 +1425,12 @@ def _zoom(
              file_path, start, end, lo + 1, shown)
     complete = "true" if shown >= hi else "false"
     return (
-        f'<passage file="{file_path}" lines="{lo + 1}-{shown}" '
-        f'you_asked_for="{start}-{end}" section_ends_at="{hi}" '
-        f'verbatim="true" complete="{complete}">\n'
-        + numbered
-        + "\n</passage>\n"
+        prompt_style.data(
+            "passage", numbered, file=file_path, lines=f"{lo + 1}-{shown}",
+            you_asked_for=f"{start}-{end}", section_ends_at=hi, verbatim="true",
+            complete=complete,
+        )
+        + "\n"
         + ("Every line above is exact - nothing summarised or reworded, so quote freely."
            if complete == "true" else
            f"Every line above is exact - nothing summarised or reworded, so quote freely. "
@@ -1426,6 +1477,10 @@ async def _execute(
     name: str, arguments: dict, call: Caller, default_path: str | None, limit: float
 ) -> str:
     try:
+        if name == LIBRARY_SKILL_TOOL:
+            from . import skills
+            from .translate import frame_skill_text
+            return frame_skill_text(skills.serve(str(arguments.get("skill") or "")))
         if name == SEARCH_TOOL:
             return await run_search(
                 str(arguments.get("query") or ""),

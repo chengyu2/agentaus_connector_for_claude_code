@@ -211,7 +211,13 @@ class TestStreamingRetry(_RetryTestBase):
         body = response.text
 
         self.assertEqual(STATE["calls"], 1, "must not replay a stream that already emitted text")
-        self.assertEqual(body.count("partial "), 1, "text was duplicated by a retry")
+        # Counted in the answer's text deltas only: the live draft (a thinking block)
+        # shows the same tokens as they arrived, which is display, not duplication.
+        answer = "".join(
+            json.loads(line[5:])["delta"]["text"] for line in body.splitlines()
+            if line.startswith("data:") and '"text_delta"' in line
+        )
+        self.assertEqual(answer.count("partial "), 1, "text was duplicated by a retry")
         # The turn still has to terminate cleanly or Claude Code hangs on the stream.
         self.assertIn("message_stop", body)
 

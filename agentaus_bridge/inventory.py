@@ -26,6 +26,7 @@ from collections import Counter, defaultdict
 
 from . import outline
 from .config import settings
+from . import prompt_style
 
 log = logging.getLogger("agentaus-bridge")
 
@@ -64,6 +65,8 @@ def render(path: str, files: list, read=None, *, detail: bool = True) -> str:
     than a paragraph describing the same thing, and this output exists to be read by a
     model that is about to decide where to look.
     """
+    if prompt_style.markdown():
+        return _render_markdown(path, files, read, detail=detail)
     if not files:
         return f"<inventory root={path!r}>\n  (no readable files)\n</inventory>"
 
@@ -114,3 +117,48 @@ def render(path: str, files: list, read=None, *, detail: bool = True) -> str:
         )
     lines.append("</inventory>")
     return "\n".join(lines)
+
+
+def _render_markdown(path: str, files: list, read, *, detail: bool) -> str:
+    """The same structure as `render`, as headings, a table and nested lists."""
+    if not files:
+        return f"## Inventory of `{path}`\n\n(no readable files)"
+
+    kinds = Counter(_kind(os.path.basename(f)) for f in files)
+    folders = defaultdict(list)
+    for full in files:
+        folders[os.path.dirname(os.path.relpath(full, path)) or "."].append(full)
+
+    lines = [f"## Inventory of `{path}`", "",
+             f"{len(files)} files in {len(folders)} folders.", "",
+             "### Kinds", "", "| kind | files |", "| --- | ---: |"]
+    lines += [f"| {kind} | {count} |" for kind, count in kinds.most_common()]
+
+    show_detail = detail and len(files) <= DETAIL_LIMIT
+    lines += ["", "### Folders", ""]
+    for folder in sorted(folders):
+        held = sorted(folders[folder])
+        lines.append(f"- `{folder}/` ({len(held)} files)")
+        if show_detail:
+            for full in held:
+                name = os.path.basename(full)
+                note = _headline(full, read)
+                try:
+                    size = f", {os.path.getsize(full)} bytes"
+                except OSError:
+                    size = ""
+                lines.append(f"  - `{name}`{size}" + (f": {note}" if note else ""))
+        else:
+            summary = ", ".join(f"{count} {kind}" for kind, count in Counter(
+                _kind(os.path.basename(f)) for f in held).most_common())
+            lines.append(f"  - {summary}")
+
+    if not show_detail and detail:
+        # Never silently. A summary that looks like a listing is how a partial survey
+        # gets reported as a complete one.
+        lines += ["", f"**Note:** {len(files)} files is more than the {DETAIL_LIMIT}-file "
+                  f"detail limit, so folders are summarised by type rather than listed file "
+                  f"by file. Ask again with a narrower path, or a glob, to see individual "
+                  f"files."]
+    return "\n".join(lines)
+

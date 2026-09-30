@@ -20,8 +20,13 @@ applying it where there is no gap would only add latency and noise.
 
 from __future__ import annotations
 
+import os
 import re
 import textwrap
+
+from . import prompt_style
+from . import skills
+from .prompt_style import Template
 
 # Appended to Claude Code's own system prompt, not a replacement for it. Kept short:
 # every token here is one less available for the conversation, and a long list of
@@ -93,6 +98,40 @@ Repeating a call you have already made wastes the turn and loses context.
 carry it out. Finish each part before starting the next.
 """
 
+ANALYSIS_GUIDANCE = """\
+
+--- Reporting an analysis ---
+
+This turn ran code over data. Rule 6 above asks for no summary; on a turn like this one
+the summary IS the deliverable, so it does not apply here. Measured on identical tasks
+with identical correct results: the useful reply ran 1,800-2,300 characters, the thin one
+ran 119 - the same numbers, with nothing a reader could act on.
+
+10. State the numbers plainly. You ran the code and the run is your evidence, so do not
+hedge a value you computed - never "the coefficient may be 0.849". A figure you did not
+see printed is one you are about to state from memory: print it, then quote it.
+
+11. Report the value the library produced. Do not re-derive a statistic by hand. A
+p-value from a normal approximation where the library used a t-distribution on 10 degrees
+of freedom was wrong in the second decimal and looked entirely plausible.
+
+12. Say what the analysis actually used: which rows, which column, which interpreter, and
+how many observations remained after dropping missing values.
+
+13. Say what it means, in the units of the data, and whether it is distinguishable from
+zero. A small sample with a weak fit means "this data cannot tell you", which is a
+finding - not a reason to go looking for a specification that produces a star.
+
+14. Say what would change it. A file often is not the population you were asked about:
+rows from another period, a column that supersedes the one you used, sentinel or zero
+values. Name each one with the number it moves and by how much, so a reader can judge
+whether it matters. If you did not check, say that instead of implying you did.
+
+15. Confirm an artefact exists rather than assuming it. A chart reported as written, from
+a call that raised after the figure was built, is a file that is not there.
+"""
+
+
 # Kept for callers that want everything regardless of context.
 AGENTAUS_GUIDANCE = CORE_GUIDANCE + TOOL_GUIDANCE
 
@@ -100,7 +139,7 @@ AGENTAUS_GUIDANCE = CORE_GUIDANCE + TOOL_GUIDANCE
 # Used for the optional review pass. Asking "what is wrong with this" is a markedly
 # easier question for a smaller model than getting it right first time, which is what
 # makes a second pass worth its latency.
-REVIEW_INSTRUCTION = """\
+REVIEW_INSTRUCTION = Template("""\
 Review the ANSWER below against the REQUEST. You are looking only for real defects:
 
 - Code that is wrong, will not run, or mishandles an edge case (empty, zero, negative, \
@@ -127,9 +166,9 @@ Say OK when the answer is sound - do not invent a defect to seem thorough.
 <answer>
 {answer}
 </answer>
-"""
+""")
 
-REVISE_INSTRUCTION = """\
+REVISE_INSTRUCTION = Template("""\
 Your previous answer to the request below was reviewed and these defects were found. \
 Produce a corrected answer.
 
@@ -147,7 +186,7 @@ changed, no mention of the review.
 <defects_found>
 {defects}
 </defects_found>
-"""
+""")
 
 
 # When to reach for each tool the bridge itself provides. Keyed by tool name so the
@@ -174,6 +213,24 @@ _WHEN_TO_USE = {
         "searching: `find`, `ls -R` and `grep -r` produce more than this conversation "
         "can carry, so you are handed a truncated preview and answer from a fragment."
     ),
+    "Skill": (
+        "Loads a written procedure for one kind of task. Check the \"Skills and "
+        "subagents\" section FIRST and load the skill it points to before any other tool. "
+        "It returns instructions, not results: then carry out its steps with your tools."
+    ),
+    "Agent": (
+        "Starts a subagent in a fresh context that returns only its conclusion - for a "
+        "broad sweep across many files, or independent parts of a task run in parallel. "
+        "Not for one lookup you can do in a single call. Leave `isolation` unset for "
+        "read-only work: a worktree is a clean checkout without the uncommitted changes."
+    ),
+    "TodoWrite": (
+        "Use it FIRST on anything needing more than about three steps, and update it as "
+        "you go. It is how you keep the objective in view across a long task: the list "
+        "you write is shown back to you on every later turn, so a step recorded is a "
+        "step you cannot lose track of. Mark one item in_progress at a time, and finish "
+        "it before starting the next."
+    ),
     "Glob": (
         "Finding files BY NAME. It cannot see inside a file, so it can never answer a "
         "question about content. Do not use it to hunt for a directory whose path you "
@@ -198,6 +255,25 @@ def tool_selection(body: dict) -> str:
     described = [(n, _WHEN_TO_USE[n]) for n in names if n in _WHEN_TO_USE]
     if not described:
         return ""
+    # TodoWrite leads, whatever order the client sent. The same finding that put Grep's
+    # restriction at the front of its description applies to the list itself: position
+    # decides what gets picked, and the tool to reach for first should be read first.
+    _LEADS = {"Skill": 0, "Agent": 1, "TodoWrite": 2}
+    described.sort(key=lambda pair: _LEADS.get(pair[0], 2))
+
+    closing = (
+        "If you planned to use a tool, use THAT tool. Do not substitute the one you are "
+        "more\nfamiliar with. Listing directories to find your bearings is not progress "
+        "- if you\nwere given a path, use it. Every name above is exact; do not invent "
+        "others."
+    )
+    if prompt_style.markdown():
+        # A real list: one bullet per tool, rather than columns aligned with spaces,
+        # which Markdown collapses.
+        lines = [f"- `{name}` - {advice}" for name, advice in described]
+        return ("\n" + prompt_style.section(
+            "tool_selection", "Which tool, and when:\n\n" + "\n".join(lines) + "\n\n" + closing
+        ) + "\n")
 
     width = max(len(n) for n, _ in described) + 2
     lines = []
@@ -208,30 +284,373 @@ def tool_selection(body: dict) -> str:
         lines.extend(" " * (width + 5) + part for part in wrapped[1:])
 
     return (
-        "\n<tool_selection>\nFinding things:\n"
+        "\n<tool_selection>\nWhich tool, and when:\n"
         + "\n".join(lines)
-        + "\n\nIf you planned to use a tool, use THAT tool. Do not substitute the one "
-        "you are more\nfamiliar with. Listing directories to find your bearings is not "
-        "progress - if you\nwere given a path, use it. Every name above is exact; do not "
-        "invent others.\n</tool_selection>\n"
+        + "\n\n" + closing + "\n</tool_selection>\n"
     )
 
 
-def guidance_for(body: dict) -> str:
+# Two independent signals, both required. Either alone is a false positive: `pytest -q`
+# and `python3 manage.py migrate` execute code and analyse nothing, while a `Read` of a
+# CSV is data with no computation over it.
+_EXECUTES = re.compile(
+    r"(?:^|[\s;|&/])(?:python[23]?|ipython|jupyter|papermill|Rscript|julia|stata|"
+    r"octave|duckdb)\b|\.(?:R|r|ipynb|jl)\b",
+    re.IGNORECASE,
+)
+
+# A tabular file, or a library whose whole purpose is computing over one.
+_TOUCHES_DATA = re.compile(
+    r"\.(?:csv|tsv|xlsx?|xlsm|parquet|feather|dta|sav|sas7bdat|json)\b|"
+    r"\b(?:pandas|polars|numpy|scipy|statsmodels|sklearn|matplotlib|seaborn|plotly|"
+    r"altair|pyarrow|ggplot2|dplyr|tidyverse|data\.table|read_csv|read_excel|"
+    r"DataFrame)\b",
+    re.IGNORECASE,
+)
+
+_ANALYSIS_TOOLS = ("Bash", "Write", "Edit", "NotebookEdit", "MultiEdit")
+_ANALYSIS_FIELDS = ("command", "file_path", "notebook_path", "content", "new_string")
+
+
+def ran_an_analysis(body: dict) -> bool:
+    """Whether this turn has executed code over data.
+
+    A structural gate, in the sense the README means: it reads what the turn *did*, costs
+    nothing, and never guesses intent from the user's wording. Keyword matching on the
+    request would read "model the retry budget" as an analysis and a bare "how many rows
+    are in this?" as not one.
+
+    Both signals must appear, though not necessarily in the same call - the script that
+    imports pandas is usually written by one call and run by the next.
+
+    Tool *inputs* only, never results: a `Read` of a file that happens to mention numpy
+    is not a turn that computed anything.
+    """
+    # The user naming a dataset is evidence this is data work, and it is often the only
+    # evidence there is: a model that writes `analyze.py` with a heredoc and runs it
+    # leaves no library name in any tool input the scan can see. Measured before this:
+    # `python3 -c "import pandas"` fired, `python3 analyze.py` did not - so whether the
+    # reporting contract arrived depended on how the model happened to create the file.
+    executes = False
+    touches_data = bool(_TOUCHES_DATA.search(_conversation_text(body)))
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            if block.get("name") not in _ANALYSIS_TOOLS:
+                continue
+            payload = block.get("input")
+            if not isinstance(payload, dict):
+                continue
+            text = " ".join(
+                str(payload.get(k) or "") for k in _ANALYSIS_FIELDS
+            )[:8000]
+            executes = executes or bool(_EXECUTES.search(text))
+            touches_data = touches_data or bool(_TOUCHES_DATA.search(text))
+            if executes and touches_data:
+                return True
+    return False
+
+
+# A tabular file named anywhere in the conversation - the user's own words, an attached
+# path, or a tool input. Extension matching, not intent guessing: the same structural
+# test the bridge already uses to decide what is worth reading.
+_DATA_FILE = re.compile(
+    r"\.(?:csv|tsv|xlsx?|xlsm|parquet|feather|dta|sav|sas7bdat)\b", re.IGNORECASE
+)
+
+# A numbered sequence, and only that. Bullets were included once and it was wrong:
+# T2 asks for a two-panel chart and lists two JSON keys as bullets, which totalled four
+# and pulled the long-task procedure onto a single-chart job. A bulleted list of output
+# fields is a specification; a numbered list is an order of work.
+_MANY_STEPS = re.compile(r"^\s*\d+[.)]\s+\S", re.M)
+_MANY_STEPS_MIN = 5
+
+
+def _conversation_text(body: dict, limit: int = 20000) -> str:
+    parts: list[str] = []
+    for message in body.get("messages") or []:
+        # Claude Code's own notes are not the conversation. Since the skill listing
+        # carries descriptions, a note mentioning "CSV" fired the data gate on a question
+        # about retry code.
+        if message.get("role") == "system":
+            continue
+        content = message.get("content")
+        texts = [content] if isinstance(content, str) else [
+            str(block.get("text") or "") for block in content or []
+            if isinstance(block, dict) and block.get("type") == "text"
+        ] if isinstance(content, list) else []
+        for text in texts:
+            # A loaded skill is not the conversation either: `read-documents` mentions
+            # `.xlsx`, and once loaded it fired the data gate on a question about a .docx.
+            if text.startswith("Base directory for this skill:"):
+                continue
+            parts.append(_REMINDERS.sub("", text))
+        if sum(len(p) for p in parts) > limit:
+            break
+    return "\n".join(parts)[:limit]
+
+
+# Claude Code's reminders carry CLAUDE.md, memory and context - not what was asked.
+_REMINDERS = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+
+
+def skills_for(body: dict) -> list[str]:
+    """Which documented procedures apply to this turn.
+
+    Structural gates, costing nothing, in the sense the README means - and they have to
+    be, because the model will not make this choice itself. Measured: `Skill` offered
+    among 28 tools and named first in the guidance, and Agentaus never called it once
+    in five runs, while Opus called it on the same prompt in the same directory.
+    """
+    wanted: list[str] = []
+    text = _conversation_text(body)
+    if ran_an_analysis(body) or _DATA_FILE.search(text):
+        wanted.append("analyse-data")
+    if len(_MANY_STEPS.findall(text)) >= _MANY_STEPS_MIN:
+        wanted.append("multi-step-work")
+    return wanted
+
+
+def guidance_for(body: dict, *, covered_by_skill: tuple = (), routing: bool = True) -> str:
     """The notes that apply to this request.
 
     Tool discipline is included only when the request actually offers tools. Sending it
     to a plain code-generation turn wastes tokens on unusable advice and dilutes the
     parts that do apply.
+
+    The reporting contract is added only once the turn has actually run something over
+    data, for the same reason and on the same evidence: it is the turn that writes up a
+    result, and on every other turn it is advice that cannot be followed.
     """
-    if body.get("tools"):
-        return CORE_GUIDANCE + TOOL_GUIDANCE + tool_selection(body)
-    return CORE_GUIDANCE
+    if not body.get("tools"):
+        return prompt_style.headings(CORE_GUIDANCE)
+    notes = CORE_GUIDANCE + TOOL_GUIDANCE
+    # The reporting contract and the `analyse-data` skill say largely the same things.
+    # Sending both is the failure the README records between two skills - "one was
+    # quietly arguing with another" - and this model handles a long list of rules badly.
+    # The skill is the more specific of the two, so the inline notes stand down for it.
+    if ran_an_analysis(body) and "analyse-data" not in covered_by_skill:
+        notes += ANALYSIS_GUIDANCE
+    routed = routing_section(body) if routing else ""
+    return prompt_style.headings(notes) + routed + tool_selection(body)
 
 
-def with_guidance(system, body: dict | None = None) -> object:
-    """Append the applicable operating notes to the system prompt being sent."""
-    notes = guidance_for(body or {})
+def with_skill_descriptions(body: dict) -> tuple[dict, int]:
+    """`body` with every bare project-skill entry in its skill listing described.
+
+    The listing sits wherever this client version put it - `system`, or a `system`-role
+    entry in `messages` - so both are rewritten. Returns (body, entries filled).
+    """
+    from .translate import system_notes
+    cwd = working_directory_of(body)
+    root = cwd if cwd and os.path.isdir(os.path.join(cwd, ".claude", "skills")) else None
+    if root is None:
+        probe = "\n".join([_as_text(body.get("system"))] + system_notes(body))
+        root = skills.locate(probe, body)
+    descriptions = skills.described(root) if root else {}
+    if not descriptions:
+        return body, 0
+
+    filled = 0
+
+    def fix(text: str) -> str:
+        nonlocal filled
+        text, n = skills.describe_listing(text, descriptions)
+        filled += n
+        return text
+
+    def fix_content(content):
+        if isinstance(content, str):
+            return fix(content)
+        if isinstance(content, list):
+            return [{**b, "text": fix(b["text"])}
+                    if isinstance(b, dict) and isinstance(b.get("text"), str) else b
+                    for b in content]
+        return content
+
+    out = dict(body)
+    if "system" in body:
+        out["system"] = fix_content(body["system"])
+    out["messages"] = [{**m, "content": fix_content(m.get("content"))}
+                       if m.get("role") == "system" else m
+                       for m in body.get("messages") or []]
+    return (out, filled) if filled else (body, 0)
+
+
+def with_library_skills(body: dict) -> tuple[dict, frozenset]:
+    """`body` with the bridge's library skills added to its skill listing.
+
+    Returns (body, the names added). Only those names are the bridge's to answer: a name
+    the client listed itself - a project skill of the same name - stays the client's.
+    Nothing is added when `Skill` is not on the wire, since nothing could load one.
+    """
+    offered = {t.get("name") for t in body.get("tools") or [] if isinstance(t, dict)}
+    library = skills.library()
+    if "Skill" not in offered or not library:
+        return body, frozenset()
+    listed = {name for name, _ in skill_listing(body)}
+    entries = [(name, about) for name, about in sorted(library.items()) if name not in listed]
+    if not entries:
+        return body, frozenset()
+    root = working_directory_of(body)
+    project = set(skills.described(root)) if root else set()
+    added: list[int] = []
+
+    def fix(text: str) -> str:
+        if added:
+            return text
+        text, n = skills.add_entries(text, entries, project)
+        if n:
+            added.append(n)
+        return text
+
+    def fix_content(content):
+        if isinstance(content, str):
+            return fix(content)
+        if isinstance(content, list):
+            return [{**b, "text": fix(b["text"])}
+                    if isinstance(b, dict) and isinstance(b.get("text"), str) else b
+                    for b in content]
+        return content
+
+    out = dict(body)
+    if "system" in body:
+        out["system"] = fix_content(body["system"])
+    out["messages"] = [{**m, "content": fix_content(m.get("content"))}
+                       if m.get("role") == "system" else m
+                       for m in body.get("messages") or []]
+    if not added:
+        return body, frozenset()
+    return out, frozenset(name for name, _ in entries)
+
+
+def _as_text(system) -> str:
+    if isinstance(system, str):
+        return system
+    return "\n".join(b.get("text", "") for b in system or []
+                     if isinstance(b, dict) and isinstance(b.get("text"), str))
+
+
+_AGENTS_HEAD = "Available agent types for the Agent tool:"
+_AGENT_ENTRY = re.compile(r"^- ([\w:.-]+):\s*(.*)$")
+
+# The part of a description that says WHEN, which is what a choice rests on.
+_USE_WHEN = re.compile(
+    r"(?:\bUse (?:this (?:skill|agent) |it )?(?:when(?:ever)?|if)\b|\bTriggers on\b|[\u2014;]\s*when\b)"
+    r"[:,]?\s*(.+)", re.I)
+
+# Most listed, fewest words: this is read before every turn by a model that handles a
+# long list of rules badly, so each entry is one line and the list is capped.
+_MAX_ROUTES_SKILLS = 28
+_MAX_ROUTES_AGENTS = 5
+_ROUTE_CHARS = 230
+
+
+def agent_listing(body: dict) -> list[tuple[str, str]]:
+    """The agent types this request offers, (name, description), in listed order."""
+    from .translate import system_notes
+    for text in [_as_text(body.get("system"))] + system_notes(body):
+        at = text.find(_AGENTS_HEAD)
+        if at < 0:
+            continue
+        entries, started = [], False
+        for line in text[at + len(_AGENTS_HEAD):].split("\n"):
+            entry = _AGENT_ENTRY.match(line)
+            if not entry:
+                if started and line.strip():
+                    break
+                continue
+            started = True
+            about = re.sub(r"\s*\(Tools:[^)]*\)\s*$", "", entry.group(2)).strip()
+            entries.append((entry.group(1), about))
+        if entries:
+            return entries
+    return []
+
+
+def _when(description: str) -> str:
+    """"asked where X is", from "... Use when asked where X is. ..." - the IF of a route."""
+    text = " ".join(description.split())
+    found = _USE_WHEN.search(text)
+    clause = found.group(1) if found else text
+    end = re.search(r"\.(?:\s|$)", clause)
+    clause = (clause[: end.start()] if end else clause).strip().rstrip(".")
+    if len(clause) > _ROUTE_CHARS:
+        clause = clause[:_ROUTE_CHARS].rsplit(" ", 1)[0] + " …"
+    if not found:
+        purpose = re.match(r"(?i)use (?:this (?:skill|agent) )?to\s+(.+)", clause)
+        if purpose:
+            return f"you need to {purpose.group(1)}"
+        return f"the task needs: {clause[:1].lower()}{clause[1:]}"
+    return clause
+
+
+def routes(body: dict) -> list[str]:
+    """One "If this -> use that" line per skill and agent type the request offers."""
+    offered = {t.get("name") for t in body.get("tools") or [] if isinstance(t, dict)}
+    lines = []
+    if "Skill" in offered:
+        for name, about in skill_listing(body)[:_MAX_ROUTES_SKILLS]:
+            if about:
+                lines.append(f"- If {_when(about)} \u2192 `Skill` with `skill: \"{name}\"`")
+    if "Agent" in offered:
+        for name, about in agent_listing(body)[:_MAX_ROUTES_AGENTS]:
+            if about:
+                lines.append(f"- If {_when(about)} \u2192 `Agent` with "
+                             f"`subagent_type: \"{name}\"`")
+        lines.append("- If the task splits into independent parts \u2192 one `Agent` call "
+                     "per part, all in the same turn, so they run in parallel")
+    return lines
+
+
+ROUTING_LEAD = """**Budget:** there is no API or token limit on this model. Loading a skill, starting a subagent, or running one more check costs nothing that matters here - so do it whenever it can make the result better. Only the quality of the result counts.
+
+- `Skill` loads a written procedure for one kind of task. It returns instructions, not results: once it is loaded, carry out its steps with your tools.
+- `Agent` starts a subagent in a fresh context. It returns only its conclusion, which keeps your own context free for the work.
+
+Before your first tool call, go down this list. If a line matches the request, do what it says first. If none matches, work directly with your tools."""
+
+
+def routing_section(body: dict) -> str:
+    """The "Skills and subagents" section: which skill or subagent a request calls for."""
+    lines = routes(body)
+    if not lines:
+        return ""
+    lines.append("- If none of these fits \u2192 no skill or subagent; use your tools directly")
+    return "\n" + prompt_style.section(
+        "skills_and_subagents", ROUTING_LEAD + "\n\n" + "\n".join(lines)) + "\n"
+
+
+def skill_listing(body: dict) -> list[tuple[str, str]]:
+    """The skills this request offers, (name, description), as the listing states them."""
+    from .translate import system_notes
+    for text in [_as_text(body.get("system"))] + system_notes(body):
+        entries = skills.listing(text)
+        if entries:
+            return entries
+    return []
+
+
+def with_guidance(system, body: dict | None = None, *, routing: bool = True) -> object:
+    """Append the applicable operating notes, and any documented procedure, to the prompt.
+
+    The procedure is injected rather than offered. See `agentaus_bridge.skills` for the
+    measurement that forced it: this model does not call the `Skill` tool.
+    """
+    body = body or {}
+    # Which procedures this project actually has, not merely which ones apply. A skill
+    # that is wanted but absent must not silence the inline notes that cover the same
+    # ground, or a project without it would be handed neither.
+    wanted = skills_for(body)
+    root = skills.locate(system, body) if wanted else None
+    present = tuple(n for n in wanted if n in skills.available(root)) if root else ()
+    notes = guidance_for(body, covered_by_skill=present, routing=routing)
+    if present:
+        notes += skills.render(root, list(present))
     if system is None:
         return notes.strip()
     if isinstance(system, str):
@@ -243,7 +662,7 @@ def with_guidance(system, body: dict | None = None) -> object:
 
 VERDICT_LINE = "VERDICT:"
 
-ADJUDICATE_INSTRUCTION = """\
+ADJUDICATE_INSTRUCTION = Template("""\
 Does the review below report any actual defect that needs fixing?
 
 Answer with exactly one word: YES or NO.
@@ -251,7 +670,7 @@ Answer with exactly one word: YES or NO.
 <review>
 {review}
 </review>
-"""
+""")
 
 
 def declared_verdict(review: str) -> bool | None:
@@ -305,31 +724,55 @@ def review_says_ok(review: str) -> bool:
 # that was offered tools, called none of them, and produced a short answer. Only then is
 # there anything to classify, and only then is a call worth making.
 
-# A real answer to a substantive question is long. Below this a turn is either an
-# acknowledgement or an excuse, and worth a look; above it, it is an answer.
-_REFUSAL_LENGTH_CEILING = 1200
+# Replies up to this long are judged. It was 1,200, on the theory that a long reply is an
+# answer - and the benchmark found the long failure that theory misses: asked to write
+# and run pareto.R, the model printed the whole script in its reply and stopped. With
+# the request in front of it the judge tells that apart from a real long answer, so the
+# ceiling now only bounds the prompt.
+_REFUSAL_LENGTH_CEILING = 20000
 
-CLASSIFY_REFUSAL_INSTRUCTION = """\
-An AI agent was given tools that read the local filesystem, and a task that needed them.
-It called no tools and replied with the text below.
+CLASSIFY_REFUSAL_INSTRUCTION = Template("""\
+An AI agent was given tools that act on the local machine - reading and writing files,
+running commands - and the task below. Its turn ended with this reply, and it called no
+tool.
+
+<request>
+{request}
+</request>
+
+<tools_it_ran>
+{ran}
+</tools_it_ran>
 
 <reply>
 {answer}
 </reply>
 
 <question>
-Is that reply the agent DECLINING to act - claiming it cannot read files, has no access
-to the filesystem, or asking the human to paste or upload something it could have
-fetched itself?
+Which one is the reply? Judge against the request and what the agent already ran: if
+the tools it ran have already done what the request asks - the file written, the command
+run - a reply saying so is an ANSWER, however short.
 
-Or is it a genuine answer, or a legitimate statement about something it really cannot
-know (a future event, a private system, a fact absent from the material)?
+REFUSAL - the agent declines to act: it claims it cannot read files or has no access to
+the filesystem, or asks the human to paste, upload or run something it could have done
+itself with its tools.
+
+STALLED - the agent stopped before the task was done, and nothing it needs from the
+human is missing. Either it says what it will do next without doing it ("We will write
+the file now", "Next I'll run the tests", "We need to write answers.json"), or its reply
+is a fragment of its own reasoning, or it put the deliverable in the reply instead of
+doing what the request asked for with it - printing a file's contents when the request
+said to write the file, showing a command when the request said to run it.
+
+ANSWER - a genuine final answer or result, or a legitimate statement about something it
+really cannot know or do, or a question the human genuinely has to answer.
 </question>
 
 <output_format>
-Exactly one word: REFUSAL or ANSWER. Nothing else.
+Exactly one word: REFUSAL, STALLED or ANSWER. Nothing else.
 </output_format>
-"""
+""")
+
 
 
 def could_be_a_refusal(answer: str, *, tools_offered: bool, called_a_tool: bool) -> bool:
@@ -344,6 +787,17 @@ def could_be_a_refusal(answer: str, *, tools_offered: bool, called_a_tool: bool)
     return 0 < len(text) <= _REFUSAL_LENGTH_CEILING
 
 
+def read_turn_verdict(verdict: str) -> str:
+    """"refusal", "stalled" or "answer". Anything unrecognised is an answer, for the same
+    reason as `read_refusal_verdict`: re-asking a good answer is the worse mistake."""
+    word = (verdict or "").strip().upper().lstrip("*`_ ")
+    if word.startswith("REFUSAL"):
+        return "refusal"
+    if word.startswith("STALLED"):
+        return "stalled"
+    return "answer"
+
+
 def read_refusal_verdict(verdict: str) -> bool:
     """Read the one-word answer. Anything unrecognised is treated as a real answer.
 
@@ -354,7 +808,7 @@ def read_refusal_verdict(verdict: str) -> bool:
     return (verdict or "").strip().upper().startswith("REFUSAL")
 
 
-REFUSAL_CORRECTION = """\
+REFUSAL_CORRECTION = Template("""\
 <correction>
 That is not true, and it was not the question.
 
@@ -366,12 +820,30 @@ Nobody is going to paste or upload anything for you. Call the tool.
 
 Start over and follow the task exactly as it was given.
 </correction>
-"""
+""")
 
 
-GROUNDING_INSTRUCTION = """\
-An agent answered a question after using tools. Below is what it actually did, and what
-it then said.
+# The small-model failure the refusal check was not built for: the turn ends on an
+# announcement. Observed on the benchmark pilot - after one correction round, the reply
+# was "We will write file at same directory." and nothing was written, so the session
+# ended with the task undone.
+STALLED_CORRECTION = Template("""\
+<correction>
+You stopped before the task the user gave you was done. Saying what you will do, or
+showing what a file should contain, does not do it - nothing was written or run.
+
+Do the remaining step of THAT task now: call the tool. Write only the files the user's
+task asks for, and run only what it needs. Do not write notes, memories, summaries or
+anything else the task did not ask for.
+
+If the task really is complete, reply with the final result instead.
+</correction>
+""")
+
+
+GROUNDING_INSTRUCTION = Template("""\
+An agent answered a question after using tools. Below is what it actually did, what
+each call returned, and what it then said.
 
 <tools_it_actually_ran>
 {ledger}
@@ -392,6 +864,12 @@ Look for:
 
 A statement is fine if it follows from a tool result, is general knowledge, or is clearly
 offered as a suggestion rather than a finding.
+
+A value a command computed and printed is SUPPORTED by that command having run. Do not
+ask for a figure to be re-derived, re-read or cited from somewhere else: the run is the
+evidence. Only flag a number that CONTRADICTS an output shown below, or that no call
+made could have produced. An output may be excerpted - a value consistent with what a
+command of that kind returns is supported, not unsupported.
 </task>
 
 <output_format>
@@ -400,10 +878,10 @@ If everything checks out, reply with exactly: GROUNDED
 Otherwise reply with GAPS on the first line, then one line per unsupported statement:
 the claim, then what would have been needed to make it. Nothing else.
 </output_format>
-"""
+""")
 
 
-STRIP_UNGROUNDED_INSTRUCTION = """\
+STRIP_UNGROUNDED_INSTRUCTION = Template("""\
 Your answer below contains statements you had no basis for. They are listed after it.
 
 <your_answer>
@@ -423,7 +901,7 @@ Change nothing else. Keep every grounded statement, its wording, and the structu
 formatting of the original. Do not add new material, do not apologise, and do not mention
 this correction.
 </task>
-"""
+""")
 
 
 def grounding_verdict(reply: str) -> str:
@@ -504,7 +982,7 @@ def worth_reviewing(text: str, *, min_chars: int = 200) -> bool:
 # affordance by asking for the plan as its own turn, then handing that plan back as
 # context for the real one. Two cheap passes beat one expensive one on a smaller model,
 # the same reason the review pass exists.
-PLAN_INSTRUCTION = """\
+PLAN_INSTRUCTION = Template("""\
 You are an agent working inside a code repository. Plan the turn below before you act.
 
 This is your own private working. Nobody reads it and nobody answers it, so a plan that \
@@ -536,7 +1014,7 @@ where the code is. You already know.
 <request>
 {request}
 </request>
-"""
+""")
 
 
 def mid_tool_loop(body: dict) -> bool:
@@ -593,6 +1071,20 @@ _CWD_PATTERNS = (
 )
 
 
+def working_directory_of(body: dict) -> str | None:
+    """The working directory, wherever this client version put it.
+
+    Claude Code 2.1.278 no longer states it in `system`: the environment block arrives as
+    a `system`-role entry in `messages`. Reading `system` alone found nothing, so the
+    planner, search path defaults and relative-path repair all silently lost the repo.
+    """
+    from .translate import system_notes
+    found = working_directory((body or {}).get("system"))
+    if found:
+        return found
+    return working_directory("\n".join(system_notes(body or {})))
+
+
 def working_directory(system) -> str | None:
     """The repository path Claude Code named in its system prompt, if it named one."""
     if isinstance(system, list):
@@ -630,7 +1122,7 @@ def _one_line(description) -> str:
     return (cut[: stop + 1] if stop > 80 else cut).rstrip() + " …"
 
 
-def plan_prompt(request: str, body: dict | None = None) -> str:
+def plan_prompt(request: str, body: dict | None = None, *, routing: bool = True) -> str:
     """The planning prompt for this turn, naming the tools that are actually available.
 
     The tool list is not decoration: a planner shown no tools plans to ask questions,
@@ -638,12 +1130,13 @@ def plan_prompt(request: str, body: dict | None = None) -> str:
     """
     body = body or {}
     lines = []
-    cwd = working_directory(body.get("system"))
+    cwd = working_directory_of(body)
     if cwd:
+        where = (f"## Working directory\n\n`{cwd}`\n\n" if prompt_style.markdown()
+                 else f"<working_directory>\n{cwd}\n</working_directory>\n")
         lines.append(
-            f"<working_directory>\n{cwd}\n</working_directory>\n"
-            f"That is the repository. Pass it as the `path` argument to any tool "
-            f"needing one."
+            where + "That is the repository. Pass it as the `path` argument to any tool "
+            "needing one."
         )
 
     # Names alone are not enough. Given a bare list, the planner picks the tool it knows
@@ -654,13 +1147,39 @@ def plan_prompt(request: str, body: dict | None = None) -> str:
     for tool in body.get("tools") or []:
         if not (isinstance(tool, dict) and tool.get("name")):
             continue
-        entries.append(f"  <tool name=\"{tool['name']}\">{_one_line(tool.get('description'))}</tool>")
+        if prompt_style.markdown():
+            entries.append(f"- `{tool['name']}` - {_one_line(tool.get('description'))}")
+        else:
+            entries.append(
+                f"  <tool name=\"{tool['name']}\">{_one_line(tool.get('description'))}</tool>")
     if entries:
-        lines.append("<tools_available>\n" + "\n".join(entries)
-                     + "\n</tools_available>\nUse these exact names and no others.")
+        if prompt_style.markdown():
+            lines.append("## Tools available\n\n" + "\n".join(entries)
+                         + "\n\nUse these exact names and no others.")
+        else:
+            lines.append("<tools_available>\n" + "\n".join(entries)
+                         + "\n</tools_available>\nUse these exact names and no others.")
+
+    # The skills, when `Skill` is on the wire. A planner that cannot see them plans the
+    # work from scratch, and the answer call then follows the plan rather than the
+    # procedure the project wrote for exactly this.
+    listed = routes(body) if routing else []
+    if listed:
+        lines.append(prompt_style.section(
+            "skills_and_subagents",
+            "If this \u2192 use that:\n\n" + "\n".join(listed) + "\n\n" + _SKILL_STEP))
 
     context = ("\n\n".join(lines) + "\n\n") if lines else ""
     return PLAN_INSTRUCTION.format(context=context, request=request[:12000])
+
+
+_SKILL_STEP = ("Begin the plan with these two lines, before anything else:\n\n"
+               "- `Skill: <name>` for the skill whose line matches the request, or "
+               "`Skill: none`\n"
+               "- `Agent: <type>` if part of the work should go to a subagent, or "
+               "`Agent: none`\n\n"
+               "A named skill is step 1 of the plan. There is no API or token limit, so "
+               "choose one whenever it fits.")
 
 
 def with_plan(system, plan: str) -> object:
@@ -684,3 +1203,81 @@ def with_plan(system, plan: str) -> object:
     if isinstance(system, list):
         return list(system) + [{"type": "text", "text": notice.strip()}]
     return system
+
+
+# --------------------------------------------------------------------------------------
+# Tool focus
+# --------------------------------------------------------------------------------------
+
+# Claude Code's own harness tools that a coding turn does not use. Measured: Claude Code
+# 2.1.278 sends 26 tools carrying 120 KB of schemas - about 30,000 tokens a call, a
+# quarter of Agentaus' window - and the largest are Artifact (34 KB), ArtifactData,
+# DesignSync and Monitor. A strong model shrugs that off. A smaller one pays for it
+# twice: in window, and in choosing among 26 names, which is where the invented and
+# misspelt calls come from.
+#
+# A deny-list, not an allow-list. The first version kept only a list of coding tools and
+# so hid every tool it had not heard of - the smoke test's custom `get_exchange_rate`
+# vanished and the model answered from memory, and a user's MCP tools would have gone
+# the same way. Only tools named here are held back; anything unrecognised stays.
+HELD_BACK_TOOLS = {
+    "Artifact", "ArtifactComments", "ArtifactData", "DesignSync", "Monitor",
+    "CronCreate", "CronDelete", "CronList", "EnterWorktree", "ExitWorktree",
+    "ListAgents", "SendMessage", "TaskStop", "Workflow", "ScheduleWakeup",
+    "RemoteTrigger", "ReportFindings", "PushNotification", "ShareOnboardingGuide",
+    "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool",
+}
+
+
+def _tools_used(body: dict) -> set:
+    used = set()
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name"):
+                    used.add(block["name"])
+    return used
+
+
+def _last_user_words(body: dict) -> str:
+    for message in reversed(body.get("messages") or []):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = [b.get("text", "") for b in content
+                     if isinstance(b, dict) and b.get("type") == "text"]
+            if any(t.strip() for t in texts):
+                return "\n".join(texts)
+    return ""
+
+
+def focus_tools(body: dict) -> tuple[dict, list]:
+    """Hold back Claude Code's non-coding harness tools, unless named or already used.
+
+    Nothing the user asks for goes missing: a held-back tool named in their message, or
+    already called in this conversation, stays on the wire, and a tool not on the
+    held-back list is never touched. Returns (body, dropped names).
+    """
+    tools = body.get("tools") or []
+    if not tools:
+        return body, []
+    asked = _last_user_words(body)
+    used = _tools_used(body)
+    kept, dropped = [], []
+    for tool in tools:
+        name = (tool or {}).get("name") or ""
+        server = name.split("__")[1] if name.startswith("mcp__") and "__" in name[5:] else ""
+        if (name not in HELD_BACK_TOOLS or name in used
+                or (name and re.search(rf"\b{re.escape(name)}\b", asked))
+                or (server and re.search(rf"\b{re.escape(server)}\b", asked, re.I))):
+            kept.append(tool)
+        else:
+            dropped.append(name)
+    if not dropped:
+        return body, []
+    return {**body, "tools": kept}, dropped
+

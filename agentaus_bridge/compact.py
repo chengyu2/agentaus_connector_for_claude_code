@@ -36,6 +36,7 @@ from .gate import hold
 from .translate import estimate_request_tokens, estimate_tokens
 # Re-exported: these lived here first and several modules import them from here.
 from .text import normalise_for_display, normalise_identifiers  # noqa: F401
+from . import prompt_style
 
 log = logging.getLogger("agentaus-bridge")
 
@@ -99,6 +100,31 @@ engineering conversation. Merge them into a single coherent record.
 
 
 Summariser = Callable[[str], Awaitable[str]]
+
+
+# The Markdown layout refers to its blocks by heading, so the three sentences that name a
+# tag get their own wording there. The XML wording above is left exactly as it was.
+_MD_WORDING = (
+    ("The conversation is inside <conversation> tags below. Your output is the record itself,\n"
+     "with no tags around it.",
+     "The conversation is in the fenced block below. Your output is the record itself, with\n"
+     "no fence or heading around it."),
+    ("A <summary> of part of a software engineering conversation is below, followed by the "
+     "<original> text it was made from.",
+     "A summary of part of a software engineering conversation is below, followed by the "
+     "original text it was made from."),
+    ("Inside <summaries> below are summaries of consecutive parts of one software "
+     "engineering conversation.",
+     "Below are summaries of consecutive parts of one software engineering conversation."),
+)
+
+
+def _styled(instruction: str) -> str:
+    if not prompt_style.markdown():
+        return instruction
+    for xml_wording, md_wording in _MD_WORDING:
+        instruction = instruction.replace(xml_wording, md_wording)
+    return prompt_style.headings(instruction)
 
 
 
@@ -339,8 +365,8 @@ class ConversationCompactor:
         label = f" (part {index} of {total})" if total > 1 else ""
         summary = normalise_identifiers(
             (await self._call(
-                SUMMARY_INSTRUCTION + label
-                + "\n<conversation>\n" + chunk + "\n</conversation>\n"
+                _styled(SUMMARY_INSTRUCTION) + label
+                + "\n" + prompt_style.data("conversation", chunk) + "\n"
             )).strip()
         )
         if not self._verify:
@@ -354,9 +380,9 @@ class ConversationCompactor:
         previous, self._priority = self._priority, "background"
         try:
             gaps = normalise_identifiers((await self._call(
-                GAP_INSTRUCTION
-                + "\n<summary>\n" + summary + "\n</summary>"
-                + "\n\n<original>\n" + chunk + "\n</original>\n"
+                _styled(GAP_INSTRUCTION)
+                + "\n" + prompt_style.data("summary", summary)
+                + "\n\n" + prompt_style.data("original", chunk) + "\n"
             )).strip())
         finally:
             self._priority = previous
@@ -418,8 +444,8 @@ class ConversationCompactor:
                 ])
                 addition = "\n".join(s for s in new_parts if s.strip())
                 merged = await self._call(
-                    MERGE_INSTRUCTION + "\n<summaries>\n" + prior
-                    + "\n\n---\n\n" + addition + "\n</summaries>\n"
+                    _styled(MERGE_INSTRUCTION) + "\n"
+                    + prompt_style.data("summaries", prior + "\n\n---\n\n" + addition) + "\n"
                 )
                 summary = merged.strip() or (prior + "\n" + addition)
             else:
@@ -449,13 +475,13 @@ class ConversationCompactor:
             # Merged by the model rather than concatenated: consecutive chunks overlap,
             # so raw concatenation repeats itself and reads as several disjoint records.
             summary = (await self._call(
-                MERGE_INSTRUCTION + "\n<summaries>\n" + joined + "\n</summaries>\n"
+                _styled(MERGE_INSTRUCTION) + "\n" + prompt_style.data("summaries", joined) + "\n"
             )).strip() or joined
 
         rounds = 0
         while estimate_tokens(summary) > chunk_budget and rounds < 3:
             summary = (await self._call(
-                MERGE_INSTRUCTION + "\n<summaries>\n" + summary + "\n</summaries>\n"
+                _styled(MERGE_INSTRUCTION) + "\n" + prompt_style.data("summaries", summary) + "\n"
             )).strip()
             rounds += 1
 

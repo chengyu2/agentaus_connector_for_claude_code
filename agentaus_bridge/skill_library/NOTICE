@@ -1,0 +1,19 @@
+Agentaus bridge skill library
+
+The skills in this directory are adapted from works by Anthropic, PBC, licensed under
+the Apache License, Version 2.0 (see LICENSE in this directory):
+
+  - anthropics/claude-plugins-official, commit ad30d62cd52ad0d0af1beda1eab7f61c601045d0
+    (2026-09-24), plugins: code-review, pr-review-toolkit, code-simplifier,
+    security-guidance, feature-dev, commit-commands, math-olympiad, skill-creator,
+    plugin-dev
+    https://github.com/anthropics/claude-plugins-official
+
+Changes made: each skill was rewritten for the Agentaus model as a single Agent Skills
+SKILL.md (with optional references/ and scripts/), in annotated Markdown. Claude
+Code-specific plumbing was removed (slash-command arguments, hooks, model names,
+Anthropic-internal references), and so was any code that calls Anthropic's API. The
+source of each skill is recorded in the `metadata.source` field of its front matter.
+
+Not included, because they are not licensed for redistribution: the docx, pdf, pptx and
+xlsx skills, doc-coauthoring, and the claude-security plugin.

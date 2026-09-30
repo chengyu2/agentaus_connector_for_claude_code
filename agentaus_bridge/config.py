@@ -100,6 +100,27 @@ class Settings:
     # Re-chunk buffered text so the terminal renders progressively. 0 disables.
     chunk_chars: int = field(default_factory=lambda: _int("BRIDGE_CHUNK_CHARS", 60))
 
+    # How the bridge lays out the prompts it writes for Agentaus: "markdown" (headings,
+    # lists, fenced blocks) or "xml" (the tagged layout it used before). See
+    # prompt_style.py. Claude turns are never touched either way.
+    agentaus_prompt_style: str = field(
+        default_factory=lambda: os.environ.get("AGENTAUS_PROMPT_STYLE", "markdown").strip().lower()
+    )
+
+    # Stream Agentaus' tokens to the client as they arrive, in a thinking block, while
+    # the bridge holds the answer back for its checks. Without it the client's token
+    # counter sits still for the whole generation and the checked answer lands at once.
+    agentaus_live_draft: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_LIVE_DRAFT", True)
+    )
+
+    # Hold back Claude Code's non-coding harness tools (Artifact, Cron, DesignSync...)
+    # unless named or already used - 26 tools, ~30k tokens, in Claude Code 2.1.278.
+    # A deny-list: custom and MCP tools are never hidden. See augment.HELD_BACK_TOOLS.
+    agentaus_tool_focus: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_TOOL_FOCUS", True)
+    )
+
     # --- timeouts -----------------------------------------------------------------
     connect_timeout: float = field(default_factory=lambda: float(_int("BRIDGE_CONNECT_TIMEOUT", 30)))
     # 1800 was half an hour of silence. A dead upstream connection - observed live,
@@ -520,6 +541,26 @@ class Settings:
     agentaus_guidance: bool = field(
         default_factory=lambda: _bool("AGENTAUS_GUIDANCE", True)
     )
+    # Skill and subagent routing: put each project skill's description back into the
+    # listing (Claude Code 2.1.281 sends project skills by bare name), add a Markdown
+    # "if this -> use that" section for every skill and agent type offered, and have the
+    # planner name the skill it will load. Opus picks skills from bare names; Agentaus
+    # did not load one in any baseline run.
+    agentaus_skill_routing: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_SKILL_ROUTING", True)
+    )
+    # A subagent follows its session: started from an Agentaus session it runs on Agentaus,
+    # from a Claude session on Claude. Off, a subagent goes by the model id Claude Code
+    # gives it - which, for a session on `agentaus`, is a Claude model.
+    # Offer the bridge's own skill library (agentaus_bridge/skill_library, adapted from
+    # Anthropic's Apache-2.0 plugins) to Agentaus in every project, and answer `Skill`
+    # calls for it in the bridge. Claude sessions never see these.
+    agentaus_skill_library: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_SKILL_LIBRARY", True)
+    )
+    agentaus_subagents_follow_session: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_SUBAGENTS_FOLLOW_SESSION", True)
+    )
     # Have the model review its own answer and revise it when defects are found.
     # "What is wrong with this?" is a much easier question for a smaller model than
     # getting it right first time, which is what makes the extra round trip pay.
@@ -539,6 +580,15 @@ class Settings:
     )
     agentaus_self_review: bool = field(
         default_factory=lambda: _bool("AGENTAUS_SELF_REVIEW", True)
+    )
+    # Review and grounding run on agent turns only - requests that offer tools. Claude
+    # Code's own utility calls offer none: the end-of-turn classifier that decides
+    # whether to notify you, title and summary generation. Each wants a short answer in
+    # an exact shape, and the review pass was observed rewriting the classifier's
+    # one-word verdict into a 3,951-character essay, twice, for 38 seconds a turn.
+    # true restores reviewing tool-less requests, for a harness that sends bare prompts.
+    agentaus_review_toolless: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_REVIEW_TOOLLESS", False)
     )
     # Answers shorter than this skip the review: they are usually acknowledgements.
     agentaus_review_min_chars: int = field(

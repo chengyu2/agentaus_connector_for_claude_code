@@ -219,3 +219,18 @@ class TestRepairingClientSideReads(unittest.TestCase):
         self.assertEqual(documents._named_path({"filename": "/a/b.xlsx"}), "/a/b.xlsx")
         self.assertIsNone(documents._named_path({"query": "not a path"}))
         self.assertIsNone(documents._named_path("not a dict"))
+
+
+class TheStylesheetIsNotContent(unittest.TestCase):
+    def test_head_style_and_script_are_dropped(self):
+        html = ("<html><head><style>@page { size: 21cm 29.7cm }\np { color: #000 }</style>"
+                "<title>x</title></head><body><script>var a = 1;</script><!-- note -->"
+                "<h1>Requirements</h1><table><tr><td>R1</td><td>Yes</td></tr></table></body></html>")
+        text = documents.html_to_text(html)
+        self.assertNotIn("@page", text)
+        self.assertNotIn("color:", text)
+        self.assertNotIn("var a", text)
+        self.assertNotIn("note", text)
+        self.assertEqual(text.strip().splitlines()[0], "Requirements")
+        self.assertIn("R1 | Yes", text)
+

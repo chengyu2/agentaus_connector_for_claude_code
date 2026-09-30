@@ -10,9 +10,11 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from xml_style import setUpModule, tearDownModule  # noqa: E402,F401
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from agentaus_bridge import augment  # noqa: E402
 from agentaus_bridge.augment import (  # noqa: E402
     CORE_GUIDANCE,
     TOOL_GUIDANCE,
@@ -169,3 +171,100 @@ class TestDeclaredVerdict(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheAnalysisReportingGate(unittest.TestCase):
+    """Rule 6 asks for no summary, and on a turn that computed something the summary is
+    the deliverable. Measured on four data tasks with identical correct results: the
+    useful reply ran 1,800-2,300 characters and the thin one ran 119.
+
+    The gate is structural - what the turn *ran*, not what the user typed. Both signals
+    are required because either alone is a false positive: `pytest -q` executes code and
+    analyses nothing, and reading a CSV is data with no computation over it.
+    """
+
+    @staticmethod
+    def turn(*calls):
+        return {
+            "tools": [{"name": "Bash"}],
+            "messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": str(i), "name": n, "input": p}
+                for i, (n, p) in enumerate(calls)
+            ]}],
+        }
+
+    def test_a_script_over_a_spreadsheet_counts(self):
+        body = self.turn(
+            ("Write", {"file_path": "/w/a.py", "content": "import pandas as pd\nd = pd.read_excel('r.xlsx')"}),
+            ("Bash", {"command": "python3 a.py"}),
+        )
+        self.assertTrue(augment.ran_an_analysis(body))
+
+    def test_the_two_signals_may_arrive_in_different_calls(self):
+        """The script that imports pandas is written by one call and run by the next."""
+        body = self.turn(
+            ("Write", {"file_path": "/w/a.py", "content": "import pandas"}),
+            ("Bash", {"command": "python3 /w/a.py"}),
+        )
+        self.assertTrue(augment.ran_an_analysis(body))
+
+    def test_r_counts_too(self):
+        body = self.turn(("Write", {"file_path": "/w/m.R", "content": "d <- read.csv('g.csv')"}))
+        self.assertTrue(augment.ran_an_analysis(body))
+
+    def test_running_the_test_suite_is_not_an_analysis(self):
+        self.assertFalse(augment.ran_an_analysis(self.turn(("Bash", {"command": "pytest -q"}))))
+
+    def test_a_management_command_is_not_an_analysis(self):
+        """`python3 manage.py migrate` executes code and computes nothing over data."""
+        self.assertFalse(
+            augment.ran_an_analysis(self.turn(("Bash", {"command": "python3 manage.py migrate"})))
+        )
+
+    def test_writing_ordinary_python_is_not_an_analysis(self):
+        body = self.turn(("Write", {"file_path": "/w/server.py", "content": "from fastapi import FastAPI"}))
+        self.assertFalse(augment.ran_an_analysis(body))
+
+    def test_reading_a_csv_is_not_computing_over_it(self):
+        self.assertFalse(augment.ran_an_analysis(self.turn(("Read", {"file_path": "/w/d.csv"}))))
+
+    def test_a_turn_with_no_tools_gets_none_of_it(self):
+        self.assertNotIn("Reporting an analysis", augment.guidance_for({"messages": []}))
+
+    def test_the_contract_is_added_only_when_it_applies(self):
+        analysis = self.turn(("Bash", {"command": "python3 -c 'import pandas'"}))
+        ordinary = self.turn(("Bash", {"command": "git status"}))
+        self.assertIn("Reporting an analysis", augment.guidance_for(analysis))
+        self.assertNotIn("Reporting an analysis", augment.guidance_for(ordinary))
+
+    def test_it_tells_the_model_the_conciseness_rule_does_not_apply_here(self):
+        """Without this the two blocks contradict each other and the shorter wins."""
+        body = self.turn(("Bash", {"command": "python3 -c 'import pandas'"}))
+        self.assertIn("does not apply here", augment.guidance_for(body))
+
+
+class TestTheAnalysisGateSeesWhatWasAsked(unittest.TestCase):
+    """The data signal used to come only from tool inputs, so whether the reporting
+    contract arrived depended on how the model happened to create its script:
+    `python3 -c "import pandas"` fired it, `python3 analyze.py` did not.
+    """
+
+    @staticmethod
+    def body(said: str, cmd: str):
+        return {"tools": [{"name": "Bash"}], "messages": [
+            {"role": "user", "content": [{"type": "text", "text": said}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "Bash",
+             "input": {"command": cmd}}]}]}
+
+    def test_running_a_script_counts_when_the_request_named_a_dataset(self):
+        b = self.body("Analyse rnd_2022-23.xlsx and report the Gini", "python3 analyze.py")
+        self.assertTrue(augment.ran_an_analysis(b))
+
+    def test_it_still_refuses_a_turn_with_no_data_anywhere(self):
+        b = self.body("Fix the retry helper", "python3 manage.py migrate")
+        self.assertFalse(augment.ran_an_analysis(b))
+
+    def test_naming_a_dataset_without_running_anything_is_not_an_analysis(self):
+        b = {"tools": [{"name": "Bash"}], "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "what is in data.csv?"}]}]}
+        self.assertFalse(augment.ran_an_analysis(b))

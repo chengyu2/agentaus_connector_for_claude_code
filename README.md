@@ -104,7 +104,8 @@ Verified against the live API while building this bridge:
 | Streaming | OpenAI SSE `data:` chunks terminated by `[DONE]` |
 | Tool calling | full round trip: `tool_calls` out, `role:"tool"` + `tool_call_id` back in |
 | Usage | `{"input_tokens": N, "output_tokens": N}` |
-| Extension | `system_prompt_overwrite: true` replaces the built-in Agentaus persona |
+| Extension | `system_prompt_overwrite: true` replaces the built-in Agentaus persona - **with the request's own system message, so it needs one** |
+| Ignored | `reasoning_effort`, `reasoning.effort`: accepted, no effect (~120 hidden reasoning tokens either way) |
 
 Two behaviours drove design decisions in the bridge:
 
@@ -112,10 +113,15 @@ Two behaviours drove design decisions in the bridge:
    model to behave as a general assistant, which fights Claude Code's agent prompt.
    The bridge always sends `system_prompt_overwrite: true` so Claude Code's system
    prompt is the only one in play. (`AGENTAUS_SYSTEM_PROMPT_OVERWRITE=false` to revert.)
-2. **Agentaus streams in large buffered chunks**, sometimes emitting nothing at all
-   until the whole answer is ready. Claude Code aborts any stream that goes silent for
-   300 seconds, so the bridge emits its own SSE `ping` events every 10 seconds while it
-   waits. Without this, long generations would look like a dead connection.
+   The flag overwrites the persona *with the request's system message*, so a request
+   without one keeps the persona: "Say hi" measured 2,442 input tokens bare and 207 with
+   a one-line system message, and offered a tool while streaming, the bare form refused
+   to use it. Every bridge helper call now carries a short system message for this reason.
+2. **Agentaus streams live** - measured, ~13-token pieces every ~100 ms, first token in
+   about a second. (An earlier version of the API buffered whole answers, which is why
+   the bridge emits SSE `ping` events every 10 seconds while it waits: Claude Code aborts
+   a stream that goes silent for 300 seconds.) See [Live tokens](#live-tokens) for why
+   the client's token counter still sat still, and what fixed it.
 
 One gotcha worth recording: Agentaus returns **HTTP 406** if you send
 `Accept: text/event-stream`. The bridge sends `Accept: */*` and lets the `stream` body
@@ -298,6 +304,30 @@ for the main loop but send cheap background calls to Agentaus:
 ```bash
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="agentaus"
 ```
+
+### Subagents follow their session
+
+A subagent started from an Agentaus session did **not** run on Agentaus. Claude Code cannot
+"inherit" a custom model id for a subagent, so it asks for its default Claude model
+instead. Measured on 2.1.281: the main loop on `agentaus`, the Explore subagent it started
+on `claude-opus-5-5`, forwarded to Anthropic. The subagent's work and your Claude quota
+went to the model you had switched away from, and nothing said so.
+
+Claude Code marks a subagent's requests - an `x-claude-code-agent-id` header, and
+`cc_is_subagent=true` in the billing line of its system prompt - and every request carries
+`x-claude-code-session-id`, shared by a session and its subagents. So the bridge remembers
+which model each session's main loop used last and sends that session's subagents the same
+way:
+
+| Session's main loop | Its subagents go to |
+| --- | --- |
+| `/model agentaus` | Agentaus |
+| `/model opus` (or any Claude model) | Anthropic, exactly as before |
+
+Switching mid-session moves the subagents with you, so the toggle is untouched. Only a
+main-loop turn (tools offered, no agent id) records the session's model: a title or summary
+call cannot flip it. The log says `route=agentaus (subagent of an Agentaus session)` when
+it applies. Turn it off with `AGENTAUS_SUBAGENTS_FOLLOW_SESSION=false`.
 
 ---
 
@@ -649,17 +679,116 @@ dropped socket.
 
 ---
 
+## What Claude Code actually sends, and what the bridge does with it
+
+Captured from Claude Code 2.1.278 - the native binary the VS Code extension ships - and
+all of it invisible from the settings file:
+
+| What arrives | Why it hurt Agentaus | What the bridge does |
+| --- | --- | --- |
+| **26 tools, 120 KB of schemas** (~30,000 tokens a call). `Artifact` alone is 34 KB | A quarter of the window gone before the conversation starts, and 26 names to choose from - where the invented and misspelt calls come from | **Tool focus**: Claude Code's non-coding harness tools are held back unless the user names them or the conversation already used them - 13 KB. A deny-list, so custom and MCP tools are never hidden. `AGENTAUS_TOOL_FOCUS=false` sends everything |
+| The environment block - **including the working directory** - as a `system`-role entry *inside `messages`*, and connector instructions the same way | Forwarded as-is it became the *last* message, after the user's request, and Agentaus answered it: a finished R task replied to with "I have not read the Claude Docs workflow you shared" | Every `system`-role entry joins the system prompt, so the turn ends on what the user said. The working-directory lookup reads them too - it had silently been finding nothing |
+| `<system-reminder>` blocks beside what the user typed: account email, commit attribution, which tools loaded | Handed to the planner, reviewer and turn judge as part of "the request" | Stripped wherever the bridge reads the request |
+| After every turn, **utility calls** with no tools: the end-of-turn state classifier (done / working / blocked / failed, which drives the "come back" notification) and session titles | The self-review pass rewrote the classifier's one-word verdict into a 4,322-character essay, twice - **39 seconds added to every Agentaus turn**, and a garbled notification state | Review and grounding run on agent turns only - requests that offer tools. `AGENTAUS_REVIEW_TOOLLESS=true` restores the old behaviour for a bare-prompt harness |
+
+## Live tokens
+
+Agentaus streams, but the bridge held every answer back until its checks had run -
+review, grounding, the syntax check, tool-call repair - because an answer already on the
+screen cannot be revised. So the client's token counter sat at zero and the answer landed
+at once. Measured through the real Claude Code binary on one 400-word answer: no visible
+characters for 57 seconds, then 4,672 at once.
+
+Now the response starts immediately, and everything Agentaus writes streams into a
+thinking block as it arrives: the plan, then the draft answer, with a line whenever the
+bridge is doing something between upstream calls (`running agentaus_search`,
+`compacting the earlier conversation`, `checking the answer`). The checked answer follows
+as ordinary text. Display only - nothing replays thinking blocks. Same prompt afterwards:
+characters visible from 5.7 seconds, growing ~450 every 2 seconds.
+`AGENTAUS_LIVE_DRAFT=false` goes back to holding everything.
+
+## Markdown or tags
+
+Every prompt the bridge writes for Agentaus - its operating notes, the plan, review,
+grounding and turn-judge passes, search and compaction calls, and the framing around each
+tool result - is Markdown by default: headings, lists, and fenced blocks.
+`AGENTAUS_PROMPT_STYLE=xml` restores the tagged layout byte for byte.
+
+The two are one source. Templates are written once, in the tagged form, and rendered at
+`.format()` time by `prompt_style.py`, so the switch cannot drift into two diverging copies
+of each prompt. Only the bridge's own words are restyled: anything substituted into a
+prompt - a request, an answer under review, a file excerpt, a tool result - arrives
+verbatim inside a fence one tilde longer than any run of tildes in it, so nothing inside
+can close its block or read as structure. That is the job a closing tag did, and a
+heading alone cannot do it: a heading says where a section starts, never where it ends.
+
+## Tool calls Agentaus spells wrong
+
+The commonest Agentaus failures on the benchmark were not wrong decisions but wrong
+spellings of right ones, and each cost a correction round - where a smaller model loses
+the thread. They are repaired now when the meaning is unambiguous (`repair.py`):
+
+- names: `agentaus_read`, `read_file`, `functions.Write`, `run_command`; `Python` becomes
+  `Bash` running the same code through `python3`
+- fields: `cmd` / `script` / `code` fill a missing `command`, `path` / `filename` a
+  missing `file_path`, `text` / `contents` a missing `content`
+- a relative `file_path` becomes absolute, which Claude Code's file tools require
+
+A repair only ever targets a tool that was offered, and never overwrites a field the call
+did set. Everything else still goes back to the model as a correction.
+
+## Turns that stop without finishing
+
+The failure the benchmark found most: the turn ends on an announcement. "We will first
+locate questions.json." "We need to write answers.json with JSON object." Or the
+deliverable arrives in the reply instead of being done - answers printed as JSON instead
+of written to the file, a whole R script printed instead of written and run. The
+baseline lost 8 of 15 MMLU-Pro batches this way.
+
+The judge that used to ask only "is this a refusal?" now has three verdicts - REFUSAL,
+STALLED, ANSWER - and sees the request the conversation started with and the ledger of
+tools already run, so "answers.json written" after a Write reads as done. A stalled turn
+is told to take the remaining step of the user's task and to write nothing else. At most
+two re-asks per conversation: the first version of this judge had none, called finished
+turns stalled 76 times in one run, and pushed one session into writing notes in the
+user's Claude memory folder.
+
+## Claude Code A/B: Agentaus against Opus 5
+
+Measured September 2026 with the Claude Code binary the VS Code extension ships (2.1.278),
+driven headless in a clean VS Code-equivalent session - fresh directory outside any
+repository, no memory, no inherited environment - once per arm. Tuned on dev halves,
+scored once on held-out halves; graded by tests, answer keys and independently computed
+reference numbers, with R scripts re-run from scratch. Harness in `abbench/`.
+
+| Suite | Agentaus, bridge before | Agentaus, this bridge | Claude Opus 5 | Median time, Agentaus / Opus |
+| --- | --- | --- | --- | --- |
+| R econometrics - data.gov.au download + Pareto model, OLS (6 runs) | 63.0% (27–88) | **100.0% (61–100)** | 100.0% (61–100) | 86s / 41s |
+| HumanEval+ - 82 held-out problems | 85.4% (76–91) | **93.9% (87–97)** | 93.9% (87–97) | 80s / 24s |
+| MMLU - 150 held-out questions | 4.7% (2–9) | **80.7% (74–86)** | 93.3% (88–96) | 58s / 24s |
+| MMLU-Pro - 150 held-out questions | 0.0% (0–2) | **70.7% (63–77)** | 86.7% (80–91) | 76s / 34s |
+
+Scores with 95% intervals. What moved the numbers was not knowledge but finishing: before,
+Agentaus announced a step and stopped, or printed the answer instead of writing the file,
+in 14-15 of 15 MMLU batches. On coding and the data.gov.au task it now draws level with
+Opus; on the knowledge suites the remaining gap is the model's knowledge. It is 2-3.5
+times slower. The version measured is `57d04fa`; later commits on this branch revert a
+change that measured worse and add failure-path fixes covered by tests.
+
 ## What the live model taught us
 
 Everything in the bridge was written against unit tests first. Driving real turns at
 Agentaus found failures no test would have caught, and the fixes are worth knowing about
 if you extend this.
 
-**Tag everything.** Agentaus follows explicit structure far more reliably than prose with
-capitalised headings. Every prompt the bridge builds uses XML tags — `<request>`,
-`<excerpt>`, `<tools_available>`, `<task>`, `<output_format>` — and so does every tool
-result it forwards. This is where most of the reliability came from, not from better
-wording.
+**Structure everything.** Agentaus follows explicit structure far more reliably than
+loose prose. Every prompt the bridge builds is sectioned - `request`, `excerpt`,
+`tools_available`, `task`, `output_format` - and so is every tool result it forwards.
+This was first done with XML tags; the layout is now Markdown headings and fenced blocks
+by default (see [Markdown or tags](#markdown-or-tags)), with the tags one setting away.
+The benchmark measured the Markdown layout together with the other changes of that round,
+not on its own, so what is established is that sectioning matters - not yet which syntax
+does it better.
 
 **A helper pass must never judge what it cannot see.** The bridge runs three extra calls
 around a turn: plan before, review after, and distil in between. Each is a *fresh*
@@ -1030,6 +1159,71 @@ answer + <tools_it_actually_ran>  →  GROUNDED
 An unreadable verdict counts as grounded. Rewriting a good answer is the more expensive
 mistake, and this pass exists because the last one made it.
 
+
+### The ledger says a call happened, not what it returned
+
+That design has a blind spot, and on analytical work it destroys exactly what it was
+built to protect. The ledger renders a call as one line:
+
+```
+- Bash(cd /w && python3 fit.py) -> ok
+```
+
+Asked whether an answer could know the coefficient it just reported, a checker holding
+that line can only say no. Verbatim, on a fitted regression:
+
+> GAPS
+> the specific numeric results (n = 12, coefficient = 0.8493, standard error = 0.9585,
+> R-squared = 0.0728, p-value = 0.3964) - **would need the actual output from fit.py
+> showing these values.**
+
+The output *was* in the conversation. The ledger simply does not carry it. The rewrite
+then turned every correct figure into *"the coefficient may be 0.849; I have not read the
+source"* - an answer contradicting itself while the right numbers sat in the file the turn
+had just written to disk. This is the README's own rule biting the pass that was written
+to enforce it: **a helper pass must never judge what it cannot see.**
+
+So the grounding check is given `render_evidence` instead - the same ledger, plus a
+bounded excerpt of what each call returned, newest first, head and tail of anything long.
+A traceback says what broke on its last line and a table says what it holds on its first;
+the middle of either is padding.
+
+Same turn, after:
+
+```
+GROUNDED
+```
+
+And the failure it exists for still fails: given one `find` and an answer asserting the
+contents of four files it never opened, all four were caught, plus a policy that does not
+exist. The distinction it now draws is between *a number a command printed* - supported,
+because the run is the evidence - and *a claim about a file nothing opened*.
+
+It costs about 2,700 extra input tokens on a grounding call, bounded at roughly 6,000.
+That is the price of not shredding correct arithmetic.
+
+**It does not fire on short answers.** `worth_grounding_check` has a 400-character floor,
+and a turn that replies with a JSON object clears neither it nor any need for it.
+
+### The bridge's own tools are evidence too
+
+The same rule was broken a second time, by a blind spot in where the evidence came from.
+The ledger is built from the message list Claude Code sends, and **bridge tool calls never
+enter that list** - `agentaus_search`, `agentaus_zoom` and the rest run inside the turn.
+Two passes judged answers without seeing them:
+
+- **Grounding stripped a correct fact.** An answer stating `CACHE_TTL_SECONDS = 600` in
+  `src/config.py`, read by `agentaus_zoom` a minute earlier, was judged to *"need a tool read
+  of src/config.py"* and rewritten to *"I have not read it"*. The live draft had been right.
+- **Self-review invented an answer.** A turn that used only bridge tools looked like a
+  prose turn, so it went to self-review, which sees only the request and the answer. An
+  answer citing `src/retry.py` lines 7-9, just zoomed, was "revised" into a description of
+  urllib3's `Retry.get_backoff_time()` - from memory, in a project with no urllib3 in it.
+
+Both are fixed the same way. Every bridge tool result from the turn (already kept to catch
+repeated calls) is rendered into the evidence alongside the ledger. A turn that used any
+bridge tool goes to the grounding check, never to the evidence-blind self-review.
+
 ---
 
 ## Truncated tool output is read back from disk
@@ -1157,6 +1351,105 @@ stated is followed more reliably than one asserted. They are deliberately short 
 token of instruction is one less for the conversation, and a long list of rules is itself
 something a smaller model handles badly.
 
+### The model has to call `Skill`, and this one does not
+
+Everything above assumes the model loads a skill when its description matches. Claude Code
+offers `Skill` as an ordinary tool and expects it to be called. Measured on the same
+prompt, in the same directory, with the same skills present and `Skill` among the 28 tools
+on the wire:
+
+```
+opus      ['Bash', 'Bash', 'Skill', 'Bash', 'Bash', ...]   invoked Skill: True
+agentaus  ['Read']                                         invoked Skill: False   (x5)
+```
+
+Naming `Skill` first in the generated `<tool_selection>` block did not move it: still
+`['Read']`. So the procedures written to compensate for this model were not reaching it,
+and the table above described a mechanism that worked on the model that needed it least.
+
+The fix is the one the rest of the bridge already applies here: **do not ask it to choose,
+hand it the thing.** A skill whose gate fires is injected into the system prompt as
+`<applicable_procedures>`; `Skill` stays on the wire for everything no gate covers.
+
+The gates are structural and cost nothing - a tabular file named anywhere in the turn
+selects `analyse-data`, five or more numbered steps selects `multi-step-work`. Both had to
+be narrowed after measurement. The first version counted bulleted lines as steps, so a
+two-panel chart task listing two panels and two JSON keys totalled four, drew in the
+long-task procedure on top of the analysis one, and the run that followed answered *"We
+will write the script `generate_rnd_plot.py` in the working directory, then run it"* and
+stopped - one turn, no tool calls, nothing on disk, against 6/6 for the same task without
+it. Restricting steps to numbered lines and raising the threshold took it back to 6/6.
+
+That is this repository's own rule turned on itself: skills are **deliberately short**,
+and a long list of rules is itself something a smaller model handles badly. Injecting two
+of them at once is a long list of rules.
+
+Finding the skills directory is done by asking the filesystem, not by parsing the prompt.
+The bridge used to read the working directory out of a labelled line in Claude Code's
+system prompt; that label is absent in 2.1.278, so the parse returned `None` and every
+lookup silently found nothing. Candidate paths are now taken from the request, walked
+upward, and the one with a `.claude/skills` directory wins. A label can be renamed; a
+directory either has the folder or it does not.
+
+Parsed skills are cached against the skills directory's mtime. This is disk work on the
+request path, and the commit that moved search into worker threads established that such
+work must not block the event loop - 0.22ms for ten skills, 0.005ms once cached.
+
+### Routing: "if this, use that"
+
+Why the model would not choose was found on Claude Code 2.1.281, which sends a **project**
+skill as a bare name - `- find-in-code`, no description - for every model. Opus picks the
+right skill from the name alone. Agentaus cannot choose between names it has no purpose
+for, and restoring the descriptions inside Claude Code's list did not move it either: the
+list is the last thing in a long system prompt, and the planner never saw it at all.
+
+So the bridge now does three things when `Skill` or `Agent` is on the wire
+(`AGENTAUS_SKILL_ROUTING`, on by default):
+
+1. **Descriptions go back into the listing**, read from each skill's own front matter.
+2. **A "Skills and subagents" section is added to the guidance**: one line per skill and
+   agent type, built from the description's own *"Use when ..."* clause:
+
+   ```
+   - If a question involves a .docx, .xlsx, .pptx or .pdf ... → `Skill` with `skill: "read-documents"`
+   - If answering means sweeping many files ... → `Agent` with `subagent_type: "Explore"`
+   - If none of these fits → no skill or subagent; use your tools directly
+   ```
+
+   It opens with the budget: **there is no API or token limit on this model**, so loading a
+   skill or starting a subagent costs nothing that matters.
+3. **The planner gets the same lines and must begin with its choice** - `Skill: <name>` or
+   `Skill: none`, and `Agent: <type>` or `Agent: none` - so the decision is made, not
+   skipped.
+
+A loaded skill needed one more fix. Claude Code's tool result says only *"Launching skill:
+read-documents"* and the procedure follows as a plain message. Agentaus passed a `.docx`
+path as the skill's argument, expected the document back, got instructions, did not follow
+them, and loaded the same skill three more times. The bridge now heads a loaded skill
+*"Procedure to follow now"* and says it is instructions, not a result; a repeat load is told
+it is already in the conversation.
+
+### The bridge's own skill library
+
+`agentaus_bridge/skill_library/` holds skills adapted from Anthropic's Apache-2.0
+plugins (attribution in its `NOTICE`), rewritten for this model in annotated Markdown:
+
+| Skill | Adapted from |
+| --- | --- |
+| `thorough-code-review` | `code-review`, and `pr-review-toolkit`'s six review lenses as parallel subagents |
+| `feature-development` | `feature-dev`: explore, design, build, review, with subagents per phase |
+| `simplify-code` | `code-simplifier` |
+| `secure-coding` | `security-guidance`'s dangerous-pattern catalogue, with a scanner script |
+| `git-commit-and-pr` | `commit-commands` |
+| `math-reasoning` | `math-olympiad`, refocused on everyday quantitative questions |
+| `skill-authoring` | `skill-creator` and `plugin-dev`, with a spec validator script |
+
+Claude Code has never heard of them, so the bridge serves them itself
+(`AGENTAUS_SKILL_LIBRARY`, on by default). It adds them to the listing, after the project's
+own skills and before Claude Code's bundled ones, and runs any `Skill` call that names one
+like its own tools. They reach every project, including one with no `.claude/skills`, and
+Claude sessions never see them. A project skill with the same name stays the project's.
+
 ### Keeping them from doubling up with the tools
 
 A tool is a **capability**; a skill is **when to reach for it and how to know you are
@@ -1233,6 +1526,9 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_RESTORE_MAX_BYTES` | `400000` | Ceiling on what is read back |
 | `AGENTAUS_THINKING` | `true` | Plan the turn in a separate call before answering it |
 | `AGENTAUS_THINKING_VISIBLE` | `true` | Show that plan as a thinking block. `false` still uses it, but does not display it |
+| `AGENTAUS_SKILL_ROUTING` | `true` | Restore project skill descriptions, add the "if this, use that" section for skills and agent types, and have the planner name its choice. See [Routing](#routing-if-this-use-that) |
+| `AGENTAUS_SKILL_LIBRARY` | `true` | Offer the bridge's own skill library to Agentaus in every project and answer `Skill` calls for it |
+| `AGENTAUS_SUBAGENTS_FOLLOW_SESSION` | `true` | A subagent runs on the model its session's main loop is on. Off, an Agentaus session's subagents go to Claude |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | `127.0.0.1` / `8787` | Listen address |
 | `BRIDGE_PASSTHROUGH` | `true` | Forward non-Agentaus models to Anthropic; `false` answers them with Agentaus instead |
 | `ANTHROPIC_UPSTREAM_BASE_URL` | `https://api.anthropic.com` | Passthrough target |
@@ -1241,6 +1537,10 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `BRIDGE_CONNECT_TIMEOUT` | `15` | Connect timeout (seconds) |
 | `BRIDGE_READ_TIMEOUT` | `300` | Per-read budget upstream. Streaming resets it on every token, so it only bounds waiting on *nothing*. Was 1800, which turned a dead connection into 30 minutes of silence |
 | `BRIDGE_STALL_WARNING` | `45` | Log that an upstream call is still waiting, and for how long. `0` disables |
+| `AGENTAUS_PROMPT_STYLE` | `markdown` | How the bridge lays out what it writes for Agentaus: `markdown` or `xml` |
+| `AGENTAUS_LIVE_DRAFT` | `true` | Stream tokens into a thinking block while the answer is held for checks |
+| `AGENTAUS_TOOL_FOCUS` | `true` | Hold back Claude Code's non-coding harness tools (Artifact, Cron, DesignSync...) unless named or used. Custom and MCP tools are never hidden |
+| `AGENTAUS_REVIEW_TOOLLESS` | `false` | Also review tool-less requests - Claude Code's own utility calls. For bare-prompt harnesses only |
 | `BRIDGE_TURN_TIMEOUT` | `900` | Wall-clock ceiling on one streamed Agentaus turn. Pings defeat Claude Code's idle timeout, so without this a wedged turn spins forever. `0` disables |
 | `BRIDGE_MAX_RETRIES` | `2` | Extra attempts after a transient upstream failure |
 | `BRIDGE_RETRY_BACKOFF` | `0.5` | Base backoff in seconds; doubles per attempt, plus jitter |

@@ -1,0 +1,11 @@
+# Downloaded benchmark data, run artefacts and logs stay local.
+data/
+logs/
+runs/
+quarantine/
+__pycache__/
+dev1.sh
+dev1_web.sh
+dev2.sh
+ref_opus.sh
+results/ctest_opus.json
