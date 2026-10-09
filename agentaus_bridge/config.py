@@ -561,6 +561,14 @@ class Settings:
     agentaus_subagents_follow_session: bool = field(
         default_factory=lambda: _bool("AGENTAUS_SUBAGENTS_FOLLOW_SESSION", True)
     )
+    # Who a commit written on an Agentaus turn credits, as `Name <email>`. Claude Code asks
+    # an unknown model for `Co-Authored-By: Claude Code <noreply@anthropic.com>`; the bridge
+    # swaps in this one. GitHub credits the account the email is verified on. Empty leaves
+    # Claude Code's line alone.
+    agentaus_coauthor: str = field(
+        default_factory=lambda: os.environ.get(
+            "AGENTAUS_COAUTHOR", "Agentaus <theteam@trellisdata.com>").strip()
+    )
     # Have the model review its own answer and revise it when defects are found.
     # "What is wrong with this?" is a much easier question for a smaller model than
     # getting it right first time, which is what makes the extra round trip pay.

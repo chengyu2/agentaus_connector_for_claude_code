@@ -27,6 +27,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from . import attribution
 from . import documents
 from . import harmony
 from . import persisted
@@ -1722,6 +1723,11 @@ async def _handle_agentaus(
         # answers from a fragment and fills the rest in. The client saved the real output
         # to disk and the bridge is on the same machine, so read it.
         current = await asyncio.to_thread(persisted.restore, current)
+
+        # Claude Code asks every model it does not know to credit Claude in its commits.
+        current, credited = attribution.credit(current, settings.agentaus_coauthor)
+        if credited:
+            rlog(logging.INFO, "attribution: commits credit %s", settings.agentaus_coauthor)
 
         # Claude Code lists project skills by bare name; put back what each is for, so
         # the model - and the planner, which reads the same listing - can choose one.

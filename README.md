@@ -689,6 +689,7 @@ all of it invisible from the settings file:
 | **26 tools, 120 KB of schemas** (~30,000 tokens a call). `Artifact` alone is 34 KB | A quarter of the window gone before the conversation starts, and 26 names to choose from - where the invented and misspelt calls come from | **Tool focus**: Claude Code's non-coding harness tools are held back unless the user names them or the conversation already used them - 13 KB. A deny-list, so custom and MCP tools are never hidden. `AGENTAUS_TOOL_FOCUS=false` sends everything |
 | The environment block - **including the working directory** - as a `system`-role entry *inside `messages`*, and connector instructions the same way | Forwarded as-is it became the *last* message, after the user's request, and Agentaus answered it: a finished R task replied to with "I have not read the Claude Docs workflow you shared" | Every `system`-role entry joins the system prompt, so the turn ends on what the user said. The working-directory lookup reads them too - it had silently been finding nothing |
 | `<system-reminder>` blocks beside what the user typed: account email, commit attribution, which tools loaded | Handed to the planner, reviewer and turn judge as part of "the request" | Stripped wherever the bridge reads the request |
+| The commit attribution asks an unknown model - `agentaus` included - for `Co-Authored-By: Claude Code <noreply@anthropic.com>` (2.1.293) | Every commit an Agentaus session made credited Claude on GitHub | Swapped for `AGENTAUS_COAUTHOR` on Agentaus turns. See [Commit credit](#commit-credit) |
 | After every turn, **utility calls** with no tools: the end-of-turn state classifier (done / working / blocked / failed, which drives the "come back" notification) and session titles | The self-review pass rewrote the classifier's one-word verdict into a 4,322-character essay, twice - **39 seconds added to every Agentaus turn**, and a garbled notification state | Review and grounding run on agent turns only - requests that offer tools. `AGENTAUS_REVIEW_TOOLLESS=true` restores the old behaviour for a bare-prompt harness |
 
 ## Live tokens
@@ -1468,6 +1469,31 @@ any model; they simply matter more where the model needs the script.
 
 ---
 
+## Commit credit
+
+GitHub credits a co-author by the email in the commit's `Co-Authored-By:` trailer, matched
+to the account that email is verified on. That is how Claude shows up as a contributor:
+`noreply@anthropic.com` is verified on Anthropic's `claude` account. Agentaus has its own
+account, [Agentaus-by-Trellis-Data](https://github.com/Agentaus-by-Trellis-Data), with
+`theteam@trellisdata.com`.
+
+Claude Code writes the trailer it wants into a `<system-reminder>`, and for a model it does
+not know it asks for `Co-Authored-By: Claude Code <noreply@anthropic.com>`. Two ways to
+change that:
+
+| Where | Credits Agentaus on | Leaves Claude's commits to Claude |
+| --- | --- | --- |
+| The bridge (`AGENTAUS_COAUTHOR`, on by default) | Agentaus turns, in every project | Yes - Claude turns pass through untouched |
+| `"attribution": {"commit": "Co-Authored-By: Agentaus <theteam@trellisdata.com>"}` in `.claude/settings.json` | Every turn in that project | No - Claude Code asks every model for that line |
+
+This repository sets both, so every commit made here credits Agentaus. The bridge only
+rewrites a trailer that stands on its own line in Claude Code's own instructions; `git log`
+output, a pasted commit and a file quoted in a reminder reach the model as they are. The
+pull request footer (`Generated with Claude Code`) is left alone, since the tool is still
+Claude Code.
+
+---
+
 ## Configuration reference
 
 All settings are environment variables, readable from `.env`. Shell exports win over
@@ -1529,6 +1555,7 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_SKILL_ROUTING` | `true` | Restore project skill descriptions, add the "if this, use that" section for skills and agent types, and have the planner name its choice. See [Routing](#routing-if-this-use-that) |
 | `AGENTAUS_SKILL_LIBRARY` | `true` | Offer the bridge's own skill library to Agentaus in every project and answer `Skill` calls for it |
 | `AGENTAUS_SUBAGENTS_FOLLOW_SESSION` | `true` | A subagent runs on the model its session's main loop is on. Off, an Agentaus session's subagents go to Claude |
+| `AGENTAUS_COAUTHOR` | `Agentaus <theteam@trellisdata.com>` | The `Co-Authored-By:` line commits on Agentaus turns end with, in place of Claude Code's Claude one. Empty leaves Claude Code's line. See [Commit credit](#commit-credit) |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | `127.0.0.1` / `8787` | Listen address |
 | `BRIDGE_PASSTHROUGH` | `true` | Forward non-Agentaus models to Anthropic; `false` answers them with Agentaus instead |
 | `ANTHROPIC_UPSTREAM_BASE_URL` | `https://api.anthropic.com` | Passthrough target |
