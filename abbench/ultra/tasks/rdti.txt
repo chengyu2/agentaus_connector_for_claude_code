@@ -1,0 +1,19 @@
+ultracode: This folder holds Australian R&D Tax Incentive data across several files:
+- rdti_2022_23.xlsx - 2022-23 claims (ABN printed with spaces)
+- rdti_2021_22_late.xlsx - late lodgers for the 2021-22 income year
+- amendments.csv - amended expenditure figures for claims in either income year
+- sector_watchlist.xlsx - 60 companies our team tracks, with a sector each
+
+Rules: identify a company by its 11-digit ABN; where a row has no ABN, identify it by company name. A company's "effective" expenditure for a year is its amended figure for that year if amendments.csv has one (even if that figure is 0), otherwise its reported figure.
+
+Answer these and write answers.json with exactly these keys:
+- q1_companies_2022_23: number of distinct companies with a 2022-23 claim
+- q2_total_effective_2022_23: total effective 2022-23 expenditure (integer dollars)
+- q3_median_effective_2022_23: median effective 2022-23 expenditure per company, rounded to the nearest dollar
+- q4_count_at_least_10m: number of companies whose effective 2022-23 expenditure is at least $10,000,000
+- q5_top_abn: ABN (11 digits, no spaces, as a string) of the company with the largest effective 2022-23 expenditure
+- q6_sector_totals: object mapping each watchlist sector to the total effective 2022-23 expenditure of its watchlist companies
+- q7_in_both_years: number of ABNs that appear both in the 2022-23 claims and the 2021-22 late lodgers
+- q8_net_amendment_change_2022_23: sum over 2022-23 amendments of (amended figure minus reported figure)
+
+Cross-check every number before writing the file, then summarise the findings briefly.

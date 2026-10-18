@@ -44,6 +44,27 @@ def _named(path: str) -> str:
     return f"`{path}`" if path else "the arguments"
 
 
+def _types_of(schema: dict) -> list[str]:
+    """The types a schema allows, as a list - `type` may be one name or several.
+
+    A workflow script's `schema` is any JSON Schema its author wrote, and nullable fields
+    are spelt `"type": ["string", "null"]`. Treated as one name, that list crashed the
+    check - `list` is unhashable - and ended the subagent's turn on an API error.
+    """
+    expected = schema.get("type")
+    names = expected if isinstance(expected, list) else [expected]
+    return [n for n in names if isinstance(n, str)]
+
+
+def _nullable(schema) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    if "null" in _types_of(schema) or schema.get("nullable") is True:
+        return True
+    return any(_nullable(option) for key in ("anyOf", "oneOf")
+               for option in schema.get(key) or [])
+
+
 def coerce(value, schema: dict):
     """Fix what can only have been meant one way, and leave the rest alone.
 
@@ -54,7 +75,11 @@ def coerce(value, schema: dict):
     """
     if not isinstance(schema, dict):
         return value
-    expected = schema.get("type")
+    # Only an unambiguous schema licenses a fix: with "null" allowed alongside one type
+    # the intent is still that type, but a field that takes a string OR a number is left
+    # exactly as sent.
+    types = [t for t in _types_of(schema) if t != "null"]
+    expected = types[0] if len(types) == 1 else None
 
     # Models routinely send a JSON document as a string. Decode it once, only when the
     # result is the shape the schema asked for - never turning "42" into 42 for a field
@@ -78,6 +103,8 @@ def coerce(value, schema: dict):
             value = int(number) if expected == "integer" and number.is_integer() else number
         except ValueError:
             pass
+    elif expected == "integer" and isinstance(value, float) and value.is_integer():
+        value = int(value)
     elif expected == "string" and isinstance(value, (int, float, bool)):
         value = json.dumps(value) if isinstance(value, bool) else str(value)
 
@@ -98,23 +125,27 @@ def check(value, schema: dict, path: str = "") -> list[str]:
         return []
     problems: list[str] = []
 
-    expected = schema.get("type")
-    if expected in _TYPES and value is not None:
+    types = [t for t in _types_of(schema) if t in _TYPES]
+    if types and value is not None:
         # bool is an int in Python and never what a numeric field wants.
-        wrong_type = not isinstance(value, _TYPES[expected]) or (
-            expected in ("number", "integer") and isinstance(value, bool)
-        )
-        if wrong_type:
+        def fits(name: str) -> bool:
+            return isinstance(value, _TYPES[name]) and not (
+                name in ("number", "integer") and isinstance(value, bool))
+        if not any(fits(name) for name in types):
             actual = type(value).__name__
-            return [f"{_named(path)} must be {expected}, but you sent {actual}."]
+            return [f"{_named(path)} must be {' or '.join(types)}, but you sent {actual}."]
 
     if isinstance(value, dict):
+        properties = schema.get("properties") or {}
         for key in schema.get("required") or []:
-            if key not in value or value[key] is None:
+            # Present-but-null is missing only where the field cannot be null. Strict
+            # output schemas make every field required and the optional ones nullable,
+            # so a valid null was being "corrected" until the rounds ran out.
+            if key not in value or (value[key] is None
+                                    and not _nullable(properties.get(key))):
                 problems.append(
                     f"{_named(path)} is missing the required field `{key}`."
                 )
-        properties = schema.get("properties") or {}
         for key, item in value.items():
             if key in properties:
                 problems += check(item, properties[key], f"{path}.{key}" if path else key)

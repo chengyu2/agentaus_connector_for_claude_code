@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import html as htmllib
+import json
 import logging
 import os
 import re
@@ -347,7 +348,12 @@ def repair_tool_results(body: dict) -> dict:
                 if isinstance(block, dict) and block.get("type") == "tool_result"
                 else None
             )
-            if not path or block.get("is_error"):
+            # Newer clients refuse an office file outright ("This tool cannot read binary
+            # files") instead of returning zip noise. That refusal is as replaceable as
+            # the noise was; any other error - a missing file - is the client's to report.
+            refused = block.get("is_error") and re.search(
+                r"cannot read binary|binary file", json.dumps(block.get("content")), re.I)
+            if not path or (block.get("is_error") and not refused):
                 blocks.append(block)
                 continue
             text = extract(path)
@@ -356,7 +362,7 @@ def repair_tool_results(body: dict) -> dict:
                 continue
             changed = repaired_any = True
             blocks.append({
-                **block,
+                **{k: v for k, v in block.items() if k != "is_error"},
                 "content": (
                     f"[The bridge re-read {os.path.basename(path)} with LibreOffice, "
                     f"because an office document is a zip archive and cannot be read as "

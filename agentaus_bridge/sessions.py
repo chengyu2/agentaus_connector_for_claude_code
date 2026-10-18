@@ -27,6 +27,9 @@ _MAX_AGE_SECONDS = 12 * 3600
 
 _lock = threading.Lock()
 _main_loop: "OrderedDict[str, tuple[bool, float]]" = OrderedDict()
+# What each session's user asked for, so its subagents can be shown it. See
+# `request_of`.
+_requests: "OrderedDict[str, tuple[str, float]]" = OrderedDict()
 
 
 def session_of(headers) -> str | None:
@@ -69,6 +72,35 @@ def main_loop_on_agentaus(session: str | None) -> bool | None:
     return seen[0]
 
 
+def note_request(session: str | None, text: str) -> None:
+    """Record the request a session's main loop is working on."""
+    if not session or not (text or "").strip():
+        return
+    with _lock:
+        _requests[session] = (text, time.monotonic())
+        _requests.move_to_end(session)
+        while len(_requests) > _MAX_SESSIONS:
+            _requests.popitem(last=False)
+
+
+def request_of(session: str | None) -> str | None:
+    """The request a subagent's session is working on, or None.
+
+    A workflow subagent sees only the prompt its script wrote, and Agentaus writes thin
+    ones. Measured: "compute the required statistics from the provided files" - no
+    rules, no questions - and a verifier told to "repeat the same calculations as
+    before", which it had never seen. Both answered confidently and wrong.
+    """
+    if not session:
+        return None
+    with _lock:
+        seen = _requests.get(session)
+    if seen is None or time.monotonic() - seen[1] > _MAX_AGE_SECONDS:
+        return None
+    return seen[0]
+
+
 def reset() -> None:
     with _lock:
         _main_loop.clear()
+        _requests.clear()

@@ -20,6 +20,7 @@ applying it where there is no gap would only add latency and noise.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import textwrap
@@ -415,7 +416,357 @@ def skills_for(body: dict) -> list[str]:
     return wanted
 
 
-def guidance_for(body: dict, *, covered_by_skill: tuple = (), routing: bool = True) -> str:
+WORKFLOW_GUIDANCE = """\
+
+--- Multi-agent workflows ---
+
+**The user opted into multi-agent orchestration ("ultracode").**
+
+- **Substantive task** → call `Workflow` **once**, with a script that fans the work out to subagents and cross-checks it.
+- **Trivial or conversational turn** → work alone, no `Workflow`.
+
+### W0. Look before you fan out
+
+Before writing the script, **read the task's inputs yourself**:
+
+- [ ] list the working directory
+- [ ] open **every** input file the request names: the question list, the brief, the README, **and the documents themselves** - `.docx`, `.xlsx` and `.pdf` included. The file list below says how each one opens.
+- [ ] peek at each data file's columns or first rows
+
+Then **quote what you found** in the subagent prompts: the real questions, the real column names, the real file paths. A subagent told only "answer the questions" will invent them.
+
+### W1. What a script is
+
+- Plain **JavaScript**. Not TypeScript: no type annotations.
+- **Line 1** is a pure literal, with no variables or calls inside it:
+  `export const meta = { name: 'kebab-name', description: 'one line', phases: [{ title: 'Solve' }] }`
+- **Write it over several lines, one statement per line.**
+- The script has **only** these functions:
+  - `await agent(prompt, opts)` → starts one subagent
+  - `await parallel([() => agent(...), () => agent(...)])` → a list of **functions**, not calls
+  - `await pipeline(items, item => agent(...), result => agent(...))`
+  - `phase(title)`, `log(text)`, and the value `args`
+- **There is no `Bash`, `Read` or other tool function inside a script.** The subagents that `agent()` starts are the ones that use tools.
+- **Never** use `require`, `fs`, `Date.now()` or `Math.random()`.
+- **End** with `return` and the result.
+
+### W2. Every subagent prompt stands alone
+
+A subagent sees **none** of this conversation. Each prompt must contain:
+
+- [ ] the **absolute path** of the working directory
+- [ ] the **file names** to use
+- [ ] **every rule** the user gave
+- [ ] **exactly what to return**
+
+For a structured result, pass `schema`: a JSON Schema object with `type`, `properties` and `required`. The subagent then returns an object of that shape.
+
+**Pass results forward.** A later agent sees nothing an earlier one found unless you put it in its prompt:
+
+```js
+const evidence = await agent(`Extract the text of /abs/dir/past/proposal.docx ...`, { schema: EVIDENCE })
+const draft = await agent(`Answer Q1-Q9 using ONLY this evidence:\n${JSON.stringify(evidence)}`, { schema: DRAFT })
+```
+
+### W3. Make subagents check each other
+
+- Two or three subagents solve the **same** thing by **different methods**, or
+- one solves and another **tries to refute** it.
+- The script **compares** their results.
+- **When they disagree, return all of them** (`return { runs, agree: false }`), and resolve the disagreement yourself after the notification. **Never** silently keep the first.
+- A checker's prompt must be as complete as the solver's. **Never** write "repeat the calculations as before": the checker has not seen them.
+
+### W4. Before you send: count the brackets
+
+- [ ] every `(`, `{`, `[` and backtick you open is **closed**
+- [ ] nothing is closed **twice**
+- [ ] long shared text sits in **one `const`** near the top
+
+### W5. A workflow runs in the background
+
+- `Workflow` returns **at once**: "Workflow launched in background" and a task ID.
+- The **result arrives later**, in a message containing `<task-notification>`.
+- **Do NOT** call `Workflow` again to fetch the result.
+- **Do NOT** re-run it by `scriptPath`. That starts a second, duplicate run.
+- While it runs, **either** do independent work (for example, compute a baseline to compare against), **or** end your turn and say what is running.
+- **Do NOT write the user's deliverable before the result arrives.** It is built from the workflow's result, not from a guess made while it runs.
+
+### W6. When the `<task-notification>` arrives
+
+1. **Read** its result.
+2. **Check** it against the source data or your baseline. Resolve any disagreement with your own tools.
+3. **Finish the user's task yourself**: write the files they asked for, then report what the workflow found.
+
+### Example
+
+```js
+export const meta = { name: 'sum-check', description: 'Two independent totals, compared', phases: [{ title: 'Solve' }] }
+const TASK = `In /abs/path/to/dir, total column units in sales.csv. Return the total.`
+const SCHEMA = { type: 'object', properties: { total: { type: 'number' }, method: { type: 'string' } }, required: ['total', 'method'] }
+const runs = await parallel([
+  () => agent(TASK + ' Use pandas.', { label: 'pandas', phase: 'Solve', schema: SCHEMA }),
+  () => agent(TASK + ' Use the csv module, no pandas.', { label: 'csv', phase: 'Solve', schema: SCHEMA }),
+])
+const ok = runs.filter(Boolean)
+return { runs: ok, agree: ok.length === 2 && ok[0].total === ok[1].total }
+```
+"""
+
+SUBAGENT_GUIDANCE = """\
+
+--- Your return value ---
+
+**You are a subagent.** Whoever started you sees **only what you return**, not your working.
+
+1. **Do the work with your tools.** Run the code and read the files. Do **not** estimate, and do **not** describe what you would do.
+2. {how}
+"""
+
+_RETURN_BY_TOOL = (
+    "**Finish with exactly one call to `StructuredOutput`.**\n"
+    "   - Its arguments **are** the answer.\n"
+    "   - Every **required** key is present.\n"
+    "   - Every value has the **declared type**: an integer as a number, not a string.\n"
+    "   - Do **not** write the answer as text instead.\n"
+    "   - Do **not** call it before the work is done."
+)
+_RETURN_BY_TEXT = (
+    "**Your final message is the return value.** State the result itself: the numbers, "
+    "the findings, the file paths. **Not** a plan, and **not** a promise of what comes next."
+)
+
+
+def is_subagent_turn(body: dict) -> bool:
+    """Whether this request is a subagent's - a workflow's agent() or an `Agent` call.
+
+    Claude Code marks them in the system prompt's billing line. `StructuredOutput` alone
+    is not a mark: a headless `--json-schema` main loop is offered it too.
+    """
+    from . import sessions
+    return sessions.is_subagent(None, body)
+
+
+PARENT_REQUEST = """\
+
+--- The request this work serves ---
+
+**Context only.** The session that started you is working on the user's request below.
+
+- **Your task is the one in your prompt.** Do only that, and return what it asks for.
+- Use this request for anything your prompt leaves out: **definitions, rules, file names, the exact questions.** Where they differ, your prompt's narrower scope wins; the request's rules still apply.
+
+```text
+{request}
+```
+"""
+
+
+def with_parent_request(system, request: str) -> object:
+    """Append the session's original request to a subagent's system prompt."""
+    note = prompt_style.headings(PARENT_REQUEST).replace("{request}", request.strip()[:8000])
+    if system is None:
+        return note.strip()
+    if isinstance(system, str):
+        return system + "\n" + note
+    if isinstance(system, list):
+        return list(system) + [{"type": "text", "text": note.strip()}]
+    return system
+
+
+def notification_turn(body: dict) -> bool:
+    """Whether the newest message is background work reporting back, not the user.
+
+    Claude Code delivers a finished workflow as a `<task-notification>` inside a system
+    reminder, and the bridge strips reminders from what its helpers read - so a planner
+    on this turn saw only the user's original request and planned to start the task
+    again.
+    """
+    for message in reversed(body.get("messages") or []):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        texts = [content] if isinstance(content, str) else [
+            b.get("text", "") for b in content or []
+            if isinstance(b, dict) and b.get("type") == "text"]
+        return any("<task-notification>" in (t or "") for t in texts)
+    return False
+
+
+def awaiting_background(body: dict) -> bool:
+    """Whether the newest step launched a `Workflow` that is now running.
+
+    After the launch, "I've started it and will report back" is the correct reply - the
+    result arrives as a later message. Judged as a stall, the re-ask told the model to
+    take the step, and it launched the same workflow a second time. Only a launch that
+    succeeded counts: a rejected script must still be fixed, and an ordinary background
+    shell command is not a reason to stop.
+    """
+    messages = body.get("messages") or []
+    launches = {}
+    for message in reversed(messages):
+        content = message.get("content")
+        if message.get("role") == "assistant":
+            if isinstance(content, list):
+                launches = {b.get("id") for b in content if isinstance(b, dict)
+                            and b.get("type") == "tool_use" and b.get("name") == "Workflow"}
+            break
+    if not launches:
+        return False
+    for message in reversed(messages):
+        if message.get("role") != "user" or not isinstance(message.get("content"), list):
+            continue
+        for block in message["content"]:
+            if (isinstance(block, dict) and block.get("type") == "tool_result"
+                    and block.get("tool_use_id") in launches and not block.get("is_error")):
+                text = block.get("content")
+                if not isinstance(text, str):
+                    text = json.dumps(text)
+                if re.search(r"launched in (the )?background", text, re.I):
+                    return True
+        break
+    return False
+
+
+_DOCUMENT_KINDS = {".docx": "Word document", ".doc": "Word document", ".xlsx": "spreadsheet",
+                   ".xls": "spreadsheet", ".pptx": "presentation", ".pdf": "PDF"}
+_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".claude", ".idea"}
+
+
+def input_files(cwd: str | None, *, depth: int = 2, limit: int = 40) -> list[str]:
+    """The files in the working directory, two levels deep, as a checklist to open.
+
+    A generic "read every input" was not enough: across four runs of a tender task
+    Agentaus read the README and the question file and never opened the `.docx`
+    proposal that held most of the evidence - not even after loading a Word skill - and
+    answered from the README alone. Naming the file, and saying it can be read, is.
+    """
+    if not cwd or not os.path.isdir(cwd):
+        return []
+    out: list[str] = []
+
+    def walk(path: str, rel: str, level: int) -> None:
+        try:
+            entries = sorted(os.scandir(path), key=lambda e: e.name)[:200]
+        except OSError:
+            return
+        for entry in entries:
+            if len(out) >= limit or entry.name.startswith("."):
+                continue
+            name = f"{rel}{entry.name}"
+            if entry.is_dir(follow_symlinks=False):
+                if entry.name not in _SKIP_DIRS and level < depth:
+                    walk(entry.path, name + "/", level + 1)
+            else:
+                ext = os.path.splitext(entry.name)[1].lower()
+                kind = _DOCUMENT_KINDS.get(ext)
+                out.append(f"`{name}`" + (f" - {kind}: {_how_to_open(entry.path, ext)}" if kind else ""))
+
+    walk(cwd, "", 1)
+    return out
+
+
+_PYTHON_READER = {".docx": "python-docx", ".doc": "python-docx", ".xlsx": "openpyxl or pandas",
+                  ".xls": "pandas", ".pptx": "python-pptx", ".pdf": "pypdf"}
+
+
+def _how_to_open(path: str, ext: str) -> str:
+    """What actually opens this document here - said truthfully, per file."""
+    from . import documents
+    if documents.available(path):
+        return "**`Read` returns its text**"
+    return (f"**open it with a short Python script in `Bash`** ({_PYTHON_READER.get(ext, 'a Python reader')});"
+            " `Read` cannot open it")
+
+
+_TASK_ID = re.compile(r"Task ID:\s*([\w-]+)")
+
+
+def pending_workflows(body: dict) -> set:
+    """Task ids of workflows this conversation launched that have not reported back."""
+    launched, reported = set(), set()
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if message.get("role") != "user":
+            continue
+        blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content or []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_result" and not block.get("is_error"):
+                text = block.get("content")
+                text = text if isinstance(text, str) else json.dumps(text)
+                if re.search(r"Workflow launched in (the )?background", text, re.I):
+                    launched.update(_TASK_ID.findall(text))
+            elif block.get("type") == "text":
+                reported.update(re.findall(r"<task-id>\s*([\w-]+)\s*</task-id>",
+                                           block.get("text") or ""))
+    return launched - reported
+
+
+WRITE_WHILE_RUNNING = (
+    "Your call to `{name}` was not run. The workflow you launched ({tasks}) is still "
+    "running, and the deliverable is built from its result. **Do not write it yet.** Its "
+    "result arrives in a message containing `<task-notification>`. Until then, either do "
+    "independent checking work that writes nothing into the working directory, or end "
+    "your turn saying what is running."
+)
+
+
+def early_deliverable_writes(calls: list, body: dict, cwd: str | None) -> list:
+    """(call, correction) for each write into the working directory while a workflow runs.
+
+    Measured: told in its guidance not to, Agentaus still wrote `response.md` from the one
+    file it had read while its workflow was reading the rest, and the session ended on
+    that draft - the workflow's evidence never reached the deliverable.
+    """
+    if not cwd:
+        return []
+    running = pending_workflows(body)
+    if not running:
+        return []
+    root = os.path.normpath(cwd) + os.sep
+    out = []
+    for call in calls:
+        if call.get("name") not in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+            continue
+        args = call.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args or "{}")
+            except ValueError:
+                continue
+        path = (args or {}).get("file_path") or (args or {}).get("notebook_path") or ""
+        if isinstance(path, str) and os.path.normpath(path).startswith(root):
+            out.append((call, WRITE_WHILE_RUNNING.format(
+                name=call.get("name"), tasks=", ".join(sorted(running)))))
+    return out
+
+
+def _where_files_go(body: dict) -> str:
+    """Name the working directory, when the environment also names a scratchpad.
+
+    Two long sandbox paths side by side get spliced. Observed: a deliverable written to
+    the session scratchpad's prefix joined to the working directory's tail - a directory
+    that did not exist - and later read back from the scratchpad, where it never was.
+    """
+    cwd = working_directory_of(body)
+    if not cwd or "scratchpad" not in _as_text(body.get("system")) + "".join(
+            _as_text(m.get("content")) for m in body.get("messages") or []
+            if m.get("role") == "system"):
+        return ""
+    return (
+        "\n--- Where files go ---\n\n"
+        f"**Working directory:** `{cwd}`\n\n"
+        "- The user's files are **there**.\n"
+        "- **Every file the user asks for is written there.** Use that exact absolute "
+        "path, or a path relative to it.\n"
+        "- A scratchpad directory is **only** for your own temporary files. **Never** "
+        "write a deliverable there.\n"
+        "- **Never** splice the two paths together.\n")
+
+
+def guidance_for(body: dict, *, covered_by_skill: tuple = (), routing: bool = True,
+                 workflow_opt_in: bool | None = None) -> str:
     """The notes that apply to this request.
 
     Tool discipline is included only when the request actually offers tools. Sending it
@@ -428,7 +779,24 @@ def guidance_for(body: dict, *, covered_by_skill: tuple = (), routing: bool = Tr
     """
     if not body.get("tools"):
         return prompt_style.headings(CORE_GUIDANCE)
-    notes = CORE_GUIDANCE + TOOL_GUIDANCE
+    notes = CORE_GUIDANCE + TOOL_GUIDANCE + _where_files_go(body)
+    if is_subagent_turn(body):
+        # A subagent hands back a value, not a write-up: the reporting contract asked
+        # for 2,000 characters of prose where the script reads one tool call, and the
+        # routing lines invited it to start subagents of its own.
+        offered = {t.get("name") for t in body.get("tools") or [] if isinstance(t, dict)}
+        how = _RETURN_BY_TOOL if "StructuredOutput" in offered else _RETURN_BY_TEXT
+        notes += SUBAGENT_GUIDANCE.format(how=how)
+        return prompt_style.headings(notes) + tool_selection(body)
+    opted = workflow_opt_in if workflow_opt_in is not None else workflow_opted_in(body)
+    if opted and any(isinstance(t, dict) and t.get("name") == "Workflow"
+                     for t in body.get("tools") or []):
+        notes += WORKFLOW_GUIDANCE
+        files = input_files(working_directory_of(body))
+        if files:
+            notes += ("\n### The files in the working directory\n\nOpen the ones the request "
+                      "is about before you write the script:\n\n"
+                      + "\n".join(f"- [ ] {f}" for f in files) + "\n")
     # The reporting contract and the `analyse-data` skill say largely the same things.
     # Sending both is the failure the README records between two skills - "one was
     # quietly arguing with another" - and this model handles a long list of rules badly.
@@ -635,7 +1003,8 @@ def skill_listing(body: dict) -> list[tuple[str, str]]:
     return []
 
 
-def with_guidance(system, body: dict | None = None, *, routing: bool = True) -> object:
+def with_guidance(system, body: dict | None = None, *, routing: bool = True,
+                  workflow_opt_in: bool | None = None) -> object:
     """Append the applicable operating notes, and any documented procedure, to the prompt.
 
     The procedure is injected rather than offered. See `agentaus_bridge.skills` for the
@@ -648,7 +1017,8 @@ def with_guidance(system, body: dict | None = None, *, routing: bool = True) -> 
     wanted = skills_for(body)
     root = skills.locate(system, body) if wanted else None
     present = tuple(n for n in wanted if n in skills.available(root)) if root else ()
-    notes = guidance_for(body, covered_by_skill=present, routing=routing)
+    notes = guidance_for(body, covered_by_skill=present, routing=routing,
+                         workflow_opt_in=workflow_opt_in)
     if present:
         notes += skills.render(root, list(present))
     if system is None:
@@ -870,6 +1240,11 @@ ask for a figure to be re-derived, re-read or cited from somewhere else: the run
 evidence. Only flag a number that CONTRADICTS an output shown below, or that no call
 made could have produced. An output may be excerpted - a value consistent with what a
 command of that kind returns is supported, not unsupported.
+
+That the agent wrote or edited a file - a Write or Edit call, or a command that created
+it - is SUPPORTED by that call: do not flag "I wrote response.md" as unread. The facts
+written INTO the file still need support like any other claim. Results reported back by
+a background workflow are SUPPORTED in the same way as a tool result.
 </task>
 
 <output_format>
@@ -960,7 +1335,9 @@ def worth_reviewing_turn(body: dict) -> bool:
     the answer with "Please provide the DOCX file". The bridge was reliably turning a
     right answer into a wrong one.
     """
-    return not mid_tool_loop(body)
+    # Nor a subagent's: its answer is a return value its parent reads, and a rewrite of
+    # it is a different value from the one the work produced.
+    return not mid_tool_loop(body) and not is_subagent_turn(body)
 
 
 def worth_reviewing(text: str, *, min_chars: int = 200) -> bool:
@@ -1052,6 +1429,12 @@ def should_think(body: dict) -> bool:
     a worse one is not just wasted latency, it is actively misleading.
     """
     if mid_tool_loop(body):
+        return False
+    # A subagent's task was written by its parent, which already planned it. Planning
+    # it again cost a call per subagent - sixteen at once under a workflow, queued
+    # behind one another and each able to sit through a Cloudflare 524 - and folded a
+    # "follow this plan" into a prompt whose only job is to return a value.
+    if is_subagent_turn(body) or notification_turn(body):
         return False
     thinking = body.get("thinking")
     if isinstance(thinking, dict) and thinking.get("type") == "enabled":
@@ -1226,7 +1609,18 @@ HELD_BACK_TOOLS = {
     "ListAgents", "SendMessage", "TaskStop", "Workflow", "ScheduleWakeup",
     "RemoteTrigger", "ReportFindings", "PushNotification", "ShareOnboardingGuide",
     "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool",
+    # New in 2.1.300: publishing a plugin, and waiting for MCP servers to start.
+    "PublishPlugin", "WaitForMcpServers",
 }
+
+# The most tool schema a request carries before unnamed MCP servers are held back too.
+# MCP tools are never hidden on principle - they are the user's own - but measured on an
+# account with the claude.ai Slack and Docs connectors attached, they were 85 KB of the
+# 112 KB still sent after focus: ~28,000 tokens a call, which compaction cannot touch. A
+# long ultracode session then overflowed the 131k window with only 78 KB of conversation,
+# and every retry failed the same way. Over this budget, a server the user has not named
+# and the conversation has not used is held back, largest first.
+_TOOL_BUDGET_BYTES = 40_000
 
 
 def _tools_used(body: dict) -> set:
@@ -1255,7 +1649,70 @@ def _last_user_words(body: dict) -> str:
     return ""
 
 
-def focus_tools(body: dict) -> tuple[dict, list]:
+# The ways a user opts into multi-agent orchestration, as Claude Code's own Workflow
+# description lists them. Without this the opt-in never reached Agentaus: headless Claude
+# Code sends no ultracode reminder - only the user's "ultracode: ..." - and the user never
+# types the tool's name, so tool focus held `Workflow` back on exactly the turns that were
+# told to use it.
+#
+# Deliberately narrow. "Write a workflow that runs pytest on every push" is a GitHub
+# Actions request, and treating it as an opt-in told the model, in bold, to start a
+# background fan-out nobody asked for. So the free-text forms need a multi-agent word,
+# reminders are read only for the ultracode keyword Claude Code's own reminder carries,
+# and the workflow-authoring skill counts when it was invoked, not merely listed.
+_ULTRACODE = re.compile(r"\bultracode\b", re.I)
+_ASKED_FOR_WORKFLOW = re.compile(
+    r"\bmulti-?agent\s+(?:workflow|orchestration)s?\b|\bthe\s+Workflow\s+tool\b|"
+    r"\bfan\s+out\s+(?:\w+\s+)?(?:sub)?agents\b|"
+    r"\borchestrate\s+(?:this|it)\s+with\s+(?:sub)?agents\b",
+    re.I,
+)
+# Claude Code's own description counts "use a workflow" and "run a workflow" - but not
+# where the workflow is plainly a CI or automation one.
+_USE_A_WORKFLOW = re.compile(r"\b(?:use|run)\s+a\s+(?:multi-?agent\s+)?workflow\b", re.I)
+_AUTOMATION = re.compile(r"github|\bactions?\b|\.ya?ml\b|\byaml\b|\bci\b|n8n|zapier|airflow|"
+                         r"\bcron\b|jenkins|gitlab|argo|temporal|step functions", re.I)
+_INVOKED_WORKFLOW_SKILL = re.compile(
+    r"<command-name>/?workflow-authoring</command-name>|^\s*/workflow-authoring\b", re.M)
+
+
+def _user_text_blocks(body: dict) -> list[str]:
+    texts = []
+    for message in body.get("messages") or []:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts.extend(b.get("text", "") for b in content
+                         if isinstance(b, dict) and b.get("type") == "text")
+    return texts
+
+
+def workflow_opted_in(body: dict) -> bool:
+    """Whether the user opted this session into Workflow orchestration.
+
+    Searched across every user message, not only the last: ultracode is a standing
+    opt-in, and by the third step of a tool loop the words that carried it are far back.
+    """
+    for text in _user_text_blocks(body):
+        if _ULTRACODE.search(text) or _INVOKED_WORKFLOW_SKILL.search(text):
+            return True
+        words = _REMINDERS.sub("", text)
+        if _ASKED_FOR_WORKFLOW.search(words) or (
+                _USE_A_WORKFLOW.search(words) and not _AUTOMATION.search(words)):
+            return True
+    for message in body.get("messages") or []:
+        for block in message.get("content") or [] if isinstance(message.get("content"), list) else []:
+            if (isinstance(block, dict) and block.get("type") == "tool_use"
+                    and block.get("name") == "Skill"
+                    and (block.get("input") or {}).get("skill") == "workflow-authoring"):
+                return True
+    return False
+
+
+def focus_tools(body: dict, *, workflow_opt_in: bool | None = None) -> tuple[dict, list]:
     """Hold back Claude Code's non-coding harness tools, unless named or already used.
 
     Nothing the user asks for goes missing: a held-back tool named in their message, or
@@ -1267,6 +1724,10 @@ def focus_tools(body: dict) -> tuple[dict, list]:
         return body, []
     asked = _last_user_words(body)
     used = _tools_used(body)
+    # Decided on the conversation before compaction when the caller has it: a summary
+    # that replaced the opening "ultracode: ..." message must not withdraw the opt-in.
+    if workflow_opt_in if workflow_opt_in is not None else workflow_opted_in(body):
+        used = used | {"Workflow"}
     kept, dropped = [], []
     for tool in tools:
         name = (tool or {}).get("name") or ""
@@ -1277,6 +1738,26 @@ def focus_tools(body: dict) -> tuple[dict, list]:
             kept.append(tool)
         else:
             dropped.append(name)
+    size = sum(len(json.dumps(t)) for t in kept)
+    if size > _TOOL_BUDGET_BYTES:
+        used_servers = {n.split("__")[1] for n in used if n.startswith("mcp__") and "__" in n[5:]}
+        by_server: dict = {}
+        for tool in kept:
+            name = (tool or {}).get("name") or ""
+            if name.startswith("mcp__") and "__" in name[5:]:
+                server = name.split("__")[1]
+                if (server not in used_servers
+                        and not re.search(rf"\b{re.escape(server)}\b", asked, re.I)
+                        and not any(re.search(rf"\b{re.escape(w)}\b", asked, re.I)
+                                    for w in re.findall(r"[A-Za-z]{4,}", server.replace("claude_ai_", "")))):
+                    by_server.setdefault(server, []).append(tool)
+        for server, tools in sorted(by_server.items(),
+                                    key=lambda kv: -sum(len(json.dumps(t)) for t in kv[1])):
+            if size <= _TOOL_BUDGET_BYTES:
+                break
+            size -= sum(len(json.dumps(t)) for t in tools)
+            kept = [t for t in kept if t not in tools]
+            dropped += [t.get("name") or "" for t in tools]
     if not dropped:
         return body, []
     return {**body, "tools": kept}, dropped

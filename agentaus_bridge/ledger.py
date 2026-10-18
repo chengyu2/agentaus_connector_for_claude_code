@@ -16,6 +16,7 @@ It costs no Agentaus calls at all.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 # Fields worth showing for a call, most identifying first. A `Read` is identified by its
@@ -245,6 +246,47 @@ def render_evidence(
         "are excerpted, so a fact consistent with an excerpt is supported too.]\n"
     )
     return head + "\n".join(blocks)
+
+
+_NOTIFICATION = re.compile(r"<task-notification>(.*?)(?:</task-notification>|\Z)", re.S)
+_NOTIFICATION_RESULT = re.compile(r"<result>(.*?)(?:</result>|\Z)", re.S)
+_NOTIFICATION_SUMMARY = re.compile(r"<summary>(.*?)</summary>", re.S)
+
+
+def render_notifications(messages: list, *, budget: int = _EVIDENCE_BUDGET) -> str:
+    """What background work reported back, for the same check `render_evidence` serves.
+
+    A workflow's result reaches the conversation as a `<task-notification>` message, not
+    a tool result, so the grounding check saw an answer full of numbers and no call that
+    produced them. Observed: eight correct figures, computed by the workflow and quoted
+    exactly, rewritten as "the repo may contain 12 956 ...; I have not read it".
+    """
+    found = []
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        texts = [content] if isinstance(content, str) else [
+            b.get("text", "") for b in content or []
+            if isinstance(b, dict) and b.get("type") == "text"]
+        for text in texts:
+            for block in _NOTIFICATION.findall(text or ""):
+                summary = _NOTIFICATION_SUMMARY.search(block)
+                result = _NOTIFICATION_RESULT.search(block)
+                found.append(((summary.group(1).strip() if summary else "background task"),
+                              (result.group(1).strip() if result else "")))
+    if not found:
+        return ""
+    blocks, spent = [], 0
+    for summary, result in reversed(found):
+        room = max(0, budget - spent)
+        body = excerpt(result, room) if result and room else ""
+        spent += len(body)
+        blocks.append(f"- {summary}" + (f"\n  <output>\n{body}\n  </output>" if body else ""))
+    blocks.reverse()
+    return ("\n[Background work reported back in this conversation. A value in an <output> "
+            "below IS supported - the agent was given it by its own workflow.]\n"
+            + "\n".join(blocks))
 
 
 # Statuses TodoWrite uses, and how they read in a reflected list.

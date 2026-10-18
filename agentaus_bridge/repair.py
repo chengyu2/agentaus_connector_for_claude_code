@@ -20,6 +20,8 @@ import logging
 import os
 import re
 
+from . import workflow_script
+
 log = logging.getLogger("agentaus-bridge")
 
 
@@ -96,6 +98,57 @@ _ALIASES = {
 _ABSOLUTE = {"Read", "Write", "Edit", "MultiEdit", "NotebookEdit"}
 
 
+def _into_working_directory(path: str, cwd: str, *, must_exist: bool) -> str | None:
+    """The same path under the real working directory, when the model garbled its prefix.
+
+    Long sandbox paths get spliced: observed, a session whose working directory was
+    `/private/tmp/claude-501/-Users-.../scratchpad/runs/wf1` wrote its answer to
+    `/private/tmp/claude-501/-private-tmp-claude-501--Users-.../scratchpad/runs/wf1/` -
+    the session-scratchpad prefix glued to the working directory's tail. The write
+    "succeeded" into a directory tree that did not exist, and the deliverable was lost.
+
+    Moved only when it can only have meant the working directory: the directory named
+    does not exist, at least its last two components match the working directory's
+    last two, and the same file under the working directory is where it is expected.
+    """
+    if not os.path.isabs(path) or not os.path.isdir(cwd):
+        return None
+    if os.path.isdir(os.path.dirname(path)):
+        return None
+    root = os.path.normpath(cwd)
+    # A path under the working directory is the model's own choice - a new
+    # subdirectory, say - however much it repeats the directory's name.
+    if os.path.normpath(path).startswith(root + os.sep):
+        return None
+    parts = [p for p in os.path.normpath(path).split(os.sep) if p]
+    tail = [p for p in root.split(os.sep) if p]
+    if len(tail) < 2:
+        return None
+    for start in range(len(parts) - 2, -1, -1):
+        if parts[start:start + 2] == tail[-2:]:
+            # Only a garbled copy of the working directory is moved: some component of
+            # the prefix must carry one of the working directory's own components inside
+            # it, the way "-private-tmp-claude-501--Users-...-scratchpad" carries
+            # "-Users-...-scratchpad". A real directory elsewhere - a backup volume, a
+            # sibling project - shares no such fragment and is left alone.
+            prefix = parts[:start]
+            own = {c for c in tail[:-2] if len(c) >= 6}
+            if not any(c != frag and frag in c for c in prefix for frag in own):
+                return None
+            rest = parts[start + 2:]
+            if not rest:
+                return None
+            candidate = os.path.join(cwd, *rest)
+            if os.path.normpath(candidate) == os.path.normpath(path):
+                return None
+            if must_exist and not os.path.exists(candidate):
+                return None
+            if not must_exist and not os.path.isdir(os.path.dirname(candidate)):
+                return None
+            return candidate
+    return None
+
+
 def _as_dict(arguments):
     if isinstance(arguments, dict):
         return dict(arguments)
@@ -152,6 +205,18 @@ def repair(call: dict, asked_as: str, schema: dict | None, cwd: str | None) -> d
             and not args["file_path"].startswith("~")):
         args["file_path"] = os.path.normpath(os.path.join(cwd, args["file_path"]))
         changed.append("relative file_path -> absolute")
+
+    if name == "Workflow" and isinstance(args.get("script"), str):
+        separated = workflow_script.separate_statements(args["script"])
+        if separated != args["script"]:
+            args["script"] = separated
+            changed.append("workflow script: `}` run into the next statement -> `;`")
+
+    if name in _ABSOLUTE and cwd and isinstance(args.get("file_path"), str):
+        moved = _into_working_directory(args["file_path"], cwd, must_exist=name != "Write")
+        if moved:
+            args["file_path"] = moved
+            changed.append("mangled working-directory path -> working directory")
 
     if not changed:
         return call

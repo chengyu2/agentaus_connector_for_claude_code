@@ -1,0 +1,11 @@
+ultracode: This is the analysis pipeline for a CliftonStrengths advisory engagement (see README.md). `tools/bank.py` is the single source of profile data for every report and figure, and it has regressed. Reported symptoms:
+- A person who has both a top-five report and a full CliftonStrengths 34 report in strength_reports/ now shows up as top-five-only.
+- Every name in the tables now carries a surname initial ("First L."), not only people who share a first name.
+- The tie case the lead_domain docstring describes no longer comes out the way the docstring says.
+- Some profiles from newer Australian reports appear to lose a theme.
+
+There may be more bugs than these symptoms show. Find and fix every bug in tools/bank.py so it behaves as README.md and the docstrings describe. Do not change documented behaviour or the function signatures.
+
+Then add a feature: `python3 tools/bank.py --json` prints a JSON list with one object per profile in the bank, each with keys `name`, `kind`, `depth`, `top5` (list of the five strongest themes), and `lead_domain` (null for a profile that is not a full 34). Running `python3 tools/bank.py` with no arguments must still print the existing summary.
+
+Verify by running the script. Finish with a short list of each bug you fixed and why it was wrong.

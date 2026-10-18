@@ -47,7 +47,10 @@ from .augment import (
     GROUNDING_INSTRUCTION,
     STRIP_UNGROUNDED_INSTRUCTION,
     could_be_a_refusal,
+    awaiting_background,
+    early_deliverable_writes,
     focus_tools,
+    is_subagent_turn,
     with_library_skills,
     with_skill_descriptions,
     grounding_verdict,
@@ -59,6 +62,8 @@ from .augment import (
     working_directory_of,
     with_guidance,
     with_plan,
+    with_parent_request,
+    workflow_opted_in,
     worth_reviewing,
     worth_reviewing_turn,
     REFUSAL_CORRECTION,
@@ -226,6 +231,8 @@ def _route(request: Request, body: dict, model: str, *, main_loop: bool) -> tupl
         return by_model, False
     if main_loop and body.get("tools"):
         sessions.note_main_loop(session, by_model)
+        if by_model:
+            sessions.note_request(session, _last_user_text(body))
     return by_model, False
 
 
@@ -697,6 +704,20 @@ async def _answer_without_tools(client: httpx.AsyncClient, payload: dict) -> str
         return ""
 
 
+# What a rewrite pass is shown of an answer. A pass shown only part of one must not
+# replace all of it: the final synthesis of a workflow's results runs past this, and a
+# revision written from its first 12,000 characters silently dropped the rest.
+_REWRITE_CHARS = 12000
+
+
+def _too_long_to_rewrite(answer: str, what: str) -> bool:
+    if len(answer or "") <= _REWRITE_CHARS:
+        return False
+    rlog(logging.INFO, "%s skipped: the answer is %d chars, past the %d a rewrite sees",
+         what, len(answer), _REWRITE_CHARS)
+    return True
+
+
 async def _fix_syntax(client: httpx.AsyncClient, answer: str) -> str:
     """If the answer's Python does not parse, ask once for the typo to be fixed.
 
@@ -704,7 +725,7 @@ async def _fix_syntax(client: httpx.AsyncClient, answer: str) -> str:
     returns the original: a broken repair must not lose a mostly-correct answer.
     """
     error = syntax.first_error(answer)
-    if not error:
+    if not error or _too_long_to_rewrite(answer, "syntax fix"):
         return answer
     rlog(logging.WARNING, "answer does not parse (%s); asking for a fix", error)
     try:
@@ -735,6 +756,12 @@ def _grounding_applies(body: dict, answer: str, ran: dict | None) -> bool:
     description of urllib3's `Retry.get_backoff_time()` - from memory, in a project that
     does not contain urllib3.
     """
+    # A subagent's answer is the value its parent reads; a rewrite would replace it.
+    # And a reply that only reports a background launch makes no claim to check: graded
+    # as one, "the workflow is running" became "the repository may contain a workflow;
+    # I have not examined it".
+    if is_subagent_turn(body) or awaiting_background(body):
+        return False
     minimum = settings.agentaus_review_min_chars
     if ran:
         return len((answer or "").strip()) >= minimum
@@ -797,9 +824,10 @@ async def _check_grounding(
     """
     ran = "\n".join(part for part in (
         ledger.render_evidence(body.get("messages") or [], limit=60),
+        ledger.render_notifications(body.get("messages") or []),
         _bridge_evidence(bridge_ran),
     ) if part)
-    if not ran:
+    if not ran or _too_long_to_rewrite(answer, "grounding check"):
         return answer
     try:
         async with hold("grounding check", "background"):
@@ -833,6 +861,8 @@ async def _self_review(client: httpx.AsyncClient, request_text: str, answer: str
     Returns the answer to use - the original when the review is clean, or a revision.
     Any failure returns the original: a broken review must never lose a good answer.
     """
+    if _too_long_to_rewrite(answer, "self-review"):
+        return answer
     try:
         async with hold("self-review", "background"):
             review = await _agentaus_summarise(
@@ -1096,9 +1126,16 @@ def _validate_tool_calls(calls: list, schemas: dict, cwd: str | None = None) -> 
             continue
         # Unambiguous slips first - a field under another name, a relative path - so
         # they cost nothing rather than a correction round. See repair.py.
-        call["arguments"] = repair.repair(
-            call, call.get("asked_as") or call.get("name") or "", schema, cwd)["arguments"]
-        fixed, problems = tool_schema.validate(call.get("arguments"), schema)
+        try:
+            call["arguments"] = repair.repair(
+                call, call.get("asked_as") or call.get("name") or "", schema, cwd)["arguments"]
+            fixed, problems = tool_schema.validate(call.get("arguments"), schema)
+        except Exception as exc:
+            # A schema this subset cannot read is the client's to judge. Forwarding the
+            # call unchecked costs nothing; raising here ended the whole turn.
+            rlog(logging.WARNING, "could not check arguments for %s (%s); forwarding "
+                 "unchecked", call.get("name"), exc)
+            continue
         if problems:
             broken.append((call, tool_schema.correction_for(
                 call.get("name") or "", problems, schema)))
@@ -1384,8 +1421,14 @@ def _original_request(body: dict) -> str:
 # kept calling a finished turn stalled kept it going until the client's turn cap.
 # Observed: 76 re-asks in one benchmark run, and a session that had finished its task
 # pushed into writing notes into the user's Claude memory folder.
-_STALL_REASKS: "OrderedDict[str, int]" = OrderedDict()
+_STALL_REASKS: "OrderedDict[str, tuple[int, int]]" = OrderedDict()
 _STALL_REASK_LIMIT = 2
+# The budget refills once the model has made this many tool calls since its last re-ask.
+# A lifetime budget of two was spent in the first minutes of a long ultracode session,
+# and its last reply - "We will apply multiple Edit calls." - ended the run with the bug
+# fixes unwritten. Calls made since the re-ask are progress; a model that keeps stopping
+# without making any still runs out after two.
+_STALL_PROGRESS_CALLS = 3
 
 
 def _stall_key(body: dict) -> str:
@@ -1393,12 +1436,21 @@ def _stall_key(body: dict) -> str:
                            + (working_directory_of(body) or "")).encode()).hexdigest()
 
 
+def _tool_calls_made(body: dict) -> int:
+    return sum(1 for m in body.get("messages") or [] if m.get("role") == "assistant"
+               and isinstance(m.get("content"), list)
+               for b in m["content"] if isinstance(b, dict) and b.get("type") == "tool_use")
+
+
 def _may_reask_stalled(body: dict) -> bool:
     key = _stall_key(body)
-    used = _STALL_REASKS.get(key, 0)
+    calls = _tool_calls_made(body)
+    used, at = _STALL_REASKS.get(key, (0, calls))
+    if calls - at >= _STALL_PROGRESS_CALLS:
+        used = 0
     if used >= _STALL_REASK_LIMIT:
         return False
-    _STALL_REASKS[key] = used + 1
+    _STALL_REASKS[key] = (used + 1, calls)
     _STALL_REASKS.move_to_end(key)
     while len(_STALL_REASKS) > 512:
         _STALL_REASKS.popitem(last=False)
@@ -1756,6 +1808,8 @@ async def _handle_agentaus(
         # compaction. That is the whole point: the calls that fall out of the window are
         # the ones the model forgets it already made.
         ledger_source = list(current.get("messages") or [])
+        # Same reason: compaction can summarise away the "ultracode: ..." that opted in.
+        opted_in = workflow_opted_in(current)
 
         before = estimate_request_tokens(current)
         if before + reserved > int(limit * settings.agentaus_compact_threshold):
@@ -1777,7 +1831,7 @@ async def _handle_agentaus(
         # survived the fit; it costs ~250 tokens the estimate does not see, which is
         # immaterial against a 0.8 threshold.
         if settings.agentaus_tool_focus:
-            fitted, dropped = focus_tools(fitted)
+            fitted, dropped = focus_tools(fitted, workflow_opt_in=opted_in)
             if dropped:
                 rlog(logging.INFO, "tool focus: offering %d tool(s), holding back %d (%s)",
                      len(fitted.get("tools") or []), len(dropped), ", ".join(dropped)[:200])
@@ -1808,7 +1862,15 @@ async def _handle_agentaus(
         # here - they are forwarded untouched by _passthrough.
         if settings.agentaus_guidance:
             fitted = {**fitted, "system": with_guidance(
-                fitted.get("system"), fitted, routing=settings.agentaus_skill_routing)}
+                fitted.get("system"), fitted, routing=settings.agentaus_skill_routing,
+                workflow_opt_in=opted_in)}
+
+        if is_subagent_turn(fitted):
+            parent = sessions.request_of(sessions.session_of(request.headers))
+            if parent:
+                fitted = {**fitted, "system": with_parent_request(fitted.get("system"), parent)}
+                rlog(logging.INFO, "subagent: shown its session's request (%d chars)",
+                     len(parent))
 
         if settings.agentaus_thinking and should_think(fitted):
             if plan_holder["text"] is None:
@@ -1908,6 +1970,7 @@ async def _handle_agentaus(
                 continue
             broken = _validate_tool_calls(mine + _theirs, _tool_schemas(payload),
                                           working_directory_of(body))
+            broken += early_deliverable_writes(_theirs, body, working_directory_of(body))
             if broken and corrections < settings.agentaus_correction_rounds:
                 corrections += 1
                 rlog(logging.WARNING, "%d malformed tool call(s): %s; correcting",
@@ -1956,6 +2019,7 @@ async def _handle_agentaus(
                 msg0 = choice0.get("message") or {}
 
         if (settings.agentaus_syntax_check and not msg0.get("tool_calls")
+                and not is_subagent_turn(body)
                 and (msg0.get("content") or "").strip()):
             parsed = await _fix_syntax(client, msg0["content"])
             if parsed != msg0.get("content"):
@@ -2187,6 +2251,8 @@ async def _agentaus_event_stream(
     tool_round = 0
     corrections = 0
     ran: dict = {}
+    # The tool_choice to put back after a stall re-ask that forced one. See below.
+    forced_from = None
     while True:
         attempt = 0
         while True:
@@ -2363,6 +2429,11 @@ async def _agentaus_event_stream(
             if recovered:
                 pending = [cleaned] if cleaned.strip() else []
                 calls = recovered
+        if forced_from is not None:
+            payload = {k: v for k, v in payload.items() if k != "tool_choice"}
+            if forced_from != "(none)":
+                payload["tool_choice"] = forced_from
+            forced_from = None
         known = _known_tool_names(payload)
         mine, theirs, invented = _partition_tool_calls(calls, known, library)
         if invented and corrections < settings.agentaus_correction_rounds:
@@ -2388,6 +2459,7 @@ async def _agentaus_event_stream(
         # Same budget as an invented name: it is the same class of mistake.
         broken = _validate_tool_calls(mine + theirs, _tool_schemas(payload),
                                       working_directory_of(original))
+        broken += early_deliverable_writes(theirs, original, working_directory_of(original))
         if broken and corrections < settings.agentaus_correction_rounds:
             corrections += 1
             rlog(logging.WARNING, "%d malformed tool call(s): %s; correcting",
@@ -2425,6 +2497,8 @@ async def _agentaus_event_stream(
         turn_verdict = "answer"
         if (
             corrections < settings.agentaus_correction_rounds
+            # Started in the background and said so: the right reply, not a stall.
+            and not awaiting_background(original)
             and could_be_a_refusal(
                 answer_so_far,
                 tools_offered=bool(known),
@@ -2467,6 +2541,13 @@ async def _agentaus_event_stream(
                 {"role": "assistant", "content": "".join(pending)[:2000]},
                 {"role": "user", "content": correction},
             ]}
+            if not is_refusal and payload.get("tools"):
+                # Words alone kept failing: "We will perform the edits." ended two runs
+                # after both re-asks were spent on more of the same. `required` makes the
+                # call the step itself - honoured about one time in three when measured,
+                # and harmless when ignored. For this one call only.
+                forced_from = payload.get("tool_choice", "(none)")
+                payload = {**payload, "tool_choice": "required"}
             pending = []
             continue
 
@@ -2503,7 +2584,8 @@ async def _agentaus_event_stream(
             answer = retried
             pending = [answer]
 
-    if buffering and answer and settings.agentaus_syntax_check and not theirs:
+    if (buffering and answer and settings.agentaus_syntax_check and not theirs
+            and not is_subagent_turn(original)):
         answer = await _fix_syntax(client, answer)
         pending = [answer]
 

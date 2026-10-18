@@ -769,12 +769,114 @@ reference numbers, with R scripts re-run from scratch. Harness in `abbench/`.
 | MMLU - 150 held-out questions | 4.7% (2–9) | **80.7% (74–86)** | 93.3% (88–96) | 58s / 24s |
 | MMLU-Pro - 150 held-out questions | 0.0% (0–2) | **70.7% (63–77)** | 86.7% (80–91) | 76s / 34s |
 
+Multi-agent `Workflow` turns ("ultracode") are measured separately, on data analysis,
+coding and tender tasks - see [Ultracode](#ultracode-multi-agent-workflows-on-agentaus).
+
 Scores with 95% intervals. What moved the numbers was not knowledge but finishing: before,
 Agentaus announced a step and stopped, or printed the answer instead of writing the file,
 in 14-15 of 15 MMLU batches. On coding and the data.gov.au task it now draws level with
 Opus; on the knowledge suites the remaining gap is the model's knowledge. It is 2-3.5
 times slower. The version measured is `57d04fa`; later commits on this branch revert a
 change that measured worse and add failure-path fixes covered by tests.
+
+## Ultracode: multi-agent workflows on Agentaus
+
+Typing **ultracode** in Claude Code opts the turn into multi-agent orchestration: the main
+loop calls the `Workflow` tool with a JavaScript script, and Claude Code runs it in the
+background, starting one subagent per `agent()` call - often several at once - and
+delivering the script's result later as a `<task-notification>` message. Each workflow
+subagent is offered a `StructuredOutput` tool and told that one call to it *is* its return
+value.
+
+Driving that path at Agentaus through the real Claude Code binary (2.1.300, headless,
+with the reminder the VS Code extension adds for the keyword) found a fault at every step.
+Each is now handled, and each has a test in `tests/test_ultracode.py`:
+
+| Step | What went wrong on Agentaus | What the bridge does now |
+| --- | --- | --- |
+| Offering the tool | Tool focus held `Workflow` back unless the user typed its name, and headless Claude Code sends no ultracode reminder - so the model was never offered the tool it was told to use | The opt-in - the `ultracode` keyword, an invoked `workflow-authoring` skill, or asking for a multi-agent workflow - keeps `Workflow` on the wire for the session, decided before compaction so a summary cannot withdraw it. CI wording ("write a workflow that runs pytest") is not an opt-in |
+| Knowing how | Nothing told the model what a script may contain, that it runs in the background, or what to do with the result | A Markdown-structured `Multi-agent workflows` section: look at the inputs first, the five functions a script has, self-contained subagent prompts, independent cross-checks, a bracket checklist, and a worked example |
+| Writing the script | Every script was one line, so `export const meta = {...} const X = ...` is a parse error; four of the first five rejections were exactly that, one three times running | A lexical repair inserts `;` between `}` and a keyword that can only start a statement - never inside a string, template, comment or regex, and never changing a valid script. Replayed on the scripts already rejected, it fixed 5 of 8 and left every valid one unchanged |
+| After the launch | "It is running, I will report back" - the right reply - was judged a stall, the re-ask said take the step, and the model launched the same workflow a second time; the duplicate's notification ended the session on a dump of the workflow reference | The stall judge sits out a reply to a successful launch. A `Write` or `Edit` into the working directory while the workflow is still running is returned to the model to wait for the result |
+| Subagent turns | Each subagent was planned, reviewed, grounding-checked and syntax-fixed like a main loop: up to four extra calls per subagent, and rewrites of the value its parent reads. Its prompt carried the 2,000-character reporting contract | Subagent turns (marked `cc_is_subagent=true`) skip the planner and every rewrite pass, and get a return contract instead: work with tools, then exactly one `StructuredOutput` call |
+| Thin subagent prompts | Agentaus wrote prompts like "compute the required statistics from the provided files" and "repeat the calculations as before" - with no rules or questions in them. The subagents answered confidently and wrong | Every request carries Claude Code's session id, so a subagent is shown its session's request as context: definitions, rules, file names. Its own prompt still sets its task |
+| Schemas | A workflow's schema is whatever its author wrote. `"type": ["string", "null"]` crashed the argument check and ended the turn; a `null` in a nullable required field was "corrected" until the rounds ran out | Type lists and nullable fields are understood; a schema the checker cannot read is forwarded unchecked rather than failing the turn |
+| The result arrives | The `<task-notification>` sits inside a system reminder, which the bridge strips from what its helpers read. The planner re-planned the task from scratch, and the grounding check - seeing numbers no tool call produced - rewrote eight correct figures as "the repo may contain 12 956 ...; I have not read it" | A notification turn is not re-planned, and its result counts as evidence for the grounding check. A rewrite pass shown only the first 12,000 characters of an answer no longer replaces all of it |
+| Paths | Two long sandbox paths side by side got spliced: the deliverable was written to the session scratchpad's prefix joined to the working directory's tail | The guidance names the working directory and says deliverables go there. A path whose directory does not exist, and whose prefix is a garbled copy of the working directory, is moved into it |
+| Documents | Claude Code 2.1.300's `Read` now refuses a `.docx` outright - "This tool cannot read binary files" - where it used to return zip noise, and the bridge's document repair skipped error results, so it never ran. Separately, across four tender runs Agentaus never opened the `.docx` that held most of the evidence | The refusal is replaced with the document's text where LibreOffice is installed. An opted-in main loop is given the working directory's files as a checklist, each document marked with what actually opens it here: `Read`, or a named Python reader in `Bash` |
+| Window | MCP tools are never hidden, and the claude.ai Slack and Docs connectors added 85 KB of schema to every call - ~28,000 tokens that compaction cannot touch. A long session overflowed the 131k window with 78 KB of conversation, and every retry failed the same way | Over a 40 KB schema budget, an MCP server the user has not named and the conversation has not used is held back, largest first. Two new harness tools (`PublishPlugin`, `WaitForMcpServers`) join the hold-back list |
+| Stopping early | The stall judge had two re-asks per conversation for its lifetime. A long session spent both early, and its last reply - "We will apply multiple Edit calls." - ended the run with the fixes unwritten | The budget refills after three tool calls of progress, so a model that keeps stopping without acting still runs out |
+
+### Measuring it
+
+`abbench/ultra/ultra.py` runs the comparison: the same three tasks, each the kind of
+work ultracode is for, given to Agentaus and to Opus 5.5 through the same bridge, graded
+afterwards with no model in the loop.
+
+```bash
+cd abbench/ultra
+../../.venv/bin/python ultra.py setup        # fixtures from the local sources below
+../../.venv/bin/python ultra.py run --arms agentaus,opus --reps 2 --label u1 --port 8787
+../../.venv/bin/python ultra.py report --label u1
+```
+
+| Task | What it is | Graded on |
+| --- | --- | --- |
+| `rdti` | Data analysis across four spreadsheets of the public ATO R&D Tax Incentive report: ABNs written three ways, an amendment file that overrides claims (one amendment is $0), two entities with no ABN | Eight figures computed independently by `build_rdti.py` |
+| `c1913` | Five bugs injected into the 1913_collective analysis pipeline, one of them not among the reported symptoms, plus a `--json` feature | The fixed module's behaviour against the untouched original |
+| `tender` | Answer a nine-question RFQ from a past proposal (`.docx`) and a README, citing sources; two questions the evidence cannot answer | Sixteen required facts, citations, and refusing to invent insurance or client records |
+
+Fixtures are built under `~/agentaus_ultra_runs` from the ATO file in `~/Downloads` and a
+local `1913_collective` checkout (`ULTRA_ATO`, `ULTRA_1913` override the paths). The
+1913 sources contain personal information, so nothing from them is committed here. Runs
+that end on a spend limit or a refused connection are excluded, not scored zero.
+
+Headless Claude Code stops waiting for background work after a ceiling and kills it: a
+workflow ended ten minutes in with "[Request interrupted by user]" and its run scored
+zero. An open VS Code session never does that, so the harness sets
+`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`. Set it yourself to drive ultracode from
+`claude -p`.
+
+### Results
+
+Measured October 2026, Claude Code 2.1.300, the VS Code ultracode reminder on every run.
+Scores are the mean of each run's graded fraction; spend-limit runs excluded.
+
+| Task | Agentaus, bridge before (n=2) | Agentaus, this bridge (n=8) | Opus 5.5 (n=2) | Median time, Agentaus / Opus |
+| --- | --- | --- | --- | --- |
+| `rdti` - spreadsheets | 0.38 | **0.61** (0.38-0.88) | 1.00 | 630s / 271s |
+| `tender` - RFQ from a `.docx` | 0.70 | **0.71** (0.65-0.80) | 0.98 | 276s / 792s |
+| `c1913` - five bugs and a feature | 0.69 | **0.53** (0.00-0.88) | 1.00 | 749s / 259s |
+
+What these numbers say, and what they do not:
+
+- **The mechanics now work.** On this bridge Agentaus launched a workflow on all 16
+  analysis and tender runs and on 4 of the 8 coding runs (it chose to fix the code
+  alone on the rest). 29 of its 36 `Workflow` calls were accepted; the 7 rejected were
+  errors the `;` repair cannot fix, such as unbalanced brackets, and it corrected them on
+  the next call. Its subagents return through `StructuredOutput`, and it waits for the
+  notification and finishes from the result. Every fault in the table above was seen
+  live, and each has a test.
+- **The results are not yet Claude's.** Opus 5.5 scored at or near full marks on every
+  valid run; Agentaus averages 0.53-0.71 with wide spread. What remains is the work
+  itself: the $0-amendment trap (a falsy zero) caught it on most `rdti` runs, it rarely
+  found the bug that was not among the reported symptoms, and on `tender` its workflows
+  extracted the `.docx` but did not pass that text on to the subagent that wrote the
+  answer. Two `c1913` runs still ended on an announced edit after the re-ask budget ran
+  out, which is why stall re-asks now also set `tool_choice: "required"` - honoured
+  about one time in three when measured.
+- **The before/after comparison is small.** n=2 against n=8, with scores that moved by
+  0.5 between rounds of the same bridge. The before arm was offered `Workflow` too,
+  because the VS Code reminder names the tool - the headless opt-in fault only bites
+  outside the extension. Read the first column as "no worse and sometimes much better",
+  not as a measured effect size. The last round of the "this bridge" column predates
+  the MCP schema budget, which is the one change written after it.
+- **Agentaus capacity is a factor.** Twelve concurrent sessions saw 27-34 Agentaus 5xx
+  and Cloudflare 524 responses per bridge and a 25-second median call, which tripled
+  wall times for both arms. `CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS` caps a
+  workflow's fan-out if the upstream is the bottleneck.
+
+---
 
 ## What the live model taught us
 

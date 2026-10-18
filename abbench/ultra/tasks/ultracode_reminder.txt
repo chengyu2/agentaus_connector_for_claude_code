@@ -1,0 +1,7 @@
+
+
+<system-reminder>
+The user included the keyword "ultracode", opting this turn into multi-agent orchestration — use the Workflow tool to fulfill the request.
+
+Ultracode is on: optimize for the most exhaustive, correct answer — not the fastest or cheapest. Use the Workflow tool on every substantive task; token cost is not a constraint. Solo only on conversational/trivial turns.
+</system-reminder>
