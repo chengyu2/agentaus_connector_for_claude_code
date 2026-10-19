@@ -1,0 +1,5 @@
+ultracode: `solutions.py` in this directory holds the signatures and docstrings of ten Python functions, each with no body.
+
+Implement every one so it is correct for every valid input its docstring describes - including edge cases such as empty inputs, zero, negatives, duplicates, single elements, ties and rounding. Keep each function's name, signature and any imports. Do not rename the file or split it.
+
+You may run Python to test your implementations. When you are done, `solutions.py` must contain all ten complete, working functions.

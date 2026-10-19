@@ -512,6 +512,32 @@ return { runs: ok, agree: ok.length === 2 && ok[0].total === ok[1].total }
 ```
 """
 
+GRAPH_GUIDANCE = """\
+
+--- Multi-agent workflows ---
+
+**The user opted into multi-agent orchestration ("ultracode").**
+
+- **Substantive task** → call `Workflow` **once**, like this:
+  `{"description": "one line saying what it does", "script": "agentaus-solve"}`
+- **Trivial or conversational turn** → no `Workflow`; just answer.
+
+You do **not** write the script. The bridge runs its own agent graph: many small agents that survey the files, break the request into items, solve each item three different ways, reconcile them, write the deliverables, and check every requirement.
+
+### While it runs
+
+- `Workflow` returns at once: "Workflow launched in background" and a task ID.
+- **Do NOT** call `Workflow` again. **Do NOT** write the deliverables yourself.
+- End your turn in one line: say the workflow is running.
+
+### When the `<task-notification>` arrives
+
+1. **Read** its result: `results`, `checks`, `open_issues`.
+2. **Open** each deliverable and confirm it is there and answers the request.
+3. **Fix** anything in `open_issues`, or anything you find wrong, with your own tools.
+4. **Report** what was done, briefly.
+"""
+
 SUBAGENT_GUIDANCE = """\
 
 --- Your return value ---
@@ -791,7 +817,12 @@ def guidance_for(body: dict, *, covered_by_skill: tuple = (), routing: bool = Tr
     opted = workflow_opt_in if workflow_opt_in is not None else workflow_opted_in(body)
     if opted and any(isinstance(t, dict) and t.get("name") == "Workflow"
                      for t in body.get("tools") or []):
-        notes += WORKFLOW_GUIDANCE
+        from .config import settings
+        from . import graph
+        texts = [t for t in _user_text_blocks(body) if "<task-notification>" not in t]
+        task = "\n".join(_REMINDERS.sub("", t) for t in texts)
+        use_graph = settings.agentaus_workflow_graph and graph.suits(task, working_directory_of(body))
+        notes += GRAPH_GUIDANCE if use_graph else WORKFLOW_GUIDANCE
         files = input_files(working_directory_of(body))
         if files:
             notes += ("\n### The files in the working directory\n\nOpen the ones the request "

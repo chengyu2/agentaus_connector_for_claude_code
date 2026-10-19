@@ -51,6 +51,7 @@ FIXTURES = RUNS / "_fixtures"
 SOURCE_1913 = Path(os.environ.get("ULTRA_1913", HOME / "PycharmProjects" / "1913_collective"))
 SOURCE_ATO = Path(os.environ.get("ULTRA_ATO", HOME / "Downloads" / (
     "report-of-information-about-research-and-development-tax-incentive-entities.xlsx")))
+HE_SOURCE = HERE.parent.parent / "benchmarks" / "data" / "HumanEval.jsonl.gz"
 PROPOSAL = "ML Research Labs - B and C Family Trust Proposal - Strategic R&D Management Solution.docx"
 
 ARMS = {"agentaus": "agentaus", "opus": "claude-opus-5-5"}
@@ -76,6 +77,20 @@ BUGS_1913 = [
      "return sum(1 for p in people if (rank(p, theme) or 99) < k)"),
 ]
 
+
+# `c1913h`: the same five plus four more, none of them among the reported symptoms - the
+# kind Agentaus rarely found, and where a frontier model has room to miss one too.
+BUGS_1913H = BUGS_1913 + [
+    ("n = re.sub(r'\\s+', ' ', n).strip().title()",
+     "n = re.sub(r'\\s+', ' ', n).strip().capitalize()"),
+    ("    if depth < 5:\n        return None", "    if depth < 6:\n        return None"),
+    ('for t in "Achiever Arranger Belief Consistency Deliberative Discipline Focus Responsibility Restorative".split():',
+     'for t in "Achiever Analytical Arranger Belief Consistency Deliberative Discipline Focus Responsibility Restorative".split():'),
+    ('for t in "Analytical Context Futuristic Ideation Input Intellection Learner Strategic".split():',
+     'for t in "Context Futuristic Ideation Input Intellection Learner Strategic".split():'),
+    ("return statistics.mean(rank(p, theme) for p in people)",
+     "return statistics.median(rank(p, theme) for p in people)"),
+]
 
 def _newest_claude_code() -> str:
     found = sorted(glob.glob(os.path.expanduser(
@@ -108,21 +123,28 @@ def cmd_setup(args):
     out.mkdir()
     subprocess.run([str(_python()), str(HERE / "build_rdti.py"), str(SOURCE_ATO), str(out)],
                    check=True, stdout=subprocess.DEVNULL)
-    # c1913: the pipeline and its profile bank, with the bugs injected
-    out = FIXTURES / "c1913"
+    # c1913 / c1913h: the pipeline and its profile bank, with the bugs injected
+    for name, bugs in (("c1913", BUGS_1913), ("c1913h", BUGS_1913H)):
+        out = FIXTURES / name
+        shutil.rmtree(out, ignore_errors=True)
+        out.mkdir()
+        shutil.copytree(SOURCE_1913 / "tools", out / "tools",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(SOURCE_1913 / "strength_reports", out / "strength_reports")
+        shutil.copy(SOURCE_1913 / "README.md", out / "README.md")
+        bank = (out / "tools" / "bank.py").read_text()
+        shutil.copy(out / "tools" / "bank.py", FIXTURES / "bank_original.py")
+        for good, bad in bugs:
+            if bank.count(good) != 1:
+                raise SystemExit(f"1913 source changed; cannot inject: {good}")
+            bank = bank.replace(good, bad)
+        (out / "tools" / "bank.py").write_text(bank)
+    # he10: ten HumanEval functions, graded with edge inputs too
+    out = FIXTURES / "he10"
     shutil.rmtree(out, ignore_errors=True)
     out.mkdir()
-    shutil.copytree(SOURCE_1913 / "tools", out / "tools",
-                    ignore=shutil.ignore_patterns("__pycache__"))
-    shutil.copytree(SOURCE_1913 / "strength_reports", out / "strength_reports")
-    shutil.copy(SOURCE_1913 / "README.md", out / "README.md")
-    bank = (out / "tools" / "bank.py").read_text()
-    shutil.copy(out / "tools" / "bank.py", FIXTURES / "bank_original.py")
-    for good, bad in BUGS_1913:
-        if bank.count(good) != 1:
-            raise SystemExit(f"1913 source changed; cannot inject: {good}")
-        bank = bank.replace(good, bad)
-    (out / "tools" / "bank.py").write_text(bank)
+    subprocess.run([str(_python()), str(HERE / "build_he.py"), str(HE_SOURCE), str(out)],
+                   check=True, stdout=subprocess.DEVNULL)
     # tender
     out = FIXTURES / "tender"
     shutil.rmtree(out, ignore_errors=True)
@@ -147,10 +169,14 @@ def grade(task: str, wd: Path) -> dict:
             return {"score": 0.0, "error": repr(exc)[:120]}
         right = [k for k, v in key.items() if got.get(k) == v]
         return {"score": round(len(right) / len(key), 3), "wrong": [k for k in key if k not in right]}
-    if task == "c1913":
-        r = subprocess.run([py, str(HERE / "grade_1913.py"), str(wd), str(FIXTURES / "bank_original.py")],
+    if task in ("c1913", "c1913h"):
+        r = subprocess.run([py, str(HERE / "grade_1913.py"), str(wd), str(FIXTURES / "bank_original.py")]
+                           + (["--hard"] if task == "c1913h" else []),
                            capture_output=True, text=True, timeout=600)
         shutil.rmtree(wd / ".orig", ignore_errors=True)
+    elif task == "he10":
+        r = subprocess.run([py, str(HERE / "grade_he.py"), str(wd), str(FIXTURES / "he10_key.json")],
+                           capture_output=True, text=True, timeout=900)
     else:
         r = subprocess.run([py, str(HERE / "grade_tender.py"), str(wd)],
                            capture_output=True, text=True, timeout=120)
@@ -237,7 +263,9 @@ def run_one(arm: str, task: str, variant: str, rep: int, label: str, port: int,
            "wall_s": round(time.time() - started, 1), "timed_out": timed_out,
            **transcript_stats(transcript.read_text().splitlines()), "grade": grade(task, wd)}
     # A limit can land mid-run, so it is read from the transcript's last words, not the wall.
-    tail = rec["result_text"][:300] or transcript.read_text()
+    # Only the session's own last words: the whole transcript quotes tool docs and
+    # results that mention limits, which flagged five timed-out runs as infrastructure.
+    tail = rec["result_text"][:300] or "\n".join(transcript.read_text().splitlines()[-3:])
     rec["infra_error"] = bool(INFRA.search(tail))
     wd.with_suffix(".json").write_text(json.dumps(rec, indent=1))
     return rec
@@ -301,7 +329,7 @@ def main():
     r.add_argument("--label", required=True)
     r.add_argument("--port", type=int, default=8787)
     r.add_argument("--jobs", type=int, default=3)
-    r.add_argument("--timeout", type=int, default=2700)
+    r.add_argument("--timeout", type=int, default=7200)
     r.add_argument("--resume", action="store_true")
     r.set_defaults(func=cmd_run)
     p = sub.add_parser("report")

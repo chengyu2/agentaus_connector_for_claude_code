@@ -816,7 +816,7 @@ afterwards with no model in the loop.
 ```bash
 cd abbench/ultra
 ../../.venv/bin/python ultra.py setup        # fixtures from the local sources below
-../../.venv/bin/python ultra.py run --arms agentaus,opus --reps 2 --label u1 --port 8787
+../../.venv/bin/python ultra.py run --arms agentaus,opus --tasks rdti,tender,c1913,c1913h,he10 --reps 2 --label u1 --port 8787
 ../../.venv/bin/python ultra.py report --label u1
 ```
 
@@ -825,6 +825,8 @@ cd abbench/ultra
 | `rdti` | Data analysis across four spreadsheets of the public ATO R&D Tax Incentive report: ABNs written three ways, an amendment file that overrides claims (one amendment is $0), two entities with no ABN | Eight figures computed independently by `build_rdti.py` |
 | `c1913` | Five bugs injected into the 1913_collective analysis pipeline, one of them not among the reported symptoms, plus a `--json` feature | The fixed module's behaviour against the untouched original |
 | `tender` | Answer a nine-question RFQ from a past proposal (`.docx`) and a README, citing sources; two questions the evidence cannot answer | Sixteen required facts, citations, and refusing to invent insurance or client records |
+| `c1913h` | The same pipeline with nine injected bugs, five of them not among the reported symptoms | As `c1913`, with a check per extra bug |
+| `he10` | Ten HumanEval functions in one file - the ten that a frontier model or Agentaus got wrong in the earlier A/B | Each function on its original tests plus edge inputs checked against the canonical solution, HumanEval+-style |
 
 Fixtures are built under `~/agentaus_ultra_runs` from the ATO file in `~/Downloads` and a
 local `1913_collective` checkout (`ULTRA_ATO`, `ULTRA_1913` override the paths). The
@@ -875,6 +877,105 @@ What these numbers say, and what they do not:
   and Cloudflare 524 responses per bridge and a 25-second median call, which tripled
   wall times for both arms. `CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS` caps a
   workflow's fan-out if the upstream is the bottleneck.
+
+### An experiment that did not pay: the bridge's own agent graph
+
+**Off by default.** `AGENTAUS_WORKFLOW_GRAPH=true` turns it on. It is kept because the
+measurements below are worth having, and because a faster or stronger upstream may change
+them.
+
+The fixes above made Agentaus's own workflows *run*. They did not make them *good*: its
+scripts carried prompts like "compute the required statistics from the provided files",
+told a verifier to "repeat the calculations as before", and never passed one agent's
+result to the next. Every fix aimed at the script it wrote was one more rule it then had
+to follow.
+
+So the experiment: when an opted-in Agentaus main loop calls `Workflow`, the bridge runs its own graph,
+[`agentaus_bridge/graphs/solve.js`](agentaus_bridge/graphs/solve.js), in place of the
+model's script, passing the user's request and the working directory. Agentaus only
+decides to run it, waits, and checks the result. Four principles shape it, each from how
+this model measurably behaves:
+
+1. **More agents.** A run starts 100-200 of them.
+2. **One simple prompt per agent.** Each has one job, a few Markdown lines, and only the
+   tools that job needs - `Bash`, `Read`, `Write`, `Edit`, `StructuredOutput`. Agents that
+   only reason over text the graph hands them (extractors, expanders, planners) get
+   `StructuredOutput` alone, and answer in one call instead of a tool loop.
+3. **More steps.** Ten stages, each a fan-out of small agents:
+
+   | Stage | Agents |
+   | --- | --- |
+   | Survey | two listers |
+   | Read | one reader per file; documents saved as plain text for everyone after |
+   | Draft | one agent does the whole task quickly in a copy - the backup deliverable |
+   | Requirements | three extractors and a merger, beside two trap hunters (a data lens and a code-versus-docstring lens); a deterministic backstop adds back any request line no requirement covers, and each unreported bug a hunter finds becomes a requirement |
+   | Expand | two per requirement, splitting it into separate outputs - one per question, function, bug or section; the finer split wins |
+   | Plan | one per item: inputs, method, traps, check |
+   | Solve | three per item, each told to use a different method, read-only, code changes made in a scratch copy and saved as a patch file |
+   | Reconcile | a judge per item who re-tests the traps with its own code even when the solvers agree; a fourth solver when there is no majority; a second and third judge before any judge overrides the solvers |
+   | Assemble | one agent applies the chosen patches with `patch`; one writes each deliverable |
+   | Verify | three checkers per requirement and per rule |
+   | Fix | one fixer per real failure, starting from a backup and undone if the checkers still find the problem |
+
+4. **Redundancy.** Every agent has a backup that runs when it dies, returns nothing, or
+   returns a plan instead of the work ("We will perform the edits."). A value is reached
+   three ways before it is trusted. A failure needs two of three checkers to show it,
+   because one weak checker's mistaken "fail" once sent fixers to overwrite eight correct
+   answers.
+
+Two things the live runs forced, both enforced by the bridge rather than asked of the
+model: at most `AGENTAUS_GRAPH_WIDTH` (default 8) agents run at once, because Agentaus
+answers 524s past about eight concurrent sessions; and any tool result over 16,000
+characters in a graph subagent is cut to head and tail, because agents printed whole
+spreadsheets into their own context - 108 requests overflowed the window in one round,
+none after the cut.
+
+Agentaus throughput sets the price: about 30 calls a minute across all sessions, so a
+graph run takes tens of minutes where Opus's own workflow takes a few. The graph has a time
+budget (50 minutes): past it, unsettled items fall back to the draft and checking is
+skipped, so a slow upstream costs quality, never the deliverable. Each agent also has a
+ten-minute deadline, after which its backup runs.
+
+#### What it measured
+
+Same harness, same five tasks, the VS Code ultracode reminder on every run. Opus 5.5 is the
+reference; "own workflow" is Agentaus writing its own scripts, with every fix in the table
+further up. Scores are means over runs, the range in brackets.
+
+| Task | Agentaus, own workflow | Agentaus, agent graph | Opus 5.5 |
+| --- | --- | --- | --- |
+| `rdti` - spreadsheets | 0.61 (0.38-0.88, n=8) | 0.53 (0.25-1.00, n=4) | 1.00 (n=2) |
+| `tender` - RFQ from a `.docx` | 0.71 (0.65-0.80, n=8) | 0.59 (0.30-0.80, n=4) | 0.98 (n=2) |
+| `he10` - ten HumanEval+ functions | **0.80** (n=3) | 0.40 (0.30-0.50, n=4) | 0.90 (n=1) |
+| `c1913` - five bugs and a feature | 0.57 (0.00-0.88, n=9) | 0.54 (0.00-0.88, n=3) | 1.00 (n=2) |
+| `c1913h` - nine bugs, five unreported | 0.14 (0.00-0.42, n=3) | 0.19 (0.00-0.42, n=4) | 1.00 (n=1) |
+| Median time | 5-15 minutes | 35-70 minutes | 2-8 minutes |
+
+Averaged over runs, the graph scored below Agentaus's own workflow on four of the five tasks -
+and on the fifth, `c1913h`, both are near zero - at five to ten times the time. No
+configuration came close to Opus. What the runs showed:
+
+- **Its middle worked; its edges did not.** On `rdti` three solvers and a judge repeatedly
+  settled seven of eight answers correctly - the $0 amendment included - and one run scored
+  1.00. Most runs lost those answers at the boundaries: requirements split into steps instead
+  of outputs, duplicate items eating the budget, a writer rewriting a code file, fixers
+  "correcting" right answers, verifiers and judges reporting input files missing without
+  looking. Each was found in a live run and fixed (an adversarial review then confirmed 21
+  more defects, also fixed), and each fix moved the score less than the run-to-run noise.
+- **More agents amplify a weak judge as much as they correct one.** Three solvers agreeing on
+  a wrong total, overturned by one right judge and restored by a second wrong one, is the
+  graph working exactly as designed.
+- **Throughput sets the ceiling.** Agentaus served 17-30 calls a minute across all sessions,
+  with Cloudflare 524s past about eight concurrent ones. A graph of 100-200 agents needs
+  1,000-3,000 calls, so it spends most of its budget queueing; the time budget and draft
+  fallback keep it from ending empty, not from ending short.
+- **Code is where it loses most.** Ten functions in one file: 0.80 by Agentaus's own script
+  in ten minutes, 0.40 through the graph in an hour. Even with code routed away from the
+  graph (`AGENTAUS_GRAPH_FOR_CODE=false`, the default when the graph is on), it did not beat
+  the own-workflow numbers on data or documents.
+
+The tasks Opus leaves headroom on are where this should be retried: `he10` is the closest
+(0.80 against 0.90), with Agentaus's own workflow.
 
 ---
 
@@ -1657,6 +1758,9 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_SKILL_ROUTING` | `true` | Restore project skill descriptions, add the "if this, use that" section for skills and agent types, and have the planner name its choice. See [Routing](#routing-if-this-use-that) |
 | `AGENTAUS_SKILL_LIBRARY` | `true` | Offer the bridge's own skill library to Agentaus in every project and answer `Skill` calls for it |
 | `AGENTAUS_SUBAGENTS_FOLLOW_SESSION` | `true` | A subagent runs on the model its session's main loop is on. Off, an Agentaus session's subagents go to Claude |
+| `AGENTAUS_WORKFLOW_GRAPH` | `false` | Run the bridge's agent graph in place of the workflow scripts Agentaus writes. See [the experiment](#an-experiment-that-did-not-pay-the-bridges-own-agent-graph) |
+| `AGENTAUS_GRAPH_WIDTH` | `8` | Most graph agents running at once |
+| `AGENTAUS_GRAPH_FOR_CODE` | `false` | With the graph on, use it for tasks that change code too |
 | `AGENTAUS_COAUTHOR` | `Agentaus <theteam@trellisdata.com>` | The `Co-Authored-By:` line commits on Agentaus turns end with, in place of Claude Code's Claude one. Empty leaves Claude Code's line. See [Commit credit](#commit-credit) |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | `127.0.0.1` / `8787` | Listen address |
 | `BRIDGE_PASSTHROUGH` | `true` | Forward non-Agentaus models to Anthropic; `false` answers them with Agentaus instead |

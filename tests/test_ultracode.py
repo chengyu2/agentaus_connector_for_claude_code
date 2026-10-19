@@ -23,7 +23,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agentaus_bridge import augment, documents, ledger, repair, schema, server, sessions, workflow_script  # noqa: E402
+from agentaus_bridge import augment, documents, graph, ledger, repair, schema, server, sessions, workflow_script  # noqa: E402
 from unittest import mock  # noqa: E402
 
 
@@ -104,10 +104,20 @@ class WorkflowIsOfferedWhenTheUserOptsIn(unittest.TestCase):
         self.assertNotIn("Workflow", offered)
         self.assertNotIn("Artifact", offered)
 
-    def test_the_main_loop_is_told_how_a_workflow_runs(self):
+    def test_by_default_the_main_loop_is_taught_to_write_the_script(self):
         notes = augment.guidance_for(self.body("ultracode: analyse these files"))
         self.assertIn("Workflow launched in background", notes)
         self.assertIn("export const meta", notes)
+
+    def test_with_the_graph_on_it_is_told_to_run_the_graph(self):
+        from agentaus_bridge.config import settings
+        saved, settings.agentaus_workflow_graph = settings.agentaus_workflow_graph, True
+        try:
+            notes = augment.guidance_for(self.body("ultracode: analyse these files"))
+        finally:
+            settings.agentaus_workflow_graph = saved
+        self.assertIn('"script": "agentaus-solve"', notes)
+        self.assertNotIn("export const meta", notes)
 
     def test_no_workflow_notes_without_the_opt_in(self):
         notes = augment.guidance_for(self.body("what does this do?"))
@@ -472,6 +482,120 @@ class MCPSchemasHaveABudget(unittest.TestCase):
     def test_under_the_budget_nothing_mcp_is_held_back(self):
         body = {"tools": [tool("Read"), tool("mcp__notes__find")], "messages": [user("hi")]}
         self.assertIn("mcp__notes__find", self.kept(body))
+
+
+class TheBridgeRunsItsOwnGraph(unittest.TestCase):
+    def setUp(self):
+        from agentaus_bridge.config import settings
+        self._saved = settings.agentaus_workflow_graph
+        settings.agentaus_workflow_graph = True
+
+    def tearDown(self):
+        from agentaus_bridge.config import settings
+        settings.agentaus_workflow_graph = self._saved
+
+    def call(self, **arguments):
+        return {"id": "w", "name": "Workflow", "arguments": __import__("json").dumps(arguments)}
+
+    def body(self):
+        return {"system": "Primary working directory: /work/proj", "tools": [tool("Workflow")],
+                "messages": [user("ultracode: total the claims in claims.xlsx")]}
+
+    def test_the_models_script_is_replaced_by_the_graph(self):
+        import json
+        calls = [self.call(script="export const meta = {} broken(", description="mine")]
+        server._run_graph_instead(calls, self.body())
+        args = json.loads(calls[0]["arguments"])
+        self.assertEqual(args["script"], graph.SCRIPT)
+        self.assertEqual(args["args"]["cwd"], "/work/proj")
+        self.assertIn("total the claims", args["args"]["task"])
+        self.assertEqual(args["description"], "mine")
+
+    def test_code_work_keeps_agentaus_own_workflow(self):
+        body = {"system": "Primary working directory: /work/proj", "tools": [tool("Workflow")],
+                "messages": [user("ultracode: implement the functions in solutions.py")]}
+        calls = [self.call(script="export const meta = { name: 'own' }")]
+        server._run_graph_instead(calls, body)
+        self.assertIn("own", calls[0]["arguments"])
+        self.assertIn("export const meta", augment.guidance_for(body))
+
+    def test_data_work_gets_the_graph(self):
+        self.assertTrue(graph.suits("ultracode: total the claims in claims.xlsx", None))
+        self.assertFalse(graph.suits("ultracode: fix the bug in tools/bank.py", None))
+
+    def test_a_script_the_user_wrote_is_not_replaced(self):
+        script = "export const meta = { name: 'mine' }\n" + "// the user's own orchestration\n" * 12
+        body = self.body()
+        body["messages"].append(user("ultracode: run exactly this:\n" + script))
+        calls = [self.call(script=script)]
+        server._run_graph_instead(calls, body)
+        self.assertIn("the user's own orchestration", calls[0]["arguments"])
+
+    def test_a_follow_up_carries_the_opening_request(self):
+        import json
+        body = self.body()
+        body["messages"].append(user("now also do the 2021 file"))
+        calls = [self.call(script="agentaus-solve")]
+        server._run_graph_instead(calls, body)
+        task = json.loads(calls[0]["arguments"])["args"]["task"]
+        self.assertIn("total the claims", task)
+        self.assertIn("now also do the 2021 file", task)
+
+    def test_a_saved_or_resumed_workflow_is_left_alone(self):
+        for kept in (self.call(name="review"), self.call(scriptPath="/x.js"),
+                     self.call(script="s", resumeFromRunId="wf_1")):
+            before = kept["arguments"]
+            server._run_graph_instead([kept], self.body())
+            self.assertEqual(kept["arguments"], before)
+
+    def test_not_without_an_opt_in_or_on_a_subagent(self):
+        plain = {"tools": [tool("Workflow")], "messages": [user("what is this?")]}
+        sub = {**self.body(), "system": SUBAGENT_SYSTEM}
+        for body in (plain, sub):
+            calls = [self.call(script="mine")]
+            server._run_graph_instead(calls, body)
+            self.assertIn("mine", calls[0]["arguments"])
+
+    def test_a_graph_subagent_gets_only_the_tools_its_job_needs(self):
+        body = {"tools": [tool(n) for n in ("Bash", "Read", "Agent", "Workflow", "StructuredOutput",
+                                             "mcp__claude_ai_Slack__x")],
+                "messages": [user(graph.MARK)]}
+        kept = {t["name"] for t in graph.focus(body)[0]["tools"]}
+        self.assertEqual(kept, {"Bash", "Read", "StructuredOutput"})
+
+    def test_a_graph_subagents_oversized_tool_result_is_cut(self):
+        big = "row\n" * 20000
+        body = {"messages": [user(graph.MARK), {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t", "content": big}]}]}
+        out, cut = graph.trim_results(body)
+        self.assertEqual(cut, 1)
+        text = out["messages"][1]["content"][0]["content"]
+        self.assertLess(len(text), graph.RESULT_CHARS + 500)
+        self.assertIn("characters cut", text)
+
+    def test_a_think_only_graph_agent_gets_only_structured_output(self):
+        body = {"tools": [tool(n) for n in ("Bash", "Read", "StructuredOutput")],
+                "messages": [user(graph.MARK + "\n" + graph.THINK + "\n# Plan one item")]}
+        self.assertEqual({t["name"] for t in graph.focus(body)[0]["tools"]}, {"StructuredOutput"})
+
+    def test_a_graph_subagent_is_recognised_by_its_mark(self):
+        self.assertTrue(graph.is_graph_task({"messages": [user(graph.MARK + "\n# Read one file")]}))
+        self.assertFalse(graph.is_graph_task({"messages": [user("compute it")]}))
+
+    def test_every_graph_prompt_carries_the_mark_and_the_graph_runs_end_to_end(self):
+        import shutil, subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        here = os.path.dirname(os.path.abspath(__file__))
+        script = os.path.join(os.path.dirname(here), "agentaus_bridge", "graphs", "solve.js")
+        r = subprocess.run([node, os.path.join(here, "graph_dry_run.mjs"), script],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        out = __import__("json").loads(r.stdout)
+        self.assertGreater(out["agents"], 30)
+        self.assertLessEqual(out["peak"], 8, "the graph must hold its concurrency cap")
+        self.assertEqual(out["deliverables"], ["answers.json"])
 
 
 class RewritesSeeTheWholeAnswer(unittest.TestCase):

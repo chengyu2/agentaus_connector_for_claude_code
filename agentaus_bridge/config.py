@@ -561,6 +561,24 @@ class Settings:
     agentaus_subagents_follow_session: bool = field(
         default_factory=lambda: _bool("AGENTAUS_SUBAGENTS_FOLLOW_SESSION", True)
     )
+    # Run the bridge's own agent graph (graphs/solve.js) in place of the script Agentaus
+    # writes for a `Workflow` call. See agentaus_bridge/graph.py. Off by default, on
+    # evidence: averaged over runs it scored below Agentaus's own workflow on four of five
+    # tasks, at five to ten times the time. See the README.
+    agentaus_workflow_graph: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_WORKFLOW_GRAPH", False)
+    )
+    # How many of the graph's agents may run at once. Agentaus starts answering 524s past
+    # about eight concurrent sessions, so lower it when several graphs run together.
+    # Run the graph for tasks that change code too. Off by default, on evidence: on ten
+    # HumanEval functions in one file the graph scored 0.30-0.50 in an hour, and Agentaus's
+    # own workflow 0.80 in ten minutes. On data and document tasks the graph is the better.
+    agentaus_graph_for_code: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_GRAPH_FOR_CODE", False)
+    )
+    agentaus_graph_width: int = field(
+        default_factory=lambda: _int("AGENTAUS_GRAPH_WIDTH", 8)
+    )
     # Who a commit written on an Agentaus turn credits, as `Name <email>`. Claude Code asks
     # an unknown model for `Co-Authored-By: Claude Code <noreply@anthropic.com>`; the bridge
     # swaps in this one. GitHub credits the account the email is verified on. Empty leaves

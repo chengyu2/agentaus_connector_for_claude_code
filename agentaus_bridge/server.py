@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import attribution
 from . import documents
+from . import graph
 from . import harmony
 from . import persisted
 from . import sessions
@@ -1111,6 +1112,32 @@ def _tool_schemas(payload: dict) -> dict:
     return schemas
 
 
+def _run_graph_instead(calls: list, body: dict) -> None:
+    """Put the bridge's agent graph in place of a script Agentaus wrote. See graph.py."""
+    if (not settings.agentaus_workflow_graph or is_subagent_turn(body)
+            or not workflow_opted_in(body)):
+        return
+    # The graph sees the whole request: on a follow-up turn, the opening request and the
+    # latest message together, not only "now do the next file".
+    first, last = _original_request(body), _last_user_text(body)
+    task = first if not last or last == first else f"{first}\n\nFollow-up:\n{last}"
+    if not graph.suits(task, working_directory_of(body)):
+        return
+    said = "\n".join(_user_texts(body))
+    for call in calls:
+        if call.get("name") != "Workflow":
+            continue
+        script = graph.script_of(call)
+        # A script the user wrote or dictated is theirs to run, not ours to replace.
+        if script and len(script) >= 200 and script.strip()[:200] in said:
+            rlog(logging.INFO, "workflow: running the user's own script")
+            continue
+        before = call.get("arguments")
+        call["arguments"] = graph.expand(call, task, working_directory_of(body))["arguments"]
+        if call["arguments"] != before:
+            rlog(logging.INFO, "workflow: substituted the agent graph")
+
+
 def _validate_tool_calls(calls: list, schemas: dict, cwd: str | None = None) -> list:
     """Fix what is unambiguously fixable; report what is not.
 
@@ -1807,6 +1834,11 @@ async def _handle_agentaus(
         # The ledger is built here, from the message list as it stands *before*
         # compaction. That is the whole point: the calls that fall out of the window are
         # the ones the model forgets it already made.
+        if graph.is_graph_task(current):
+            current, cut = graph.trim_results(current)
+            if cut:
+                rlog(logging.INFO, "graph subagent: cut %d oversized tool result(s)", cut)
+
         ledger_source = list(current.get("messages") or [])
         # Same reason: compaction can summarise away the "ultracode: ..." that opted in.
         opted_in = workflow_opted_in(current)
@@ -1832,6 +1864,9 @@ async def _handle_agentaus(
         # immaterial against a 0.8 threshold.
         if settings.agentaus_tool_focus:
             fitted, dropped = focus_tools(fitted, workflow_opt_in=opted_in)
+            if graph.is_graph_task(fitted):
+                fitted, more = graph.focus(fitted)
+                dropped = dropped + more
             if dropped:
                 rlog(logging.INFO, "tool focus: offering %d tool(s), holding back %d (%s)",
                      len(fitted.get("tools") or []), len(dropped), ", ".join(dropped)[:200])
@@ -1849,7 +1884,10 @@ async def _handle_agentaus(
             offered.append(bridge_tools.INVESTIGATE_SCHEMA)
         if settings.agentaus_zoom:
             offered.append(bridge_tools.ZOOM_SCHEMA)
-        if offered:
+        # Not for a graph subagent: the graph already chose its context, and one
+        # `agentaus_search` fans out into dozens of model calls - measured, hundreds of a
+        # graph run's calls against an upstream that serves about thirty a minute.
+        if offered and not graph.is_graph_task(fitted):
             fitted = inject_bridge_tools(fitted, offered)
 
         if settings.agentaus_tool_ledger:
@@ -1865,7 +1903,9 @@ async def _handle_agentaus(
                 fitted.get("system"), fitted, routing=settings.agentaus_skill_routing,
                 workflow_opt_in=opted_in)}
 
-        if is_subagent_turn(fitted):
+        # A graph subagent's prompt already carries exactly the context the graph chose;
+        # the whole request on top would undo the point of a small prompt.
+        if is_subagent_turn(fitted) and not graph.is_graph_task(fitted):
             parent = sessions.request_of(sessions.session_of(request.headers))
             if parent:
                 fitted = {**fitted, "system": with_parent_request(fitted.get("system"), parent)}
@@ -1968,6 +2008,7 @@ async def _handle_agentaus(
                 payload = _with_tool_results(
                     payload, invented, [_correction_for(c, known) for c in invented])
                 continue
+            _run_graph_instead(_theirs, body)
             broken = _validate_tool_calls(mine + _theirs, _tool_schemas(payload),
                                           working_directory_of(body))
             broken += early_deliverable_writes(_theirs, body, working_directory_of(body))
@@ -2457,6 +2498,7 @@ async def _agentaus_event_stream(
         # A well-named call with malformed arguments is rejected by the client with a
         # wall of validator internals, which costs the turn and tells the model nothing.
         # Same budget as an invented name: it is the same class of mistake.
+        _run_graph_instead(theirs, original)
         broken = _validate_tool_calls(mine + theirs, _tool_schemas(payload),
                                       working_directory_of(original))
         broken += early_deliverable_writes(theirs, original, working_directory_of(original))

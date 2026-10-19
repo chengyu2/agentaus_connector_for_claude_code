@@ -26,6 +26,14 @@ checks = {
  'count_top_inclusive': lambda: all(c.count_top(t, k) == o.count_top(t, k) for t in o.THEMES for k in (1, 5, 10)),
  'no_regression': lambda: all(c.mean_rank(t) == o.mean_rank(t) for t in o.THEMES) and c.domain_slots() == o.domain_slots() and c.THEMES == o.THEMES and c.DOMAIN == o.DOMAIN,
 }
+if '--hard' in sys.argv:
+    # c1913h's four further bugs, each its own check rather than one "no regression".
+    checks.update({
+        'names_cleaned': lambda: set(c.BANK) == set(o.BANK),
+        'partial_profiles_kept': lambda: set(c.PART) == set(o.PART) and len(c.BANK) == len(o.BANK),
+        'domain_membership': lambda: c.DOMAIN == o.DOMAIN,
+        'mean_rank_is_a_mean': lambda: all(c.mean_rank(t) == o.mean_rank(t) for t in o.THEMES),
+    })
 for k, f in checks.items(): out[k] = same(f)
 # Feature: --json prints one object per profile.
 try:
