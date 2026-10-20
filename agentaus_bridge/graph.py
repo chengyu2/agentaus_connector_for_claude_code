@@ -30,7 +30,17 @@ from .config import settings
 log = logging.getLogger("agentaus-bridge")
 
 MARK = "[agentaus-graph]"
-SCRIPT = (Path(__file__).parent / "graphs" / "solve.js").read_text()
+_GRAPHS = Path(__file__).parent / "graphs"
+SCRIPT = (_GRAPHS / "solve.js").read_text()
+DYNAMIC_SCRIPT = (_GRAPHS / "dynamic.js").read_text()
+# Every role in the dynamic graph works from a skill file: scout, plan, review-plan, solve,
+# merge, check, assemble, fix. Passed in with the script, so no agent spends a call reading
+# its own instructions off disk.
+SKILLS = {p.stem: p.read_text() for p in sorted((_GRAPHS / "skills").glob("*.md"))}
+
+
+def script_for() -> str:
+    return DYNAMIC_SCRIPT if settings.agentaus_graph_kind == "dynamic" else SCRIPT
 
 
 def expand(call: dict, task: str, cwd: str | None) -> dict:
@@ -47,10 +57,12 @@ def expand(call: dict, task: str, cwd: str | None) -> dict:
         arguments = {}
     if any(arguments.get(k) for k in ("name", "resumeFromRunId", "scriptPath")):
         return call
+    dynamic = settings.agentaus_graph_kind == "dynamic"
     expanded = {
         "description": arguments.get("description") or "Agentaus agent graph",
-        "script": SCRIPT,
-        "args": {"task": task, "cwd": cwd or "", "width": settings.agentaus_graph_width},
+        "script": script_for(),
+        "args": {"task": task, "cwd": cwd or "", "width": settings.agentaus_graph_width,
+                 **({"skills": SKILLS} if dynamic else {})},
     }
     log.info("workflow: running the agent graph for a %d-char request", len(task or ""))
     return {**call, "arguments": json.dumps(expanded)}
@@ -106,8 +118,12 @@ def focus(body: dict) -> tuple[dict, list]:
     `StructuredOutput` alone, so it answers in one call instead of a tool loop.
     """
     tools = body.get("tools") or []
-    allowed = {"StructuredOutput"} if _is_think_only(body) else GRAPH_TOOLS
+    think = _is_think_only(body)
+    allowed = {"StructuredOutput"} if think else GRAPH_TOOLS
     kept = [t for t in tools if (t or {}).get("name") in allowed]
+    # A think-only agent with no schema to fill gets no tools at all: it writes Markdown.
+    if think and not kept:
+        return ({**body, "tools": []}, [(t or {}).get("name") or "" for t in tools]) if tools else (body, [])
     if not kept or len(kept) == len(tools):
         return body, []
     dropped = [(t or {}).get("name") or "" for t in tools if t not in kept]
@@ -169,7 +185,8 @@ def suits(task: str, cwd: str | None) -> bool:
     through the graph and 0.80 through Agentaus's own script. So code work stays with the
     model's own workflow unless AGENTAUS_GRAPH_FOR_CODE says otherwise.
     """
-    if settings.agentaus_graph_for_code:
+    # The dynamic graph plans the shape of each task, and code is where it gains most.
+    if settings.agentaus_graph_kind == "dynamic" or settings.agentaus_graph_for_code:
         return True
     text = task or ""
     if _CODE_PATH.search(text):

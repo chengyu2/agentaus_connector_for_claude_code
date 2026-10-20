@@ -561,18 +561,24 @@ class Settings:
     agentaus_subagents_follow_session: bool = field(
         default_factory=lambda: _bool("AGENTAUS_SUBAGENTS_FOLLOW_SESSION", True)
     )
-    # Run the bridge's own agent graph (graphs/solve.js) in place of the script Agentaus
-    # writes for a `Workflow` call. See agentaus_bridge/graph.py. Off by default, on
-    # evidence: averaged over runs it scored below Agentaus's own workflow on four of five
-    # tasks, at five to ten times the time. See the README.
+    # Run one of the bridge's agent graphs in place of the script Agentaus writes for a
+    # `Workflow` call. See agentaus_bridge/graph.py. On by default for the dynamic graph,
+    # on evidence: across five tasks it averaged 0.64 against 0.57 for Agentaus's own
+    # workflow, with its gains on code - two bug-fix tasks from 0.57 to 0.88 and 0.14 to
+    # 0.50. The fixed graph averaged 0.45. See the README.
     agentaus_workflow_graph: bool = field(
-        default_factory=lambda: _bool("AGENTAUS_WORKFLOW_GRAPH", False)
+        default_factory=lambda: _bool("AGENTAUS_WORKFLOW_GRAPH", True)
     )
     # How many of the graph's agents may run at once. Agentaus starts answering 524s past
     # about eight concurrent sessions, so lower it when several graphs run together.
-    # Run the graph for tasks that change code too. Off by default, on evidence: on ten
-    # HumanEval functions in one file the graph scored 0.30-0.50 in an hour, and Agentaus's
-    # own workflow 0.80 in ten minutes. On data and document tasks the graph is the better.
+    # Run the FIXED graph for tasks that change code too. Off by default, on evidence: on
+    # code it lost to Agentaus's own workflow (ten functions in one file: 0.30-0.50 against
+    # 0.80). The dynamic graph is not restricted - code is where it gains most.
+    # Which graph runs when AGENTAUS_WORKFLOW_GRAPH is on: "dynamic" (planners decide the
+    # shape of the work, in Markdown; graphs/dynamic.js) or "fixed" (graphs/solve.js).
+    agentaus_graph_kind: str = field(
+        default_factory=lambda: os.environ.get("AGENTAUS_GRAPH_KIND", "dynamic").strip().lower() or "dynamic"
+    )
     agentaus_graph_for_code: bool = field(
         default_factory=lambda: _bool("AGENTAUS_GRAPH_FOR_CODE", False)
     )

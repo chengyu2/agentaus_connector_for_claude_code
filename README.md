@@ -878,11 +878,11 @@ What these numbers say, and what they do not:
   wall times for both arms. `CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS` caps a
   workflow's fan-out if the upstream is the bottleneck.
 
-### An experiment that did not pay: the bridge's own agent graph
+### An experiment that did not pay: a fixed agent graph
 
-**Off by default.** `AGENTAUS_WORKFLOW_GRAPH=true` turns it on. It is kept because the
-measurements below are worth having, and because a faster or stronger upstream may change
-them.
+**Superseded by the [dynamic graph](#the-dynamic-graph-planners-decide-the-shape-in-markdown).**
+`AGENTAUS_GRAPH_KIND=fixed` selects it. It is kept because the measurements below are what
+led to the dynamic design.
 
 The fixes above made Agentaus's own workflows *run*. They did not make them *good*: its
 scripts carried prompts like "compute the required statistics from the provided files",
@@ -976,6 +976,57 @@ configuration came close to Opus. What the runs showed:
 
 The tasks Opus leaves headroom on are where this should be retried: `he10` is the closest
 (0.80 against 0.90), with Agentaus's own workflow.
+
+### The dynamic graph: planners decide the shape, in Markdown
+
+**On by default for ultracode** (`AGENTAUS_WORKFLOW_GRAPH=true`, `AGENTAUS_GRAPH_KIND=dynamic`).
+
+The fixed graph gave every task the same ten stages and every item three solvers. Here the
+shape is decided per task by agents, and the script
+([`graphs/dynamic.js`](agentaus_bridge/graphs/dynamic.js)) is only the runtime that carries
+it out:
+
+1. **Scout** - one agent surveys the project and writes a Markdown brief.
+2. **Plan, twice** - a lean planner and a careful planner each write a plan in Markdown: one
+   `## Subtask` per output, each with its difficulty, how many solvers it gets (1 easy, 2-3
+   medium, 3-5 hard), whether it is checked, how its answers are merged, and what it depends on.
+3. **Review** - a reviewer compares the two and writes the plan the work follows.
+4. **Run the plan** - each subtask once its dependencies are done: its solvers, a **merger**
+   that combines their answers by the plan's strategy (`vote`, `best-evidence`, `combine`,
+   `union`, `pick-change`), and a checker if the plan asked for one; a failed check gets one
+   more solver and a second merge.
+5. **Assemble, then check** - an assembler writes the deliverables and applies patches; two
+   checkers check the finished work; a fixer runs if either finds a problem.
+
+Every role works from a skill file, in [`graphs/skills/`](agentaus_bridge/graphs/skills) -
+`scout`, `plan`, `review-plan`, `solve`, `merge`, `check`, `assemble`, `fix` - and every agent
+hands the next one Markdown. The bridge passes the skills in with the script, so no agent
+spends a call reading its own instructions. Planners, the reviewer and mergers reason over
+text they are handed and get no tools at all: one call each. The runtime keeps only what an
+agent should not decide: at most `AGENTAUS_GRAPH_WIDTH` agents at once, a cap of 36 solvers,
+a backup for every agent, deadlines, and a one-subtask fallback if no plan can be read.
+
+#### What it measured
+
+Same harness and tasks as above, two runs each.
+
+| Task | Agentaus, own workflow | Fixed graph | **Dynamic graph** | Opus 5.5 |
+| --- | --- | --- | --- | --- |
+| `c1913` - five bugs and a feature | 0.57 | 0.54 | **0.88** (0.88, 0.88) | 1.00 |
+| `c1913h` - nine bugs, five unreported | 0.14 | 0.19 | **0.50** (0.50, 0.50) | 1.00 |
+| `he10` - ten HumanEval+ functions | **0.80** | 0.40 | 0.60 (0.60, 0.60) | 0.90 |
+| `rdti` - spreadsheets | **0.61** | 0.53 | 0.56 (0.50, 0.62) | 1.00 |
+| `tender` - RFQ from a `.docx` | **0.71** | 0.59 | 0.65 (0.80, 0.50) | 0.98 |
+| **Mean** | 0.57 | 0.45 | **0.64** | 0.98 |
+| Agents per run | - | 100-200 | 12-53 | - |
+| Typical time | 5-15 min | 35-70 min | 10-80 min | 2-8 min |
+
+The first approach here to beat Agentaus's own workflow on average, and the gains are where
+Agentaus was weakest: the two bug-fix tasks, identical across both runs. It uses a quarter
+of the fixed graph's agents because easy work gets one solver. It loses on `he10`, is level
+on data and documents within the noise, and is still well short of Opus everywhere. Two runs
+per task is a small sample: read the bug-fix gains as solid and the rest as not yet decided.
+
 
 ---
 
@@ -1758,9 +1809,10 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `AGENTAUS_SKILL_ROUTING` | `true` | Restore project skill descriptions, add the "if this, use that" section for skills and agent types, and have the planner name its choice. See [Routing](#routing-if-this-use-that) |
 | `AGENTAUS_SKILL_LIBRARY` | `true` | Offer the bridge's own skill library to Agentaus in every project and answer `Skill` calls for it |
 | `AGENTAUS_SUBAGENTS_FOLLOW_SESSION` | `true` | A subagent runs on the model its session's main loop is on. Off, an Agentaus session's subagents go to Claude |
-| `AGENTAUS_WORKFLOW_GRAPH` | `false` | Run the bridge's agent graph in place of the workflow scripts Agentaus writes. See [the experiment](#an-experiment-that-did-not-pay-the-bridges-own-agent-graph) |
+| `AGENTAUS_WORKFLOW_GRAPH` | `true` | Run a bridge agent graph in place of the workflow scripts Agentaus writes. See [the dynamic graph](#the-dynamic-graph-planners-decide-the-shape-in-markdown) |
+| `AGENTAUS_GRAPH_KIND` | `dynamic` | `dynamic` (planners decide the shape, in Markdown, from skill files) or `fixed` (the ten-stage graph) |
 | `AGENTAUS_GRAPH_WIDTH` | `8` | Most graph agents running at once |
-| `AGENTAUS_GRAPH_FOR_CODE` | `false` | With the graph on, use it for tasks that change code too |
+| `AGENTAUS_GRAPH_FOR_CODE` | `false` | Use the fixed graph for tasks that change code too. The dynamic graph always takes them |
 | `AGENTAUS_COAUTHOR` | `Agentaus <theteam@trellisdata.com>` | The `Co-Authored-By:` line commits on Agentaus turns end with, in place of Claude Code's Claude one. Empty leaves Claude Code's line. See [Commit credit](#commit-credit) |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | `127.0.0.1` / `8787` | Listen address |
 | `BRIDGE_PASSTHROUGH` | `true` | Forward non-Agentaus models to Anthropic; `false` answers them with Agentaus instead |

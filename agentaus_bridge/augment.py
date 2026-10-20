@@ -532,7 +532,7 @@ You do **not** write the script. The bridge runs its own agent graph: many small
 
 ### When the `<task-notification>` arrives
 
-1. **Read** its result: `results`, `checks`, `open_issues`.
+1. **Read** its result: what was planned, what each check found, and any open issue.
 2. **Open** each deliverable and confirm it is there and answers the request.
 3. **Fix** anything in `open_issues`, or anything you find wrong, with your own tools.
 4. **Report** what was done, briefly.

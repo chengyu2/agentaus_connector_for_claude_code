@@ -104,9 +104,18 @@ class WorkflowIsOfferedWhenTheUserOptsIn(unittest.TestCase):
         self.assertNotIn("Workflow", offered)
         self.assertNotIn("Artifact", offered)
 
-    def test_by_default_the_main_loop_is_taught_to_write_the_script(self):
+    def test_by_default_the_main_loop_is_told_to_run_the_graph(self):
         notes = augment.guidance_for(self.body("ultracode: analyse these files"))
         self.assertIn("Workflow launched in background", notes)
+        self.assertIn('"script": "agentaus-solve"', notes)
+
+    def test_with_the_graph_off_it_is_taught_to_write_the_script(self):
+        from agentaus_bridge.config import settings
+        saved, settings.agentaus_workflow_graph = settings.agentaus_workflow_graph, False
+        try:
+            notes = augment.guidance_for(self.body("ultracode: analyse these files"))
+        finally:
+            settings.agentaus_workflow_graph = saved
         self.assertIn("export const meta", notes)
 
     def test_with_the_graph_on_it_is_told_to_run_the_graph(self):
@@ -487,12 +496,12 @@ class MCPSchemasHaveABudget(unittest.TestCase):
 class TheBridgeRunsItsOwnGraph(unittest.TestCase):
     def setUp(self):
         from agentaus_bridge.config import settings
-        self._saved = settings.agentaus_workflow_graph
-        settings.agentaus_workflow_graph = True
+        self._saved = settings.agentaus_workflow_graph, settings.agentaus_graph_kind
+        settings.agentaus_workflow_graph, settings.agentaus_graph_kind = True, "fixed"
 
     def tearDown(self):
         from agentaus_bridge.config import settings
-        settings.agentaus_workflow_graph = self._saved
+        settings.agentaus_workflow_graph, settings.agentaus_graph_kind = self._saved
 
     def call(self, **arguments):
         return {"id": "w", "name": "Workflow", "arguments": __import__("json").dumps(arguments)}
@@ -510,6 +519,14 @@ class TheBridgeRunsItsOwnGraph(unittest.TestCase):
         self.assertEqual(args["args"]["cwd"], "/work/proj")
         self.assertIn("total the claims", args["args"]["task"])
         self.assertEqual(args["description"], "mine")
+
+    def test_the_dynamic_graph_takes_code_work_too(self):
+        from agentaus_bridge.config import settings
+        saved, settings.agentaus_graph_kind = settings.agentaus_graph_kind, "dynamic"
+        try:
+            self.assertTrue(graph.suits("ultracode: fix the bug in tools/bank.py", None))
+        finally:
+            settings.agentaus_graph_kind = saved
 
     def test_code_work_keeps_agentaus_own_workflow(self):
         body = {"system": "Primary working directory: /work/proj", "tools": [tool("Workflow")],
@@ -596,6 +613,48 @@ class TheBridgeRunsItsOwnGraph(unittest.TestCase):
         self.assertGreater(out["agents"], 30)
         self.assertLessEqual(out["peak"], 8, "the graph must hold its concurrency cap")
         self.assertEqual(out["deliverables"], ["answers.json"])
+
+
+class TheDynamicGraph(unittest.TestCase):
+    def test_every_role_has_a_skill(self):
+        for role in ("scout", "plan", "review-plan", "solve", "merge", "check", "assemble", "fix"):
+            self.assertIn(role, graph.SKILLS)
+            self.assertIn("Markdown", graph.SKILLS[role])
+
+    def test_the_dynamic_graph_is_the_default_kind_and_carries_the_skills(self):
+        import json
+        from agentaus_bridge.config import settings
+        self.assertEqual(settings.agentaus_graph_kind, "dynamic")
+        call = {"id": "w", "name": "Workflow", "arguments": json.dumps({"script": "agentaus-solve"})}
+        args = json.loads(graph.expand(call, "ultracode: total it", "/w")["arguments"])
+        self.assertEqual(args["script"], graph.DYNAMIC_SCRIPT)
+        self.assertIn("merge", args["args"]["skills"])
+
+    def test_a_think_only_agent_without_a_schema_gets_no_tools(self):
+        body = {"tools": [tool("Bash"), tool("Read")],
+                "messages": [user(graph.MARK + "\n" + graph.THINK + "\n# Plan the work")]}
+        self.assertEqual(graph.focus(body)[0]["tools"], [])
+
+    def test_the_planned_graph_runs_end_to_end(self):
+        import json, shutil, subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        here = os.path.dirname(os.path.abspath(__file__))
+        root = os.path.dirname(here)
+        r = subprocess.run([node, os.path.join(here, "graph_dynamic_dry_run.mjs"),
+                            os.path.join(root, "agentaus_bridge", "graphs", "dynamic.js"),
+                            os.path.join(root, "agentaus_bridge", "graphs", "skills")],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        out = json.loads(r.stdout)
+        self.assertEqual(out["missingSkill"], 0)
+        # The plan's choices, not the script's: 3 solvers for the hard subtask, 1 for the easy.
+        self.assertEqual(sum(1 for l in out["labels"] if l.startswith("solve-1.") and l[-1].isdigit()), 3)
+        self.assertEqual(sum(1 for l in out["labels"] if l.startswith("solve-2.")), 1)
+        self.assertIn("solve-1.redo", out["labels"])
+        self.assertLess(out["labels"].index("merge-1"), out["labels"].index("solve-2.1"))
+        self.assertIn("# Result:", out["result"])
 
 
 class RewritesSeeTheWholeAnswer(unittest.TestCase):
