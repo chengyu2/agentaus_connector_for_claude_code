@@ -261,6 +261,16 @@ class Settings:
     agentaus_max_concurrency: int = field(
         default_factory=lambda: _int("AGENTAUS_MAX_CONCURRENCY", 8)
     )
+    # One adaptive limit on EVERY call to Agentaus - user turns, graph agents and the
+    # bridge's own helpers alike - see throttle.py. It drops to one call at a time on a
+    # 5xx, 429 or transport failure and climbs back one step at a time, never above this.
+    agentaus_upstream_concurrency: int = field(
+        default_factory=lambda: _int("AGENTAUS_UPSTREAM_CONCURRENCY", 10)
+    )
+    # The least time between two steps up, so a lucky burst does not undo a failure.
+    agentaus_upstream_ramp_seconds: float = field(
+        default_factory=lambda: _float("AGENTAUS_UPSTREAM_RAMP_SECONDS", 20.0)
+    )
     max_concurrency_is_explicit: bool = field(
         default_factory=lambda: bool(
             os.environ.get("AGENTAUS_MAX_CONCURRENCY", "").strip()
@@ -584,6 +594,15 @@ class Settings:
     )
     agentaus_graph_width: int = field(
         default_factory=lambda: _int("AGENTAUS_GRAPH_WIDTH", 8)
+    )
+    # How long, in seconds, a graph agent may run before its next request is sent with no
+    # tools and an instruction to report. Measured: agents the graph had stopped waiting for
+    # kept editing files 15+ minutes later. The writer roles (assemble, fix) get the second.
+    agentaus_graph_agent_max_s: int = field(
+        default_factory=lambda: _int("AGENTAUS_GRAPH_AGENT_MAX_S", 720)
+    )
+    agentaus_graph_writer_max_s: int = field(
+        default_factory=lambda: _int("AGENTAUS_GRAPH_WRITER_MAX_S", 1500)
     )
     # Who a commit written on an Agentaus turn credits, as `Name <email>`. Claude Code asks
     # an unknown model for `Co-Authored-By: Claude Code <noreply@anthropic.com>`; the bridge

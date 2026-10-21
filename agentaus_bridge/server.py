@@ -36,6 +36,7 @@ from . import sessions
 from . import prompt_style
 from . import repair
 from . import syntax
+from . import throttle
 from . import schema as tool_schema
 from . import tools as bridge_tools
 from .augment import (
@@ -105,6 +106,7 @@ _STRIP_RESPONSE_HEADERS = {
 
 @app.on_event("startup")
 async def _startup() -> None:
+    # Every Agentaus call takes a slot from one adaptive limit, beneath every caller.
     app.state.client = httpx.AsyncClient(
         timeout=httpx.Timeout(
             settings.read_timeout,
@@ -112,7 +114,8 @@ async def _startup() -> None:
             read=settings.read_timeout,
             write=settings.connect_timeout,
         ),
-        limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
+        transport=throttle.LimitedTransport(httpx.AsyncHTTPTransport(
+            limits=httpx.Limits(max_connections=64, max_keepalive_connections=32))),
         follow_redirects=False,
     )
     # Claude traffic gets its own pool. Sharing one meant a burst of bridge helper calls
@@ -1918,6 +1921,17 @@ async def _handle_agentaus(
                     plan_holder["text"] = await _plan_turn(client, fitted, on_plan_piece)
             fitted = {**fitted, "system": with_plan(fitted.get("system"), plan_holder["text"])}
 
+        # A graph agent past its time is asked for its result, with no tools to keep going.
+        # Last, so nothing after it puts tools back. See graph.overdue.
+        if graph.is_graph_task(fitted) and is_subagent_turn(fitted):
+            over, news = graph.overdue(fitted)
+            if over:
+                fitted = graph.time_up(fitted)
+                if news:
+                    rlog(logging.WARNING, "graph agent (%s) is %.0fs past its %ds limit; "
+                         "asking for its result with no tools", graph.role_of(fitted) or "?",
+                         over, graph.agent_limit(fitted))
+
         built = anthropic_request_to_agentaus(
             fitted,
             system_prompt_overwrite=settings.system_prompt_overwrite,
@@ -2008,10 +2022,13 @@ async def _handle_agentaus(
                 payload = _with_tool_results(
                     payload, invented, [_correction_for(c, known) for c in invented])
                 continue
-            _run_graph_instead(_theirs, body)
+            # In a worker thread: preparing the graph copies the project and reads its
+            # documents - measured, 9s for fourteen PDFs - and would stall every other request.
+            await asyncio.to_thread(_run_graph_instead, _theirs, body)
             broken = _validate_tool_calls(mine + _theirs, _tool_schemas(payload),
                                           working_directory_of(body))
             broken += early_deliverable_writes(_theirs, body, working_directory_of(body))
+            broken += graph.guarded_writes(_theirs, body, working_directory_of(body))
             if broken and corrections < settings.agentaus_correction_rounds:
                 corrections += 1
                 rlog(logging.WARNING, "%d malformed tool call(s): %s; correcting",
@@ -2498,10 +2515,11 @@ async def _agentaus_event_stream(
         # A well-named call with malformed arguments is rejected by the client with a
         # wall of validator internals, which costs the turn and tells the model nothing.
         # Same budget as an invented name: it is the same class of mistake.
-        _run_graph_instead(theirs, original)
+        await asyncio.to_thread(_run_graph_instead, theirs, original)
         broken = _validate_tool_calls(mine + theirs, _tool_schemas(payload),
                                       working_directory_of(original))
         broken += early_deliverable_writes(theirs, original, working_directory_of(original))
+        broken += graph.guarded_writes(theirs, original, working_directory_of(original))
         if broken and corrections < settings.agentaus_correction_rounds:
             corrections += 1
             rlog(logging.WARNING, "%d malformed tool call(s): %s; correcting",

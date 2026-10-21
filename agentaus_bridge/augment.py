@@ -518,9 +518,12 @@ GRAPH_GUIDANCE = """\
 
 **The user opted into multi-agent orchestration ("ultracode").**
 
-- **Substantive task** → call `Workflow` **once**, like this:
+- **Any task that involves files, data, documents or code** → your **first** action is to
+  call `Workflow` **once**, like this:
   `{"description": "one line saying what it does", "script": "agentaus-solve"}`
-- **Trivial or conversational turn** → no `Workflow`; just answer.
+  Do not start the work yourself first, and do not decide it is too small: the graph scales
+  itself down for small tasks.
+- **Only a greeting or a question about this conversation** → no `Workflow`; just answer.
 
 You do **not** write the script. The bridge runs its own agent graph: many small agents that survey the files, break the request into items, solve each item three different ways, reconcile them, write the deliverables, and check every requirement.
 
@@ -1757,12 +1760,21 @@ def focus_tools(body: dict, *, workflow_opt_in: bool | None = None) -> tuple[dic
     used = _tools_used(body)
     # Decided on the conversation before compaction when the caller has it: a summary
     # that replaced the opening "ultracode: ..." message must not withdraw the opt-in.
-    if workflow_opt_in if workflow_opt_in is not None else workflow_opted_in(body):
+    opted = workflow_opt_in if workflow_opt_in is not None else workflow_opted_in(body)
+    if opted:
         used = used | {"Workflow"}
+    # With the bridge's graph on, an opted-in main loop orchestrates through Workflow. Offered
+    # `Agent` as well, Agentaus handed ten functions to one subagent instead, twice running.
+    from .config import settings
+    hide_agent = (opted and settings.agentaus_workflow_graph and not is_subagent_turn(body)
+                  and "Agent" not in _tools_used(body))
     kept, dropped = [], []
     for tool in tools:
         name = (tool or {}).get("name") or ""
         server = name.split("__")[1] if name.startswith("mcp__") and "__" in name[5:] else ""
+        if name == "Agent" and hide_agent:
+            dropped.append(name)
+            continue
         if (name not in HELD_BACK_TOOLS or name in used
                 or (name and re.search(rf"\b{re.escape(name)}\b", asked))
                 or (server and re.search(rf"\b{re.escape(server)}\b", asked, re.I))):

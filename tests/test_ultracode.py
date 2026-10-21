@@ -630,10 +630,193 @@ class TheDynamicGraph(unittest.TestCase):
         self.assertEqual(args["script"], graph.DYNAMIC_SCRIPT)
         self.assertIn("merge", args["args"]["skills"])
 
+    def test_an_opted_in_main_loop_orchestrates_through_workflow_not_agent(self):
+        body = {"tools": [tool("Workflow"), tool("Agent"), tool("Read")],
+                "messages": [user("ultracode: implement the functions")]}
+        offered = {t["name"] for t in augment.focus_tools(body)[0]["tools"]}
+        self.assertIn("Workflow", offered)
+        self.assertNotIn("Agent", offered)
+        plain = {"tools": [tool("Agent"), tool("Read")], "messages": [user("explain this")]}
+        self.assertIn("Agent", {t["name"] for t in augment.focus_tools(plain)[0]["tools"]})
+
     def test_a_think_only_agent_without_a_schema_gets_no_tools(self):
         body = {"tools": [tool("Bash"), tool("Read")],
                 "messages": [user(graph.MARK + "\n" + graph.THINK + "\n# Plan the work")]}
         self.assertEqual(graph.focus(body)[0]["tools"], [])
+
+    def test_graph_agents_cannot_write_where_their_role_forbids(self):
+        cwd = tempfile.mkdtemp()
+        src = os.path.join(cwd, "bank.py")
+        open(src, "w").write("x = 1\n")
+        def body(role):
+            return {"messages": [user(f"{graph.MARK}\n# Job\n\n## Your skill: {role}\n")]}
+        def call(name, path):
+            return [{"name": name, "arguments": {"file_path": path, "content": "y"}}]
+        self.assertTrue(graph.guarded_writes(call("Edit", src), body("solve"), cwd))
+        self.assertFalse(graph.guarded_writes(call("Write", "/tmp/copy/bank.py"), body("solve"), cwd))
+        self.assertTrue(graph.guarded_writes(call("Write", src), body("assemble"), cwd))
+        self.assertFalse(graph.guarded_writes(call("Edit", src), body("assemble"), cwd))
+        self.assertFalse(graph.guarded_writes(call("Write", os.path.join(cwd, "answers.json")), body("assemble"), cwd))
+        self.assertFalse(graph.guarded_writes(call("Edit", src), {"messages": [user("fix it")]}, cwd))
+
+    def test_the_role_is_read_from_an_indented_prompt(self):
+        # The harness indents every prompt line by two spaces; the heading never sat at column 0.
+        body = {"messages": [user(f"{graph.MARK}\n  # Job\n\n  ---\n  ## Your skill: solve\n")]}
+        self.assertEqual(graph.role_of(body), "solve")
+        self.assertEqual(graph.role_of({"messages": [user(f"{graph.MARK}\n> ### Your skill:  review-plan")]}),
+                         "review-plan")
+
+    def test_read_only_roles_cannot_write_into_the_project_through_bash(self):
+        cwd = "/Users/x/proj"
+        s = graph.scratch_of(cwd)
+        blocked = [
+            "sed -i '' 's/a/b/' tools/bank.py",
+            "perl -pi -e 's/a/b/' tools/bank.py",
+            "apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: tools/bank.py\n*** End Patch\nEOF",
+            "patch -p1 < /tmp/fix.patch",
+            "cat > tools/bank.py <<'EOF'\nprint(1)\nEOF",
+            "python3 tools/bank.py --json > answers.json",
+            "python3 - <<'EOF'\np = 'tools/bank.py'\nopen(p, 'w').write('x')\nEOF",
+            "python3 -c \"import json; json.dump({}, open('answers.json', 'w'))\"",
+            "python3 -c \"from pathlib import Path; Path('out.txt').write_text('x')\"",
+            "cp x tools/bank.py",
+            "cp /tmp/sol/bank.py /Users/x/proj/tools/bank.py",
+            "mv tools/bank.py tools/old.py",
+            "rm -f answers.json",
+            "touch figures/x.png",
+            "echo x | tee report.md",
+            "git apply /tmp/fix.patch",
+            "git checkout -- tools/bank.py",
+            "cd /Users/x/proj/tools && sed -i 's/a/b/' bank.py",
+            "cd /tmp/work && cp result.json /Users/x/proj/answers.json",
+            "bash -c \"sed -i 's/a/b/' tools/bank.py\"",
+        ]
+        allowed = [
+            "cd /Users/x/proj && python3 tools/bank.py --json | head",
+            "grep -n def tools/bank.py",
+            "cat tools/bank.py",
+            "sed -n '1,40p' tools/bank.py",
+            "python3 -c \"import json; json.load(open('answers.json'))\"",
+            "python3 tools/bank.py > /dev/null 2>&1",
+            "python3 -c 'print(1 if 2 > 1 else 0)'",
+            f"rm -rf {s}/s1/a && mkdir -p {s}/s1/a && cp -R /Users/x/proj {s}/s1/a/repo",
+            f"cp -R {s}/pristine {s}/m1/c1/repo",
+            f"cd {s}/s1/a/repo && sed -i '' 's/a/b/' tools/bank.py",
+            f"cd {s}/s1/a/repo && patch -p1 < {s}/s1/a/fix.patch",
+            f"cd {s}/s1/a && diff -ruN {s}/pristine repo > fix.patch",
+            f"python3 - <<'EOF'\nOUT = '{s}/out.json'\nimport json\njson.dump({{}}, open(OUT, 'w'))\nEOF",
+            "ls -la > /tmp/listing.txt",
+            "git diff --stat",
+        ]
+        for command in blocked:
+            self.assertTrue(graph.bash_writes_into(command, cwd), command)
+        for command in allowed:
+            self.assertEqual(graph.bash_writes_into(command, cwd), [], command)
+
+        def body(role):
+            return {"messages": [user(f"{graph.MARK}\n  ## Your skill: {role}\n")]}
+        bash = [{"name": "Bash", "arguments": {"command": "sed -i '' 's/a/b/' tools/bank.py"}}]
+        refused = graph.guarded_writes(bash, body("scout"), cwd)
+        self.assertEqual(len(refused), 1)
+        self.assertIn("read-only for your role (scout)", refused[0][1])
+        # The roles that put the result in place may write; so may a prompt with no role.
+        self.assertEqual(graph.guarded_writes(bash, body("assemble"), cwd), [])
+        self.assertEqual(graph.guarded_writes(bash, {"messages": [user(graph.MARK)]}, cwd), [])
+
+    def test_the_bridge_prepares_the_scratch_folder_before_the_graph_starts(self):
+        import json, shutil, subprocess, zipfile
+        cwd = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cwd, True)
+        self.addCleanup(shutil.rmtree, graph.scratch_of(cwd), True)
+        os.makedirs(os.path.join(cwd, "past"))
+        os.makedirs(os.path.join(cwd, ".git"))
+        w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+        cell = lambda t: f"<w:tc><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc>"
+        document = (f'<w:document {w}><w:body><w:p><w:r><w:t>Pricing</w:t></w:r></w:p>'
+                    f'<w:tbl><w:tr>{cell("Milestone 1")}{cell("30%")}</w:tr>'
+                    f'<w:tr>{cell("Total")}{cell("AUD $88,000.00")}</w:tr></w:tbl>'
+                    f'<w:p><w:r><w:t>After</w:t><w:tab/><w:t>table</w:t></w:r></w:p></w:body></w:document>')
+        with zipfile.ZipFile(os.path.join(cwd, "past", "old.docx"), "w") as z:
+            z.writestr("word/document.xml", document)
+        with open(os.path.join(cwd, "solutions.py"), "w") as fh:
+            fh.write('RATES = {"a": 1}\nlog = object()\n\ndef add(a, b):\n    """Add.\n\n'
+                     '    >>> add(1, 2)\n    3\n    """\n    raise NotImplementedError\n\n'
+                     'def sub(a, b):\n    return a - b\n')
+        with open(os.path.join(cwd, "test_solutions.py"), "w") as fh:
+            fh.write("def test_x():\n    pass\n")
+        old = os.path.join(graph.scratch_of(cwd), "leftover")
+        os.makedirs(old, exist_ok=True)
+        from agentaus_bridge.config import settings
+        self.assertEqual(settings.agentaus_graph_kind, "dynamic")
+        call = {"id": "w", "name": "Workflow", "arguments": json.dumps({"script": "x"})}
+        args = json.loads(graph.expand(call, "ultracode: do it", cwd)["arguments"])["args"]
+
+        self.assertFalse(os.path.exists(old), "the scratch folder starts empty")
+        self.assertTrue(os.path.isfile(os.path.join(args["pristine"], "solutions.py")))
+        self.assertFalse(os.path.exists(os.path.join(args["pristine"], ".git")))
+        [text] = args["texts"]
+        self.assertEqual(text["source"], os.path.join("past", "old.docx"))
+        with open(text["text"]) as fh:
+            written = fh.read()
+        self.assertEqual(written, "Pricing\nMilestone 1 | 30%\nTotal | AUD $88,000.00\nAfter\ttable\n")
+        self.assertEqual(text["lines"], 4)
+        self.assertEqual([(f["fn"], f["stub"], f["signature"]) for f in args["functions"]],
+                         [("add", True, "def add(a, b)"), ("sub", False, "def sub(a, b)")])
+        self.assertIn(">>> add(1, 2)", args["functions"][0]["doc"])
+        self.assertEqual(args["constants"], [{"file": "solutions.py", "names": ["RATES"]}])
+
+        candidate = os.path.join(cwd, "candidate.py")
+        for source, want in (("def add(a, b):\n    return a + b\n", "1/1 docstring examples pass"),
+                             ("def add(a, b):\n    return a * b\n", "0/1 docstring examples pass"),
+                             ("def add(a, b:\n", "0/1 docstring examples pass"),
+                             ("if __name__ == '__main__':\n    input()\ndef add(a, b):\n    return a + b\n",
+                              "1/1 docstring examples pass")):
+            with open(candidate, "w") as fh:
+                fh.write(source)
+            r = subprocess.run([sys.executable, args["examples"], os.path.join(args["pristine"], "solutions.py"),
+                                candidate], capture_output=True, text=True, timeout=30, stdin=subprocess.PIPE)
+            self.assertEqual(r.stdout.strip().splitlines()[-1], want, r.stdout + r.stderr)
+            if "add(a, b:" in source:
+                self.assertTrue(r.stdout.startswith("MISMATCH import"), r.stdout)
+
+    def test_the_scratch_folder_is_named_as_the_graph_names_it(self):
+        self.assertEqual(graph.scratch_of("/Users/x/my proj"), "/tmp/agentaus-graph/Users_x_my_proj-dyn")
+        self.assertEqual(graph.scratch_of(""), "/tmp/agentaus-graph/task-dyn")
+
+    def test_an_agent_past_its_time_is_asked_for_its_result_without_tools(self):
+        from agentaus_bridge.config import settings
+        prompt = f"{graph.MARK}\n  ## Your skill: solve\n  Implement add() - {id(self)}"
+        first = {"tools": [tool("Bash")], "messages": [user(prompt)]}
+        later = {"tools": [tool("Bash")], "tool_choice": {"type": "auto"}, "messages": [
+            user(prompt),
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                                               "input": {"command": "ls"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "a.py"}]}]}
+        self.assertEqual(graph.overdue(first, now=1000.0), (0.0, False))
+        self.assertEqual(graph.overdue(later, now=1000.0 + settings.agentaus_graph_agent_max_s - 1)[0], 0.0)
+        over, news = graph.overdue(later, now=1000.0 + settings.agentaus_graph_agent_max_s + 30)
+        self.assertEqual((over, news), (30.0, True))
+        self.assertFalse(graph.overdue(later, now=1000.0 + settings.agentaus_graph_agent_max_s + 60)[1],
+                         "said once per agent")
+        stopped = graph.time_up(later)
+        self.assertNotIn("tools", stopped)
+        self.assertNotIn("tool_choice", stopped)
+        self.assertEqual(len(stopped["messages"]), 3, "no second user turn in a row")
+        self.assertEqual(stopped["messages"][-1]["content"][0]["type"], "tool_result")
+        self.assertEqual(stopped["messages"][-1]["content"][-1]["text"], graph.TIME_UP)
+        self.assertEqual(graph.time_up(stopped), stopped, "a refit is not told twice")
+        # The translated payload stays valid: the tool result, then the instruction.
+        from agentaus_bridge.translate import anthropic_request_to_agentaus
+        sent = anthropic_request_to_agentaus(stopped)
+        self.assertEqual([m["role"] for m in sent["messages"]][-2:], ["tool", "user"])
+        self.assertNotIn("tools", sent)
+        # A retry with the same prompt starts its own clock; the writers get longer.
+        self.assertEqual(graph.overdue(first, now=5000.0)[0], 0.0)
+        assemble = {"messages": [user(f"{graph.MARK}\n  ## Your skill: assemble\n  {id(self)}"),
+                                 {"role": "assistant", "content": "x"}, user("go on")]}
+        graph.overdue({"messages": assemble["messages"][:1]}, now=0.0)
+        self.assertEqual(graph.overdue(assemble, now=settings.agentaus_graph_agent_max_s + 60)[0], 0.0)
+        self.assertGreater(graph.overdue(assemble, now=settings.agentaus_graph_writer_max_s + 60)[0], 0)
 
     def test_the_planned_graph_runs_end_to_end(self):
         import json, shutil, subprocess
@@ -650,8 +833,9 @@ class TheDynamicGraph(unittest.TestCase):
         out = json.loads(r.stdout)
         self.assertEqual(out["missingSkill"], 0)
         # The plan's choices, not the script's: 3 solvers for the hard subtask, 1 for the easy.
-        self.assertEqual(sum(1 for l in out["labels"] if l.startswith("solve-1.") and l[-1].isdigit()), 3)
-        self.assertEqual(sum(1 for l in out["labels"] if l.startswith("solve-2.")), 1)
+        solvers = lambda n: len({l for l in out["labels"] if l.startswith(f"solve-{n}.") and l.split(".")[-1].isdigit()})
+        self.assertEqual(solvers(1), 3)
+        self.assertEqual(solvers(2), 1)
         self.assertIn("solve-1.redo", out["labels"])
         self.assertLess(out["labels"].index("merge-1"), out["labels"].index("solve-2.1"))
         self.assertIn("# Result:", out["result"])
