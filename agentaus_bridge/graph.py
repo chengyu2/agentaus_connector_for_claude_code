@@ -70,6 +70,11 @@ def expand(call: dict, task: str, cwd: str | None) -> dict:
         "description": arguments.get("description") or "Agentaus agent graph",
         "script": script_for(),
         "args": {"task": task, "cwd": cwd or "", "width": settings.agentaus_graph_width,
+                 # The graph waits a little longer than the bridge lets an agent run, so the
+                 # result an agent is made to report at TIME_UP still counts. Measured: the
+                 # cap was 720 s and the graph's deadline 600 s - every forced report arrived
+                 # after the graph had stopped listening.
+                 "deadline_ms": (settings.agentaus_graph_agent_max_s + 120) * 1000,
                  **({"skills": SKILLS, **prepare(cwd)} if dynamic else {})},
     }
     log.info("workflow: running the agent graph for a %d-char request", len(task or ""))
@@ -217,6 +222,62 @@ def _texts(cwd: str, files: list[str], inputs: str) -> list:
     return out
 
 
+# A question the request's documents ask: `Q3. ...`, `**Q3.** ...`, `- Q3: ...`, and the heading
+# forms `## Q3 - title` / `### Q3` with the question on the line below. Measured: the graph
+# read the question numbers off the planner's Task, which said "Q1, Q2, ... Q9" - so Q3 to
+# Q8 were never planned, though the RFQ listed all nine, one per line.
+_QUESTION = re.compile(r"^[ \t>*#-]*\**Q(\d{1,2})\**[.:)]\**\s+(\S.{6,400}?)\s*$", re.M)
+_QUESTION_HEADING = re.compile(
+    r"^[ \t>]*#{1,6}[ \t]*\**Q(\d{1,2})\b\**[ \t]*(?:[-\u2010-\u2015:.)]\**[ \t]*)?(.*?)[ \t]*$", re.M)
+_MAX_QUESTIONS = 40
+_QUESTION_FILES = 200
+_QUESTION_BYTES = 2 * 1024 * 1024
+
+
+def _question_text(text: str) -> str:
+    return re.sub(r"^\*+|\*+$", "", text.strip()).strip()
+
+
+def _questions_in(text: str) -> list:
+    """(n, question, line) for each question line in one text, in the order they appear."""
+    found = []
+    for m in _QUESTION.finditer(text):
+        found.append((m.start(), int(m.group(1)), _question_text(m.group(2))))
+    for m in _QUESTION_HEADING.finditer(text):
+        title = _question_text(m.group(2))
+        if len(title) < 7:
+            # `### Q3` with the question itself on the next line that is not a heading.
+            rest = text[m.end():].lstrip("\n").split("\n", 3)
+            nxt = next((l.strip() for l in rest[:3] if l.strip()), "")
+            if nxt and not nxt.startswith("#") and not _QUESTION.match(nxt):
+                title = f"{title} - {_question_text(nxt)}" if title else _question_text(nxt)
+        if len(title) >= 7:
+            found.append((m.start(), int(m.group(1)), title[:400]))
+    return [(n, q, text.count("\n", 0, at) + 1) for at, n, q in sorted(found)]
+
+
+def _questions(cwd: str, files: list[str], texts: list) -> list:
+    """Every numbered question in the project's text files and document copies.
+
+    Shallowest file first, so the request's own RFQ at the top of the project wins over a
+    past response in a subfolder; for each number, the first seen wins.
+    """
+    sources = [(f, os.path.join(cwd, f)) for f in files if f.lower().endswith((".md", ".txt"))]
+    sources += [(t["source"], t["text"]) for t in texts]
+    sources.sort(key=lambda s: (s[0].count(os.sep), s[0]))
+    found: dict = {}
+    for rel, path in sources[:_QUESTION_FILES]:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                text = fh.read(_QUESTION_BYTES)
+        except OSError:
+            continue
+        for n, question, line in _questions_in(text):
+            if n not in found:
+                found[n] = {"n": n, "text": f"Q{n}. {question}", "file": rel, "line": line}
+    return [found[k] for k in sorted(found)][:_MAX_QUESTIONS]
+
+
 def _is_stub(fn) -> bool:
     for k, node in enumerate(fn.body):
         if k == 0 and isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) \
@@ -292,9 +353,10 @@ def _make_writable(path: str) -> None:
 
 
 def prepare(cwd: str | None) -> dict:
-    """The args the bridge adds for the dynamic graph: pristine, texts, functions, constants,
-    examples. Best effort - a step that fails is logged and left out, never raised."""
-    extra: dict = {"pristine": "", "texts": [], "functions": [], "constants": [], "examples": ""}
+    """The args the bridge adds for the dynamic graph: pristine, texts, questions, functions,
+    constants, examples. Best effort - a step that fails is logged and left out, never raised."""
+    extra: dict = {"pristine": "", "texts": [], "questions": [], "functions": [], "constants": [],
+                   "examples": ""}
     if not cwd or not os.path.isdir(cwd):
         return extra
     scratch = scratch_of(cwd)
@@ -311,6 +373,7 @@ def prepare(cwd: str | None) -> dict:
     steps = (
         ("pristine", lambda: _snapshot(cwd, files, os.path.join(scratch, "pristine"))),
         ("texts", lambda: _texts(cwd, files, os.path.join(scratch, "inputs"))),
+        ("questions", lambda: _questions(cwd, files, extra["texts"])),
         ("inventory", lambda: _inventory(cwd, files)),
         ("examples", lambda: _write(os.path.join(scratch, "examples.py"), EXAMPLES_SCRIPT)),
     )
@@ -324,9 +387,9 @@ def prepare(cwd: str | None) -> dict:
             extra["functions"], extra["constants"] = got
         else:
             extra[name] = got
-    log.info("graph prep: %s in %.1fs - snapshot %s, %d document(s), %d function(s), "
-             "%d file(s) of constants", scratch, time.monotonic() - started,
-             "yes" if extra["pristine"] else "no", len(extra["texts"]),
+    log.info("graph prep: %s in %.1fs - snapshot %s, %d document(s), %d question(s), "
+             "%d function(s), %d file(s) of constants", scratch, time.monotonic() - started,
+             "yes" if extra["pristine"] else "no", len(extra["texts"]), len(extra["questions"]),
              len(extra["functions"]), len(extra["constants"]))
     return extra
 
@@ -369,6 +432,9 @@ def limited(thunk):
     finally:
         if hasattr(signal, 'SIGALRM'):
             signal.alarm(0)
+# "0/0 pass" read as a pass. Measured: 26 agents ran this on a module with no `>>>` lines and
+# went on as if their change were tested.
+NONE = "no docstring examples - write the docstring's prose examples as asserts yourself"
 cases = [(call, want) for fn in ast.parse(open(spec).read()).body
          if isinstance(fn, ast.FunctionDef) and not (only and fn.name != only)
          for call, want in examples(fn)]
@@ -380,7 +446,7 @@ try:
     limited(lambda: exec(compile(open(cand).read(), cand, 'exec'), ns))
 except BaseException as e:
     print(f'MISMATCH import {cand}: {e!r}')
-    print(f'0/{len(cases)} docstring examples pass')
+    print(f'0/{len(cases)} docstring examples pass' if cases else NONE)
     sys.exit(0)
 bad = n = 0
 for call, want in cases:
@@ -403,7 +469,7 @@ for call, want in cases:
         got, ok = f'error {e!r}', False
     bad += not ok
     print(('ok       ' if ok else 'MISMATCH ') + f'{call} -> {got!r}' + ('' if ok else f'   docstring says {want}'))
-print(f'{n - bad}/{n} docstring examples pass')
+print(f'{n - bad}/{n} docstring examples pass' if n else NONE)
 '''
 
 
@@ -587,6 +653,13 @@ def guarded_writes(calls: list, body: dict, cwd: str | None) -> list:
                 out.append((call, "Your command was not run: it would write into the project "
                                   f"folder, which is read-only for your role ({role}). Work in "
                                   "your own copy under /tmp, as your task says."))
+            # Measured (he10, d9): an assembler blocked from `Write` seven times ran
+            # `cp <solver copy>/solutions.py <project>/solutions.py` instead, and one solver's
+            # file replaced nine good functions.
+            elif role in LONG_ROLES and isinstance(command, str) and overwrites_source(command, cwd):
+                out.append((call, "Your command was not run: it replaces an existing source file "
+                                  "in the project whole. Run the commands you were given, or make "
+                                  "small `Edit` calls."))
             continue
         path = (args or {}).get("file_path") or (args or {}).get("notebook_path") or ""
         inside = isinstance(path, str) and os.path.normpath(path).startswith(root)
@@ -702,6 +775,25 @@ def _options_and_args(words: list, takes_value=()) -> tuple[set, list]:
     return opts, args
 
 
+_COPIERS = ("cp", "install", "ln", "rsync", "ditto")
+_COPY_VALUES = {"-m", "-o", "-g", "-S"}
+_RSYNC_VALUES = {"-e", "-f", "--exclude", "--include", "--filter", "--exclude-from",
+                 "--include-from", "--files-from", "--rsh", "--backup-dir", "--suffix",
+                 "--log-file", "--chmod", "--chown", "--rsync-path"}
+
+
+def _copy_parts(name: str, rest: list) -> tuple[list, list]:
+    """(sources, [destination]) of a cp/mv/install/ln/rsync/ditto command, as written."""
+    values = _RSYNC_VALUES if name == "rsync" else _COPY_VALUES
+    if "-t" in rest and rest.index("-t") + 1 < len(rest):
+        dest = rest[rest.index("-t") + 1]
+        return _options_and_args(rest, takes_value=values | {"-t"})[1], [dest]
+    args = _options_and_args(rest, takes_value=values)[1]
+    if name == "rsync":
+        args = [a for a in args if not re.match(r"^[^/]*:", a)]   # host:path is not here
+    return (args[:-1], args[-1:]) if len(args) >= 2 else ([], [])
+
+
 def _command_writes(words: list, here: str, bodies: list, env: dict) -> list:
     """The raw write targets of one simple command (no redirects); "." means where it runs."""
     while words and (words[0] in _WRAPPERS or re.match(r"^\w+=", words[0])
@@ -734,11 +826,8 @@ def _command_writes(words: list, here: str, bodies: list, env: dict) -> list:
         return _options_and_args(rest)[1]
     if name in ("mv", "rm", "touch", "truncate", "unlink", "rmdir", "shred"):
         return _options_and_args(rest, takes_value={"-s", "-t"})[1]
-    if name in ("cp", "install", "ln"):
-        if "-t" in rest and rest.index("-t") + 1 < len(rest):
-            return [rest[rest.index("-t") + 1]]
-        args = _options_and_args(rest, takes_value={"-m", "-o", "-g", "-S"})[1]
-        return args[-1:] if len(args) >= 2 else []
+    if name in _COPIERS:
+        return _copy_parts(name, rest)[1][-1:]
     if name == "apply_patch":
         found = [a or b for body in bodies + [" ".join(rest)] for a, b in _PATCH_FILE.findall(body)]
         return found or ["."]
@@ -792,8 +881,60 @@ def _python_writes(code: str) -> list:
     return out
 
 
-def _bash_targets(command: str, start: str, env: dict | None = None) -> list:
-    """Every path a shell command would write to, resolved, in the order found."""
+def _whole_writes(words: list, here: str, env: dict) -> list:
+    """The files one simple command replaces whole - cp/mv/rsync/install/ditto onto them, or
+    tee - resolved. A directory copied into a directory replaces each file it holds."""
+    while words and (words[0] in _WRAPPERS or re.match(r"^\w+=", words[0])
+                     or (words[0].startswith("-") and len(words[0]) > 1)):
+        word = words.pop(0)
+        if re.match(r"^\w+=", word):
+            env[word.split("=", 1)[0]] = word.split("=", 1)[1]
+    if not words:
+        return []
+    name, rest = os.path.basename(words[0]), words[1:]
+    if name in ("bash", "sh", "zsh") and "-c" in rest and rest.index("-c") + 1 < len(rest):
+        return _bash_targets(rest[rest.index("-c") + 1], here, env, whole=True)
+    if name == "tee":
+        if any(w in ("-a", "--append") for w in rest):
+            return []
+        return [t for t in (_resolve(w, here, env) for w in _options_and_args(rest)[1]) if t]
+    if name not in _COPIERS + ("mv",):
+        return []
+    sources, dest = _copy_parts(name, rest)
+    target = _resolve(dest[0], here, env) if dest else None
+    if not target:
+        return []
+    if not os.path.isdir(target):
+        return [target]
+    out = []
+    for raw in sources:
+        src = _resolve(raw, here, env)
+        if not src:
+            continue
+        if not os.path.isdir(src):
+            out.append(os.path.join(target, os.path.basename(src)))
+            continue
+        # `cp -R a/. b/`, `rsync a/ b/` and ditto copy a folder's contents; `cp -R a b/` copies
+        # the folder into b.
+        into = target if (raw.endswith(("/.", "/")) or name == "ditto") else os.path.join(
+            target, os.path.basename(src))
+        seen = 0
+        for root, dirs, files in os.walk(src):
+            dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+            for f in files:
+                out.append(os.path.join(into, os.path.relpath(os.path.join(root, f), src)))
+                seen += 1
+            if seen > _SNAPSHOT_FILES:
+                break
+    return out
+
+
+def _bash_targets(command: str, start: str, env: dict | None = None, whole: bool = False) -> list:
+    """Every path a shell command would write to, resolved, in the order found.
+
+    `whole`: only the files it replaces whole - a copy onto them, `tee`, or a `>` redirect -
+    and not the ones it edits in place (`sed -i`, `patch`, a python edit script) or appends to.
+    """
     env = {} if env is None else env
     text, bodies = _heredocs(command)
     tokens = _tokens(_newlines_to_separators(text))
@@ -808,7 +949,8 @@ def _bash_targets(command: str, start: str, env: dict | None = None) -> list:
                 nxt = segment[k + 1] if k + 1 < len(segment) else ""
                 if words and words[-1].isdigit():
                     words.pop()   # the 2 of `2>/dev/null` is not an argument
-                if not (token.endswith("&") and re.fullmatch(r"\d+|-", nxt)) and nxt:
+                if not (token.endswith("&") and re.fullmatch(r"\d+|-", nxt)) and nxt \
+                        and not (whole and token not in (">", ">|", "&>")):
                     redirects.append(nxt)
                 k += 2
                 continue
@@ -822,7 +964,10 @@ def _bash_targets(command: str, start: str, env: dict | None = None) -> list:
             here = _resolve(dest, here, env) or here
             segment.clear()
             return
-        raw = _command_writes(list(words), here, bodies, env) + redirects
+        if whole:
+            raw = [("abs", t) for t in _whole_writes(list(words), here, env)] + redirects
+        else:
+            raw = _command_writes(list(words), here, bodies, env) + redirects
         for t in raw:
             if isinstance(t, tuple):
                 targets.append(t[1])
@@ -854,6 +999,27 @@ def bash_writes_into(command: str, cwd: str) -> list:
     return [t for t in targets if t == root or t.startswith(root.rstrip("/") + "/")]
 
 
+def overwrites_source(command: str, cwd: str) -> bool:
+    """Whether a shell command replaces an existing source file in cwd whole - `cp x bank.py`,
+    `cat > bank.py`, `rsync copy/ project/`. Copies from the graph's own pristine snapshot or
+    pre-fix backup (restore, undo) are not counted; neither are `patch` and edit scripts."""
+    root = _norm(cwd)
+    scratch = _norm(scratch_of(cwd))
+    try:
+        if re.search(rf"{re.escape(scratch)}/pristine\b|/before-fix\b", _norm_command(command)):
+            return False
+        targets = _bash_targets(command, root, whole=True)
+    except Exception as exc:  # noqa: BLE001 - an unreadable command is not blocked
+        log.debug("could not read a shell command (%s)", exc)
+        return False
+    inside = [t for t in targets if t.startswith(root.rstrip("/") + "/")]
+    return any(_SOURCE.search(t) and os.path.isfile(t) for t in inside)
+
+
+def _norm_command(command: str) -> str:
+    return re.sub(r"/private(/(?:tmp|var)/)", r"\1", command)
+
+
 # --- Agents the graph has stopped waiting for ---------------------------------------------
 #
 # The graph moves on after a deadline, but the agent it gave up on keeps looping. Measured:
@@ -878,6 +1044,33 @@ def _first_user_text(body: dict) -> str:
     return ""
 
 
+def _agent_key(body: dict) -> tuple[str, str]:
+    """(key, title) an agent is known by across all its requests.
+
+    The graph prompt's own title line, the project it works in, and whether it is the
+    backup attempt. Measured (he10, d9): keyed on a hash of every text block of the first
+    user message, the key changed between an agent's requests - Claude Code adds reminder
+    blocks to that message as a run goes on - and agents ran 1100-1300 s with no TIME_UP.
+    """
+    for message in body.get("messages") or []:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        texts = [content] if isinstance(content, str) else [
+            b.get("text", "") for b in content or [] if isinstance(b, dict)]
+        for text in texts:
+            if MARK in (text or ""):
+                head = text[text.index(MARK):]
+                title = re.search(r"^[ \t>]*#[ \t]+(\S.*?)[ \t]*$", head, re.M)
+                folder = re.search(r"\*\*Project folder:\*\*[ \t]*`([^`\n]*)`", head)
+                backup = "**Backup attempt:**" in head
+                name = title.group(1) if title else head[len(MARK):400].strip()
+                key = f"{name}|{folder.group(1) if folder else ''}|{backup}"
+                return key, name + (" (backup)" if backup else "")
+    text = _first_user_text(body)
+    return text, text[:80]
+
+
 def agent_limit(body: dict) -> int:
     if role_of(body) in LONG_ROLES:
         return settings.agentaus_graph_writer_max_s
@@ -887,14 +1080,17 @@ def agent_limit(body: dict) -> int:
 def overdue(body: dict, now: float | None = None) -> tuple[float, bool]:
     """(how far past its limit this graph agent is - 0 when not, whether that is news).
 
-    An agent is known by its opening prompt. Its first request - nothing but that prompt -
-    starts the clock again, so a retry launched with the same prompt gets its own time.
+    An agent is known by its prompt's title (see _agent_key). Its first request - nothing
+    but that prompt - starts the clock again, so a retry launched with the same prompt gets
+    its own time. Call it with the request as received, before fitting or compaction.
     """
     now = time.monotonic() if now is None else now
-    key = hashlib.sha256(_first_user_text(body).encode()).hexdigest()
-    fresh = len(body.get("messages") or []) <= 1
+    key, title = _agent_key(body)
+    key = hashlib.sha256(key.encode()).hexdigest()
+    fresh = not any(m.get("role") == "assistant" for m in body.get("messages") or [])
     entry = _FIRST_SEEN.get(key)
     if entry is None or fresh:
+        log.info("graph agent clock started: %s", title[:200])
         entry = _FIRST_SEEN[key] = [now, False]
     _FIRST_SEEN.move_to_end(key)
     while len(_FIRST_SEEN) > _FIRST_SEEN_LIMIT:
@@ -925,3 +1121,148 @@ def time_up(body: dict) -> dict:
     else:
         messages.append({"role": "user", "content": [block]})
     return {**trimmed, "messages": messages}
+
+
+# --- Plain characters in every text write --------------------------------------------------
+#
+# Measured (tender, d9): the graph's response.md was clean - its normalise step saw to that -
+# and then the main loop rewrote it in one `Write` with 14 non-breaking hyphens, 48 narrow
+# no-break spaces and 3 NBSPs; "GST‑registered" no longer matched "GST-registered". So every
+# text write by a graph agent, or by a main loop that runs the graph, is made plain on its way
+# to Claude Code: the hyphens, spaces and brackets a person would have typed.
+
+_PLAIN = [(re.compile("[‐‑‒−]"), "-"),
+          (re.compile("[    ]"), " "),
+          (re.compile("【([^】\n]{1,80})】"), r"[\1]")]
+_PLAIN_FILE = re.compile(r"\.(md|txt|markdown)$", re.I)
+
+
+def plain(text: str) -> str:
+    for pattern, to in _PLAIN:
+        text = pattern.sub(to, text)
+    return text
+
+
+def plain_text_writes(calls: list) -> int:
+    """Write/Edit/MultiEdit calls on .md/.txt files, with plain characters in what they write.
+
+    In place; returns how many calls changed. `old_string` is never touched - it has to
+    match the file as it is.
+    """
+    changed = 0
+    for call in calls:
+        if call.get("name") not in ("Write", "Edit", "MultiEdit"):
+            continue
+        raw = call.get("arguments")
+        try:
+            args = json.loads(raw or "{}") if isinstance(raw, str) else raw
+        except ValueError:
+            continue
+        if not isinstance(args, dict):
+            continue
+        path = args.get("file_path") or args.get("path") or ""
+        if not isinstance(path, str) or not _PLAIN_FILE.search(path):
+            continue
+        new = dict(args)
+        for key in ("content", "new_string"):
+            if isinstance(new.get(key), str):
+                new[key] = plain(new[key])
+        if isinstance(new.get("edits"), list):
+            new["edits"] = [{**e, "new_string": plain(e["new_string"])}
+                            if isinstance(e, dict) and isinstance(e.get("new_string"), str) else e
+                            for e in new["edits"]]
+        # An edit whose only change was the characters made plain would now change nothing.
+        if isinstance(new.get("old_string"), str) and new.get("new_string") == new["old_string"]:
+            new["new_string"] = args.get("new_string")
+        if new == args:
+            continue
+        call["arguments"] = json.dumps(new) if isinstance(raw, str) else new
+        changed += 1
+    return changed
+
+
+# --- Agents whose whole job is one command -------------------------------------------------
+#
+# Restore, section writers, join, normalise, backup, undo and swaps each send an agent told
+# "Run exactly this command - nothing else - then reply with what it printed". Measured (d9
+# tender): eight of them took 506 s, one normalise made six more tool calls after its
+# command, and a restore's one-word reply was taken for a failure. The graph marks such a
+# prompt with EXACT on the line before a single fenced ```bash block, and the bridge plays
+# the agent itself: the first request gets the Bash call, the second gets its output back as
+# the reply. Nothing goes upstream.
+
+EXACT = "[exact-command]"
+_EXACT_BLOCK = re.compile(
+    r"^([ \t]*)" + re.escape(EXACT) + r"[ \t]*\n(?:[ \t]*\n)?([ \t]*)```(?:bash|sh)?[ \t]*\n(.*)\n[ \t]*```[ \t]*$",
+    re.M | re.S)   # greedy: a section's own ``` fences sit inside its heredoc
+EXACT_OUTPUT_CHARS = 4000
+
+
+def _texts_of(message: dict) -> list:
+    content = message.get("content")
+    return [content] if isinstance(content, str) else [
+        b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text"]
+
+
+def exact_command_of(body: dict) -> str | None:
+    """The command a graph agent's prompt says to run exactly, or None.
+
+    The harness indents every line of the prompt; the fence's own indent is taken off each
+    line, so a heredoc's terminator and a python body come back as the graph wrote them.
+    """
+    for message in body.get("messages") or []:
+        if message.get("role") == "assistant":
+            break
+        if message.get("role") != "user":
+            continue
+        for text in _texts_of(message):
+            if MARK not in (text or "") or EXACT not in text:
+                continue
+            m = _EXACT_BLOCK.search(text)
+            if not m:
+                return None
+            indent = m.group(2)
+            lines = [l[len(indent):] if l.startswith(indent) else "" if not l.strip() else l
+                     for l in m.group(3).split("\n")]
+            command = "\n".join(lines).strip("\n")
+            return command or None
+    return None
+
+
+def _tool_result_text(block: dict) -> str:
+    content = block.get("content")
+    if isinstance(content, list):
+        content = "\n".join(b.get("text", "") for b in content if isinstance(b, dict))
+    return content if isinstance(content, str) else ""
+
+
+def exact_command(body: dict) -> tuple[str, str] | None:
+    """What the bridge answers for an exact-command graph agent, without the model.
+
+    ("run", command) on its first request; ("report", output) on the request carrying that
+    command's tool result; None for any other shape, which goes upstream as usual.
+    """
+    if not is_graph_task(body) or "Bash" not in {(t or {}).get("name") for t in body.get("tools") or []}:
+        return None
+    command = exact_command_of(body)
+    if not command:
+        return None
+    messages = body.get("messages") or []
+    assistants = [k for k, m in enumerate(messages) if m.get("role") == "assistant"]
+    if not assistants:
+        return "run", command
+    if len(assistants) != 1 or assistants[0] != len(messages) - 2 or messages[-1].get("role") != "user":
+        return None
+    content = messages[assistants[0]].get("content")
+    uses = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"] \
+        if isinstance(content, list) else []
+    if len(uses) != 1 or uses[0].get("name") != "Bash" \
+            or (uses[0].get("input") or {}).get("command") != command:
+        return None
+    last = messages[-1].get("content")
+    results = [b for b in last if isinstance(b, dict) and b.get("type") == "tool_result"
+               and b.get("tool_use_id") == uses[0].get("id")] if isinstance(last, list) else []
+    if not results:
+        return None
+    output = _tool_result_text(results[0]).strip("\n")
+    return "report", (output[:EXACT_OUTPUT_CHARS] if output.strip() else "(no output)")

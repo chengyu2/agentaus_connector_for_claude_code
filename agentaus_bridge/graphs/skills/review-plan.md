@@ -14,6 +14,7 @@ Two planners planned the same request. Write the plan the work will follow.
       each output that needs it. Each output's solvers work from the original files.
 - [ ] **Delete every subtask that assembles, writes or cross-checks** - the runtime does
       those. Move any format detail into `## Assembly`.
+- [ ] **One subtask per `## Stated outputs` row whose two columns differ** (see the plan skill).
 - [ ] **One subtask per output** the request asks for: every question, key, value, function,
       bug and section. Split "implement all ten functions" into ten, and "fix `tools/bank.py`"
       into one subtask per reported symptom plus, when the request says there may be more,
@@ -41,7 +42,7 @@ Write only the plan, in **exactly** this Markdown:
 ## Deliverables
 - `path` - what it must contain
 
-## Subtask 1: <the output>
+## Subtask 1: <the output, in backticks exactly as the brief spells it - `q2_total`, `is_bored` - or Q3>
 - Difficulty: easy | medium | hard
 - Solvers: <1-5>
 - Check: yes | no

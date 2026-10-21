@@ -1115,10 +1115,21 @@ def _tool_schemas(payload: dict) -> dict:
     return schemas
 
 
+def _graph_main_loop(body: dict) -> bool:
+    """A main loop whose `Workflow` call the bridge runs its graph in place of."""
+    return bool(settings.agentaus_workflow_graph and not is_subagent_turn(body)
+                and workflow_opted_in(body))
+
+
+def _writes_plain_text(body: dict) -> bool:
+    """Whether this request's text writes are made plain - see graph.plain_text_writes. A
+    graph agent's, and an opted-in main loop's; a plain user session is left as it is."""
+    return (graph.is_graph_task(body) and is_subagent_turn(body)) or _graph_main_loop(body)
+
+
 def _run_graph_instead(calls: list, body: dict) -> None:
     """Put the bridge's agent graph in place of a script Agentaus wrote. See graph.py."""
-    if (not settings.agentaus_workflow_graph or is_subagent_turn(body)
-            or not workflow_opted_in(body)):
+    if not _graph_main_loop(body):
         return
     # The graph sees the whole request: on a follow-up turn, the opening request and the
     # latest message together, not only "now do the next file".
@@ -1758,6 +1769,47 @@ def _checks_apply(body: dict) -> bool:
     return bool(body.get("tools")) or settings.agentaus_review_toolless
 
 
+def _exact_command_response(body: dict, exact: tuple, model: str, wants_stream: bool,
+                            started: float) -> Response:
+    """The turn an exact-command graph agent would have taken, made without the model: the
+    Bash call on its first request, the command's output as its reply on the second."""
+    kind, value = exact
+    if kind == "run":
+        call_id = f"toolu_{uuid.uuid4().hex[:24]}"
+        arguments = {"command": value, "description": "Run the graph's exact command",
+                     "timeout": 600000}
+        rlog(logging.INFO, "graph exact command: running it without the model (%s)",
+             value.split("\n", 1)[0][:120])
+    else:
+        rlog(logging.INFO, "graph exact command: replying with its output (%d chars) without "
+             "the model", len(value))
+    if wants_stream:
+        builder = AnthropicStreamBuilder(model, input_tokens=estimate_request_tokens(body),
+                                         chunk_chars=settings.chunk_chars)
+
+        async def events() -> AsyncIterator[bytes]:
+            yield builder.start()
+            if kind == "run":
+                yield builder.tool_use(call_id, "Bash", arguments)
+                yield builder.finish("tool_calls", None)
+            else:
+                yield builder.text(value)
+                yield builder.finish("stop", None)
+
+        return StreamingResponse(events(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    content = ([{"type": "tool_use", "id": call_id, "name": "Bash", "input": arguments}]
+               if kind == "run" else [{"type": "text", "text": value}])
+    rlog(logging.INFO, "POST /v1/messages model=%s route=agentaus stream=false -> 200 in %.1fs "
+         "(exact command, no upstream call)", model, time.monotonic() - started)
+    return JSONResponse({
+        "id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant",
+        "model": model, "content": content,
+        "stop_reason": "tool_use" if kind == "run" else "end_turn", "stop_sequence": None,
+        "usage": {"input_tokens": estimate_request_tokens(body), "output_tokens": 0},
+    })
+
+
 async def _handle_agentaus(
     request: Request, body: dict, model: str, wants_stream: bool
 ) -> Response:
@@ -1775,6 +1827,24 @@ async def _handle_agentaus(
     limit = _context_limit()
     reserved = int(body.get("max_tokens") or 0)
     original_estimate = estimate_request_tokens(body)
+
+    # An agent that runs one exact command is played by the bridge. See graph.exact_command.
+    exact = graph.exact_command(body) if is_subagent_turn(body) else None
+    if exact is not None:
+        return _exact_command_response(body, exact, display_model, wants_stream, started)
+
+    # How far past its time a graph agent is, read off the request as received: fitting and
+    # compaction rewrite the messages the agent is known by. See graph.overdue.
+    clock = {"over": 0.0}
+    if graph.is_graph_task(body) and is_subagent_turn(body):
+        over, news = graph.overdue(body)
+        clock["over"] = over
+        if over and news:
+            rlog(logging.WARNING, "graph agent (%s) is %.0fs past its %ds limit; "
+                 "asking for its result with no tools", graph.role_of(body) or "?",
+                 over, graph.agent_limit(body))
+    # Decided on the request as received, before compaction can drop the opt-in.
+    plain_text = _writes_plain_text(body)
 
     # Written once and reused across refits: a refit recompacts the same turn, and
     # re-planning it would pay for the same call again to get the same plan.
@@ -1922,15 +1992,10 @@ async def _handle_agentaus(
             fitted = {**fitted, "system": with_plan(fitted.get("system"), plan_holder["text"])}
 
         # A graph agent past its time is asked for its result, with no tools to keep going.
-        # Last, so nothing after it puts tools back. See graph.overdue.
-        if graph.is_graph_task(fitted) and is_subagent_turn(fitted):
-            over, news = graph.overdue(fitted)
-            if over:
-                fitted = graph.time_up(fitted)
-                if news:
-                    rlog(logging.WARNING, "graph agent (%s) is %.0fs past its %ds limit; "
-                         "asking for its result with no tools", graph.role_of(fitted) or "?",
-                         over, graph.agent_limit(fitted))
+        # Last, so nothing after it puts tools back. The clock was read off the request as
+        # received, above. See graph.overdue.
+        if clock["over"]:
+            fitted = graph.time_up(fitted)
 
         built = anthropic_request_to_agentaus(
             fitted,
@@ -2025,6 +2090,8 @@ async def _handle_agentaus(
             # In a worker thread: preparing the graph copies the project and reads its
             # documents - measured, 9s for fourteen PDFs - and would stall every other request.
             await asyncio.to_thread(_run_graph_instead, _theirs, body)
+            if plain_text and graph.plain_text_writes(_theirs):
+                rlog(logging.INFO, "plain text: normalised characters in a text-file write")
             broken = _validate_tool_calls(mine + _theirs, _tool_schemas(payload),
                                           working_directory_of(body))
             broken += early_deliverable_writes(_theirs, body, working_directory_of(body))
@@ -2202,7 +2269,7 @@ async def _handle_agentaus(
             async for chunk in _agentaus_event_stream(
                 client, prepared_payload, prepared_body, display_model, started, refit,
                 plan=None if streamed_plan else plan_holder["text"], builder=builder,
-                library=library_holder["names"],
+                library=library_holder["names"], plain_text=plain_text,
             ):
                 yield chunk
         except asyncio.CancelledError:
@@ -2242,6 +2309,7 @@ async def _agentaus_event_stream(
     plan: str | None = None,
     builder: AnthropicStreamBuilder | None = None,
     library: frozenset = frozenset(),
+    plain_text: bool = False,
 ) -> AsyncIterator[bytes]:
     """Produce a valid Anthropic SSE stream from an Agentaus response.
 
@@ -2516,6 +2584,8 @@ async def _agentaus_event_stream(
         # wall of validator internals, which costs the turn and tells the model nothing.
         # Same budget as an invented name: it is the same class of mistake.
         await asyncio.to_thread(_run_graph_instead, theirs, original)
+        if plain_text and graph.plain_text_writes(theirs):
+            rlog(logging.INFO, "plain text: normalised characters in a text-file write")
         broken = _validate_tool_calls(mine + theirs, _tool_schemas(payload),
                                       working_directory_of(original))
         broken += early_deliverable_writes(theirs, original, working_directory_of(original))

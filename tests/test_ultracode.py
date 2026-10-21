@@ -841,6 +841,269 @@ class TheDynamicGraph(unittest.TestCase):
         self.assertIn("# Result:", out["result"])
 
 
+class TheGraphRoundD9Fixes(unittest.TestCase):
+    """The bridge-side fixes from the d9 benchmark diagnosis."""
+
+    def graph_prompt(self, title, *lines, backup=False, skill="assemble"):
+        # As the harness sends it: a frame line, then every line of the prompt indented.
+        text = "\n".join([graph.MARK, f"# {title}", "",
+                          "**Project folder:** `/Users/x/proj` - every input file is there.",
+                          "", "---", f"## Your skill: {skill}", "", "# Skill", "---", "", *lines])
+        if backup:
+            text += "\n\n**Backup attempt:** the previous agent returned nothing usable."
+        return ("[Workflow harness - computed task] The computed task text follows:\n"
+                + "\n".join("  " + l for l in text.split("\n")))
+
+    def test_an_agents_clock_survives_reminders_added_to_its_first_message(self):
+        from agentaus_bridge.config import settings
+        prompt = self.graph_prompt(f"Solve subtask 3: `count_top` (solver 1) {id(self)}", skill="solve")
+        first = {"messages": [user(prompt)]}
+        # Claude Code adds reminder blocks to the opening message as a run goes on.
+        grown = {"role": "user", "content": [{"type": "text", "text": "<system-reminder>new tools</system-reminder>"},
+                                             {"type": "text", "text": prompt}]}
+        later = {"messages": [grown, {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "x"}]}]}
+        with self.assertLogs("agentaus-bridge", "INFO") as logs:
+            graph.overdue(first, now=0.0)
+            over, news = graph.overdue(later, now=settings.agentaus_graph_agent_max_s + 10.0)
+        self.assertEqual((over, news), (10.0, True))
+        self.assertEqual(sum("graph agent clock started: Solve subtask 3" in l for l in logs.output), 1)
+        # The backup attempt is another agent with its own clock.
+        backup = {"messages": [user(self.graph_prompt(f"Solve subtask 3: `count_top` (solver 1) {id(self)}",
+                                                      backup=True, skill="solve")), *later["messages"][1:]]}
+        graph.overdue({"messages": backup["messages"][:1]}, now=500.0)
+        self.assertEqual(graph.overdue(backup, now=600.0)[0], 0.0)
+
+    def test_the_graph_waits_longer_than_the_bridge_lets_an_agent_run(self):
+        import json
+        from agentaus_bridge.config import settings
+        call = {"id": "w", "name": "Workflow", "arguments": json.dumps({"script": "x"})}
+        args = json.loads(graph.expand(call, "ultracode: do it", None)["arguments"])["args"]
+        self.assertEqual(args["deadline_ms"], (settings.agentaus_graph_agent_max_s + 120) * 1000)
+        self.assertGreater(args["deadline_ms"], settings.agentaus_graph_agent_max_s * 1000)
+
+    def test_every_question_the_documents_ask_is_listed(self):
+        import json, shutil
+        cwd = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cwd, True)
+        self.addCleanup(shutil.rmtree, graph.scratch_of(cwd), True)
+        os.makedirs(os.path.join(cwd, "past"))
+        with open(os.path.join(cwd, "RFQ.md"), "w") as fh:
+            fh.write("# Request for Quotation\n\nAnswer every question below.\n\n"
+                     "Q1. Identify your organisation: legal entity name and ABN.\n"
+                     "**Q2.** Describe a comparable engagement you have delivered.\n"
+                     "- Q3: Describe your method and the evidence base it draws on.\n"
+                     "## Q4 - Provide a fixed price showing GST\n\n"
+                     "### Q5\n\nState your position on using psychometric assessments.\n"
+                     "Q1 2024 revenue was up, which is not a question.\n")
+        with open(os.path.join(cwd, "past", "old_response.md"), "w") as fh:
+            fh.write("Q1. Some other tender's question one, from years ago.\n"
+                     "Q6. Describe your accreditation with any assessment publisher.\n")
+        args = graph.prepare(cwd)
+        self.assertEqual([q["n"] for q in args["questions"]], [1, 2, 3, 4, 5, 6])
+        by = {q["n"]: q for q in args["questions"]}
+        self.assertEqual(by[1], {"n": 1, "text": "Q1. Identify your organisation: legal entity name and ABN.",
+                                 "file": "RFQ.md", "line": 5})
+        self.assertEqual(by[2]["text"], "Q2. Describe a comparable engagement you have delivered.")
+        self.assertEqual(by[4]["text"], "Q4. Provide a fixed price showing GST")
+        self.assertEqual(by[5]["text"], "Q5. State your position on using psychometric assessments.")
+        self.assertEqual((by[6]["file"], by[6]["line"]), (os.path.join("past", "old_response.md"), 2))
+        json.dumps(args["questions"])
+
+    def test_a_function_with_no_examples_is_not_reported_as_passing(self):
+        import shutil, subprocess
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        runner = graph._write(os.path.join(d, "examples.py"), graph.EXAMPLES_SCRIPT)
+        spec = os.path.join(d, "spec.py")
+        with open(spec, "w") as fh:
+            fh.write('def count_top(xs, k):\n    """How many ranks are in the top k."""\n    return 0\n')
+        r = subprocess.run([sys.executable, runner, spec, spec, "count_top"], capture_output=True,
+                           text=True, timeout=30)
+        self.assertEqual(r.stdout.strip().splitlines()[-1],
+                         "no docstring examples - write the docstring's prose examples as asserts yourself")
+        self.assertNotIn("0/0", r.stdout)
+
+    def test_text_writes_get_plain_characters(self):
+        import json
+        nb = "GST‑registered since 3 July 【README】 − 5"
+        calls = [
+            {"name": "Write", "arguments": json.dumps({"file_path": "/p/response.md", "content": nb})},
+            {"name": "Edit", "arguments": {"file_path": "/p/notes.txt", "old_string": "a‑b",
+                                           "new_string": "c‑d"}},
+            {"name": "MultiEdit", "arguments": {"file_path": "/p/r.markdown", "edits": [
+                {"old_string": "x y", "new_string": "x z"}]}},
+            {"name": "Write", "arguments": {"file_path": "/p/solutions.py", "content": nb}},
+            {"name": "Bash", "arguments": {"command": f"echo '{nb}' > a.md"}},
+        ]
+        self.assertEqual(graph.plain_text_writes(calls), 3)
+        self.assertIsInstance(calls[0]["arguments"], str, "a JSON string stays a JSON string")
+        self.assertEqual(json.loads(calls[0]["arguments"])["content"],
+                         "GST-registered since 3 July [README] - 5")
+        self.assertEqual(calls[1]["arguments"]["new_string"], "c-d")
+        self.assertEqual(calls[1]["arguments"]["old_string"], "a‑b", "old_string must match the file")
+        self.assertEqual(calls[2]["arguments"]["edits"], [{"old_string": "x y", "new_string": "x z"}])
+        self.assertEqual(calls[3]["arguments"]["content"], nb, "code is left alone")
+        self.assertIn(nb, calls[4]["arguments"]["command"])
+
+    def test_only_graph_requests_get_plain_text_writes(self):
+        from agentaus_bridge.config import settings
+        saved, settings.agentaus_workflow_graph = settings.agentaus_workflow_graph, True
+        try:
+            agent = {"system": SUBAGENT_SYSTEM, "messages": [user(self.graph_prompt("Write it"))]}
+            opted = {"tools": [tool("Workflow")], "messages": [user("ultracode: answer the RFQ")]}
+            plain = {"tools": [tool("Write")], "messages": [user("tidy up notes.md")]}
+            other = {"system": SUBAGENT_SYSTEM, "messages": [user("explore the repo")]}
+            self.assertTrue(server._writes_plain_text(agent))
+            self.assertTrue(server._writes_plain_text(opted))
+            self.assertFalse(server._writes_plain_text(plain))
+            self.assertFalse(server._writes_plain_text(other))
+        finally:
+            settings.agentaus_workflow_graph = saved
+
+    def test_a_writer_may_not_replace_a_source_file_whole_with_bash(self):
+        import shutil
+        cwd = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, cwd, True)
+        solver = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, solver, True)
+        for d in (cwd, solver):
+            os.makedirs(os.path.join(d, "tools"))
+            for rel in ("solutions.py", os.path.join("tools", "bank.py")):
+                with open(os.path.join(d, rel), "w") as fh:
+                    fh.write("x = 1\n")
+        s = graph.scratch_of(cwd)
+        blocked = [
+            f"cp '{solver}/solutions.py' '{cwd}/solutions.py'",
+            f"cp {solver}/solutions.py solutions.py",
+            f"cp {solver}/tools/bank.py tools/",
+            f"cp -f {solver}/solutions.py solutions.py",
+            "cat > solutions.py <<'EOF'\nx = 2\nEOF",
+            f"python3 {solver}/gen.py > tools/bank.py",
+            "echo x | tee solutions.py",
+            f"mv {solver}/solutions.py {cwd}/solutions.py",
+            f"rsync -a {solver}/ {cwd}/",
+            f"cp -R {solver}/. {cwd}/",
+            f"bash -c \"cp {solver}/solutions.py solutions.py\"",
+        ]
+        allowed = [
+            f"rsync -ai --checksum --exclude .git --exclude '*.pyc' {s}/pristine/ {cwd}/ | head -40; echo restored",
+            f"cp -R {s}/before-fix/. {cwd}/ && echo undone",
+            f"cd {cwd} && patch -p1 --forward -F 3 < {solver}/fix.patch",
+            f"python3 - {cwd}/solutions.py add {solver}/add.py <<'PY'\nimport sys\nopen(sys.argv[1], 'w').write('x')\nPY",
+            f"sed -i '' 's/a/b/' solutions.py",
+            f"cp {solver}/solutions.py {cwd}/new_module.py",
+            f"cp {solver}/solutions.py {s}/s1/1/solutions.py",
+            "cat >> solutions.py <<'EOF'\n\ndef extra():\n    pass\nEOF",
+            f"python3 solutions.py > {cwd}/output.txt 2>&1",
+            f"cat {s}/sections/*.md > {cwd}/response.md",
+        ]
+        for command in blocked:
+            self.assertTrue(graph.overwrites_source(command, cwd), command)
+        for command in allowed:
+            self.assertFalse(graph.overwrites_source(command, cwd), command)
+
+        def body(role):
+            return {"messages": [user(f"{graph.MARK}\n  ## Your skill: {role}\n")]}
+        bash = [{"name": "Bash", "arguments": {"command": blocked[0]}}]
+        for role in ("assemble", "fix"):
+            [(_, why)] = graph.guarded_writes(bash, body(role), cwd)
+            self.assertIn("replaces an existing source file in the project whole", why)
+        self.assertEqual(graph.guarded_writes(bash, {"messages": [user("fix it")]}, cwd), [])
+        # rsync and ditto now count as writes for the read-only roles too.
+        self.assertTrue(graph.bash_writes_into(f"rsync -a --exclude .git {solver}/ ./", cwd))
+        self.assertEqual(graph.bash_writes_into(f"rsync -a ./ {solver}/copy/", cwd), [])
+
+    # --- Exact-command agents ---------------------------------------------------------------
+
+    COMMAND = ("mkdir -p /tmp/s && cat > /tmp/s/01.md <<'AGENTAUS_SECTION_END'\n## Q1\n\n"
+               "```python\nprint(1)\n```\n\nAGENTAUS_SECTION_END\nwc -l /tmp/s/01.md")
+
+    def exact_body(self, *more, tools=("Bash", "Read")):
+        prompt = self.graph_prompt("Write section 1 of 3 of response.md",
+                                   "Run exactly this command - nothing else - then reply with what it printed:",
+                                   "", graph.EXACT, "```bash", *self.COMMAND.split("\n"), "```", "",
+                                   "Your final message is your result.")
+        return {"model": "agentaus", "max_tokens": 64, "system": SUBAGENT_SYSTEM,
+                "tools": [tool(n) for n in tools], "messages": [user(prompt), *more]}
+
+    def ran(self, call_id="toolu_1", output="3 /tmp/s/01.md\n"):
+        return ({"role": "assistant", "content": [{"type": "tool_use", "id": call_id, "name": "Bash",
+                                                   "input": {"command": self.COMMAND}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call_id,
+                                              "content": [{"type": "text", "text": output}]}]})
+
+    def test_the_exact_command_is_read_back_as_the_graph_wrote_it(self):
+        self.assertEqual(graph.exact_command(self.exact_body()), ("run", self.COMMAND))
+        self.assertEqual(graph.exact_command(self.exact_body(*self.ran())), ("report", "3 /tmp/s/01.md"))
+        self.assertEqual(graph.exact_command(self.exact_body(*self.ran(output=""))), ("report", "(no output)"))
+        long = graph.exact_command(self.exact_body(*self.ran(output="x" * 9000)))
+        self.assertEqual(len(long[1]), graph.EXACT_OUTPUT_CHARS)
+        # Any other shape goes to the model.
+        self.assertIsNone(graph.exact_command(self.exact_body(tools=("Read",))))
+        assistant, result = self.ran()
+        other = {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash",
+                                                   "input": {"command": "ls"}}]}
+        self.assertIsNone(graph.exact_command(self.exact_body(other, result)))
+        self.assertIsNone(graph.exact_command(self.exact_body(assistant, result, other, result)))
+        self.assertIsNone(graph.exact_command(self.exact_body(assistant, user("go on"))))
+        plain = {"tools": [tool("Bash")], "messages": [user(self.graph_prompt("Solve it", "```bash", "ls", "```"))]}
+        self.assertIsNone(graph.exact_command(plain))
+
+    def post(self, body, stream):
+        from fastapi.testclient import TestClient
+        def upstream(*a, **k):
+            raise AssertionError("an exact-command agent must not reach the model")
+        with mock.patch.object(server, "_post_with_retry", upstream), \
+                mock.patch.object(server, "_agentaus_event_stream", upstream), \
+                TestClient(server.app) as client:
+            return client.post("/v1/messages", json={**body, "stream": stream})
+
+    def events(self, response):
+        import json
+        out = []
+        for chunk in response.text.split("\n\n"):
+            lines = dict(l.split(": ", 1) for l in chunk.strip().split("\n") if ": " in l)
+            if "data" in lines:
+                out.append(json.loads(lines["data"]))
+        return out
+
+    def test_an_exact_command_agent_runs_without_the_model(self):
+        import json
+        r = self.post(self.exact_body(), stream=False)
+        self.assertEqual(r.status_code, 200, r.text)
+        message = r.json()
+        self.assertEqual(message["stop_reason"], "tool_use")
+        [block] = message["content"]
+        self.assertEqual(block["type"], "tool_use")
+        self.assertEqual(block["name"], "Bash")
+        self.assertTrue(block["id"].startswith("toolu_"))
+        self.assertEqual(block["input"], {"command": self.COMMAND, "description": "Run the graph's exact command",
+                                          "timeout": 600000})
+        r = self.post(self.exact_body(*self.ran()), stream=False)
+        self.assertEqual(r.json()["stop_reason"], "end_turn")
+        self.assertEqual(r.json()["content"], [{"type": "text", "text": "3 /tmp/s/01.md"}])
+
+        r = self.post(self.exact_body(), stream=True)
+        self.assertEqual(r.status_code, 200, r.text)
+        events = self.events(r)
+        self.assertEqual([e["type"] for e in events][0], "message_start")
+        self.assertEqual([e["type"] for e in events][-2:], ["message_delta", "message_stop"])
+        start = next(e for e in events if e["type"] == "content_block_start")
+        self.assertEqual((start["content_block"]["type"], start["content_block"]["name"], start["content_block"]["input"]),
+                         ("tool_use", "Bash", {}))
+        sent = "".join(e["delta"]["partial_json"] for e in events if e["type"] == "content_block_delta")
+        self.assertEqual(json.loads(sent)["command"], self.COMMAND)
+        self.assertEqual(events[-2]["delta"]["stop_reason"], "tool_use")
+
+        r = self.post(self.exact_body(*self.ran()), stream=True)
+        events = self.events(r)
+        text = "".join(e["delta"]["text"] for e in events if e["type"] == "content_block_delta")
+        self.assertEqual(text, "3 /tmp/s/01.md")
+        self.assertEqual(events[-2]["delta"]["stop_reason"], "end_turn")
+
+
 class RewritesSeeTheWholeAnswer(unittest.TestCase):
     def test_an_answer_longer_than_a_rewrite_sees_is_kept(self):
         long_answer = "x" * (server._REWRITE_CHARS + 1)

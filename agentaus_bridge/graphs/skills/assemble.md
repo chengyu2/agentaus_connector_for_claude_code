@@ -11,9 +11,9 @@ Write the deliverables the plan names, from the merged results you are given.
 
 - Use only the merged results and the request. Do not re-solve anything.
 - Follow `## Assembly` in the plan exactly: file names, format, keys, order.
-- **Code changes only as told.** Run each command you are given, in order - they put chosen
-  functions in place and apply chosen patches. If one fails, make the same change by hand
-  with small edits. Never rewrite a whole source file.
+- **Code changes are already in place** - the runtime applied them before you started. Make
+  by hand, with small `Edit`s, only a change marked `FAILED`, from that subtask's Answer. Never
+  copy a file over a project source file and never rewrite a whole source file.
 - **Work through the checklist.** Every item in it - each **bold** key value - goes into a
   deliverable exactly as written. Do not round, reformat or recompute it.
 - A value goes in exactly as the merged result gives it. Prose is written from the merged

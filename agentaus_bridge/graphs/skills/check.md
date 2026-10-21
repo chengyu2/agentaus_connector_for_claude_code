@@ -20,6 +20,9 @@ You check work someone else did. **Run code to check it** - do not judge by eye.
    you find it, FAIL and quote the line. If the brief has Stated outputs, run the program and
    compare each row.
 4. Machine-readable output (JSON, CSV): parse it with the real parser, never by eye.
+   For code, test in the copy you are given, never in the project. A change that passes an
+   example only through a rule naming that example's values, or that edited a docstring or
+   its examples, is a FAIL.
 5. Decide.
 
 ## Write back, in Markdown

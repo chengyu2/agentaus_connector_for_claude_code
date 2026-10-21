@@ -41,8 +41,18 @@ request says otherwise. Where the documents do not hold the answer, say so - nev
 3. Change the code with small edits - never rewrite a whole file - until every test passes.
    **Never edit a docstring, README or comment to match your change, and never change a
    function's name, arguments or defaults.**
-4. Save the change exactly as told (one function: save that function; otherwise a patch),
-   and save your tests to the tests file you are given.
+4. Save the change exactly as told (one function: save that function; otherwise leave it in
+   your copy's `repo` - never write a patch by hand), and save your tests to the tests file
+   you are given.
+
+**When the obvious reading fails a docstring example, the reading is wrong - not the example.**
+Write down at least three other readings of the words (how a sign, a tie, a boundary or a
+rounding rule could be meant), code each as a three-line function, and run every example
+against each. Keep the one reading that passes **all** of them. Never branch on an example's
+literal input, and never add a rule that exists only to hit one example's output.
+
+**The planner's notes are a paraphrase and may be wrong.** Where they disagree with the spec
+(the docstring, the question, the README), follow the spec and say so under `## Evidence`.
 
 **Auditing a function for bugs nobody reported?** Read it line by line against its name, its
 docstring and the README, and check each of these:
@@ -53,8 +63,12 @@ docstring and the README, and check each of these:
 - [ ] `0`, empty and `None` treated as false where they are real values
 - [ ] mean versus median, sum versus count, the wrong field or key
 - [ ] spelling variants and string normalisation (case, spaces, accents, US/UK spellings)
-- [ ] a mapping or table entry that puts something in the wrong group: print each group's
-      members and size and compare with the model the request or README names
+- [ ] a mapping or table: write each group's expected members and size **from a source other
+      than this code** - the README, the documents in the project, the public model the request
+      names - with the source beside each. Then print what the code has and compare. An
+      expected column copied from the code means the audit is not done.
+- [ ] every prose example in a docstring or README ("X reads as Y"): run the code on exactly
+      that input and check it gives exactly that result
 - [ ] every numeric threshold or constant, tried on the real cases the README names
 - [ ] "the word X" versus "starts with the letters X"; how a negative number's sign and digits count
 - [ ] a sibling that measures the same thing: totals that must agree (e.g. a count of "in the

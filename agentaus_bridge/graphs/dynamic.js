@@ -31,17 +31,23 @@ const PRISTINE = String((args && args.pristine) || '').trim()
 const BASE = PRISTINE || CWD
 const TEXTS = (args && args.texts) || []
 const FUNCTIONS = (args && args.functions) || []
+const QUESTIONS = (args && args.questions) || []
 const CONSTANTS = (args && args.constants) || []
 const EXAMPLES = String((args && args.examples) || '').trim()
 
 const WIDTH = Math.max(1, Number((args && args.width) || 8))
-const DEADLINE_MS = Math.max(60000, Number((args && args.deadline_ms) || 600000))
-const BUDGET_MS = Math.max(1000, Number((args && args.budget_ms) || 4200000))
+// An agent's deadline runs from when it gets a slot. The bridge asks an agent for its result,
+// without tools, a little before this (args.deadline_ms is set from the bridge's own limit).
+const DEADLINE_MS = Math.max(60000, Number((args && args.deadline_ms) || 840000))
+// The budget for solving, merging and checking, counted from when solving starts.
+const BUDGET_MS = Math.max(1000, Number((args && args.budget_ms) || 3600000))
 const SCOUT_MS = 360000
 const MAX_SUBTASKS = 24
 // The plan chooses solver counts; the runtime keeps the total within what the upstream can
 // serve - about thirty calls a minute across every session.
-const MAX_SOLVERS_TOTAL = 40
+// Measured (d9): 40 solvers on 6 slots kept every slot busy for an hour, and most answers
+// came too late to count. Four solvers per slot.
+const MAX_SOLVERS_TOTAL = Math.min(40, WIDTH * 4)
 
 let late = false
 let live = 0
@@ -55,11 +61,13 @@ function later(ms, fn) {
   timers.push(t)
   return t
 }
-later(BUDGET_MS, () => {
-  late = true
-  for (const w of waiting.filter(w => LATE_SKIPS.has(w.ph))) w.resolve()
-  waiting.splice(0, waiting.length, ...waiting.filter(w => !LATE_SKIPS.has(w.ph)))
-})
+function startBudget() {
+  later(BUDGET_MS, () => {
+    late = true
+    for (const w of waiting.filter(w => LATE_SKIPS.has(w.ph))) w.resolve()
+    waiting.splice(0, waiting.length, ...waiting.filter(w => !LATE_SKIPS.has(w.ph)))
+  })
+}
 
 // ---------------------------------------------------------------------------------
 // Runtime helpers
@@ -106,33 +114,53 @@ function prompt(skill, title, lines, think) {
 }
 
 const PLAN_SHAPED = /^\s*(i|we)('ll| will| am going to| are going to)\b|^\s*(let me|next,? i|first,? i)\b/i
-function usable(text) {
+// Measured (d9 tender): a merger replied "I'm sorry, but that request is too large and complex
+// for me to handle in a single step", and that went into the deliverable as the answer to Q2.
+const REFUSAL = /^\W{0,3}(I[’']m sorry|I am sorry|sorry,|I can(?:no|[’'])t|I[’']m unable|I am unable)\b[\s\S]{0,600}?\b(too (large|complex|big)|single step|separate (actions|steps)|unable to (complete|do|help)|break (it|the task|this|the request) (in|down))/i
+function usable(text, short) {
   const t = String(text || '').trim()
-  return t.length >= 20 && !PLAN_SHAPED.test(t)
+  return t.length >= (short ? 1 : 20) && !PLAN_SHAPED.test(t) && !REFUSAL.test(t)
 }
+// Plain keyboard characters in everything an agent hands on, so the text a checker or fixer
+// quotes matches the file, which is normalised the same way.
+const plain = s => String(s).replace(/[‐-‒−]/g, '-').replace(/[    ]/g, ' ').replace(/【([^】\n]{1,80})】/g, '[$1]')
 
 // One agent with a backup: a dead, empty, plan-shaped or rejected reply is asked again,
 // once. The deadline stops the waiting, not the agent, so its slot is held until it settles.
 // opts.wait: a writer (assembler, fixer) is never raced against the deadline - a backup
 // running beside a live first attempt wrote the same files at the same time.
+// The deadline runs from when the agent gets its slot, not from when it was queued, and an
+// attempt that runs past it stays in the race beside its backup: the first usable answer
+// wins. Measured (d9): the deadline counted queue time, so with 40 solvers on 6 slots most
+// "timed out" before they started, ran anyway, and 57 of 82 answers were thrown away - among
+// them all three that fixed count_top.
+function firstUsable(runs, ok) {
+  return new Promise(resolve => {
+    let left = runs.length
+    const settle = out => {
+      const t = typeof out === 'string' ? out : out ? JSON.stringify(out) : ''
+      if (ok(t)) resolve(plain(t))
+      else if (--left === 0) resolve(null)
+    }
+    for (const r of runs) r.then(settle, () => settle(null))
+  })
+}
+
 async function ask(text, label, ph, accept, opts = {}) {
+  const ok = t => usable(t, opts.short) && (!accept || accept(t))
+  const runs = []
   for (const attempt of [1, 2]) {
-    if (late && LATE_SKIPS.has(ph)) return null
+    if (late && LATE_SKIPS.has(ph)) return runs.length ? firstUsable(runs, ok) : null
     const body = attempt === 1 ? text
       : `${text}\n\n**Backup attempt:** the previous agent returned nothing usable or a plan instead of the result. Do the work now, then reply with the result.`
-    let out = null
-    try {
-      let timer = null
-      const run = slot(() => agent(body, { label: attempt === 1 ? label : `${label}:backup`, phase: ph }), ph, opts.pri || 0)
-      out = opts.wait ? await run : await Promise.race([
-        run, new Promise(resolve => { timer = setTimeout(() => resolve(null), opts.deadline || DEADLINE_MS) }),
-      ])
-      if (timer !== null) clearTimeout(timer)
-    } catch (e) {
-      out = null
-    }
-    const text2 = typeof out === 'string' ? out : out ? JSON.stringify(out) : ''
-    if (usable(text2) && (!accept || accept(text2))) return text2
+    let begin = () => {}
+    const begun = new Promise(r => { begin = r })
+    runs.push(slot(() => { begin(); return agent(body, { label: attempt === 1 ? label : `${label}:backup`, phase: ph }) }, ph, opts.pri || 0))
+    let timer = null
+    const timeout = opts.wait ? new Promise(() => {}) : begun.then(() => new Promise(r => { timer = setTimeout(() => r(null), opts.deadline || DEADLINE_MS) }))
+    const out = await Promise.race([firstUsable(runs, ok), timeout])
+    if (timer !== null) clearTimeout(timer)
+    if (out) return out
   }
   return null
 }
@@ -310,7 +338,7 @@ if (!plan || !plan.subtasks.length) {
 // normalise the claims") whose output - a 13,000-row table - cannot be passed on, and
 // "assemble response.md" subtasks that raced the assembler.
 const OUTPUT_MARK = /`[^`]+`|\bQ\d{1,2}\b|\b[a-z]\w*_\w+\b/i
-const STEP = /^(load|read|parse|normali[sz]e|prepare|gather (data|inputs|sources)|collect|derive|build|assemble|write|compile|produce|create)\b|cross[- ]?check|verify all|summary of findings|^(bug[- ‐-―]?fix(es)?\s+)?summary\b|^verif(y|ication)\b/i
+const STEP = /^(load|read|parse|normali[sz]e|prepare|gather (data|inputs|sources)|collect|derive|build|assemble|write|compile|produce|create)\b|cross[- ]?check|verify all|summary of findings|^`?(bug[-_ ‐-―]?fix(es)?[\s_]+)?summary\b|^verif(y|ication)\b/i
 {
   const dropped = new Set()
   const kept = plan.subtasks.filter(st => {
@@ -354,14 +382,18 @@ function extractCommand(repoFile, fn, out) {
   return `python3 - ${q(repoFile)} ${fn} ${q(out)} <<'PY'\nimport ast,sys\nf,fn,out=sys.argv[1:4]; code=open(f).read(); lines=code.splitlines(keepends=True)\n${AST_FIND}\nopen(out,'w').write(''.join(lines[s:n.end_lineno])); print(open(out).read()[:3000])\nPY`
 }
 function replaceCommand(target, fn, src) {
-  return `python3 - ${q(target)} ${fn} ${q(src)} <<'PY'\nimport ast,sys\nt,fn,src=sys.argv[1:4]; code=open(t).read(); lines=code.splitlines(keepends=True); new=open(src).read().rstrip(chr(10))+chr(10)\nfound=[n for n in ast.parse(code).body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name==fn]\nif found:\n    n=found[0]; s=(n.decorator_list[0].lineno if n.decorator_list else n.lineno)-1\n    try:\n        c=[x for x in ast.parse(new).body if isinstance(x,(ast.FunctionDef,ast.AsyncFunctionDef)) and x.name==fn][0]; d=ast.get_docstring(c) is not None; body=c.body[1:] if d else c.body\n        if ast.get_docstring(n) is not None and body and body[0].lineno>(c.body[0].end_lineno if d else c.lineno):\n            new=''.join(lines[s:n.body[0].end_lineno])+''.join(new.splitlines(keepends=True)[body[0].lineno-1:c.end_lineno])\n    except Exception:\n        pass\n    lines[s:n.end_lineno]=[new]\nelse:\n    lines.append(chr(10)+chr(10)+new)\nopen(t,'w').write(''.join(lines)); print('replaced' if found else 'appended', fn)\nPY`
+  return `python3 - ${q(target)} ${fn} ${q(src)} <<'PY'\nimport ast,sys\nt,fn,src=sys.argv[1:4]; code=open(t).read(); lines=code.splitlines(keepends=True); new=open(src).read().rstrip(chr(10))+chr(10)\ntry:\n    m=ast.parse(new); cs=[x for x in m.body if isinstance(x,(ast.FunctionDef,ast.AsyncFunctionDef)) and x.name==fn]\n    if cs and len(m.body)>1:\n        sl=new.splitlines(keepends=True); c0=cs[0]; a=(c0.decorator_list[0].lineno if c0.decorator_list else c0.lineno)-1; new=''.join(sl[a:c0.end_lineno]).rstrip(chr(10))+chr(10)\nexcept Exception:\n    pass\nfound=[n for n in ast.parse(code).body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name==fn]\nif found:\n    n=found[0]; s=(n.decorator_list[0].lineno if n.decorator_list else n.lineno)-1\n    try:\n        c=[x for x in ast.parse(new).body if isinstance(x,(ast.FunctionDef,ast.AsyncFunctionDef)) and x.name==fn][0]; d=ast.get_docstring(c) is not None; body=c.body[1:] if d else c.body\n        if ast.get_docstring(n) is not None and body and body[0].lineno>(c.body[0].end_lineno if d else c.lineno):\n            new=''.join(lines[s:n.body[0].end_lineno])+''.join(new.splitlines(keepends=True)[body[0].lineno-1:c.end_lineno])\n    except Exception:\n        pass\n    lines[s:n.end_lineno]=[new]\nelse:\n    lines.append(chr(10)+chr(10)+new)\nopen(t,'w').write(''.join(lines)); print('replaced' if found else 'appended', fn)\nPY`
 }
 function functionOf(st) {
   if (st.kind !== 'code') return null
   const text = `${st.title}\n${st.task}`
   // A constant (`SPELLING`) is not a function, and a name the code does not define is not one.
-  const names = [...new Set((st.title.match(/`([A-Za-z_]\w*)`/g) || []).map(n => n.replace(/`/g, '')))]
-    .filter(n => !/^[A-Z][A-Z0-9_]*$/.test(n))
+  // A reviewer wrote `## Subtask 1: is_bored`, without backticks, and all ten functions were
+  // missed - then planned a second time by the coverage pass (d9). A bare word the inventory
+  // knows is a name too.
+  const ticked = (st.title.match(/`([A-Za-z_]\w*)`/g) || []).map(n => n.replace(/`/g, ''))
+  const bare = (st.title.match(/\b[A-Za-z_]\w*\b/g) || []).filter(n => FUNCTIONS.some(f => f.fn === n))
+  const names = [...new Set([...ticked, ...bare])].filter(n => !/^[A-Z][A-Z0-9_]*$/.test(n))
   const known = FUNCTIONS.length ? names.filter(n => FUNCTIONS.some(f => f.fn === n)) : names
   const fn = known.length === 1 ? known[0] : null
   if (!fn) return null
@@ -466,18 +498,38 @@ phase('Review')
   }
 }
 
-// A text subtask answering three or more questions is one subtask per question. Measured: one
-// subtask for nine questions gave each solver nine answers to write, and facts in the README
-// never reached Q3; with one subtask per question, they did.
+// A text subtask answering three or more questions is one subtask per question, and every
+// question the request or its files ask has one. Measured: one subtask for nine questions gave
+// each solver nine answers to write, and facts in the README never reached Q3; and (d9) a plan
+// that wrote "Q1, Q2, ... Q9" was split into Q1, Q2 and Q9 only.
 {
-  const qs = st => {
-    const text = `${st.title}\n${st.task}`
-    const range = text.match(/\bQ(\d{1,2})\s*(?:-|‐|‑|‒|–|—|to|through)\s*Q?(\d{1,2})\b/i)
-    const set = new Set((text.match(/\bQ(\d{1,2})\b/gi) || []).map(x => Number(x.slice(1))))
-    if (range && Number(range[2]) > Number(range[1]) && Number(range[2]) - Number(range[1]) < 15) {
-      for (let k = Number(range[1]); k <= Number(range[2]); k++) set.add(k)
+  const qNums = text => {
+    const set = new Set()
+    const t = String(text || '')
+    for (const m of t.matchAll(/\bQ(\d{1,2})\s*(?:-|‐|‑|‒|–|—|to|through|\.\.\.|…|,\s*(?:\.\.\.|…)\s*,?)\s*Q?(\d{1,2})\b/gi)) {
+      const a = Number(m[1]), b = Number(m[2])
+      if (b > a && b - a < 15) for (let k = a; k <= b; k++) set.add(k)
     }
-    return [...set].sort((a, b) => a - b)
+    for (const m of t.matchAll(/\bQ(\d{1,2})\b/gi)) set.add(Number(m[1]))
+    return set
+  }
+  const asked = new Set([...qNums(TASK), ...QUESTIONS.map(x => Number(x.n))])
+  const textSubtasks = plan.subtasks.filter(st => st.kind === 'text')
+  const qs = st => {
+    const own = qNums(`${st.title}\n${st.task}`)
+    // A text subtask naming several questions, or the only text subtask, answers every one asked.
+    const whole = own.size >= 2 || textSubtasks.length === 1
+    return [...new Set([...own, ...(whole && asked.size >= 3 ? asked : [])])].sort((a, b) => a - b)
+  }
+  // Each question's subtask holds the question, word for word, and only the notes about it.
+  // Measured (d9): a merger handed the notes for all nine answered "too large for one step".
+  const questionTask = (k, groupTask) => {
+    const found = QUESTIONS.find(x => Number(x.n) === k)
+    const notes = String(groupTask || '').split('\n').filter(l => new RegExp(`\\bQ${k}\\b`).test(l) && !/\b(create|write|begin|ends?|heading|file)\b/i.test(l))
+    return [`Answer **Q${k}** of the request, and only Q${k}.`, '',
+      found ? `The question, word for word (\`${found.file}\` line ${found.line}):\n\n> ${found.text}` : 'Quote the question word for word from the file that asks it.', '',
+      'Answer every part of it from the documents, citing each fact. Where the documents lack something it asks for, say so plainly and say what we would supply.',
+      notes.length ? `\nThe planner's notes on Q${k} (context only - the question and the documents win):\n${notes.join('\n')}` : ''].join('\n')
   }
   let next = Math.max(0, ...plan.subtasks.map(o => o.n)) + 1
   const out = []
@@ -485,13 +537,33 @@ phase('Review')
     const list = st.kind === 'text' ? qs(st) : []
     if (list.length < 3) { out.push(st); continue }
     const parts = list.map(k => ({ n: next++, title: `Q${k}`, difficulty: st.difficulty === 'easy' ? 'medium' : st.difficulty,
-      solvers: Math.max(2, Math.min(3, st.solvers)), check: true, merge: 'combine', kind: 'text', deps: [],
-      task: `Answer **Q${k}** of the request. Quote the question **word for word** from the file that asks it, then answer exactly that question - every part of it.\n\nThe planner's notes for the group it was in (context only; where they disagree with the question or the documents, the question and the documents win):\n\n${nest(st.task, 4)}` }))
+      solvers: Math.max(2, Math.min(3, st.solvers)), check: true, merge: 'combine', kind: 'text', deps: [], task: questionTask(k, st.task) }))
     for (const o of plan.subtasks) o.deps = o.deps.flatMap(d => d === st.n ? parts.map(p => p.n) : [d])
     out.push(...parts)
     log(`plan: split subtask ${st.n} into one per question (${list.map(k => `Q${k}`).join(', ')})`)
   }
-  plan.subtasks = out.slice(0, MAX_SUBTASKS)
+  plan.subtasks = out
+  // A question asked but in no subtask gets one.
+  const has = k => plan.subtasks.some(st => new RegExp(`^\\W*Q${k}\\b`, 'i').test(st.title))
+  const missing = [...asked].filter(k => !has(k)).sort((a, b) => a - b)
+  if (missing.length && asked.size >= 3 && plan.subtasks.some(st => st.kind === 'text')) {
+    plan.subtasks.push(...missing.map(k => ({ n: next++, title: `Q${k}`, difficulty: 'medium', solvers: 2, check: true,
+      merge: 'combine', kind: 'text', deps: [], task: questionTask(k, '') })))
+    log(`plan: added ${missing.map(k => `Q${k}`).join(', ')} - asked, but in no subtask`)
+  }
+  // In question order, so the sections are.
+  const qOf = st => (st.title.match(/^\W*Q(\d{1,2})\b/i) || [])[1]
+  if (plan.subtasks.every(st => st.kind !== 'text' || qOf(st))) {
+    plan.subtasks.sort((x, y) => (Number(qOf(x)) || 0) - (Number(qOf(y)) || 0))
+  }
+  plan.subtasks = plan.subtasks.slice(0, MAX_SUBTASKS)
+}
+
+// Code subtasks each change their own copy of the original project; none waits on another.
+// Measured (d9): a `--json` subtask waited 45 minutes behind seventeen others, then lost its
+// only run to the budget.
+for (const st of plan.subtasks) {
+  if (st.kind === 'code') st.deps = st.deps.filter(d => !plan.subtasks.some(o => o.n === d && o.kind === 'code'))
 }
 
 // Keep the total, now the plan is final.
@@ -514,7 +586,8 @@ const METHOD = [
 
 function codeSteps(st, dir) {
   const f = functionOf(st)
-  const copy = `- Copy: \`rm -rf ${q(dir)} && mkdir -p ${q(dir)} && cp -R ${q(BASE)} ${q(dir + '/repo')} && chmod -R u+w ${q(dir)}\` - work **only** in \`${dir}/repo\`.`
+  // Made once: a backup continues in the same copy rather than wiping the first attempt's work.
+  const copy = `- Copy (safe to repeat): \`mkdir -p ${q(dir)} && { [ -f ${q(dir + '/.copied')} ] || { rm -rf ${q(dir + '/repo')} && mkdir -p ${q(dir + '/repo')} && cp -R ${q(BASE)}/. ${q(dir + '/repo')}/ && chmod -R u+w ${q(dir + '/repo')} && touch ${q(dir + '/.copied')}; }; }\` - work **only** in \`${dir}/repo\`.`
   const examples = f && EXAMPLES && PRISTINE
     ? `- **The docstring's examples are the spec.** Run them before and after your change:\n\`\`\`bash\npython3 ${q(EXAMPLES)} ${q(`${PRISTINE}/${f.file}`)} ${q(`${dir}/repo/${f.file}`)} ${f.fn}\n\`\`\`\n  Every line must read \`ok\`. Paste its last line under \`## Evidence\`.`
     : null
@@ -526,8 +599,8 @@ function codeSteps(st, dir) {
       `- Under \`## Change\`, give \`${dir}/${f.fn}.py\`; under \`## Tests\`, \`${dir}/tests.py\`.`].join('\n')
   }
   return ['\n## Your copy', copy, tests,
-    `- Save the change: \`cd ${q(dir)} && diff -ruN -x __pycache__ -x .git ${q(BASE)} repo | sed -e "s#^--- ${BASE}#--- a#" -e "s#^+++ repo#+++ b#" > fix.patch\``,
-    `- Under \`## Change\`, give \`${dir}/fix.patch\`; under \`## Tests\`, \`${dir}/tests.py\`.`].join('\n')
+    `- **Leave your change in \`${dir}/repo\`** - the runtime reads it from there. Never write or edit a patch by hand.`,
+    `- Under \`## Change\`, give \`${dir}/repo\`; under \`## Tests\`, \`${dir}/tests.py\`.`].join('\n')
 }
 
 function solvePrompt(st, k, deps, feedback) {
@@ -535,14 +608,89 @@ function solvePrompt(st, k, deps, feedback) {
   return prompt('solve', `Solve subtask ${st.n}: ${st.title} (solver ${k})`, [
     `**Kind:** ${st.kind}. **Difficulty:** ${st.difficulty}.`, '',
     '## The request - the whole job, of which your subtask is one part', '```text', TASK, '```', '',
-    '## Your subtask', `**${st.title}**`, '', nest(st.task, 3), '',
+    '## Your subtask', `**${st.title}**`, '',
     specOf(st), '',
+    specOf(st) ? "## The planner's notes - a paraphrase that may be wrong; the spec above wins" : null, nest(st.task, 3), '',
     deps.length ? '## Results it depends on' : null, ...deps,
     '', '## The brief from the scout', brief, '',
     `## Your method\n${METHOD[(k - 1) % METHOD.length]}`,
     st.kind === 'code' ? codeSteps(st, dir) : null,
     feedback ? `\n## A checker found a problem with the first answer\n${feedback}\nSolve it again with this in mind.` : null,
   ])
+}
+
+// One agent that runs one exact command. The marker lets the bridge run it without the model.
+function runExactly(label, cmd, ph) {
+  return ask(prompt('assemble', label, [
+    'Run exactly this command - nothing else - then reply with what it printed:', '', '[exact-command]', '```bash', cmd, '```',
+  ]), label, ph, null, { wait: true, short: true, pri: -1 })
+}
+
+// A function's candidates are picked by a script, not an agent: each solver's copy of the
+// function goes into a fresh copy of the project, the docstring's examples run first, then
+// every solver's tests, pooled. A solver whose reply never arrived still has its copy on disk.
+// Measured (d9): every merge of a function was given up on or skipped, so the first solver
+// won blind; and three solvers that fixed count_top in their copies were never heard from.
+const PICK = `${SCRATCH}/pick.py`
+const PICK_PY = String.raw`import ast,os,shutil,subprocess,sys,tempfile
+root,rel,fn,ex=sys.argv[1:5]; rest=sys.argv[5:]; i=rest.index('--'); cands=rest[:i]; tests=[t for t in rest[i+1:] if os.path.exists(t)]
+def fnsrc(path):
+    code=open(path).read()
+    for n in ast.parse(code).body:
+        if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name==fn:
+            lines=code.splitlines(True); s=(n.decorator_list[0].lineno if n.decorator_list else n.lineno)-1
+            return ''.join(lines[s:n.end_lineno])
+def put(path,new):
+    code=open(path).read(); lines=code.splitlines(True)
+    ns=[n for n in ast.parse(code).body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name==fn]
+    if ns:
+        n=ns[0]; s=(n.decorator_list[0].lineno if n.decorator_list else n.lineno)-1; lines[s:n.end_lineno]=[new.rstrip(chr(10))+chr(10)]
+    else:
+        lines.append(chr(10)*2+new)
+    open(path,'w').write(''.join(lines))
+orig=fnsrc(os.path.join(root,rel)) or ''
+rows=[]
+for c in cands:
+    k,d,replied=c.split('|')
+    path=os.path.join(d,fn+'.py')
+    if not os.path.exists(path): path=os.path.join(d,'repo',rel)
+    try:
+        new=fnsrc(path)
+    except Exception as e:
+        print('candidate',k,'unreadable:',e); continue
+    if not new:
+        print('candidate',k,'has no',fn); continue
+    w=tempfile.mkdtemp(); shutil.copytree(root,w,dirs_exist_ok=True); put(os.path.join(w,rel),new)
+    bad=0
+    if ex!='-':
+        try:
+            out=subprocess.run([sys.executable,ex,os.path.join(root,rel),os.path.join(w,rel),fn],capture_output=True,text=True,timeout=120).stdout
+            bad=out.count('MISMATCH')
+        except Exception:
+            bad=99
+    passed=0
+    for t in tests:
+        try:
+            passed+=subprocess.run([sys.executable,t],cwd=w,capture_output=True,timeout=120).returncode==0
+        except Exception:
+            pass
+    changed=new.strip()!=orig.strip()
+    print(f'candidate {k}: {path} - docstring example mismatches {bad}, pooled tests passed {passed}/{len(tests)}, replied {replied}, changed {changed}')
+    rows.append(((bad,-passed,-int(replied=='1')),k,path))
+rows.sort()
+print('CHOSEN', rows[0][2] if rows else 'none')
+`
+let pickReady = false
+const solverDir = (st, k) => `${SCRATCH}/s${st.n}/${k}`
+async function pickFunction(st, f, ks, replies) {
+  const cands = ks.map(k => `${k}|${solverDir(st, k)}|${replies[k] ? 1 : 0}`)
+  const tests = ks.map(k => `${solverDir(st, k)}/tests.py`)
+  const out = await runExactly(`pick-${st.n}`, `python3 ${q(PICK)} ${q(BASE)} ${q(f.file)} ${f.fn} ${EXAMPLES && PRISTINE ? q(EXAMPLES) : '-'} ${cands.map(q).join(' ')} -- ${tests.map(q).join(' ')}`, 'Pick')
+  const chosen = ((out || '').match(/CHOSEN (\S+)/) || [])[1]
+  if (!chosen || chosen === 'none') return null
+  const k = Number((chosen.match(new RegExp(`/s${st.n}/(\\d+)/`)) || [])[1])
+  const reply = replies[k] || `## Answer\nSolver ${k}'s copy of \`${f.fn}\` - its reply never arrived; chosen by the tests below.`
+  return { result: `${reply}\n\n## Why\n${(out.match(/^candidate .*$/gm) || []).join('\n')}`, change: chosen, dir: solverDir(st, k) }
 }
 
 // Answers that say the same thing need no merger. Measured: unanimous answers went through a
@@ -560,7 +708,7 @@ async function merge(st, results, strategy) {
     '## How to test each candidate',
     `1. Pool every \`## Tests\` file below.`,
     `2. For candidate N: \`rm -rf ${q(`${SCRATCH}/m${st.n}/cN`)} && mkdir -p ${q(`${SCRATCH}/m${st.n}/cN`)} && cp -R ${q(BASE)} ${q(`${SCRATCH}/m${st.n}/cN/repo`)} && chmod -R u+w ${q(`${SCRATCH}/m${st.n}/cN`)}\`, then put the candidate in place - ` +
-      (f ? `its function, with:\n\`\`\`bash\n${replaceCommand(`${SCRATCH}/m${st.n}/cN/repo/${f.file}`, f.fn, 'CANDIDATE_FUNCTION_FILE')}\n\`\`\`` : '`cd` into the copy and `patch -p1 < CANDIDATE_PATCH`.'),
+      (f ? `its function, with:\n\`\`\`bash\n${replaceCommand(`${SCRATCH}/m${st.n}/cN/repo/${f.file}`, f.fn, 'CANDIDATE_FUNCTION_FILE')}\n\`\`\`` : `copy the candidate's own folder over it: \`cp -R CANDIDATE_REPO/. ${q(`${SCRATCH}/m${st.n}/cN/repo`)}/\`, where CANDIDATE_REPO is the \`repo\` folder under its \`## Change\`.`),
     f && EXAMPLES && PRISTINE ? `3. **Docstring examples first:** \`python3 ${q(EXAMPLES)} ${q(`${PRISTINE}/${f.file}`)} ${q(`${SCRATCH}/m${st.n}/cN/repo/${f.file}`)} ${f.fn}\`. A candidate that fails any example loses to one that passes them all, whatever the pooled tests say.` : null,
     `${f && EXAMPLES && PRISTINE ? 4 : 3}. Run every pooled tests file from \`${SCRATCH}/m${st.n}/cN/repo\`, count the passes, and keep the candidate that passes most.`,
   ].join('\n') : null
@@ -568,8 +716,8 @@ async function merge(st, results, strategy) {
     `**Strategy:** \`${code ? 'pick-change' : strategy}\``, '', '## The subtask', `**${st.title}**`, '', nest(st.task, 3), '',
     specOf(st), '', runIt, '',
     ...results.map((r, k) => card(`Result ${k + 1}`, r, { top: 2, evidence: true })),
-  ].filter(l => l !== null), !code), `merge-${st.n}`, code ? 'Pick' : 'Merge')
-  if (!merged) return results[0]
+  ].filter(l => l !== null), !code), `merge-${st.n}`, code ? 'Pick' : 'Merge', md => code || !!section(md, 'Answer'), { pri: -1 })
+  if (!merged) return bestOf(results)
   // A merger that names no saved change keeps the first solver's, so the assembler still has
   // one to put in place.
   const paths = results.flatMap(r => section(r, 'Change').match(/[^\s`'"]+\.(py|patch)\b/g) || [])
@@ -579,39 +727,87 @@ async function merge(st, results, strategy) {
   return merged
 }
 
+// The result whose evidence is fullest, when no merger answered.
+const bestOf = results => results.filter(r => section(r, 'Answer'))
+  .sort((a, b) => section(b, 'Evidence').length - section(a, 'Evidence').length)[0] || results[0]
+
 const VERDICT = md => (String(md || '').match(/\*\*Verdict:\*\*\s*(PASS|FAIL)/i) || [])[1]
 
+// Where a code result's change lives: the solver copy it names, or the first that replied.
+function dirOf(st, result, ks, replies) {
+  const k = Number((String(result || '').match(new RegExp(`/s${st.n}/(\\d+)/`)) || [])[1])
+  if (k) return solverDir(st, k)
+  const first = ks.find(x => replies[x])
+  return first ? solverDir(st, first) : null
+}
+
+// A code result is tested in a copy holding that change - never in the project, which still
+// holds the old code. Measured (d9): a checker imported the project's module and failed a
+// correct change it had never loaded.
+function testCopy(st, d) {
+  if (st.kind !== 'code' || !d) return null
+  const f = functionOf(st)
+  const c = `${SCRATCH}/c${st.n}`
+  const make = f && d.change
+    ? `rm -rf ${q(c)} && mkdir -p ${q(c)} && cp -R ${q(BASE)}/. ${q(c)}/ && ${replaceCommand(`${c}/${f.file}`, f.fn, d.change)}`
+    : d.dir ? `rm -rf ${q(c)} && mkdir -p ${q(c)} && cp -R ${q(d.dir + '/repo')}/. ${q(c)}/` : null
+  return make ? `## Test it in a copy holding the change - never in the project\n\`\`\`bash\n${make}\n\`\`\`\nThen run everything from \`${c}\`.` : null
+}
+
 async function runSubtask(st, deps) {
-  const results = (await parallel(Array.from({ length: st.solvers }, (_, k) => () =>
-    ask(solvePrompt(st, k + 1, deps), `solve-${st.n}.${k + 1}`, 'Solve', shown, { pri: k })))).filter(Boolean)
-  if (!results.length) return { st, result: '', why: 'no solver returned a result' }
-  let result = await merge(st, results, st.merge)
+  const f = functionOf(st)
+  const byScript = st.kind === 'code' && !!f && pickReady
+  const ks = Array.from({ length: st.solvers }, (_, k) => k + 1)
+  const outs = await parallel(ks.map(k => () => ask(solvePrompt(st, k, deps), `solve-${st.n}.${k}`, 'Solve', shown, { pri: k - 1 })))
+  const replies = {}
+  ks.forEach((k, i) => { if (outs[i]) replies[k] = outs[i] })
+  const decide = async kset => {
+    if (byScript) {
+      const picked = await pickFunction(st, f, kset, replies)
+      if (picked) return picked
+    }
+    const results = kset.map(k => replies[k]).filter(Boolean)
+    if (!results.length) return null
+    const result = await merge(st, results, st.merge)
+    return { result, dir: st.kind === 'code' ? dirOf(st, result, kset, replies) : null }
+  }
+  let d = await decide(ks)
+  if (!d) return { st, result: '', why: 'no solver returned a result' }
   if (st.check && !late) {
     const checkOnce = n => ask(prompt('check', `Check subtask ${st.n}: ${st.title} (checker ${n})`, [
       '## The request', '```text', TASK, '```', '',
-      '## What was asked of this part', `**${st.title}**`, '', nest(st.task, 3), '', specOf(st), '',
-      card('The result to check', result, { top: 2, evidence: true }),
-    ]), `check-${st.n}${n > 1 ? `.${n}` : ''}`, 'Check', md => !!VERDICT(md))
+      '## What was asked of this part', `**${st.title}**`, '', specOf(st), '', nest(st.task, 3), '',
+      testCopy(st, d), '',
+      card('The result to check', d.result, { top: 2, evidence: true }),
+    ]), `check-${st.n}${n > 1 ? `.${n}` : ''}`, 'Check', md => !!VERDICT(md), { pri: -1 })
     const check = await checkOnce(1)
     // A failure is acted on only when a second checker, who has not seen the first, finds it
     // too. Measured: one checker's mistaken FAIL brought in a redo that replaced three
     // solvers' correct median.
     const second = check && /fail/i.test(VERDICT(check)) ? await checkOnce(2) : null
     if (second && /fail/i.test(VERDICT(second))) {
-      const redo = await ask(solvePrompt(st, results.length + 1, deps,
-        `${section(check, 'Problem') || check}\n${section(second, 'Problem')}`), `solve-${st.n}.redo`, 'Solve', shown, { pri: 5 })
+      const k = st.solvers + 1
+      const feedback = `What the checkers found:\n${section(check, 'Problem') || check}\n${section(second, 'Problem')}\n\nReply in your solve format - \`## Answer\`, \`## Key values\`, \`## Evidence\` - never a verdict.`
+      const redo = await ask(solvePrompt(st, k, deps, feedback), `solve-${st.n}.redo`, 'Solve', shown, { pri: 5 })
       // The redo joins the original solvers rather than facing the merged result alone, so
       // one new answer cannot outvote three.
-      if (redo) result = await merge(st, results.concat([redo]), st.merge)
-      return { st, result, check: 'FAIL (confirmed) then redone' }
+      if (redo) replies[k] = redo
+      const again = redo || byScript ? await decide([...ks, k]) : null
+      if (again) d = again
+      else if (!section(d.result, 'Answer')) d = { ...d, result: bestOf(Object.values(replies)) }
+      return { st, ...d, check: redo ? 'FAIL (confirmed) then redone' : 'FAIL (confirmed); the redo returned nothing' }
     }
-    if (check && /fail/i.test(VERDICT(check))) return { st, result, check: 'FAIL not confirmed by a second checker - kept' }
-    return { st, result, check: check ? VERDICT(check) : 'not checked' }
+    if (check && /fail/i.test(VERDICT(check))) return { st, ...d, check: 'FAIL not confirmed by a second checker - kept' }
+    return { st, ...d, check: check ? VERDICT(check) : 'not checked' }
   }
-  return { st, result, check: st.check ? 'skipped: time budget' : 'not needed' }
+  return { st, ...d, check: st.check ? 'skipped: time budget' : 'not needed' }
 }
 
 phase('Solve')
+startBudget()
+if (plan.subtasks.some(st => st.kind === 'code' && functionOf(st))) {
+  pickReady = /installed/.test(await runExactly('install-picker', `mkdir -p ${q(SCRATCH)} && cat > ${q(PICK)} <<'AGENTAUS_PICK_END'\n${PICK_PY}AGENTAUS_PICK_END\npython3 -m py_compile ${q(PICK)} && echo installed`, 'Solve') || '')
+}
 const done = {}
 const pending = plan.subtasks.slice()
 while (pending.length) {
@@ -630,9 +826,18 @@ const resultOf = st => (done[st.n] && done[st.n].result) || ''
 const RAW = plan.subtasks.map(resultOf).join('\n\n')
 const RESULTS = plan.subtasks.map(st => card(`Subtask ${st.n}: ${st.title}`, resultOf(st), { status: done[st.n] && done[st.n].check })).join('\n\n---\n\n')
 // Every key value, as one checklist the assembler fills and the final checkers tick off.
+// Paths are not values; a code change is one item; a value no checker passed is marked, and
+// loses to the README or a docstring. Measured (d9): an unchecked "10 / 2" from one solver
+// failed both final checkers and sent a fixer to break a correct file.
 const CHECKLIST = plan.subtasks.flatMap(st => {
-  const keys = keyValues(resultOf(st))
-  return keys.length ? keys.map(k => k.replace(/^- /, `- [ ] Subtask ${st.n} - `)) : [`- [ ] Subtask ${st.n} - **${st.title}**: its answer is in the deliverable`]
+  const trusted = /^PASS/i.test(String((done[st.n] && done[st.n].check) || ''))
+  const tag = trusted ? '' : ' _(unchecked: where the README or a docstring disagrees, they win - report it, it is not a FAIL by itself)_'
+  if (st.kind === 'code') {
+    const f = functionOf(st)
+    return [`- [ ] Subtask ${st.n} - **${st.title}**: the change is in ${f ? `\`${f.fn}\` in \`${f.file}\`` : 'the project'}${tag}`]
+  }
+  const keys = keyValues(resultOf(st)).filter(k => !/\/tmp\/|\.(py|patch)\b|^- \*\*[^*]*(path|file)[^*]*:\*\*/i.test(k))
+  return keys.length ? keys.map(k => k.replace(/^- /, `- [ ] Subtask ${st.n} - `) + tag) : [`- [ ] Subtask ${st.n} - **${st.title}**: its answer is in the deliverable${tag}`]
 }).join('\n')
 
 // ---------------------------------------------------------------------------------
@@ -640,10 +845,6 @@ const CHECKLIST = plan.subtasks.flatMap(st => {
 // ---------------------------------------------------------------------------------
 
 phase('Assemble')
-// One agent that runs one exact command.
-const runExactly = (label, cmd, ph) => ask(prompt('assemble', label, [
-  'Run exactly this command - nothing else - then reply with what it printed:', '', '```bash', cmd, '```',
-]), label, ph, null, { wait: true })
 // The project goes back to how it was when the work began, before anything is put in place:
 // every edit made before assembly - by anyone - is undone, and only the chosen changes go in.
 // Files created since are left; only changed files are put back.
@@ -660,12 +861,28 @@ function inProject(d) {
   return `${CWD}/${p.startsWith('/') ? p.split('/').pop() : p}`
 }
 const deliverables = [...new Set(plan.deliverables.map(inProject).filter(Boolean))]
-const patches = [...RAW.matchAll(/[^\s`'"]+\/fix\.patch/g)].map(m => m[0])
-const swaps = plan.subtasks.map(st => ({ st, f: functionOf(st), r: (done[st.n] && done[st.n].result) || '' }))
-  .filter(x => x.f).map(x => {
-    const path = (x.r.match(new RegExp(`[^\\s\`'"]+\\/${x.f.fn}\\.py`)) || [])[0]
-    return path ? replaceCommand(`${CWD}/${x.f.file}`, x.f.fn, path) : null
-  }).filter(Boolean)
+// Every code change goes in by exact command: a chosen function by name, any other change as
+// a patch the runtime makes from the solver's copy. Measured (d9): solvers named patch files
+// they never wrote or wrote by hand, malformed; an assembler then copied one solver's whole
+// file over the project.
+const status = (cmd, n) => cmd.includes("<<'PY'")
+  ? cmd.replace("<<'PY'", `<<'PY' && echo "applied subtask ${n}" || echo "FAILED subtask ${n}"`)
+  : `{ ${cmd}; } && echo "applied subtask ${n}" || echo "FAILED subtask ${n}"`
+const changeLines = plan.subtasks.filter(st => st.kind === 'code' && done[st.n] && done[st.n].result).map(st => {
+  const f = functionOf(st)
+  const d = done[st.n]
+  const change = d.change || (f && (resultOf(st).match(new RegExp(`[^\\s\`'"]+\\/${f.fn}\\.py`)) || [])[0])
+  if (f && change) return status(replaceCommand(`${CWD}/${f.file}`, f.fn, change), st.n)
+  if (!d.dir) return null
+  const made = `${d.dir}/made.patch`
+  return `(cd ${q(d.dir)} && diff -ru -x __pycache__ -x .git ${q(BASE)} repo | sed -e "s#^--- ${BASE}#--- a#" -e "s#^+++ repo#+++ b#" > made.patch); ` +
+    `if [ -s ${q(made)} ]; then (cd ${q(CWD)} && patch -p1 --forward -F 3 < ${q(made)} >/dev/null) && echo "applied subtask ${st.n}" || echo "FAILED subtask ${st.n}"; else echo "no change in subtask ${st.n}"; fi`
+}).filter(Boolean)
+const applied = changeLines.length ? (await runExactly('apply-changes', changeLines.join('\n'), 'Assemble') || '(the changes could not be applied)') : ''
+const failedChanges = [...applied.matchAll(/FAILED subtask (\d+)/g)].map(m => Number(m[1]))
+if (changeLines.length) log(`assemble: ${changeLines.length} code change(s) put in place, ${failedChanges.length} failed`)
+const patches = []
+const swaps = []
 // Prose deliverables built from one section per subtask are written section by section:
 // one agent per section, each running one exact command. A single assembler asked to write
 // all nine answers claimed it had, and the file held two.
@@ -673,30 +890,34 @@ const SECTION_FILE = /\.(md|txt)$/i
 const sectionMode = deliverables.length === 1 && SECTION_FILE.test(deliverables[0])
   && plan.subtasks.length > 1 && plan.subtasks.every(st => st.kind === 'text')
 const sectionsWritten = []
-if (sectionMode) {
-  const file = deliverables[0]
-  for (const [k, st] of plan.subtasks.entries()) {
-    const body = section((done[st.n] && done[st.n].result) || '', 'Answer') || (done[st.n] && done[st.n].result) || '(no result)'
-    const text = /^#{1,3}\s/.test(body.trim()) ? body.trim() : `## ${st.title}\n\n${body.trim()}`
-    // Each section is its own file, written with `>`: running the command twice cannot
-    // write it twice. Measured: a section writer ran its `>>` append twice, and the
-    // duplicate failed both final checkers.
-    const part = `${SCRATCH}/sections/${String(k + 1).padStart(2, '0')}.md`
-    const ok = await ask(prompt('assemble', `Write section ${k + 1} of ${plan.subtasks.length} of ${file.split('/').pop()}`, [
-      'Run exactly this command - nothing else - then report the line count it prints:', '',
-      '```bash', `mkdir -p ${q(`${SCRATCH}/sections`)} && cat > ${q(part)} <<'AGENTAUS_SECTION_END'\n${text}\n\nAGENTAUS_SECTION_END\nwc -l ${q(part)}`, '```',
-    ]), `section-${k + 1}`, 'Assemble', null, { wait: true })
-    sectionsWritten.push(!!ok)
-  }
-  await runExactly('join-sections', `cat ${q(`${SCRATCH}/sections`)}/*.md > ${q(file)} && grep -c '^## ' ${q(file)} && wc -l ${q(file)}`, 'Assemble')
+const sectionPart = k => `${SCRATCH}/sections/${String(k + 1).padStart(2, '0')}.md`
+async function writeSection(k, st) {
+  const body = section((done[st.n] && done[st.n].result) || '', 'Answer') || (done[st.n] && done[st.n].result) || '(no result)'
+  // Exactly one heading per section: the subtask's own. Measured (d9): an answer starting
+  // `#### Q8` was given a `## Q8` above it, and the doubled heading hid the section.
+  const strip = b => b.trim().replace(/^(#{1,6}[^\n]*\n+)+/, '').replace(/^#{1,6}\s+(.*)$/gm, '**$1**')
+  const text = plain(`## ${st.title}\n\n${strip(body)}`)
+  // Each section is its own file, written with `>`: running the command twice cannot write
+  // it twice. Measured: a section writer ran its `>>` append twice, and the duplicate failed
+  // both final checkers.
+  const part = sectionPart(k)
+  return !!(await runExactly(`section-${k + 1}`, `mkdir -p ${q(`${SCRATCH}/sections`)} && cat > ${q(part)} <<'AGENTAUS_SECTION_END'\n${text}\n\nAGENTAUS_SECTION_END\nwc -l ${q(part)}`, 'Assemble'))
 }
-const assembled = sectionMode ? `## Written\n- \`${deliverables[0]}\` - ${sectionsWritten.filter(Boolean).length} of ${plan.subtasks.length} sections` : await ask(prompt('assemble', 'Build the deliverables', [
+const joinSections = file => runExactly('join-sections', `cat ${q(`${SCRATCH}/sections`)}/*.md > ${q(file)} && grep -c '^## ' ${q(file)} && wc -l ${q(file)}`, 'Assemble')
+if (sectionMode) {
+  for (const [k, st] of plan.subtasks.entries()) sectionsWritten.push(await writeSection(k, st))
+  await joinSections(deliverables[0])
+}
+const codeOnly = changeLines.length > 0 && !failedChanges.length && deliverables.every(d => /\.(py|js|ts|mjs|cjs|sh)$/.test(d))
+  && plan.subtasks.every(st => st.kind === 'code')
+const assembled = sectionMode ? `## Written\n- \`${deliverables[0]}\` - ${sectionsWritten.filter(Boolean).length} of ${plan.subtasks.length} sections`
+  : codeOnly ? `## Written\n${applied}`
+  : await ask(prompt('assemble', 'Build the deliverables', [
   '## The request', '```text', TASK, '```', '',
   '## Deliverables - write each at exactly this path, in the project folder',
   deliverables.length ? deliverables.map(d => `- \`${d}\``).join('\n') : `(as the request names them - in \`${CWD}\`, never in a scratch folder)`, '',
   '## Assembly', plan.assembly || 'As the request describes.', '',
-  swaps.length ? `## Put the chosen functions in place - run each command, in order\n${swaps.map(c => `\`\`\`bash\n${c}\n\`\`\``).join('\n')}` : null, '',
-  patches.length ? `## Patches to apply, in order\n${[...new Set(patches)].map(p => `- \`cd ${q(CWD)} && patch -p1 --forward -F 3 < ${q(p)}\``).join('\n')}` : null, '',
+  changeLines.length ? `## Code changes - already put in place by the runtime\n\`\`\`text\n${applied}\n\`\`\`\n${failedChanges.length ? `**Make each FAILED change by hand**, with small \`Edit\`s, from that subtask's Answer below: ${failedChanges.map(n => `subtask ${n}`).join(', ')}.` : 'Do not change the code again.'}` : null, '',
   '## Checklist - every item must end up in a deliverable, exactly as written', CHECKLIST, '',
   '## Merged results', RESULTS,
 ]), 'assemble', 'Assemble', null, { wait: true })
@@ -717,6 +938,7 @@ phase('Final check')
 // recomputed four correct values, both fell into the same trap, and the fixer overwrote them.
 const finalPrompt = n => prompt('check', `Check the finished work (checker ${n})`, [
   '## What was asked', '```text', TASK, '```', '',
+  EXAMPLES && PRISTINE && FUNCTIONS.length ? `**First, run the docstring examples on each changed Python file and paste the last line:** \`python3 ${q(EXAMPLES)} ${q(PRISTINE)}/FILE ${q(CWD)}/FILE\` - a \`MISMATCH\` line is a FAIL.\n` : null,
   '## Your job here',
   '- Each deliverable exists at its path and has every part the request asks for, in the format it asks for.',
   '- Each value or section in it **matches the merged result below**. Do **not** recompute values: they were settled by several solvers and checked. A deliverable that matches its merged result PASSES on that point.',
@@ -738,11 +960,41 @@ let restored = false
 // The fixer runs only when both checkers find a problem, starts from a backup, and is
 // undone if a fresh checker still finds one. Measured: a fixer acting on one checker's word
 // recomputed four correct values the wrong way and overwrote them.
-if (finals.length >= 2 && failing.length === finals.length && !late) {
+let repaired = []
+// A sectioned document is repaired section by section: the failing subtasks are solved again
+// and their sections rewritten. Measured (d9): a whole-file fixer spent 17 minutes editing
+// text that did not match the file, and was undone.
+if (sectionMode && finals.length >= 2 && failing.length === finals.length && !late) {
+  const named = new Set()
+  for (const md of failing) {
+    for (const m of section(md, 'Checklist').matchAll(/^\s*[-*]\s*\[ \]\s*Subtask\s+(\d+)/gim)) named.add(Number(m[1]))
+    for (const m of section(md, 'Problem').matchAll(/\bQ(\d{1,2})\b/g)) {
+      const st = plan.subtasks.find(o => new RegExp(`^\\W*Q${m[1]}\\b`, 'i').test(o.title))
+      if (st) named.add(st.n)
+    }
+  }
   const backup = `${SCRATCH}/before-fix`
-  const saved = await ask(prompt('assemble', 'Back up the project', [
-    `Run exactly: \`rm -rf ${q(backup)} && mkdir -p ${q(backup)} && cp -R ${q(CWD)}/. ${q(backup)}/ && ls ${q(backup)} | head\``,
-  ]), 'backup', 'Final check')
+  const targets = plan.subtasks.filter(st => named.has(st.n)).slice(0, 4)
+  if (targets.length && await runExactly('backup', `rm -rf ${q(backup)} && mkdir -p ${q(backup)} && cp -R ${q(CWD)}/. ${q(backup)}/ && echo saved`, 'Final check')) {
+    const problems = failing.map(md => section(md, 'Problem')).join('\n')
+    for (const st of targets) {
+      const again = await runSubtask({ ...st, task: `${st.task}\n\n**The final checkers found a problem with this part:**\n${problems}` }, [])
+      if (again && again.result && section(again.result, 'Answer')) { done[st.n] = again; repaired.push(st.title) }
+    }
+    if (repaired.length) {
+      for (const [k, st] of plan.subtasks.entries()) if (repaired.includes(st.title)) await writeSection(k, st)
+      await joinSections(deliverables[0])
+      await normalise()
+      recheck = await ask(finalPrompt(3), 'final-check-3', 'Final check', md => !!VERDICT(md))
+      if (recheck && /fail/i.test(VERDICT(recheck))) {
+        restored = !!(await runExactly('undo', `cp -R ${q(backup)}/. ${q(CWD)}/ && echo undone`, 'Final check'))
+      }
+    }
+  }
+}
+if (!sectionMode && finals.length >= 2 && failing.length === finals.length && !late) {
+  const backup = `${SCRATCH}/before-fix`
+  const saved = await runExactly('backup', `rm -rf ${q(backup)} && mkdir -p ${q(backup)} && cp -R ${q(CWD)}/. ${q(backup)}/ && echo saved`, 'Final check')
   if (saved) {
     fix = await ask(prompt('fix', 'Fix the problem the checkers found', [
       '## What was asked', '```text', TASK, '```', '',
@@ -768,11 +1020,15 @@ const lines = [
   ...plan.subtasks.map(st => `- ${st.n}. ${st.title} - ${st.difficulty}, ${st.solvers} solver(s), check: ${(done[st.n] && done[st.n].check) || 'n/a'}`),
   '', '## Assembly', assembled || '(the assembler returned nothing)',
   '', '## Final check', ...finals.map((md, k) => `- Checker ${k + 1}: ${VERDICT(md)} - ${section(md, 'Problem').slice(0, 300)}`),
+  repaired.length ? `- Sections solved again and rewritten: ${repaired.join(', ')}` : null,
   fix ? `- Fixer: ${section(fix, 'Fixed').slice(0, 300)}` : null,
   recheck ? `- Re-check: ${VERDICT(recheck)} - ${section(recheck, 'Problem').slice(0, 300)}` : null,
   restored ? '- The fix did not pass the re-check and was undone.' : null,
   '', '## Next step',
   passed ? 'Open each deliverable to confirm it is there, then report.' : 'Open each deliverable, check it against the request with your own tools, fix what is wrong, then report.',
+  '**Never rewrite a deliverable whole with `Write`** - fix only what a checker named, with small `Edit`s. Each part above was solved and checked by several agents.',
+  sectionMode ? 'Keep exactly one `## ` heading per section, plain `-` hyphens, and every citation.' : null,
+  EXAMPLES && PRISTINE && FUNCTIONS.length ? `Check code against its docstring examples with \`python3 ${q(EXAMPLES)} ${q(PRISTINE)}/FILE ${q(CWD)}/FILE\`; never add a special case for an example's values.` : null,
   'When you edit, copy `old_string` from the file itself - without the line-number prefix the Read tool shows.',
 ].filter(l => l !== null)
 return lines.join('\n')

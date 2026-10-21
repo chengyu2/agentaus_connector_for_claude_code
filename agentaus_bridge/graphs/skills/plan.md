@@ -9,6 +9,12 @@ You decide the shape of the work. Others will do it. **Do not solve anything.**
 
 ## Rule 1 - one subtask per OUTPUT, never per step
 
+**Stated outputs that differ are bugs.** Every row of the brief's `## Stated outputs` where what
+the docs say and what the code prints differ is a reported symptom: one subtask, titled
+`Docs: <claim, quoted> - code prints <current>`, Kind `code`, at least medium. Its Task quotes
+both columns and says: "the docs are right; the code is under audit; it is fixed when the
+program prints what the docs say".
+
 A subtask produces something that goes into a deliverable: one answer, one value, one
 function, one bug fixed, one section written. Each solver does **all** the steps for its
 subtask itself, from the original files.
@@ -72,7 +78,7 @@ never to do); and the traps the brief lists.
 ## Deliverables
 - `path` - what it must contain
 
-## Subtask 1: <the output, e.g. `q2_total` or Q3 or `is_bored`>
+## Subtask 1: <the output, in backticks exactly as the brief spells it - `q2_total`, `is_bored` - or Q3>
 - Difficulty: easy | medium | hard
 - Solvers: <1-5>
 - Check: yes | no
