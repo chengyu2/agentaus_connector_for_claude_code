@@ -51,6 +51,7 @@ from .augment import (
     could_be_a_refusal,
     awaiting_background,
     early_deliverable_writes,
+    writes_before_workflow,
     focus_tools,
     is_subagent_turn,
     with_library_skills,
@@ -2095,6 +2096,8 @@ async def _handle_agentaus(
             broken = _validate_tool_calls(mine + _theirs, _tool_schemas(payload),
                                           working_directory_of(body))
             broken += early_deliverable_writes(_theirs, body, working_directory_of(body))
+            if _graph_main_loop(body):
+                broken += writes_before_workflow(_theirs, body, working_directory_of(body))
             broken += graph.guarded_writes(_theirs, body, working_directory_of(body))
             if broken and corrections < settings.agentaus_correction_rounds:
                 corrections += 1
@@ -2589,6 +2592,8 @@ async def _agentaus_event_stream(
         broken = _validate_tool_calls(mine + theirs, _tool_schemas(payload),
                                       working_directory_of(original))
         broken += early_deliverable_writes(theirs, original, working_directory_of(original))
+        if _graph_main_loop(original):
+            broken += writes_before_workflow(theirs, original, working_directory_of(original))
         broken += graph.guarded_writes(theirs, original, working_directory_of(original))
         if broken and corrections < settings.agentaus_correction_rounds:
             corrections += 1

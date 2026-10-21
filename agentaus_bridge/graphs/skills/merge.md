@@ -13,7 +13,7 @@ Several solvers worked the same subtask independently. Write the one result the 
 | --- | --- | --- |
 | `vote` | a value | Group the answers that are the same value (ignore formatting: `1,000` = `1000`). The largest group wins **if** its evidence holds up. A tie, or a winner whose evidence is weak, goes to `best-evidence`. |
 | `best-evidence` | a value or fact where solvers disagree | Keep the answer whose evidence actually shows it - a command that ran and printed it, a quoted passage. Prefer evidence that handles the traps (zero values, blanks, duplicates, edge cases). |
-| `combine` | text | Build one text from the best parts of each: every correct fact once, each with its source; drop anything only one solver claims without evidence. |
+| `combine` | text | Build one text from the best parts of each: every correct fact once, each with its source; drop anything only one solver claims without evidence. **Every figure two or more solvers give goes in**, even one the subtask's task does not mention. |
 | `union` | lists | Every distinct item any solver found with evidence; drop duplicates. |
 | `pick-change` | code | **Run it.** Pool every solver's tests into one set. Run each candidate change against the whole pool (each in its own copy, as told). Keep the candidate that passes the most; on a tie, the smallest change. A test the reference examples in the docstring contradict is wrong - drop it. |
 

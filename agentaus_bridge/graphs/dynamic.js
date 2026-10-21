@@ -146,21 +146,31 @@ function firstUsable(runs, ok) {
   })
 }
 
+// A backup still queued when an answer arrives never starts. Measured (d10): five queued
+// backups ran 15-30 minutes after their first attempt had answered, in the same solver copy,
+// and two of them reverted a correct fix. opts.once: no backup at all.
 async function ask(text, label, ph, accept, opts = {}) {
   const ok = t => usable(t, opts.short) && (!accept || accept(t))
   const runs = []
+  let answered = false
+  const done = out => { if (out) answered = true; return out }
   for (const attempt of [1, 2]) {
-    if (late && LATE_SKIPS.has(ph)) return runs.length ? firstUsable(runs, ok) : null
+    if (opts.once && attempt === 2) return done(runs.length ? await firstUsable(runs, ok) : null)
+    if (late && LATE_SKIPS.has(ph)) return done(runs.length ? await firstUsable(runs, ok) : null)
     const body = attempt === 1 ? text
       : `${text}\n\n**Backup attempt:** the previous agent returned nothing usable or a plan instead of the result. Do the work now, then reply with the result.`
     let begin = () => {}
     const begun = new Promise(r => { begin = r })
-    runs.push(slot(() => { begin(); return agent(body, { label: attempt === 1 ? label : `${label}:backup`, phase: ph }) }, ph, opts.pri || 0))
+    runs.push(slot(() => {
+      if (answered) return null
+      begin()
+      return agent(body, { label: attempt === 1 ? label : `${label}:backup`, phase: ph })
+    }, ph, (opts.pri || 0) + (attempt === 2 ? 10 : 0)))
     let timer = null
     const timeout = opts.wait ? new Promise(() => {}) : begun.then(() => new Promise(r => { timer = setTimeout(() => r(null), opts.deadline || DEADLINE_MS) }))
     const out = await Promise.race([firstUsable(runs, ok), timeout])
     if (timer !== null) clearTimeout(timer)
-    if (out) return out
+    if (out) return done(out)
   }
   return null
 }
@@ -290,6 +300,9 @@ phase('Scout')
 const INVENTORY = [
   TEXTS.length ? ['## Plain-text copies of the documents - made by a script, complete, tables included',
     ...TEXTS.map(t => `- \`${t.source}\` -> \`${t.text}\` (${t.lines} lines)`)].join('\n') : null,
+  QUESTIONS.length ? ['## The questions the request must answer - copied by a script, word for word',
+    ...QUESTIONS.map(x => `- Q${x.n} (\`${x.file}\` line ${x.line}): ${x.text}`)].join('\n') : null,
+  TEXTS.length ? 'A file with no copy listed here (`.md`, `.txt`, `.csv`, code) is plain text already: read it at its own path.' : null,
   FUNCTIONS.length ? ['## Functions in the code - exact names',
     ...FUNCTIONS.slice(0, 100).map(f => `- \`${f.fn}\` in \`${f.file}\` line ${f.line}${f.stub ? ' - **a stub, to implement**' : ''}`)].join('\n') : null,
   CONSTANTS.length ? ['## Module-level tables and constants',
@@ -388,21 +401,37 @@ function functionOf(st) {
   if (st.kind !== 'code') return null
   const text = `${st.title}\n${st.task}`
   // A constant (`SPELLING`) is not a function, and a name the code does not define is not one.
-  // A reviewer wrote `## Subtask 1: is_bored`, without backticks, and all ten functions were
-  // missed - then planned a second time by the coverage pass (d9). A bare word the inventory
-  // knows is a name too.
-  const ticked = (st.title.match(/`([A-Za-z_]\w*)`/g) || []).map(n => n.replace(/`/g, ''))
-  const bare = (st.title.match(/\b[A-Za-z_]\w*\b/g) || []).filter(n => FUNCTIONS.some(f => f.fn === n))
-  const names = [...new Set([...ticked, ...bare])].filter(n => !/^[A-Z][A-Z0-9_]*$/.test(n))
+  // The function a subtask is about: a backticked name in its title, else in its task, else a
+  // `name(` or a snake_case word in its title, or a title that is the name. Never a plain word:
+  // measured (d10), "top-five" bound a subtask to `top`, and "first name" to `first`. And
+  // (d9) a reviewer wrote `## Subtask 1: is_bored` without backticks.
+  const inv = n => !/^[A-Z][A-Z0-9_]*$/.test(n) && (!FUNCTIONS.length || FUNCTIONS.some(f => f.fn === n))
+  const tick = t => [...new Set((t.match(/`([A-Za-z_]\w*)(?:\(\))?`/g) || []).map(n => n.replace(/[`()]/g, '')))].filter(inv)
+  let names = tick(st.title)
+  if (!names.length) names = tick(st.task)
+  if (!names.length) {
+    const bare = (st.title.match(/\b[A-Za-z_]\w*\b/g) || []).filter(n => FUNCTIONS.some(f => f.fn === n))
+    const lead = (st.title.trim().match(/^(?:Audit\s+)?([A-Za-z_]\w*)\b/) || [])[1]
+    names = [...new Set(bare.filter(n => n.includes('_') || n === lead || new RegExp(`\\b${n}\\(`).test(st.title)))].filter(inv)
+  }
   const known = FUNCTIONS.length ? names.filter(n => FUNCTIONS.some(f => f.fn === n)) : names
   const fn = known.length === 1 ? known[0] : null
   if (!fn) return null
-  const inv = FUNCTIONS.filter(f => f.fn === fn)
-  if (inv.length === 1) return { fn, file: inv[0].file }
+  const found = FUNCTIONS.filter(f => f.fn === fn)
+  if (found.length === 1) return { fn, file: found[0].file }
   const pys = plan.deliverables.filter(d => /\.py$/.test(d)).map(d => d.replace(CWD + '/', ''))
   const named = (text.match(/[\w./-]+\.py\b/g) || []).map(f => f.replace(CWD + '/', '').replace(/^\.\//, ''))
   const file = named.find(f => pys.includes(f)) || (pys.length === 1 ? pys[0] : named.find(f => !/test/i.test(f)))
   return file ? { fn, file } : null
+}
+
+// Where the function's own spec is the whole job - a stub to implement, or an audit - the
+// planner's paraphrase is left out. Measured (d9, d10): the planner's "use absolute value"
+// was the rule every order_by_points solver followed, against the docstring's own example.
+function specOnly(st) {
+  const f = functionOf(st)
+  const inv = f && FUNCTIONS.find(x => x.fn === f.fn && x.file === f.file)
+  return !!(inv && inv.doc && (inv.stub || /^\W*Audit\b/i.test(st.title)))
 }
 
 // A function's specification, verbatim from the original file.
@@ -489,7 +518,17 @@ phase('Review')
     }
     for (const c of CONSTANTS.filter(c => inFixed({ file: c.file }))) {
       added.push({ n: next++, title: `Audit the module-level tables in ${c.file}`, difficulty: 'medium', solvers: 2, check: true, merge: 'pick-change',
-        kind: 'code', deps: [], task: `Audit every module-level table, mapping and threshold in \`${c.file}\` - ${c.names.map(n => `\`${n}\``).join(', ')} - against the README and any model or standard the request names. Print each group's members and sizes and compare. Fix only entries that are wrong.` })
+        kind: 'code', deps: [], task: `Audit every module-level table, mapping and threshold in \`${c.file}\` - ${c.names.map(n => `\`${n}\``).join(', ')} - against the README and any model or standard the request names. The project's own documents often print these groups (a chart or a table by group): find them in the plain-text copies (\`grep -n -i -A60 '<a group name>' <copy>\`), copy that listing with its \`file:line\` as the expected table, then print the code's groups and compare member by member. Memory of a model is not a source. Fix only entries that are wrong.` })
+    }
+  }
+  // A flag or option the request asks to add is a feature, with its own subtask. Measured
+  // (d10): the split planned one subtask per symptom and per function, and `--json` was in none.
+  if (plan.subtasks.some(st => st.kind === 'code')) {
+    for (const flag of new Set(TASK.match(/(?<![\w-])--[a-z][\w-]*/g) || [])) {
+      if (plan.subtasks.concat(added).some(st => `${st.title}\n${st.task}`.includes(flag))) continue
+      const sentence = TASK.split(/(?<=[.!?])\s+|\n+/).find(x => x.includes(flag)) || flag
+      added.push({ n: next++, title: `Feature: \`${flag}\``, difficulty: 'medium', solvers: 2, check: true, merge: 'pick-change',
+        kind: 'code', deps: [], task: `Add what the request asks for, word for word:\n\n> ${sentence.trim()}\n\nKeep every existing behaviour, and run the program both with and without it.` })
     }
   }
   if (added.length) {
@@ -551,12 +590,36 @@ phase('Review')
       merge: 'combine', kind: 'text', deps: [], task: questionTask(k, '') })))
     log(`plan: added ${missing.map(k => `Q${k}`).join(', ')} - asked, but in no subtask`)
   }
+  // A subtask for one asked question carries that question word for word, never the planner's
+  // words. Measured (d10): the plan's Q5-Q8 tasks described milestones, a schedule and contact
+  // details - not the questions - and every solver answered what the task said.
+  for (const st of plan.subtasks) {
+    if (st.kind !== 'text') continue
+    const own = [...qNums(st.title)]
+    if (own.length !== 1 || !QUESTIONS.some(x => Number(x.n) === own[0])) continue
+    st.title = `Q${own[0]}`
+    st.task = questionTask(own[0], '')
+  }
   // In question order, so the sections are.
   const qOf = st => (st.title.match(/^\W*Q(\d{1,2})\b/i) || [])[1]
   if (plan.subtasks.every(st => st.kind !== 'text' || qOf(st))) {
     plan.subtasks.sort((x, y) => (Number(qOf(x)) || 0) - (Number(qOf(y)) || 0))
   }
   plan.subtasks = plan.subtasks.slice(0, MAX_SUBTASKS)
+}
+
+// An Audit is judged against the spec, never against what the code does now. Measured (d10): a
+// planner wrote "check that count_top counts ranks < k" and "validate that mean_rank computes
+// the median" - the bugs themselves, as the spec - and the checkers held the fixes to it.
+// Then the floors, after every pass that adds or rewrites subtasks.
+for (const st of plan.subtasks) {
+  const f = functionOf(st)
+  if (st.kind === 'code' && f && /^\W*Audit\b/i.test(st.title)) {
+    st.task = `Audit \`${f.fn}\` in \`${f.file}\` for bugs nobody reported, with the audit checklist in your skill. Judge it by its name, its docstring, its callers, the README and the documents - never by what it does now. Fix what is wrong; change nothing that is right.`
+  }
+  if (st.kind === 'code' && st.difficulty === 'easy') st.difficulty = 'medium'
+  st.solvers = Math.max(st.solvers, { easy: 1, medium: 2, hard: 3 }[st.difficulty] || 2)
+  if (st.difficulty !== 'easy') st.check = true
 }
 
 // Code subtasks each change their own copy of the original project; none waits on another.
@@ -610,7 +673,7 @@ function solvePrompt(st, k, deps, feedback) {
     '## The request - the whole job, of which your subtask is one part', '```text', TASK, '```', '',
     '## Your subtask', `**${st.title}**`, '',
     specOf(st), '',
-    specOf(st) ? "## The planner's notes - a paraphrase that may be wrong; the spec above wins" : null, nest(st.task, 3), '',
+    specOnly(st) ? null : specOf(st) ? "## The planner's notes - a paraphrase that may be wrong; the spec above wins" : null, specOnly(st) ? null : nest(st.task, 3), '',
     deps.length ? '## Results it depends on' : null, ...deps,
     '', '## The brief from the scout', brief, '',
     `## Your method\n${METHOD[(k - 1) % METHOD.length]}`,
@@ -678,19 +741,45 @@ for c in cands:
     print(f'candidate {k}: {path} - docstring example mismatches {bad}, pooled tests passed {passed}/{len(tests)}, replied {replied}, changed {changed}')
     rows.append(((bad,-passed,-int(replied=='1')),k,path))
 rows.sort()
-print('CHOSEN', rows[0][2] if rows else 'none')
+frozen=os.environ.get('PICK_OUT')
+if rows and frozen:
+    os.makedirs(os.path.dirname(frozen),exist_ok=True); open(frozen,'w').write(fnsrc(rows[0][2]))
+print('CHOSEN', frozen if rows and frozen else rows[0][2] if rows else 'none', 'mismatches', rows[0][0][0] if rows else -1, 'from', rows[0][2] if rows else '-')
 `
 let pickReady = false
 const solverDir = (st, k) => `${SCRATCH}/s${st.n}/${k}`
+// The picker installs itself if it is not there yet: nothing waits on an install agent's word.
+const installPick = `mkdir -p ${q(SCRATCH)} && { [ -s ${q(PICK)} ] || cat > ${q(PICK)} <<'AGENTAUS_PICK_END'\n${PICK_PY}AGENTAUS_PICK_END\n}`
 async function pickFunction(st, f, ks, replies) {
   const cands = ks.map(k => `${k}|${solverDir(st, k)}|${replies[k] ? 1 : 0}`)
   const tests = ks.map(k => `${solverDir(st, k)}/tests.py`)
-  const out = await runExactly(`pick-${st.n}`, `python3 ${q(PICK)} ${q(BASE)} ${q(f.file)} ${f.fn} ${EXAMPLES && PRISTINE ? q(EXAMPLES) : '-'} ${cands.map(q).join(' ')} -- ${tests.map(q).join(' ')}`, 'Pick')
-  const chosen = ((out || '').match(/CHOSEN (\S+)/) || [])[1]
-  if (!chosen || chosen === 'none') return null
-  const k = Number((chosen.match(new RegExp(`/s${st.n}/(\\d+)/`)) || [])[1])
-  const reply = replies[k] || `## Answer\nSolver ${k}'s copy of \`${f.fn}\` - its reply never arrived; chosen by the tests below.`
-  return { result: `${reply}\n\n## Why\n${(out.match(/^candidate .*$/gm) || []).join('\n')}`, change: chosen, dir: solverDir(st, k) }
+  // The chosen function is frozen at once: a solver still running cannot change it afterwards.
+  const frozen = `${SCRATCH}/chosen/s${st.n}/${f.fn}.py`
+  const out = await runExactly(`pick-${st.n}`, `${installPick}\nPICK_OUT=${q(frozen)} python3 ${q(PICK)} ${q(BASE)} ${q(f.file)} ${f.fn} ${EXAMPLES && PRISTINE ? q(EXAMPLES) : '-'} ${cands.map(q).join(' ')} -- ${tests.map(q).join(' ')}`, 'Pick')
+  const m = (out || '').match(/CHOSEN (\S+) mismatches (-?\d+) from (\S+)/)
+  if (!m || m[1] === 'none') return null
+  const k = Number((m[3].match(new RegExp(`/s${st.n}/(\\d+)/`)) || [])[1])
+  const reply = replies[k] || `## Answer\nCandidate ${k}'s \`${f.fn}\` - chosen by the tests below.`
+  return { result: `${reply}\n\n## Why\n${(out.match(/^candidate .*$/gm) || []).join('\n')}`, change: m[1], dir: solverDir(st, k), mismatches: Number(m[2]) }
+}
+
+// When every candidate breaks a docstring example, the reading of the words is wrong. One
+// agent writes five readings as whole functions, a command saves them, and the picker - which
+// ranks example mismatches first - chooses among solvers and readings alike. Measured (d9,
+// d10): every order_by_points candidate kept the planner's "absolute value" reading and failed
+// the docstring's own example; agents then patched the example's values in by hand.
+async function readings(st, f) {
+  const md = await ask(prompt('solve', `Read the spec of ${f.fn} five ways`, [
+    specOf(st), '',
+    `The obvious reading of this docstring fails at least one of its own examples. Write **five different readings** of its words - how a sign, a tie, a boundary, "the word" versus "the letters", an order or a rounding rule could be meant. Write each as one complete Python function named \`${f.fn}\`, imports inside it, in its own \`\`\`python block. Work each example through each reading; never branch on an example's literal input.`,
+  ], true), `readings-${st.n}`, 'Readings', t => (t.match(/```python/g) || []).length >= 2)
+  if (!md) return []
+  const blocks = [...md.matchAll(/```python\n([\s\S]*?)```/g)].map(x => x[1]).filter(b => new RegExp(`def ${f.fn}\\(`).test(b)).slice(0, 6)
+  const rk = blocks.map((_, j) => 21 + j)
+  if (!blocks.length) return []
+  await runExactly(`readings-save-${st.n}`, blocks.map((b, j) =>
+    `mkdir -p ${q(solverDir(st, rk[j]))} && cat > ${q(`${solverDir(st, rk[j])}/${f.fn}.py`)} <<'AGENTAUS_READING_END'\n${b}AGENTAUS_READING_END`).join('\n') + '\necho saved', 'Readings')
+  return rk
 }
 
 // Answers that say the same thing need no merger. Measured: unanimous answers went through a
@@ -718,6 +807,19 @@ async function merge(st, results, strategy) {
     ...results.map((r, k) => card(`Result ${k + 1}`, r, { top: 2, evidence: true })),
   ].filter(l => l !== null), !code), `merge-${st.n}`, code ? 'Pick' : 'Merge', md => code || !!section(md, 'Answer'), { pri: -1 })
   if (!merged) return bestOf(results)
+  // Every figure two or more solvers gave stays. Measured (d10): all three solvers gave the
+  // GST-inclusive total, and the merger kept only the two figures the task had named.
+  if (st.kind === 'text') {
+    const nums = t => new Set(((section(t, 'Answer') + '\n' + section(t, 'Key values')).match(/\d[\d,]{2,}(?:\.\d+)?/g) || []).map(n => n.replace(/,/g, '').replace(/\.0+$/, '')))
+    const count = new Map()
+    for (const r of results) for (const n of nums(r)) count.set(n, (count.get(n) || 0) + 1)
+    const agreed = [...count].filter(([, c]) => c >= 2).map(([n]) => n)
+    const lost = agreed.filter(n => !nums(merged).has(n))
+    if (lost.length) {
+      log(`merge-${st.n}: the merged answer dropped ${lost.join(', ')}, given by two or more solvers - kept the fullest solver answer`)
+      return results.slice().sort((a, b) => agreed.filter(n => nums(b).has(n)).length - agreed.filter(n => nums(a).has(n)).length)[0]
+    }
+  }
   // A merger that names no saved change keeps the first solver's, so the assembler still has
   // one to put in place.
   const paths = results.flatMap(r => section(r, 'Change').match(/[^\s`'"]+\.(py|patch)\b/g) || [])
@@ -758,7 +860,8 @@ async function runSubtask(st, deps) {
   const f = functionOf(st)
   const byScript = st.kind === 'code' && !!f && pickReady
   const ks = Array.from({ length: st.solvers }, (_, k) => k + 1)
-  const outs = await parallel(ks.map(k => () => ask(solvePrompt(st, k, deps), `solve-${st.n}.${k}`, 'Solve', shown, { pri: k - 1 })))
+  // A code solver needs no backup: its copy on disk is read whether or not it replies.
+  const outs = await parallel(ks.map(k => () => ask(solvePrompt(st, k, deps), `solve-${st.n}.${k}`, 'Solve', shown, { pri: k - 1, once: st.kind === 'code' })))
   const replies = {}
   ks.forEach((k, i) => { if (outs[i]) replies[k] = outs[i] })
   const decide = async kset => {
@@ -769,10 +872,23 @@ async function runSubtask(st, deps) {
     const results = kset.map(k => replies[k]).filter(Boolean)
     if (!results.length) return null
     const result = await merge(st, results, st.merge)
-    return { result, dir: st.kind === 'code' ? dirOf(st, result, kset, replies) : null }
+    let dir = st.kind === 'code' ? dirOf(st, result, kset, replies) : null
+    if (dir) {
+      const frozen = `${SCRATCH}/chosen/s${st.n}`
+      if (/frozen/.test(await runExactly(`freeze-${st.n}`, `rm -rf ${q(frozen)} && mkdir -p ${q(frozen)} && cp -R ${q(dir + '/repo')} ${q(frozen + '/repo')} && echo frozen`, 'Pick') || '')) dir = frozen
+    }
+    return { result, dir }
   }
   let d = await decide(ks)
   if (!d) return { st, result: '', why: 'no solver returned a result' }
+  if (byScript && d.mismatches > 0) {
+    const rk = await readings(st, f)
+    if (rk.length) {
+      const again = await pickFunction(st, f, [...ks, ...rk], replies)
+      d = { ...(again || d), readings: rk }
+      log(`subtask ${st.n}: ${rk.length} reading(s) of the spec; the chosen candidate breaks ${d.mismatches} example(s)`)
+    }
+  }
   if (st.check && !late) {
     const checkOnce = n => ask(prompt('check', `Check subtask ${st.n}: ${st.title} (checker ${n})`, [
       '## The request', '```text', TASK, '```', '',
@@ -792,7 +908,7 @@ async function runSubtask(st, deps) {
       // The redo joins the original solvers rather than facing the merged result alone, so
       // one new answer cannot outvote three.
       if (redo) replies[k] = redo
-      const again = redo || byScript ? await decide([...ks, k]) : null
+      const again = redo || byScript ? await decide([...ks, k, ...(d.readings || [])]) : null
       if (again) d = again
       else if (!section(d.result, 'Answer')) d = { ...d, result: bestOf(Object.values(replies)) }
       return { st, ...d, check: redo ? 'FAIL (confirmed) then redone' : 'FAIL (confirmed); the redo returned nothing' }
@@ -805,9 +921,7 @@ async function runSubtask(st, deps) {
 
 phase('Solve')
 startBudget()
-if (plan.subtasks.some(st => st.kind === 'code' && functionOf(st))) {
-  pickReady = /installed/.test(await runExactly('install-picker', `mkdir -p ${q(SCRATCH)} && cat > ${q(PICK)} <<'AGENTAUS_PICK_END'\n${PICK_PY}AGENTAUS_PICK_END\npython3 -m py_compile ${q(PICK)} && echo installed`, 'Solve') || '')
-}
+pickReady = plan.subtasks.some(st => st.kind === 'code' && functionOf(st))
 const done = {}
 const pending = plan.subtasks.slice()
 while (pending.length) {
@@ -879,7 +993,11 @@ const changeLines = plan.subtasks.filter(st => st.kind === 'code' && done[st.n] 
     `if [ -s ${q(made)} ]; then (cd ${q(CWD)} && patch -p1 --forward -F 3 < ${q(made)} >/dev/null) && echo "applied subtask ${st.n}" || echo "FAILED subtask ${st.n}"; else echo "no change in subtask ${st.n}"; fi`
 }).filter(Boolean)
 const applied = changeLines.length ? (await runExactly('apply-changes', changeLines.join('\n'), 'Assemble') || '(the changes could not be applied)') : ''
-const failedChanges = [...applied.matchAll(/FAILED subtask (\d+)/g)].map(m => Number(m[1]))
+// A change counts as applied only when its own line says so. Measured (d10): a reply that
+// dropped every FAILED line was read as "0 failed", and no one made the changes by hand.
+const changeNs = plan.subtasks.filter(st => st.kind === 'code' && done[st.n] && done[st.n].result).map(st => st.n)
+const okNs = new Set([...applied.matchAll(/^(?:applied|no change in) subtask (\d+)\s*$/gm)].map(m => Number(m[1])))
+const failedChanges = changeNs.filter(n => !okNs.has(n))
 if (changeLines.length) log(`assemble: ${changeLines.length} code change(s) put in place, ${failedChanges.length} failed`)
 const patches = []
 const swaps = []
@@ -1027,6 +1145,10 @@ const lines = [
   '', '## Next step',
   passed ? 'Open each deliverable to confirm it is there, then report.' : 'Open each deliverable, check it against the request with your own tools, fix what is wrong, then report.',
   '**Never rewrite a deliverable whole with `Write`** - fix only what a checker named, with small `Edit`s. Each part above was solved and checked by several agents.',
+  (() => {
+    const settled = plan.subtasks.filter(st => st.kind === 'code' && functionOf(st) && /^PASS/i.test(String((done[st.n] && done[st.n].check) || ''))).map(st => `\`${functionOf(st).fn}\``)
+    return settled.length ? `**Settled - do not edit:** ${settled.join(', ')}. Each passed its docstring examples and a checker; a test you write that disagrees with one is more likely wrong than the function. Never edit a docstring.` : null
+  })(),
   sectionMode ? 'Keep exactly one `## ` heading per section, plain `-` hyphens, and every citation.' : null,
   EXAMPLES && PRISTINE && FUNCTIONS.length ? `Check code against its docstring examples with \`python3 ${q(EXAMPLES)} ${q(PRISTINE)}/FILE ${q(CWD)}/FILE\`; never add a special case for an example's values.` : null,
   'When you edit, copy `old_string` from the file itself - without the line-number prefix the Read tool shows.',

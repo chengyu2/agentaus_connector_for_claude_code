@@ -771,6 +771,43 @@ def early_deliverable_writes(calls: list, body: dict, cwd: str | None) -> list:
     return out
 
 
+WRITE_BEFORE_WORKFLOW = (
+    "Your call to `{name}` was not run. **Call `Workflow` first, and change no project file "
+    "before it.** The agent graph takes the project as it is when the workflow starts as the "
+    "original: a draft written now becomes the specification its solvers start from."
+)
+
+
+def writes_before_workflow(calls: list, body: dict, cwd: str | None) -> list:
+    """(call, correction) for each write into the working directory before the first Workflow
+    call. Measured (d10 he10): the main loop wrote ten draft functions over the stubs four seconds
+    before calling Workflow; the graph took the draft as the original, its solvers approved it,
+    and its docstring examples were lost from the "verbatim" spec."""
+    if not cwd:
+        return []
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if message.get("role") == "assistant" and isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Workflow"
+                for b in content):
+            return []
+    root = os.path.normpath(cwd) + os.sep
+    out = []
+    for call in calls:
+        if call.get("name") not in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+            continue
+        args = call.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args or "{}")
+            except ValueError:
+                continue
+        path = (args or {}).get("file_path") or (args or {}).get("notebook_path") or ""
+        if isinstance(path, str) and os.path.normpath(path).startswith(root):
+            out.append((call, WRITE_BEFORE_WORKFLOW.format(name=call.get("name"))))
+    return out
+
+
 def _where_files_go(body: dict) -> str:
     """Name the working directory, when the environment also names a scratchpad.
 

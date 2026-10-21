@@ -51,6 +51,14 @@ rounding rule could be meant), code each as a three-line function, and run every
 against each. Keep the one reading that passes **all** of them. Never branch on an example's
 literal input, and never add a rule that exists only to hit one example's output.
 
+**Every implementation's tests include the traps:** "the word X" versus "starts with the
+letters X" (`"Is"` is not the word `"I"`), how a negative number's sign and digits count,
+ties, and the boundary itself.
+
+**A task sentence that says what the code does now** ("counts ranks `< k`", "computes the
+median") describes the code under audit, not the spec. The function's name is part of the
+spec: `mean_*` is a mean; "top k" includes the k-th. Never add or rewrite a docstring.
+
 **The planner's notes are a paraphrase and may be wrong.** Where they disagree with the spec
 (the docstring, the question, the README), follow the spec and say so under `## Evidence`.
 

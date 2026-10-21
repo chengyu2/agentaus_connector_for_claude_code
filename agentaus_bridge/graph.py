@@ -1251,18 +1251,28 @@ def exact_command(body: dict) -> tuple[str, str] | None:
     assistants = [k for k, m in enumerate(messages) if m.get("role") == "assistant"]
     if not assistants:
         return "run", command
-    if len(assistants) != 1 or assistants[0] != len(messages) - 2 or messages[-1].get("role") != "user":
+    # Claude Code appends notices after the tool result as more user messages - an MCP
+    # authentication notice, a tools delta. Measured (d10): every follow-up had five messages,
+    # none was recognised, and the model took over all 49 exact-command agents - pick lines lost,
+    # FAILED lines dropped, a whole command run twice with typos.
+    # And it interleaves `system` messages (d11: roles user,system,assistant,user,system).
+    later = messages[assistants[0] + 1:] if len(assistants) == 1 else []
+    if not later or any(m.get("role") not in ("user", "system") for m in later):
+        log.info("graph exact command: follow-up not recognised (roles %s)",
+                 ",".join(str(m.get("role")) for m in messages))
         return None
     content = messages[assistants[0]].get("content")
     uses = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"] \
         if isinstance(content, list) else []
     if len(uses) != 1 or uses[0].get("name") != "Bash" \
             or (uses[0].get("input") or {}).get("command") != command:
+        log.info("graph exact command: follow-up not recognised (the assistant turn is not that Bash call)")
         return None
-    last = messages[-1].get("content")
-    results = [b for b in last if isinstance(b, dict) and b.get("type") == "tool_result"
-               and b.get("tool_use_id") == uses[0].get("id")] if isinstance(last, list) else []
+    results = [b for m in later if isinstance(m.get("content"), list) for b in m["content"]
+               if isinstance(b, dict) and b.get("type") == "tool_result"
+               and b.get("tool_use_id") == uses[0].get("id")]
     if not results:
+        log.info("graph exact command: follow-up not recognised (no tool result for the call)")
         return None
     output = _tool_result_text(results[0]).strip("\n")
     return "report", (output[:EXACT_OUTPUT_CHARS] if output.strip() else "(no output)")

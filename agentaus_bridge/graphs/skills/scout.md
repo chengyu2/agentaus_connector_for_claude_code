@@ -25,7 +25,8 @@ assembly is undone, and an edit you describe as done misleads every agent after 
    the scratch folder with a script - never type a copy yourself.
 4. **Copy, word for word:** each question the request must answer (with its file and line),
    and each code function's docstring under its name. Never restate a rule in your own words.
-5. **Stated outputs.** Copy every count, total and example output that the README or a
+5. **Stated outputs** - for code only; for a question list or documents, leave the table out
+   and copy the questions word for word under `## What is in them`. Copy every count, total and example output that the README or a
    docstring states - including prose examples ("X, with four of A and four of B, reads as
    B"). Run the code once, **unchanged**, on exactly those inputs, and record what it prints.
 

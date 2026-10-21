@@ -1069,6 +1069,33 @@ class TheGraphRoundD9Fixes(unittest.TestCase):
                 out.append(json.loads(lines["data"]))
         return out
 
+    def test_notices_after_the_tool_result_do_not_hide_it(self):
+        # Measured (d10): Claude Code sends an MCP notice and a tools delta after the tool
+        # result, as more user messages; the follow-up was not recognised and went to the model.
+        assistant, result = self.ran()
+        notice = {"role": "user", "content": [{"type": "text", "text": "The following MCP servers require authentication"}]}
+        body = self.exact_body(notice, assistant, result, notice)
+        self.assertEqual(graph.exact_command(body), ("report", "3 /tmp/s/01.md"))
+        # d11: Claude Code also interleaves system messages.
+        system = {"role": "system", "content": "context"}
+        self.assertEqual(graph.exact_command(self.exact_body(system, assistant, result, system)), ("report", "3 /tmp/s/01.md"))
+        # A second assistant turn means the model is already involved: leave it.
+        self.assertIsNone(graph.exact_command(self.exact_body(assistant, result, assistant, result)))
+
+    def test_no_project_write_before_the_first_workflow_call(self):
+        import json
+        cwd = "/w/proj"
+        write = {"name": "Write", "arguments": json.dumps({"file_path": "/w/proj/solutions.py", "content": "x"})}
+        elsewhere = {"name": "Write", "arguments": json.dumps({"file_path": "/tmp/notes.md", "content": "x"})}
+        before = {"messages": [user("ultracode: implement solutions.py")]}
+        out = augment.writes_before_workflow([write, elsewhere], before, cwd)
+        self.assertEqual([c for c, _ in out], [write])
+        self.assertIn("Call `Workflow` first", out[0][1])
+        after = {"messages": [user("ultracode: implement solutions.py"),
+                              {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Workflow", "input": {}}]},
+                              {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "launched"}]}]}
+        self.assertEqual(augment.writes_before_workflow([write], after, cwd), [])
+
     def test_an_exact_command_agent_runs_without_the_model(self):
         import json
         r = self.post(self.exact_body(), stream=False)
