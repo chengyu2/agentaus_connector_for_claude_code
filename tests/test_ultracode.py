@@ -752,6 +752,11 @@ class TheDynamicGraph(unittest.TestCase):
         args = json.loads(graph.expand(call, "ultracode: do it", cwd)["arguments"])["args"]
 
         self.assertFalse(os.path.exists(old), "the scratch folder starts empty")
+        # The earlier run's folder is set aside, not deleted. See TheGraphRoundD12Fixes.
+        [aside] = [n for n in os.listdir("/tmp/agentaus-graph")
+                   if n.startswith(os.path.basename(graph.scratch_of(cwd)) + ".prev")]
+        self.addCleanup(shutil.rmtree, os.path.join("/tmp/agentaus-graph", aside), True)
+        self.assertTrue(os.path.isdir(os.path.join("/tmp/agentaus-graph", aside, "leftover")))
         self.assertTrue(os.path.isfile(os.path.join(args["pristine"], "solutions.py")))
         self.assertFalse(os.path.exists(os.path.join(args["pristine"], ".git")))
         [text] = args["texts"]
@@ -1129,6 +1134,455 @@ class TheGraphRoundD9Fixes(unittest.TestCase):
         text = "".join(e["delta"]["text"] for e in events if e["type"] == "content_block_delta")
         self.assertEqual(text, "3 /tmp/s/01.md")
         self.assertEqual(events[-2]["delta"]["stop_reason"], "end_turn")
+
+
+class TheGraphRoundD12Fixes(unittest.TestCase):
+    """The bridge-side fixes from the d12 benchmark diagnosis (he10, c1913h, c1913)."""
+
+    CWD = "/w/d12proj"
+
+    def setUp(self):
+        from agentaus_bridge.config import settings
+        graph.forget_runs()
+        self.addCleanup(graph.forget_runs)
+        self._saved = settings.agentaus_workflow_graph, settings.agentaus_graph_kind
+        settings.agentaus_workflow_graph, settings.agentaus_graph_kind = True, "dynamic"
+
+    def tearDown(self):
+        from agentaus_bridge.config import settings
+        settings.agentaus_workflow_graph, settings.agentaus_graph_kind = self._saved
+
+    def edit(self, path="/w/d12proj/solutions.py"):
+        import json
+        return {"id": "e1", "name": "Edit", "arguments": json.dumps(
+            {"file_path": path, "old_string": "    return 1", "new_string": "    return 2"})}
+
+    def workflow(self, script="export const meta = {}"):
+        import json
+        return {"id": "w2", "name": "Workflow", "arguments": json.dumps(
+            {"script": script, "description": "Fix order_by_points"})}
+
+    def body(self, *more, request="ultracode: implement the functions in solutions.py", session="s1"):
+        return {"model": "agentaus", "max_tokens": 64, "metadata": {"user_id": f"user_x_session_{session}"},
+                "system": f"Primary working directory: {self.CWD}",
+                "tools": [tool(n) for n in ("Workflow", "Edit", "Read", "Bash", "Skill")],
+                "messages": [user(request), *more]}
+
+    def launch(self, task="ultracode: implement the functions in solutions.py", task_id="w2ejzhiq6"):
+        use = {"role": "assistant", "content": [{"type": "tool_use", "id": "wf1", "name": "Workflow", "input": {
+            "description": "Implement", "script": graph.DYNAMIC_SCRIPT, "args": {"task": task}}}]}
+        result = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "wf1", "content": (
+            f"Workflow launched in background. Task ID: {task_id}\nTranscript dir: /Users/x/.claude/projects/p")}]}
+        return use, result
+
+    def notification(self, task_id="w2ejzhiq6"):
+        return user(NOTIFICATION.replace("<task-id>w1</task-id>", f"<task-id>{task_id}</task-id>"))
+
+    def read(self, n=1):
+        return ({"role": "assistant", "content": [{"type": "tool_use", "id": f"r{n}", "name": "Read",
+                                                   "input": {"file_path": f"{self.CWD}/solutions.py"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"r{n}",
+                                              "content": "1\tdef f():\n2\t    return 1\n"}]})
+
+    def compacted(self, body):
+        # What the bridge's compaction leaves: the newest exchange only.
+        return {**body, "messages": body["messages"][-2:]}
+
+    # --- 1. Graph session state survives compaction -----------------------------------------
+
+    def test_a_graph_launch_is_remembered_past_compaction(self):
+        full = self.body(*self.launch(), self.notification(), *self.read())
+        self.assertEqual(graph.run_state(server._graph_session(full)), "reported")
+        # The compacted body has no Workflow call, and the session record still knows it ran.
+        self.assertEqual(augment.writes_before_workflow([self.edit()], self.compacted(full), self.CWD), [])
+        # Before any graph ran the write is still refused, as before.
+        self.assertEqual(len(augment.writes_before_workflow([self.edit()], self.body(session="other"), self.CWD)), 1)
+
+    def test_a_running_graph_blocks_deliverable_writes_even_when_compacted(self):
+        running = self.body(*self.launch(), *self.read())
+        server._graph_session(running)
+        out = augment.early_deliverable_writes([self.edit()], self.compacted(running), self.CWD)
+        self.assertEqual(len(out), 1)
+        self.assertIn("w2ejzhiq6", out[0][1])
+        self.assertEqual(augment.writes_before_workflow([self.edit()], self.compacted(running), self.CWD), [])
+        # The graph's own agents share the session's user_id and folder, and must still write.
+        agent = {**self.compacted(running), "system": SUBAGENT_SYSTEM + [
+            {"type": "text", "text": f"Primary working directory: {self.CWD}"}]}
+        self.assertEqual(graph.run_key(agent), graph.run_key(running))
+        self.assertEqual(augment.early_deliverable_writes([self.edit()], agent, self.CWD), [])
+
+    def test_a_second_workflow_after_the_report_is_refused(self):
+        full = self.body(*self.launch(), self.notification(), *self.read())
+        call = self.workflow()
+        [(refused, why)] = server._graph_reruns([call, self.edit()], full)
+        self.assertIs(refused, call)
+        self.assertEqual(why, server.GRAPH_ALREADY_RAN)
+        self.assertEqual(why, "Your `Workflow` call was not run: the agent graph already ran in this session "
+                              "and reported. Make the fix its result names yourself: `Read` the lines, copy "
+                              "`old_string` from that Read exactly (indentation included), and `Edit`.")
+        # Remembered as finished: refused on a body whose request and launch were compacted
+        # away (opted in only by the skill call left in it).
+        skill = ({"role": "assistant", "content": [{"type": "tool_use", "id": "sk", "name": "Skill",
+                                                    "input": {"skill": "workflow-authoring"}}]},
+                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "sk",
+                                               "content": "Launching skill: workflow-authoring"}]})
+        gone = {**full, "messages": [*skill, *self.read()]}
+        self.assertEqual(server._graph_reruns([call], gone), [(call, server.GRAPH_ALREADY_RAN)])
+        # Claude Code's own compaction summary is not a new request either.
+        summary = {**full, "messages": [user("This session is being continued from a previous conversation "
+                                             "that ran out of context. ultracode: ..."), *self.read()]}
+        self.assertEqual(len(server._graph_reruns([call], summary)), 1)
+
+    def test_a_second_workflow_while_the_first_runs_is_refused(self):
+        running = self.body(*self.launch(), *self.read())
+        [(_, why)] = server._graph_reruns([self.workflow()], running)
+        self.assertIn("already running in this session (w2ejzhiq6)", why)
+        self.assertIn("Do not start another", why)
+
+    def test_a_new_request_after_the_report_may_start_a_new_graph(self):
+        full = self.body(*self.launch(), self.notification(), user("ultracode: now do part two"))
+        self.assertEqual(server._graph_reruns([self.workflow()], full), [])
+
+    def test_the_graph_never_runs_on_an_empty_task(self):
+        import json
+        from agentaus_bridge.config import settings
+        with mock.patch.object(graph, "prepare", return_value={}):
+            # Nothing the user said is left (only the opt-in skill's call and body), and nothing
+            # is remembered: the call is left alone.
+            empty = {**self.body(), "messages": [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "sk", "name": "Skill",
+                                                   "input": {"skill": "workflow-authoring"}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "sk", "content": "Launching skill: workflow-authoring"},
+                    {"type": "text", "text": "# Workflow authoring reference"}]}]}
+            self.assertTrue(server._graph_main_loop(empty))
+            self.assertEqual(server._original_request(empty), "")
+            call = self.workflow()
+            server._run_graph_instead([call], empty)
+            self.assertNotIn(graph.DYNAMIC_SCRIPT[:200], call["arguments"])
+            # Substituted once with the request, then asked again with the request compacted
+            # away (not yet launched): the remembered task is used, not "".
+            first = self.workflow()
+            server._run_graph_instead([first], self.body())
+            task = json.loads(first["arguments"])["args"]["task"]
+            self.assertIn("implement the functions", task)
+            again = self.workflow()
+            server._run_graph_instead([again], empty)
+            self.assertEqual(json.loads(again["arguments"])["args"]["task"], task)
+        self.assertEqual(settings.agentaus_graph_kind, "dynamic")
+
+    def test_the_guards_read_the_body_the_client_sent_not_the_compacted_one(self):
+        import json
+        full = self.body(*self.launch(), self.notification(), *self.read())
+        posts = []
+
+        class Reply:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {"choices": [{"message": {"content": "", "tool_calls": [
+                    {"id": "e1", "type": "function", "function": {"name": "Edit", "arguments": json.dumps(
+                        {"file_path": f"{TheGraphRoundD12Fixes.CWD}/solutions.py",
+                         "old_string": "    return 1", "new_string": "    return 2"})}}]},
+                    "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+
+        async def upstream(*a, **k):
+            posts.append(k.get("json_body"))
+            return Reply()
+
+        async def compact(request, body, **k):
+            return self.compacted(body)
+
+        async def no_plan(*a, **k):
+            return ""
+
+        from fastapi.testclient import TestClient
+        from agentaus_bridge.config import settings
+        for stream in (False, True):
+            posts.clear()
+            with mock.patch.object(server, "_post_with_retry", upstream), \
+                    mock.patch.object(server, "_fit_to_window", compact), \
+                    mock.patch.object(server, "_plan_turn", no_plan), \
+                    mock.patch.object(settings, "upstream_stream", False), \
+                    TestClient(server.app) as client:
+                r = client.post("/v1/messages", json={**full, "stream": stream})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(len(posts), 1, "the Edit was corrected instead of forwarded")
+            self.assertIn('"name":"Edit"' if stream else "Edit", r.text.replace('": "', '":"'))
+            # The upstream copy of the compacted conversation is what was sent.
+            self.assertNotIn('"wf1"', json.dumps([m for m in posts[0]["messages"] if m["role"] != "system"]))
+
+    # --- 2. The graph's task excludes skill bodies ------------------------------------------
+
+    def test_a_skill_body_is_not_part_of_the_graphs_task(self):
+        import json
+        skill = "# Workflow authoring reference\n" + "Write scripts like this. " * 700
+        body = self.body(
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "sk", "name": "Skill",
+                                               "input": {"skill": "workflow-authoring"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "sk", "content": "Launching skill: workflow-authoring"},
+                {"type": "text", "text": skill}]},
+            user(skill),
+            user("<system-reminder>\nTodo list is empty\n</system-reminder>"))
+        self.assertEqual(server._user_texts(body), ["ultracode: implement the functions in solutions.py"])
+        call = self.workflow()
+        with mock.patch.object(graph, "prepare", return_value={}):
+            server._run_graph_instead([call], body)
+        task = json.loads(call["arguments"])["args"]["task"]
+        self.assertEqual(task, "ultracode: implement the functions in solutions.py")
+        # A real follow-up after the skill still counts.
+        later = {**body, "messages": body["messages"] + [
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}, user("also fix tests")]}
+        self.assertEqual(server._last_user_text(later), "also fix tests")
+
+    # --- 3. Keep the main loop alive while the graph runs -----------------------------------
+
+    def post(self, body, stream):
+        from fastapi.testclient import TestClient
+        def upstream(*a, **k):
+            raise AssertionError("the launched turn must not reach the model")
+        with mock.patch.object(server, "_post_with_retry", upstream), \
+                mock.patch.object(server, "_agentaus_event_stream", upstream), \
+                TestClient(server.app) as client:
+            return client.post("/v1/messages", json={**body, "stream": stream})
+
+    def test_the_launched_turn_is_answered_without_the_model(self):
+        body = self.body(*self.launch())
+        self.assertEqual(server._graph_waiting_reply(body), server.GRAPH_WAITING)
+        self.assertEqual(server.GRAPH_WAITING,
+                         "The workflow is running in the background; I will check its result when it finishes.")
+        r = self.post(body, stream=False)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["stop_reason"], "end_turn")
+        self.assertEqual(r.json()["content"], [{"type": "text", "text": server.GRAPH_WAITING}])
+        r = self.post(body, stream=True)
+        events = TheGraphRoundD9Fixes.events(None, r)
+        self.assertEqual("".join(e["delta"]["text"] for e in events if e["type"] == "content_block_delta"),
+                         server.GRAPH_WAITING)
+        self.assertEqual(events[-2]["delta"]["stop_reason"], "end_turn")
+        # The launch was noted on the way: the session now knows its graph is running.
+        self.assertEqual(graph.run_state(graph.note_run(self.compacted(body))), "running")
+
+    def test_only_the_bare_launch_result_is_answered_by_the_bridge(self):
+        use, result = self.launch()
+        typed = {**result, "content": result["content"] + [{"type": "text", "text": "and check README"}]}
+        reminded = {**result, "content": result["content"] + [
+            {"type": "text", "text": "<system-reminder>todo</system-reminder>"}]}
+        self.assertIsNone(server._graph_waiting_reply(self.body(use, typed)))
+        self.assertEqual(server._graph_waiting_reply(self.body(use, reminded)), server.GRAPH_WAITING)
+        self.assertIsNone(server._graph_waiting_reply(self.body(use, result, *self.read())))
+        rejected = {**result, "content": [{**result["content"][0], "is_error": True}]}
+        self.assertIsNone(server._graph_waiting_reply(self.body(use, rejected)))
+        plain = {**self.body(use, result), "messages": [user("total the claims"), use, result]}
+        self.assertIsNone(server._graph_waiting_reply(plain))
+
+    def test_restored_output_is_capped_to_a_share_of_the_window(self):
+        from agentaus_bridge import persisted
+        from agentaus_bridge.translate import estimate_tokens
+        folder = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, folder, True)
+        saved = os.path.join(folder, "ls.txt")
+        with open(saved, "w") as fh:
+            fh.write("/Users/x/.claude/projects/p/abc.jsonl\n" * 20000)
+        preview = f"<persisted-output>\nOutput too large (705KB). Full output saved to: {saved}\nPreview (first 2KB):\n..."
+        body = {"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "b", "content": preview}]}]}
+        whole = persisted.restore(body)["messages"][0]["content"][0]["content"]
+        capped = persisted.restore(body, 20000)["messages"][0]["content"][0]["content"]
+        self.assertGreater(estimate_tokens(whole), 40000)
+        self.assertLessEqual(estimate_tokens(capped), 20000 + 200)
+        self.assertIn("Narrow the command", capped)
+        # Two results share the budget, newest first.
+        two = {"messages": [body["messages"][0], {"role": "assistant", "content": "x"}, body["messages"][0]]}
+        out = persisted.restore(two, 20000)["messages"]
+        self.assertIn("The bridge read that file", out[2]["content"][0]["content"])
+        self.assertLessEqual(sum(estimate_tokens(m["content"][0]["content"]) for m in (out[0], out[2])), 20000 + 1000)
+
+    def test_one_huge_tool_result_is_clipped_to_fit(self):
+        from agentaus_bridge.translate import estimate_request_tokens
+        huge = "\n".join(f"/Users/x/.claude/projects/p/{i}.jsonl" for i in range(30000))
+        body = {"messages": [user("look"), {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "ls -R"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "b", "content": huge},
+                                         {"type": "tool_result", "tool_use_id": "c", "content": "small"}]}]}
+        self.assertGreater(estimate_request_tokens(body), 100000)
+        clipped, n = server._clip_largest_tool_results(body, 20000)
+        self.assertEqual(n, 1)
+        self.assertLessEqual(estimate_request_tokens(clipped), 20000)
+        self.assertGreater(estimate_request_tokens(clipped), 10000)
+        text = clipped["messages"][2]["content"][0]["content"]
+        self.assertTrue(text.startswith("/Users/x/.claude/projects/p/0.jsonl"))
+        self.assertTrue(text.endswith("29999.jsonl"))
+        self.assertIn("cut to fit the context window", text)
+        self.assertEqual(clipped["messages"][2]["content"][1]["content"], "small")
+        self.assertIs(server._clip_largest_tool_results(body, 10**7)[0], body)
+
+    def test_the_maximum_context_length_error_is_recognised_and_its_window_learned(self):
+        message = ('{"error":{"code":400,"message":"This model\'s maximum context length is 131072 tokens. '
+                   'However, you requested 0 output tokens and your prompt contains 248801 input tokens, for '
+                   'a total of 248801 tokens. Please reduce the length of the input prompt."}}')
+        self.assertTrue(server._is_over_length(message))
+        self.assertFalse(server._is_transient(message))
+        server._reset_learned_limit()
+        self.addCleanup(server._reset_learned_limit)
+        server._learn_limit_from(message)
+        self.assertEqual(server._learned_limit, 131072)
+
+    def test_an_over_window_request_is_clipped_when_it_is_fitted(self):
+        import asyncio
+        from agentaus_bridge.translate import estimate_request_tokens
+        huge = "x y z " * 200000
+        body = {"messages": [user("look"), {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "cat big"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "b", "content": huge}]}]}
+
+        class Compactor:
+            async def compact(self, body, **k):
+                return {"messages": body["messages"], "summary": None, "summarised": 0, "method": "none"}
+
+        with mock.patch.object(server, "_get_compactor", lambda request: Compactor()):
+            fitted = asyncio.run(server._fit_to_window(None, body, limit=50000, reserve=1000, scale=1.0))
+        self.assertLessEqual(estimate_request_tokens(fitted), 50000 - 1000)
+        self.assertGreater(estimate_request_tokens(fitted), 25000, "only what is over is cut")
+
+    # --- 4. apply_patch for graph agents ----------------------------------------------------
+
+    def test_apply_patch_gets_an_immediate_correction(self):
+        prompt = f"{graph.MARK}\n  ## Your skill: solve\n  Solve subtask 8"
+        body = {"messages": [user(prompt)]}
+        for command in ("apply_patch <<'EOF'\n*** Begin Patch\nEOF", "  apply_patch < p.diff",
+                        "cd /tmp/s8 && apply_patch <<'EOF'\nx\nEOF"):
+            [(_, why)] = graph.guarded_writes([{"name": "Bash", "arguments": {"command": command}}], body, None)
+            self.assertEqual(why, "`apply_patch` is not installed here. Write the file you were given instead "
+                                  "(it holds only your function), or use small `Edit`s.")
+        self.assertEqual(graph.guarded_writes(
+            [{"name": "Bash", "arguments": {"command": "grep apply_patch notes.md"}}], body, None), [])
+        # Not a graph agent: left alone.
+        self.assertEqual(graph.guarded_writes(
+            [{"name": "Bash", "arguments": {"command": "apply_patch x"}}], {"messages": [user("hi")]}, "/w"), [])
+
+    # --- 5. The graph script stays out of the main loop's history ---------------------------
+
+    def test_the_graph_script_is_not_resent_upstream(self):
+        use, result = self.launch()
+        own = {"role": "assistant", "content": [{"type": "tool_use", "id": "o", "name": "Workflow",
+                                                 "input": {"script": "export const meta = {}", "description": "mine"}}]}
+        body = self.body(use, result, own)
+        out, swapped = server._without_graph_script(body)
+        self.assertEqual(swapped, 1)
+        self.assertEqual(out["messages"][1]["content"][0]["input"],
+                         {"description": "Implement", "script": "agentaus-solve"})
+        self.assertEqual(out["messages"][3], own)
+        self.assertEqual(body["messages"][1]["content"][0]["input"]["script"], graph.DYNAMIC_SCRIPT,
+                         "the client's body is left as it was")
+        plain = self.body()
+        self.assertIs(server._without_graph_script(plain)[0], plain)
+
+    def test_compaction_keeps_the_request_and_the_report_whole(self):
+        from agentaus_bridge import compact
+        use, result = self.launch()
+        head = [user("<system-reminder>email</system-reminder>ultracode: fix the bank tool"), use, result,
+                self.notification()]
+        kept = compact.verbatim_record(head)
+        self.assertIn("ultracode: fix the bank tool", kept)
+        self.assertNotIn("email", kept)
+        self.assertIn("<task-notification>", kept)
+        self.assertIn("<task-id>w2ejzhiq6</task-id>", kept)
+        self.assertEqual(compact.verbatim_record([use]), "")
+        # And a compaction keeps them, beside the summary.
+        import asyncio
+
+        async def summarise(text):
+            return "SUMMARY"
+        body = {"system": "s", "messages": head + [
+            {"role": "assistant", "content": [{"type": "text", "text": "padding " * 400}]}] * 1 + [
+            user("x " * 1500), {"role": "assistant", "content": [{"type": "text", "text": "y " * 1500}]},
+            user("now?")]}
+        plan = asyncio.run(compact.ConversationCompactor(summarise, verify=False).compact(
+            body, limit=6000, reserve=100))
+        self.assertEqual(plan["method"], "summarised")
+        self.assertIn("ultracode: fix the bank tool", plan["summary"])
+        self.assertIn("<task-id>w2ejzhiq6</task-id>", plan["summary"])
+
+    # --- 6. Scratch per run, and budget -----------------------------------------------------
+
+    def test_earlier_scratch_folders_are_set_aside_and_two_kept(self):
+        import json, shutil
+        cwd = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cwd, True)
+        scratch = graph.scratch_of(cwd)
+        parent, base = os.path.split(scratch)
+
+        def asides():
+            return sorted(n for n in os.listdir(parent) if n.startswith(base + ".prev"))
+
+        def cleanup():
+            shutil.rmtree(scratch, True)
+            for n in asides():
+                shutil.rmtree(os.path.join(parent, n), True)
+        self.addCleanup(cleanup)
+        with open(os.path.join(cwd, "a.py"), "w") as fh:
+            fh.write("def f():\n    return 1\n")
+        for run in range(4):
+            graph.prepare(cwd)
+            with open(os.path.join(scratch, "mark"), "w") as fh:
+                fh.write(str(run))
+        self.assertEqual(len(asides()), 2)
+        def mark(folder):
+            with open(os.path.join(folder, "mark")) as fh:
+                return fh.read()
+        self.assertEqual(sorted(mark(os.path.join(parent, n)) for n in asides()), ["1", "2"],
+                         "the newest two earlier runs are kept")
+        self.assertEqual(mark(scratch), "3")
+        graph.prepare(cwd)
+        self.assertFalse(os.path.exists(os.path.join(scratch, "mark")), "each run starts a fresh folder")
+        self.assertEqual(sorted(mark(os.path.join(parent, n)) for n in asides()), ["2", "3"])
+        call = {"id": "w", "name": "Workflow", "arguments": json.dumps({"script": "x"})}
+        args = json.loads(graph.expand(call, "ultracode: do it", cwd)["arguments"])["args"]
+        self.assertEqual(args["budget_ms"], 2700000)
+
+    # --- 7. No planning pass for a graph main loop's first turn -----------------------------
+
+    def test_a_graph_main_loop_is_not_planned_before_its_workflow(self):
+        self.assertTrue(server._graph_not_started(self.body()))
+        self.assertFalse(server._graph_not_started(self.body(*self.launch())))
+        self.assertFalse(server._graph_not_started({**self.body(), "messages": [user("total the claims")]}))
+        server._graph_session(self.body(*self.launch()))
+        self.assertFalse(server._graph_not_started(self.compacted(self.body(*self.read()))))
+
+        planned = []
+
+        class Reply:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {"choices": [{"message": {"content": "Reading first."}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+
+        async def upstream(*a, **k):
+            return Reply()
+
+        async def plan(*a, **k):
+            planned.append(1)
+            return "a plan"
+
+        async def judge(*a, **k):
+            return "answer"
+
+        from fastapi.testclient import TestClient
+        with mock.patch.object(server, "_post_with_retry", upstream), \
+                mock.patch.object(server, "_plan_turn", plan), \
+                mock.patch.object(server, "_agentaus_summarise", judge), \
+                TestClient(server.app) as client:
+            r = client.post("/v1/messages", json={**self.body(session="first"), "stream": False})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(planned, [])
+            plain = {**self.body(session="plain"), "messages": [user("explain the claims total")]}
+            client.post("/v1/messages", json={**plain, "stream": False})
+            self.assertEqual(planned, [1], "an ordinary turn is still planned")
 
 
 class RewritesSeeTheWholeAnswer(unittest.TestCase):

@@ -40,7 +40,8 @@ request says otherwise. Where the documents do not hold the answer, say so - nev
    case. Run them and watch the old code fail.
 3. Change the code with small edits - never rewrite a whole file - until every test passes.
    **Never edit a docstring, README or comment to match your change, and never change a
-   function's name, arguments or defaults.**
+   function's name, arguments or defaults.** Command-line code - argument parsing, printing,
+   exiting - goes under `if __name__ == "__main__":`; importing the module must run nothing.
 4. Save the change exactly as told (one function: save that function; otherwise leave it in
    your copy's `repo` - never write a patch by hand), and save your tests to the tests file
    you are given.

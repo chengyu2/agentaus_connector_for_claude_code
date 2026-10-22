@@ -711,7 +711,15 @@ _TASK_ID = re.compile(r"Task ID:\s*([\w-]+)")
 
 
 def pending_workflows(body: dict) -> set:
-    """Task ids of workflows this conversation launched that have not reported back."""
+    """Task ids of workflows this conversation launched that have not reported back.
+
+    Pass the body as the client sent it. The session's graph record counts too: a launch that
+    compaction summarised away is still running until its notification arrives."""
+    from . import graph
+    entry = graph.note_run(body)
+    remembered = set()
+    if graph.run_state(entry) == "running":
+        remembered = {t for t in entry["launched"] - entry["reported"] if t != "?"} or {"the agent graph"}
     launched, reported = set(), set()
     for message in body.get("messages") or []:
         content = message.get("content")
@@ -729,7 +737,7 @@ def pending_workflows(body: dict) -> set:
             elif block.get("type") == "text":
                 reported.update(re.findall(r"<task-id>\s*([\w-]+)\s*</task-id>",
                                            block.get("text") or ""))
-    return launched - reported
+    return (launched - reported) | remembered
 
 
 WRITE_WHILE_RUNNING = (
@@ -782,8 +790,16 @@ def writes_before_workflow(calls: list, body: dict, cwd: str | None) -> list:
     """(call, correction) for each write into the working directory before the first Workflow
     call. Measured (d10 he10): the main loop wrote ten draft functions over the stubs four seconds
     before calling Workflow; the graph took the draft as the original, its solvers approved it,
-    and its docstring examples were lost from the "verbatim" spec."""
+    and its docstring examples were lost from the "verbatim" spec.
+
+    Pass the body as the client sent it. Measured (d12 he10, c1913h): given the compacted body,
+    whose first Workflow call had been summarised away, this refused 40 correct post-graph
+    Edits, and the model obeyed by launching a second graph. A launch the session's graph
+    record remembers counts as the Workflow call."""
     if not cwd:
+        return []
+    from . import graph
+    if graph.run_state(graph.note_run(body)) in ("running", "reported"):
         return []
     for message in body.get("messages") or []:
         content = message.get("content")

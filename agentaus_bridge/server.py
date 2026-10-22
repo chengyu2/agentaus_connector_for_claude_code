@@ -87,6 +87,7 @@ from .translate import (
     anthropic_request_to_agentaus,
     inject_bridge_tools,
     estimate_request_tokens,
+    estimate_tokens,
     raw_token_count,
     sse,
     trim_messages_to_fit,
@@ -514,7 +515,7 @@ async def _post_with_retry(
 #   "The engine prompt length 224662 exceeds the max_model_len 131072"
 # so the bridge learns the number from the API instead of trusting a constant that
 # goes stale the moment Trellis Data changes the model.
-_MAX_MODEL_LEN = re.compile(r"max_model_len\s+(\d+)")
+_MAX_MODEL_LEN = re.compile(r"max_model_len\s+(\d+)|maximum context length is\s+(\d+)")
 _learned_limit: int | None = None
 
 
@@ -530,7 +531,7 @@ def _learn_limit_from(message: str) -> None:
     match = _MAX_MODEL_LEN.search(message or "")
     if not match:
         return
-    value = int(match.group(1))
+    value = int(match.group(1) or match.group(2))
     if value > 0 and value != _learned_limit:
         _learned_limit = value
         rlog(logging.INFO, "learned Agentaus context window from the API: %d tokens", value)
@@ -1128,14 +1129,114 @@ def _writes_plain_text(body: dict) -> bool:
     return (graph.is_graph_task(body) and is_subagent_turn(body)) or _graph_main_loop(body)
 
 
+def _graph_session(body: dict) -> dict | None:
+    """This session's graph record (see graph.note_run), from the body as the client sent it."""
+    entry = graph.note_run(body)
+    if entry is not None and entry.get("said") is None:
+        # Started from a launch the bridge had no record of: what the user had said by then.
+        cut = entry.get("found_at") or 0
+        entry["said"] = _last_user_text({"messages": (body.get("messages") or [])[:cut]})
+    return entry
+
+
+GRAPH_ALREADY_RAN = (
+    "Your `Workflow` call was not run: the agent graph already ran in this session and "
+    "reported. Make the fix its result names yourself: `Read` the lines, copy `old_string` "
+    "from that Read exactly (indentation included), and `Edit`."
+)
+GRAPH_STILL_RUNNING = (
+    "Your `Workflow` call was not run: the agent graph is already running in this session "
+    "({tasks}). Do not start another. Wait for its result - it arrives in a message "
+    "containing `<task-notification>` - or end your turn saying what is running."
+)
+
+
+def _graph_reruns(calls: list, body: dict) -> list:
+    """(call, correction) for a second `Workflow` call in a session whose graph has run.
+
+    Measured (d12 he10, c1913h): a second graph, started after the first had reported, ran on
+    a 0-char task until the 7,200 s kill, and its picks would have taken he10 from 0.8 to 0.6.
+    A new request from the user since the graph started may start a new one; while one is
+    running, nothing may. Pass the body as the client sent it.
+    """
+    if not _graph_main_loop(body):
+        return []
+    workflows = [c for c in calls if c.get("name") == "Workflow"]
+    if not workflows:
+        return []
+    entry = _graph_session(body)
+    state = graph.run_state(entry)
+    if state == "running":
+        tasks = ", ".join(sorted(t for t in entry["launched"] - entry["reported"] if t != "?"))
+        return [(c, GRAPH_STILL_RUNNING.format(tasks=tasks or "launched earlier")) for c in workflows]
+    if state == "reported" and not _new_request_since(body, entry):
+        return [(c, GRAPH_ALREADY_RAN) for c in workflows]
+    return []
+
+
+def _new_request_since(body: dict, entry: dict) -> bool:
+    """Whether the user has asked for something since the graph started. Nothing said (the
+    request compacted away) and Claude Code's own compaction summary are not a new request."""
+    said = _last_user_text(body)
+    return bool(said) and said != (entry.get("said") or "") and not said.startswith(
+        "This session is being continued from a previous conversation")
+
+
+def _graph_not_started(body: dict) -> bool:
+    """A graph main loop before its first Workflow call - the body as the client sent it."""
+    if not _graph_main_loop(body) or graph.run_state(graph.note_run(body)) != "none":
+        return False
+    return not any(
+        isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Workflow"
+        for m in body.get("messages") or [] if m.get("role") == "assistant"
+        and isinstance(m.get("content"), list) for b in m["content"])
+
+
+def _without_graph_script(body: dict) -> tuple[dict, int]:
+    """`body` with each Workflow call that carries the bridge's graph cut to its description
+    and a stand-in script. Measured (d12 c1913h): one such call held 115,148 characters of
+    script, skills and inventory, and on the first request after the graph reported it alone
+    pushed the conversation into compaction - which summarised the call away."""
+    swapped = 0
+    messages = []
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if message.get("role") != "assistant" or not isinstance(content, list):
+            messages.append(message)
+            continue
+        blocks = []
+        for block in content:
+            if (isinstance(block, dict) and block.get("type") == "tool_use"
+                    and block.get("name") == "Workflow" and isinstance(block.get("input"), dict)
+                    and graph.is_graph_script(block["input"].get("script"))):
+                swapped += 1
+                block = {**block, "input": {"description": block["input"].get("description") or "",
+                                            "script": graph.SCRIPT_STAND_IN}}
+            blocks.append(block)
+        messages.append({**message, "content": blocks})
+    return ({**body, "messages": messages}, swapped) if swapped else (body, 0)
+
+
 def _run_graph_instead(calls: list, body: dict) -> None:
-    """Put the bridge's agent graph in place of a script Agentaus wrote. See graph.py."""
+    """Put the bridge's agent graph in place of a script Agentaus wrote. See graph.py.
+
+    Pass the body as the client sent it: the task is the user's request, and compaction can
+    summarise that away."""
     if not _graph_main_loop(body):
         return
     # The graph sees the whole request: on a follow-up turn, the opening request and the
     # latest message together, not only "now do the next file".
     first, last = _original_request(body), _last_user_text(body)
     task = first if not last or last == first else f"{first}\n\nFollow-up:\n{last}"
+    if not task.strip():
+        # Measured (d12 he10, c1913h): "running the agent graph for a 0-char request" - its
+        # planners invented the rules the solvers then followed.
+        task = (graph.note_run(body) or {}).get("task") or ""
+        if not task.strip():
+            if any(c.get("name") == "Workflow" for c in calls):
+                rlog(logging.WARNING, "workflow: no request to run the agent graph on; "
+                     "leaving the call alone")
+            return
     if not graph.suits(task, working_directory_of(body)):
         return
     said = "\n".join(_user_texts(body))
@@ -1150,6 +1251,7 @@ def _run_graph_instead(calls: list, body: dict) -> None:
         before = call.get("arguments")
         call["arguments"] = graph.expand(call, task, working_directory_of(body))["arguments"]
         if call["arguments"] != before:
+            graph.remember_run(body, task, _last_user_text(body))
             rlog(logging.INFO, "workflow: substituted the agent graph")
 
 
@@ -1427,12 +1529,39 @@ def _without_reminders(text: str) -> str:
     return _REMINDER.sub("", text or "").strip()
 
 
+def _launches_skill(block) -> bool:
+    if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+        return False
+    text = block.get("content")
+    if isinstance(text, list):
+        text = "\n".join(b.get("text", "") for b in text if isinstance(b, dict))
+    return "Launching skill:" in str(text or "")
+
+
 def _user_texts(body: dict) -> list:
+    """What the user said, message by message: no system reminders, no background-task
+    reports, and no skill bodies.
+
+    A skill's body arrives as user text after its `Skill` call ("Launching skill: ...").
+    Measured (d12 c1913, he10): the 17.5 KB workflow-authoring reference became the graph's
+    "Follow-up:", in every agent's prompt - solver prompts of about 40 k characters.
+    """
     out = []
+    in_skill = False
     for message in body.get("messages") or []:
+        content = message.get("content")
+        if message.get("role") == "assistant":
+            # Everything the user side sends until the next assistant turn is the skill's.
+            in_skill = isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Skill"
+                for b in content)
+            continue
         if message.get("role") != "user":
             continue
-        content = message.get("content")
+        if isinstance(content, list) and any(_launches_skill(b) for b in content):
+            in_skill = True
+        if in_skill:
+            continue
         if isinstance(content, str):
             text = _without_reminders(content)
         elif isinstance(content, list):
@@ -1441,7 +1570,7 @@ def _user_texts(body: dict) -> list:
                 if isinstance(b, dict) and b.get("type") == "text"))
         else:
             text = ""
-        if text:
+        if text and "<task-notification>" not in text:
             out.append(text)
     return out
 
@@ -1654,7 +1783,7 @@ async def _fit_to_window(
             "(~%d -> ~%d tokens)",
             plan["summarised"], target, estimated, estimate_request_tokens(fitted),
         )
-        return fitted
+        return _clipped_to(fitted, target, reserve)
     if plan["method"] == "trimmed":
         fitted = {**body, "messages": plan["messages"]}
         fitted["system"] = _with_trim_notice(body.get("system"), plan["dropped"])
@@ -1663,8 +1792,75 @@ async def _fit_to_window(
             "message(s) instead (~%d -> ~%d tokens)",
             target, plan["dropped"], estimated, estimate_request_tokens(fitted),
         )
-        return fitted
-    return body
+        return _clipped_to(fitted, target, reserve)
+    return _clipped_to(body, target, reserve)
+
+
+def _tool_result_text(block: dict) -> str | None:
+    text = block.get("content")
+    if isinstance(text, list):
+        if not all(isinstance(b, dict) and b.get("type") == "text" for b in text):
+            return None
+        return "\n".join(b.get("text", "") for b in text)
+    return text if isinstance(text, str) else None
+
+
+_CLIP_FLOOR_CHARS = 4000
+
+
+def _clip_largest_tool_results(body: dict, target: int) -> tuple[dict, int]:
+    """`body` with its largest tool results cut to head and tail until it fits `target` tokens.
+
+    Measured (d12 c1913): one 400 KB `ls -R` result sat in the unfinished last exchange, which
+    compaction never touches ("compaction result: 485857 -> 485857"), and every request after
+    it was rejected as too long. Returns (body, how many results were clipped).
+    """
+    clipped = 0
+    for _ in range(8):
+        over = estimate_request_tokens(body) - target
+        if over <= 0:
+            break
+        found = None
+        for i, message in enumerate(body.get("messages") or []):
+            if message.get("role") != "user" or not isinstance(message.get("content"), list):
+                continue
+            for j, block in enumerate(message["content"]):
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    text = _tool_result_text(block)
+                    if text and len(text) > _CLIP_FLOOR_CHARS and (
+                            found is None or len(text) > len(found[2])):
+                        found = (i, j, text)
+        if found is None:
+            break
+        i, j, text = found
+        tokens = max(estimate_tokens(text), 1)
+        # Cut what is over, and a tenth more for the estimate, never below the floor.
+        keep = max(int(len(text) * max(tokens - over, 0) / tokens * 0.9), _CLIP_FLOOR_CHARS)
+        if keep >= len(text):
+            break
+        short = _head_and_tail(text, keep * 2 // 3, keep // 3).replace(
+            " characters ...]", " characters cut to fit the context window. Print less: "
+            "counts, head, or the lines you need ...]", 1)
+        messages = list(body["messages"])
+        blocks = list(messages[i]["content"])
+        blocks[j] = {**blocks[j], "content": short}
+        messages[i] = {**messages[i], "content": blocks}
+        body = {**body, "messages": messages}
+        clipped += 1
+    return body, clipped
+
+
+def _clipped_to(body: dict, target: int, reserve: int) -> dict:
+    """`body`, its largest tool results clipped if it still does not fit after fitting."""
+    room = max(target - reserve, target // 2)
+    if estimate_request_tokens(body) <= room:
+        return body
+    clipped_body, clipped = _clip_largest_tool_results(body, room)
+    if clipped:
+        rlog(logging.WARNING, "still over the window after fitting; clipped %d large tool "
+             "result(s) to head and tail (~%d -> ~%d tokens)", clipped,
+             estimate_request_tokens(body), estimate_request_tokens(clipped_body))
+    return clipped_body
 
 
 # Failures Agentaus reports INSIDE a 200 response - an error chunk in the stream, or an
@@ -1688,7 +1884,11 @@ def _is_transient(text: str) -> bool:
 def _is_over_length(text: str) -> bool:
     """Whether an upstream error is Agentaus reporting the prompt as too long."""
     lowered = (text or "").lower()
-    return "max_model_len" in lowered or "exceeds" in lowered and "prompt" in lowered
+    # Measured (d12 c1913): "This model's maximum context length is 131072 tokens. However,
+    # ... your prompt contains 248801 input tokens" was not recognised, so the identical
+    # request was sent again three times and the run ended on the error.
+    return ("max_model_len" in lowered or "maximum context length" in lowered
+            or "exceeds" in lowered and "prompt" in lowered)
 
 
 # A timeout is only a size problem if the request does not fit. Anything at or under the
@@ -1776,39 +1976,75 @@ def _exact_command_response(body: dict, exact: tuple, model: str, wants_stream: 
     Bash call on its first request, the command's output as its reply on the second."""
     kind, value = exact
     if kind == "run":
-        call_id = f"toolu_{uuid.uuid4().hex[:24]}"
         arguments = {"command": value, "description": "Run the graph's exact command",
                      "timeout": 600000}
         rlog(logging.INFO, "graph exact command: running it without the model (%s)",
              value.split("\n", 1)[0][:120])
-    else:
-        rlog(logging.INFO, "graph exact command: replying with its output (%d chars) without "
-             "the model", len(value))
+        return _synthetic_response(body, model, wants_stream, started, "exact command",
+                                   tool=("Bash", arguments))
+    rlog(logging.INFO, "graph exact command: replying with its output (%d chars) without "
+         "the model", len(value))
+    return _synthetic_response(body, model, wants_stream, started, "exact command", text=value)
+
+
+def _synthetic_response(body: dict, model: str, wants_stream: bool, started: float, why: str,
+                        *, text: str | None = None, tool: tuple | None = None) -> Response:
+    """A whole assistant turn made by the bridge - one text block (end_turn) or one tool call
+    (tool_use) - streamed or not, as the client asked. No upstream call."""
+    call_id = f"toolu_{uuid.uuid4().hex[:24]}"
     if wants_stream:
         builder = AnthropicStreamBuilder(model, input_tokens=estimate_request_tokens(body),
                                          chunk_chars=settings.chunk_chars)
 
         async def events() -> AsyncIterator[bytes]:
             yield builder.start()
-            if kind == "run":
-                yield builder.tool_use(call_id, "Bash", arguments)
+            if tool is not None:
+                yield builder.tool_use(call_id, tool[0], tool[1])
                 yield builder.finish("tool_calls", None)
             else:
-                yield builder.text(value)
+                yield builder.text(text or "")
                 yield builder.finish("stop", None)
 
         return StreamingResponse(events(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    content = ([{"type": "tool_use", "id": call_id, "name": "Bash", "input": arguments}]
-               if kind == "run" else [{"type": "text", "text": value}])
+    content = ([{"type": "tool_use", "id": call_id, "name": tool[0], "input": tool[1]}]
+               if tool is not None else [{"type": "text", "text": text or ""}])
     rlog(logging.INFO, "POST /v1/messages model=%s route=agentaus stream=false -> 200 in %.1fs "
-         "(exact command, no upstream call)", model, time.monotonic() - started)
+         "(%s, no upstream call)", model, time.monotonic() - started, why)
     return JSONResponse({
         "id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant",
         "model": model, "content": content,
-        "stop_reason": "tool_use" if kind == "run" else "end_turn", "stop_sequence": None,
+        "stop_reason": "tool_use" if tool is not None else "end_turn", "stop_sequence": None,
         "usage": {"input_tokens": estimate_request_tokens(body), "output_tokens": 0},
     })
+
+
+GRAPH_WAITING = ("The workflow is running in the background; I will check its result when it "
+                 "finishes.")
+
+
+def _graph_waiting_reply(body: dict) -> str | None:
+    """The reply to a graph main loop's "Workflow launched in background" turn, or None.
+
+    Measured (d12 c1913): told to end its turn, the model ran `ls -R ~/.claude/projects`
+    (prompted by the launch result's "Transcript dir" line), got 705 KB, and the conversation
+    never fitted the window again - the graph's result was never read. Only when the newest
+    user message is that launch's result and holds nothing the user typed.
+    """
+    if not _graph_main_loop(body) or not awaiting_background(body):
+        return None
+    messages = [m for m in body.get("messages") or [] if m.get("role") != "system"]
+    if len(messages) < 2 or messages[-1].get("role") != "user":
+        return None
+    content, previous = messages[-1].get("content"), messages[-2].get("content")
+    uses = [b for b in previous or [] if isinstance(b, dict) and b.get("type") == "tool_use"] \
+        if isinstance(previous, list) else []
+    if not uses or any(u.get("name") != "Workflow" for u in uses) or not isinstance(content, list):
+        return None
+    if any(isinstance(b, dict) and b.get("type") == "text" and _without_reminders(b.get("text", ""))
+           for b in content):
+        return None
+    return GRAPH_WAITING
 
 
 async def _handle_agentaus(
@@ -1828,11 +2064,23 @@ async def _handle_agentaus(
     limit = _context_limit()
     reserved = int(body.get("max_tokens") or 0)
     original_estimate = estimate_request_tokens(body)
+    # The body as the client sent it. `body` is rebound to the fitted one below, and a
+    # compacted body has lost the turns the guards and the graph's task are read from.
+    received = body
 
     # An agent that runs one exact command is played by the bridge. See graph.exact_command.
     exact = graph.exact_command(body) if is_subagent_turn(body) else None
     if exact is not None:
         return _exact_command_response(body, exact, display_model, wants_stream, started)
+    if _graph_main_loop(body):
+        # Fold this request's launches and reports into the session's graph record first.
+        _graph_session(body)
+        waiting = _graph_waiting_reply(body)
+        if waiting:
+            rlog(logging.INFO, "graph main loop: the workflow is launched; replying without "
+                 "the model")
+            return _synthetic_response(body, display_model, wants_stream, started,
+                                       "workflow launched", text=waiting)
 
     # How far past its time a graph agent is, read off the request as received: fitting and
     # compaction rewrite the messages the agent is known by. See graph.overdue.
@@ -1875,7 +2123,17 @@ async def _handle_agentaus(
         # A preview standing in for a 1.6 MB listing is worse than useless - the model
         # answers from a fragment and fills the rest in. The client saved the real output
         # to disk and the bridge is on the same machine, so read it.
-        current = await asyncio.to_thread(persisted.restore, current)
+        current = await asyncio.to_thread(
+            persisted.restore, current,
+            int(limit * settings.agentaus_restore_window_share) if limit > 0 else None)
+
+        # The graph script the bridge put in a Workflow call is ~115 KB, resent upstream on
+        # every later main-loop request. The model never needs it again.
+        if not is_subagent_turn(current):
+            current, swapped = _without_graph_script(current)
+            if swapped:
+                rlog(logging.INFO, "workflow: sent %d graph call(s) upstream without the script",
+                     swapped)
 
         # Claude Code asks every model it does not know to credit Claude in its commits.
         current, credited = attribution.credit(current, settings.agentaus_coauthor)
@@ -1986,7 +2244,9 @@ async def _handle_agentaus(
                 rlog(logging.INFO, "subagent: shown its session's request (%d chars)",
                      len(parent))
 
-        if settings.agentaus_thinking and should_think(fitted):
+        # Measured (d12 c1913): the planning pass took 254 s and failed with 524 before a
+        # graph main loop's first turn reached the model - a turn whose job is to call Workflow.
+        if settings.agentaus_thinking and should_think(fitted) and not _graph_not_started(received):
             if plan_holder["text"] is None:
                 with _Phase("planning"):
                     plan_holder["text"] = await _plan_turn(client, fitted, on_plan_piece)
@@ -2088,17 +2348,23 @@ async def _handle_agentaus(
                 payload = _with_tool_results(
                     payload, invented, [_correction_for(c, known) for c in invented])
                 continue
+            # The guards and the graph's task read the body as the client sent it, not the
+            # compacted one - see _graph_reruns.
+            reruns = _graph_reruns(_theirs, received)
             # In a worker thread: preparing the graph copies the project and reads its
             # documents - measured, 9s for fourteen PDFs - and would stall every other request.
-            await asyncio.to_thread(_run_graph_instead, _theirs, body)
+            await asyncio.to_thread(_run_graph_instead,
+                                    [c for c in _theirs if all(c is not r for r, _ in reruns)],
+                                    received)
             if plain_text and graph.plain_text_writes(_theirs):
                 rlog(logging.INFO, "plain text: normalised characters in a text-file write")
-            broken = _validate_tool_calls(mine + _theirs, _tool_schemas(payload),
-                                          working_directory_of(body))
-            broken += early_deliverable_writes(_theirs, body, working_directory_of(body))
-            if _graph_main_loop(body):
-                broken += writes_before_workflow(_theirs, body, working_directory_of(body))
-            broken += graph.guarded_writes(_theirs, body, working_directory_of(body))
+            cwd = working_directory_of(received)
+            broken = _validate_tool_calls(mine + _theirs, _tool_schemas(payload), cwd)
+            broken += reruns
+            broken += early_deliverable_writes(_theirs, received, cwd)
+            if _graph_main_loop(received):
+                broken += writes_before_workflow(_theirs, received, cwd)
+            broken += graph.guarded_writes(_theirs, received, cwd)
             if broken and corrections < settings.agentaus_correction_rounds:
                 corrections += 1
                 rlog(logging.WARNING, "%d malformed tool call(s): %s; correcting",
@@ -2273,6 +2539,7 @@ async def _handle_agentaus(
                 client, prepared_payload, prepared_body, display_model, started, refit,
                 plan=None if streamed_plan else plan_holder["text"], builder=builder,
                 library=library_holder["names"], plain_text=plain_text,
+                client_body=received,
             ):
                 yield chunk
         except asyncio.CancelledError:
@@ -2313,12 +2580,16 @@ async def _agentaus_event_stream(
     builder: AnthropicStreamBuilder | None = None,
     library: frozenset = frozenset(),
     plain_text: bool = False,
+    client_body: dict | None = None,
 ) -> AsyncIterator[bytes]:
     """Produce a valid Anthropic SSE stream from an Agentaus response.
 
     `builder` is passed when the response has already started - message_start sent and
     the plan streamed live - so this continues it rather than beginning a second one.
+    `original` is the prepared (fitted, possibly compacted) body; `client_body` the body as
+    the client sent it, which the write guards and the graph's task are read from.
     """
+    received = client_body if client_body is not None else original
     if builder is None:
         builder = AnthropicStreamBuilder(
             model,
@@ -2586,15 +2857,21 @@ async def _agentaus_event_stream(
         # A well-named call with malformed arguments is rejected by the client with a
         # wall of validator internals, which costs the turn and tells the model nothing.
         # Same budget as an invented name: it is the same class of mistake.
-        await asyncio.to_thread(_run_graph_instead, theirs, original)
+        # The guards and the graph's task read the body as the client sent it, not the
+        # compacted one - see _graph_reruns.
+        reruns = _graph_reruns(theirs, received)
+        await asyncio.to_thread(_run_graph_instead,
+                                [c for c in theirs if all(c is not r for r, _ in reruns)],
+                                received)
         if plain_text and graph.plain_text_writes(theirs):
             rlog(logging.INFO, "plain text: normalised characters in a text-file write")
-        broken = _validate_tool_calls(mine + theirs, _tool_schemas(payload),
-                                      working_directory_of(original))
-        broken += early_deliverable_writes(theirs, original, working_directory_of(original))
-        if _graph_main_loop(original):
-            broken += writes_before_workflow(theirs, original, working_directory_of(original))
-        broken += graph.guarded_writes(theirs, original, working_directory_of(original))
+        cwd = working_directory_of(received)
+        broken = _validate_tool_calls(mine + theirs, _tool_schemas(payload), cwd)
+        broken += reruns
+        broken += early_deliverable_writes(theirs, received, cwd)
+        if _graph_main_loop(received):
+            broken += writes_before_workflow(theirs, received, cwd)
+        broken += graph.guarded_writes(theirs, received, cwd)
         if broken and corrections < settings.agentaus_correction_rounds:
             corrections += 1
             rlog(logging.WARNING, "%d malformed tool call(s): %s; correcting",
@@ -2644,7 +2921,7 @@ async def _agentaus_event_stream(
                 async with hold("refusal check", "urgent"):
                     verdict = await _agentaus_summarise(
                         client, CLASSIFY_REFUSAL_INSTRUCTION.format(
-                            request=_original_request(original)[:4000],
+                            request=_original_request(received)[:4000],
                             ran=ledger.render(original.get("messages") or [], limit=40)
                             or "(nothing yet)",
                             answer=_head_and_tail(answer_so_far, 2500, 1500))

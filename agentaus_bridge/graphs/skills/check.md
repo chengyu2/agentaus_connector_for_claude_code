@@ -24,6 +24,9 @@ and what the spec gives.
    you find it, FAIL and quote the line. If the brief has Stated outputs, run the program and
    compare each row.
 4. Machine-readable output (JSON, CSV): parse it with the real parser, never by eye.
+   For an Audit, FAIL only with a quoted sentence of the docstring, README or request that the
+   function breaks, and the input that shows it. `None`, unknown names, empty lists or keys the
+   spec never mentions are not bugs - handling for them changes documented behaviour.
    For code, test in the copy you are given, never in the project. A task sentence that says
    what the code does now ("counts ranks `< k`", "computes the median") describes the code
    under audit, not the spec: if the change matches the function's name, docstring and README

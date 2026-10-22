@@ -75,6 +75,10 @@ def expand(call: dict, task: str, cwd: str | None) -> dict:
                  # cap was 720 s and the graph's deadline 600 s - every forced report arrived
                  # after the graph had stopped listening.
                  "deadline_ms": (settings.agentaus_graph_agent_max_s + 120) * 1000,
+                 # Solve, merge and check together. Measured (d12): on the 3,600 s default
+                 # workflow 1 ran 4,076-4,525 s, and with the main loop after it a run did
+                 # not fit inside 7,200 s.
+                 "budget_ms": settings.agentaus_graph_budget_s * 1000,
                  **({"skills": SKILLS, **prepare(cwd)} if dynamic else {})},
     }
     log.info("workflow: running the agent graph for a %d-char request", len(task or ""))
@@ -352,6 +356,40 @@ def _make_writable(path: str) -> None:
                 pass
 
 
+PREVIOUS_SCRATCH = 2
+
+
+def _set_aside(scratch: str) -> None:
+    """Rename an earlier run's scratch folder to `<scratch>.prev<epoch>`, keeping the newest
+    PREVIOUS_SCRATCH of them. Measured (d12 he10, c1913h): a second graph deleted the first
+    one's solver copies and its pristine snapshot, so the run could not be diagnosed and the
+    second snapshot was taken of the first graph's output."""
+    parent, base = os.path.split(scratch)
+    prefix = base + ".prev"
+
+    def order(name: str) -> tuple:
+        epoch, _, n = name[len(prefix):].partition("_")
+        return (int(epoch) if epoch.isdigit() else 0, int(n) if n.isdigit() else 0)
+
+    def earlier() -> list:
+        try:
+            return sorted((e for e in os.listdir(parent or ".") if e.startswith(prefix)), key=order)
+        except OSError:
+            return []
+
+    if os.path.exists(scratch):
+        epoch = int(time.time())
+        # Two runs in one second get `_1`, `_2`: always after the ones already set aside.
+        same = [order(e)[1] for e in earlier() if order(e)[0] == epoch]
+        name = f"{prefix}{epoch}" + (f"_{max(same) + 1}" if same else "")
+        os.replace(scratch, os.path.join(parent, name))
+    kept = earlier()
+    for name in kept[:-PREVIOUS_SCRATCH] if len(kept) > PREVIOUS_SCRATCH else []:
+        path = os.path.join(parent, name)
+        _make_writable(path)
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def prepare(cwd: str | None) -> dict:
     """The args the bridge adds for the dynamic graph: pristine, texts, questions, functions,
     constants, examples. Best effort - a step that fails is logged and left out, never raised."""
@@ -362,9 +400,7 @@ def prepare(cwd: str | None) -> dict:
     scratch = scratch_of(cwd)
     started = time.monotonic()
     try:
-        if os.path.exists(scratch):
-            _make_writable(scratch)
-        shutil.rmtree(scratch, ignore_errors=True)
+        _set_aside(scratch)
         os.makedirs(scratch, exist_ok=True)
         files = _project_files(cwd)
     except Exception as exc:  # noqa: BLE001
@@ -482,6 +518,139 @@ def script_of(call: dict) -> str:
         except ValueError:
             return ""
     return (arguments or {}).get("script") or "" if isinstance(arguments, dict) else ""
+
+
+def is_graph_script(script) -> bool:
+    """Whether a Workflow script is the bridge's own graph."""
+    return isinstance(script, str) and bool(script) and script in (SCRIPT, DYNAMIC_SCRIPT)
+
+
+# The main loop's stand-in for the graph script in its own history. See server._without_graph_script.
+SCRIPT_STAND_IN = "agentaus-solve"
+
+
+# --- One graph per session, remembered past compaction ---------------------------------------
+#
+# Measured (d12 he10, c1913h): compaction summarised the first Workflow call away, the guards
+# read the compacted messages and decided no Workflow had run, 40 correct Edits were refused
+# with "Call `Workflow` first", and the model launched a second graph - on a 0-char task, since
+# the request had been summarised away too. So each graph substitution is remembered here, per
+# session, with its task, and what the client's messages show about it is folded in.
+
+_RUNS: "OrderedDict[str, dict]" = OrderedDict()
+_RUNS_LIMIT = 256
+_TASK_ID = re.compile(r"Task ID:\s*([\w-]+)")
+_REPORTED = re.compile(r"<task-id>\s*([\w-]+)\s*</task-id>")
+_NO_ID = "?"
+
+
+def run_key(body: dict) -> str | None:
+    """The session a main loop's request belongs to: Claude Code's `metadata.user_id` (it names
+    the session) and the working directory. None when neither is known."""
+    from .augment import working_directory_of
+    user = str(((body or {}).get("metadata") or {}).get("user_id") or "")
+    cwd = working_directory_of(body)
+    cwd = os.path.normpath(cwd) if cwd else ""
+    return f"{user}\x00{cwd}" if user or cwd else None
+
+
+def _keep(key: str, entry: dict) -> dict:
+    _RUNS[key] = entry
+    _RUNS.move_to_end(key)
+    while len(_RUNS) > _RUNS_LIMIT:
+        _RUNS.popitem(last=False)
+    return entry
+
+
+def remember_run(body: dict, task: str, said: str | None) -> None:
+    """Record that the graph was put in place of this session's Workflow call."""
+    key = run_key(body)
+    if key:
+        _keep(key, {"task": task, "said": said, "at": time.time(), "launched": set(),
+                    "reported": set(), "found_at": None})
+
+
+def forget_runs() -> None:
+    """Clear every session's record. For tests: it is module state."""
+    _RUNS.clear()
+
+
+def _texts_in(content) -> list:
+    if isinstance(content, str):
+        return [content]
+    return [b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text"]
+
+
+def _result_text(block: dict) -> str:
+    text = block.get("content")
+    if isinstance(text, list):
+        return "\n".join(b.get("text", "") for b in text if isinstance(b, dict))
+    return text if isinstance(text, str) else json.dumps(text)
+
+
+def note_run(body: dict) -> dict | None:
+    """This session's graph record, updated with what the client's messages show: graph
+    launches ("Workflow launched in background") and their `<task-notification>` reports.
+
+    Read the body as the client sent it, never a compacted one. A launch seen with no record
+    (the bridge restarted) starts one, with the task the graph call carried; its `found_at` is
+    the message index of that call, so the caller can fill `said`.
+
+    None for a subagent: the graph's own agents share the session's `user_id` and working
+    directory, and its assembler must write while the graph runs.
+    """
+    from .augment import is_subagent_turn
+    key = run_key(body)
+    if not key or is_subagent_turn(body):
+        return None
+    entry = _RUNS.get(key)
+    uses: dict = {}
+    launched, reported = set(), set()
+    first_use = None
+    for index, message in enumerate(body.get("messages") or []):
+        content = message.get("content")
+        if message.get("role") == "assistant" and isinstance(content, list):
+            for block in content:
+                if (isinstance(block, dict) and block.get("type") == "tool_use"
+                        and block.get("name") == "Workflow"
+                        and is_graph_script((block.get("input") or {}).get("script"))):
+                    uses[block.get("id")] = (index, ((block.get("input") or {}).get("args") or {}).get("task") or "")
+            continue
+        if message.get("role") != "user":
+            continue
+        for block in content if isinstance(content, list) else []:
+            if (isinstance(block, dict) and block.get("type") == "tool_result"
+                    and block.get("tool_use_id") in uses and not block.get("is_error")):
+                text = _result_text(block)
+                if re.search(r"Workflow launched in (the )?background", text, re.I):
+                    launched.update(_TASK_ID.findall(text) or [_NO_ID])
+                    if first_use is None:
+                        first_use = uses[block.get("tool_use_id")]
+        for text in _texts_in(content):
+            if "<task-notification>" in (text or ""):
+                reported.update(_REPORTED.findall(text))
+                if launched:
+                    reported.add(_NO_ID)
+    if entry is None:
+        if not launched:
+            return None
+        entry = _keep(key, {"task": first_use[1], "said": None, "at": time.time(),
+                            "launched": set(), "reported": set(), "found_at": first_use[0]})
+    entry["launched"] |= launched
+    entry["reported"] |= reported & (entry["launched"] | {_NO_ID})
+    return entry
+
+
+def run_state(entry: dict | None) -> str:
+    """"none", "substituted" (not yet seen launched), "running" or "reported"."""
+    if not entry:
+        return "none"
+    if not entry["launched"]:
+        return "substituted"
+    if entry["launched"] - entry["reported"] - {_NO_ID} or (
+            _NO_ID in entry["launched"] and _NO_ID not in entry["reported"]):
+        return "running"
+    return "reported"
 
 
 def is_graph_task(body: dict) -> bool:
@@ -625,6 +794,11 @@ def role_of(body: dict) -> str | None:
     return None
 
 
+NO_APPLY_PATCH = ("`apply_patch` is not installed here. Write the file you were given instead "
+                  "(it holds only your function), or use small `Edit`s.")
+_APPLY_PATCH = re.compile(r"\s*(?:cd\s+[^;&|\n]+?\s*(?:&&|;)\s*)?apply_patch\b")
+
+
 def guarded_writes(calls: list, body: dict, cwd: str | None) -> list:
     """(call, correction) for each write a graph agent may not make.
 
@@ -632,10 +806,10 @@ def guarded_writes(calls: list, body: dict, cwd: str | None) -> list:
     source file wholesale - an assembler once replaced `bank.py` with a merger's
     reconstruction of it, and the module stopped running.
     """
-    if not cwd or not is_graph_task(body):
+    if not is_graph_task(body):
         return []
     role = role_of(body)
-    root = os.path.normpath(cwd) + os.sep
+    root = os.path.normpath(cwd) + os.sep if cwd else None
     out = []
     for call in calls:
         name = call.get("name")
@@ -649,6 +823,13 @@ def guarded_writes(calls: list, body: dict, cwd: str | None) -> list:
                 continue
         if name == "Bash":
             command = (args or {}).get("command") if isinstance(args, dict) else None
+            # Measured (d12 he10): solvers ran `apply_patch` again and again - exit 127 each
+            # time, and one hung as a background task.
+            if isinstance(command, str) and _APPLY_PATCH.match(command):
+                out.append((call, NO_APPLY_PATCH))
+                continue
+            if not root:
+                continue
             if role in READ_ONLY_ROLES and isinstance(command, str) and bash_writes_into(command, cwd):
                 out.append((call, "Your command was not run: it would write into the project "
                                   f"folder, which is read-only for your role ({role}). Work in "
@@ -660,6 +841,8 @@ def guarded_writes(calls: list, body: dict, cwd: str | None) -> list:
                 out.append((call, "Your command was not run: it replaces an existing source file "
                                   "in the project whole. Run the commands you were given, or make "
                                   "small `Edit` calls."))
+            continue
+        if not root:
             continue
         path = (args or {}).get("file_path") or (args or {}).get("notebook_path") or ""
         inside = isinstance(path, str) and os.path.normpath(path).startswith(root)

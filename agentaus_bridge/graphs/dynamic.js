@@ -355,7 +355,7 @@ const STEP = /^(load|read|parse|normali[sz]e|prepare|gather (data|inputs|sources
 {
   const dropped = new Set()
   const kept = plan.subtasks.filter(st => {
-    const step = STEP.test(st.title) && !OUTPUT_MARK.test(st.title.replace(/^(write|produce|create)\s+`[^`]+`$/i, ''))
+    const step = STEP.test(st.title.replace(/`/g, '')) && !OUTPUT_MARK.test(st.title.replace(/^(write|produce|create)\s+`[^`]+`$/i, ''))
     const deliverableWriter = /^(assemble|write|compile|produce|create)\b/i.test(st.title) && plan.deliverables.some(d => st.title.includes(d.split('/').pop()))
     if ((step || deliverableWriter) && plan.subtasks.length > 1) { dropped.add(st.n); return false }
     return true
@@ -399,6 +399,10 @@ function replaceCommand(target, fn, src) {
 }
 function functionOf(st) {
   if (st.kind !== 'code') return null
+  // A feature or command-line change is a whole-copy change. Measured (d12): "Implement
+  // `--json`" named `lead_domain` as an output key, was bound to it, lost its `__main__`
+  // change, and its untouched `lead_domain` put the bug back over the fix.
+  if (/(?<![\w-])--[a-z][\w-]*|__main__|command[- ]line|\bCLI\b|^\W*Feature\b/i.test(st.title)) return null
   const text = `${st.title}\n${st.task}`
   // A constant (`SPELLING`) is not a function, and a name the code does not define is not one.
   // The function a subtask is about: a backticked name in its title, else in its task, else a
@@ -531,6 +535,34 @@ phase('Review')
         kind: 'code', deps: [], task: `Add what the request asks for, word for word:\n\n> ${sentence.trim()}\n\nKeep every existing behaviour, and run the program both with and without it.` })
     }
   }
+  // A count the docs state that the program does not print is a bug to find, not a line to
+  // confirm. Measured (d9, d10, d12 c1913h): "twelve profiles" against "bank size: 11" was
+  // planned as a check that confirms the summary, waited behind eight subtasks, never ran, and
+  // the one-character bug behind it cost six checks every time.
+  if (plan.subtasks.some(st => st.kind === 'code')) {
+    const WORDS = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, twenty: 20 }
+    const nums = t => new Set((String(t).toLowerCase().match(/\d[\d,]*|\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|twenty)\b/g) || [])
+      .map(x => String(WORDS[x] || x.replace(/,/g, ''))))
+    const rows = section(scouted, 'Stated outputs').split('\n').filter(l => /^\s*\|/.test(l) && !/^\s*\|\s*:?-{3}/.test(l)).slice(1)
+      .map(l => l.split('|').slice(1, -1).map(c => c.trim())).filter(r => r.length >= 3 && r[0] && r[2])
+    const differs = r => { const a = nums(r[0]), b = nums(r[2]); return a.size > 0 && [...a].some(x => !b.has(x)) }
+    for (const [claim, src, now] of rows.filter(differs).slice(0, 3)) {
+      added.push({ n: next++, title: `Docs: ${claim.replace(/`/g, '').slice(0, 70)} - code prints ${now.replace(/`/g, '').slice(0, 50)}`,
+        difficulty: 'hard', solvers: 2, check: true, merge: 'pick-change', kind: 'code', deps: [],
+        task: `The docs say (${src}):\n\n> ${claim}\n\nThe program prints now:\n\n> ${now}\n\nThe docs are right; the code is under audit. Run the program, find the item that is missing or extra, follow it back through each function to the line that drops or adds it, and fix that line. It is fixed when the program prints what the docs say.` })
+    }
+    // In a plan whose deliverables are code, a subtask that only confirms or verifies is
+    // a check the runtime already runs.
+    if (plan.deliverables.length && plan.deliverables.every(d => /\.(py|js|ts|mjs|cjs|sh)$/.test(d))) {
+      const confirm = st => st.kind !== 'code' && /\b(confirm|verify|verif(ies|ication)|matches|check that)\b/i.test(`${st.title}\n${st.task}`)
+      const gone = new Set(plan.subtasks.filter(confirm).map(st => st.n))
+      if (gone.size) {
+        plan.subtasks = plan.subtasks.filter(st => !gone.has(st.n))
+        for (const st of plan.subtasks) st.deps = st.deps.filter(d => !gone.has(d))
+        log(`plan: dropped confirm-only subtask(s) ${[...gone].join(', ')} - the runtime checks`)
+      }
+    }
+  }
   if (added.length) {
     plan.subtasks = plan.subtasks.concat(added).slice(0, MAX_SUBTASKS)
     log(`plan: added ${added.length} subtask(s) so every function is covered`)
@@ -622,6 +654,42 @@ for (const st of plan.subtasks) {
   if (st.difficulty !== 'easy') st.check = true
 }
 
+// One subtask per function: several bound to the same function are one, the symptom's words
+// first. Measured (d12 c1913): three subtasks were bound to `lead_domain`; each began from the
+// original, and at apply the last one's untouched copy put the bug back.
+{
+  const auditing = /\b(more|other|further|any|every|all|hidden|unreported)\b[^.\n]{0,40}\b(bugs?|problems?|issues?|errors?|defects?)\b|\baudit\b/i.test(TASK)
+  const groups = new Map()
+  for (const st of plan.subtasks) {
+    const f = functionOf(st)
+    if (!f) continue
+    const key = `${f.file}:${f.fn}`
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(st)
+  }
+  const gone = new Set()
+  for (const [, group] of groups) {
+    group.sort((a, b) => (/^\W*Audit\b/i.test(a.title) ? 1 : 0) - (/^\W*Audit\b/i.test(b.title) ? 1 : 0))
+    const [first, ...rest] = group
+    for (const st of rest) {
+      if (!/^\W*Audit\b/i.test(st.title)) first.task += `\n\nAlso, in the same function (from "${st.title}"):\n${st.task}`
+      first.solvers = Math.max(first.solvers, st.solvers)
+      gone.add(st.n)
+    }
+    // Measured (d12 c1913h): the function a symptom named was never audited, and its other
+    // bug survived three rounds.
+    const f = functionOf(first)
+    if (auditing && !/^\W*Audit\b/i.test(first.title)) {
+      first.task += `\n\nThen audit the whole of \`${f.fn}\` with the audit checklist in your skill - every threshold and constant tried on the real files, and the README's stated counts compared with what the program prints.`
+    }
+  }
+  if (gone.size) {
+    plan.subtasks = plan.subtasks.filter(st => !gone.has(st.n))
+    for (const st of plan.subtasks) st.deps = st.deps.filter(d => !gone.has(d)).map(d => d)
+    log(`plan: merged subtask(s) ${[...gone].join(', ')} into the subtask for the same function`)
+  }
+}
+
 // Code subtasks each change their own copy of the original project; none waits on another.
 // Measured (d9): a `--json` subtask waited 45 minutes behind seventeen others, then lost its
 // only run to the budget.
@@ -630,12 +698,17 @@ for (const st of plan.subtasks) {
 }
 
 // Keep the total, now the plan is final.
+// Audits give up solvers first. Measured (d12 c1913): the trim took the reported symptoms
+// down to one solver each while the audits of functions with no bug kept two.
 total = plan.subtasks.reduce((n, s) => n + s.solvers, 0)
-while (total > MAX_SOLVERS_TOTAL) {
-  const most = plan.subtasks.slice().sort((a, b) => b.solvers - a.solvers)[0]
-  if (most.solvers <= 1) break
-  most.solvers -= 1
-  total -= 1
+{
+  const audit = st => /^\W*Audit\b/i.test(st.title) ? 0 : 1
+  while (total > MAX_SOLVERS_TOTAL) {
+    const most = plan.subtasks.filter(s => s.solvers > 1).sort((a, b) => audit(a) - audit(b) || b.solvers - a.solvers)[0]
+    if (!most) break
+    most.solvers -= 1
+    total -= 1
+  }
 }
 log(`plan (final): ${plan.subtasks.length} subtask(s), ${total} solver(s)`)
 
@@ -656,10 +729,17 @@ function codeSteps(st, dir) {
     : null
   const tests = `- Save your tests as \`${dir}/tests.py\`: a plain script that imports what it tests from the project's own module and \`assert\`s, run as \`cd ${q(dir + '/repo')} && python3 ${q(dir + '/tests.py')}\`.`
   if (f) {
-    return [`\n## Your copy - this subtask is the function \`${f.fn}\` in \`${f.file}\``, copy, tests, examples,
-      `- Change only the body of \`${f.fn}\` - never its name, arguments, defaults or docstring. Put any \`import\` it needs inside the function.`,
-      `- Save the function, exactly:\n\`\`\`bash\n${extractCommand(`${dir}/repo/${f.file}`, f.fn, `${dir}/${f.fn}.py`)}\n\`\`\``,
-      `- Under \`## Change\`, give \`${dir}/${f.fn}.py\`; under \`## Tests\`, \`${dir}/tests.py\`.`].join('\n')
+    // The function alone, in its own file: the solver changes it there and puts it into its
+    // copy by command. Measured (d12 he10): ten identical stubs in one file - `Edit` found ten
+    // matches, `apply_patch` does not exist here, and 21 of 25 solvers never got a change in.
+    const own = `${dir}/${f.fn}.py`
+    const seed = `- Copy, and your function alone in its own file (safe to repeat):\n\`\`\`bash\nmkdir -p ${q(dir)} && { [ -f ${q(dir + '/.copied')} ] || { rm -rf ${q(dir + '/repo')} && mkdir -p ${q(dir + '/repo')} && cp -R ${q(BASE)}/. ${q(dir + '/repo')}/ && chmod -R u+w ${q(dir + '/repo')} && touch ${q(dir + '/.copied')} && ${extractCommand(`${dir}/repo/${f.file}`, f.fn, own).replace("<<'PY'", ">/dev/null <<'PY'")}\n}; }\ncat ${q(own)}\n\`\`\``
+    return [`\n## Your copy - this subtask is the function \`${f.fn}\` in \`${f.file}\``, seed,
+      `- **Change \`${f.fn}\` in \`${own}\`, and only there** - \`Write\` that whole small file. Never edit \`repo/${f.file}\` itself.`,
+      `- Change only the body - never its name, arguments, defaults or docstring. Put any \`import\` it needs inside the function.`,
+      `- Put it into your copy and run the examples - exactly, after every change:\n\`\`\`bash\n${replaceCommand(`${dir}/repo/${f.file}`, f.fn, own)}${EXAMPLES && PRISTINE ? `\npython3 ${q(EXAMPLES)} ${q(`${PRISTINE}/${f.file}`)} ${q(`${dir}/repo/${f.file}`)} ${f.fn}` : ''}\n\`\`\`\n  Every example line must read \`ok\`. Paste the last line under \`## Evidence\`.`,
+      tests,
+      `- Under \`## Change\`, give \`${own}\`; under \`## Tests\`, \`${dir}/tests.py\`.`].join('\n')
   }
   return ['\n## Your copy', copy, tests,
     `- **Leave your change in \`${dir}/repo\`** - the runtime reads it from there. Never write or edit a patch by hand.`,
@@ -715,16 +795,19 @@ orig=fnsrc(os.path.join(root,rel)) or ''
 rows=[]
 for c in cands:
     k,d,replied=c.split('|')
-    path=os.path.join(d,fn+'.py')
-    if not os.path.exists(path): path=os.path.join(d,'repo',rel)
-    try:
-        new=fnsrc(path)
-    except Exception as e:
-        print('candidate',k,'unreadable:',e); continue
+    # The function file, unless it is untouched and the copy holds a change.
+    path=None; new=None
+    for p in (os.path.join(d,fn+'.py'),os.path.join(d,'repo',rel)):
+        try:
+            s=fnsrc(p) if os.path.exists(p) else None
+        except Exception as e:
+            print('candidate',k,'unreadable:',p,e); s=None
+        if s and (new is None or (new.strip()==orig.strip() and s.strip()!=orig.strip())):
+            path,new=p,s
     if not new:
         print('candidate',k,'has no',fn); continue
     w=tempfile.mkdtemp(); shutil.copytree(root,w,dirs_exist_ok=True); put(os.path.join(w,rel),new)
-    bad=0
+    bad=0; out=''
     if ex!='-':
         try:
             out=subprocess.run([sys.executable,ex,os.path.join(root,rel),os.path.join(w,rel),fn],capture_output=True,text=True,timeout=120).stdout
@@ -739,12 +822,14 @@ for c in cands:
             pass
     changed=new.strip()!=orig.strip()
     print(f'candidate {k}: {path} - docstring example mismatches {bad}, pooled tests passed {passed}/{len(tests)}, replied {replied}, changed {changed}')
-    rows.append(((bad,-passed,-int(replied=='1')),k,path))
+    rows.append(((bad,-passed,-int(replied=='1')),k,path,out,changed))
 rows.sort()
+for l in (rows[0][3].splitlines() if rows else []):
+    if 'MISMATCH' in l: print('EXAMPLE', l)
 frozen=os.environ.get('PICK_OUT')
 if rows and frozen:
     os.makedirs(os.path.dirname(frozen),exist_ok=True); open(frozen,'w').write(fnsrc(rows[0][2]))
-print('CHOSEN', frozen if rows and frozen else rows[0][2] if rows else 'none', 'mismatches', rows[0][0][0] if rows else -1, 'from', rows[0][2] if rows else '-')
+print('CHOSEN', frozen if rows and frozen else rows[0][2] if rows else 'none', 'mismatches', rows[0][0][0] if rows else -1, 'from', rows[0][2] if rows else '-', 'changed', rows[0][4] if rows else False)
 `
 let pickReady = false
 const solverDir = (st, k) => `${SCRATCH}/s${st.n}/${k}`
@@ -756,11 +841,12 @@ async function pickFunction(st, f, ks, replies) {
   // The chosen function is frozen at once: a solver still running cannot change it afterwards.
   const frozen = `${SCRATCH}/chosen/s${st.n}/${f.fn}.py`
   const out = await runExactly(`pick-${st.n}`, `${installPick}\nPICK_OUT=${q(frozen)} python3 ${q(PICK)} ${q(BASE)} ${q(f.file)} ${f.fn} ${EXAMPLES && PRISTINE ? q(EXAMPLES) : '-'} ${cands.map(q).join(' ')} -- ${tests.map(q).join(' ')}`, 'Pick')
-  const m = (out || '').match(/CHOSEN (\S+) mismatches (-?\d+) from (\S+)/)
+  const m = (out || '').match(/CHOSEN (\S+) mismatches (-?\d+) from (\S+)(?: changed (\w+))?/)
   if (!m || m[1] === 'none') return null
   const k = Number((m[3].match(new RegExp(`/s${st.n}/(\\d+)/`)) || [])[1])
   const reply = replies[k] || `## Answer\nCandidate ${k}'s \`${f.fn}\` - chosen by the tests below.`
-  return { result: `${reply}\n\n## Why\n${(out.match(/^candidate .*$/gm) || []).join('\n')}`, change: m[1], dir: solverDir(st, k), mismatches: Number(m[2]) }
+  return { result: `${reply}\n\n## Why\n${(out.match(/^candidate .*$/gm) || []).join('\n')}`, change: m[1], dir: solverDir(st, k), mismatches: Number(m[2]),
+    changed: m[4] !== 'False', evidence: (out.match(/^EXAMPLE .*$/gm) || []).map(l => l.replace(/^EXAMPLE\s+/, '')).join('\n') }
 }
 
 // When every candidate breaks a docstring example, the reading of the words is wrong. One
@@ -768,14 +854,20 @@ async function pickFunction(st, f, ks, replies) {
 // ranks example mismatches first - chooses among solvers and readings alike. Measured (d9,
 // d10): every order_by_points candidate kept the planner's "absolute value" reading and failed
 // the docstring's own example; agents then patched the example's values in by hand.
-async function readings(st, f) {
-  const md = await ask(prompt('solve', `Read the spec of ${f.fn} five ways`, [
+async function readings(st, f, evidence, round) {
+  const md = await ask(prompt('solve', `Read the spec of ${f.fn} five ways${round > 1 ? ' (again)' : ''}`, [
     specOf(st), '',
-    `The obvious reading of this docstring fails at least one of its own examples. Write **five different readings** of its words - how a sign, a tie, a boundary, "the word" versus "the letters", an order or a rounding rule could be meant. Write each as one complete Python function named \`${f.fn}\`, imports inside it, in its own \`\`\`python block. Work each example through each reading; never branch on an example's literal input.`,
-  ], true), `readings-${st.n}`, 'Readings', t => (t.match(/```python/g) || []).length >= 2)
+    evidence ? `## The best candidate so far breaks these examples (what it returned is shown)\n\`\`\`text\n${evidence}\n\`\`\`` : null, '',
+    '## Method',
+    '1. List every rule the docstring states in plain words - how ties are ordered, what is included - and keep each one fixed. A reading may change only what the words leave open.',
+    '2. Work each failing example backwards: under those fixed rules, write what the function must compute for each input element for the expected output to come out (inequalities are enough).',
+    '3. Find readings of the open words that give exactly those values - the main computation (how a sign, a digit, a boundary, "the word" versus "the letters", a rounding rule is meant), not only the tie order.',
+    '4. Check every reading by hand on every example before you write it.', '',
+    `Write **five different readings**, each as one complete Python function named \`${f.fn}\`, imports inside it, in its own \`\`\`python block. Never branch on an example's literal input.`,
+  ], true), `readings-${st.n}${round > 1 ? `.${round}` : ''}`, 'Readings', t => (t.match(/```python/g) || []).length >= 2)
   if (!md) return []
   const blocks = [...md.matchAll(/```python\n([\s\S]*?)```/g)].map(x => x[1]).filter(b => new RegExp(`def ${f.fn}\\(`).test(b)).slice(0, 6)
-  const rk = blocks.map((_, j) => 21 + j)
+  const rk = blocks.map((_, j) => 10 * (round + 1) + 1 + j)
   if (!blocks.length) return []
   await runExactly(`readings-save-${st.n}`, blocks.map((b, j) =>
     `mkdir -p ${q(solverDir(st, rk[j]))} && cat > ${q(`${solverDir(st, rk[j])}/${f.fn}.py`)} <<'AGENTAUS_READING_END'\n${b}AGENTAUS_READING_END`).join('\n') + '\necho saved', 'Readings')
@@ -802,7 +894,7 @@ async function merge(st, results, strategy) {
     `${f && EXAMPLES && PRISTINE ? 4 : 3}. Run every pooled tests file from \`${SCRATCH}/m${st.n}/cN/repo\`, count the passes, and keep the candidate that passes most.`,
   ].join('\n') : null
   const merged = await ask(prompt('merge', `Merge results for subtask ${st.n}: ${st.title}`, [
-    `**Strategy:** \`${code ? 'pick-change' : strategy}\``, '', '## The subtask', `**${st.title}**`, '', nest(st.task, 3), '',
+    `**Strategy:** \`${code ? 'pick-change' : strategy}\``, '', '## The subtask', `**${st.title}**`, '', specOnly(st) ? null : nest(st.task, 3), '',
     specOf(st), '', runIt, '',
     ...results.map((r, k) => card(`Result ${k + 1}`, r, { top: 2, evidence: true })),
   ].filter(l => l !== null), !code), `merge-${st.n}`, code ? 'Pick' : 'Merge', md => code || !!section(md, 'Answer'), { pri: -1 })
@@ -846,13 +938,14 @@ function dirOf(st, result, ks, replies) {
 // A code result is tested in a copy holding that change - never in the project, which still
 // holds the old code. Measured (d9): a checker imported the project's module and failed a
 // correct change it had never loaded.
-function testCopy(st, d) {
+function testCopy(st, d, bare) {
   if (st.kind !== 'code' || !d) return null
   const f = functionOf(st)
   const c = `${SCRATCH}/c${st.n}`
   const make = f && d.change
     ? `rm -rf ${q(c)} && mkdir -p ${q(c)} && cp -R ${q(BASE)}/. ${q(c)}/ && ${replaceCommand(`${c}/${f.file}`, f.fn, d.change)}`
     : d.dir ? `rm -rf ${q(c)} && mkdir -p ${q(c)} && cp -R ${q(d.dir + '/repo')}/. ${q(c)}/` : null
+  if (bare) return make
   return make ? `## Test it in a copy holding the change - never in the project\n\`\`\`bash\n${make}\n\`\`\`\nThen run everything from \`${c}\`.` : null
 }
 
@@ -881,22 +974,38 @@ async function runSubtask(st, deps) {
   }
   let d = await decide(ks)
   if (!d) return { st, result: '', why: 'no solver returned a result' }
-  if (byScript && d.mismatches > 0) {
-    const rk = await readings(st, f)
-    if (rk.length) {
-      const again = await pickFunction(st, f, [...ks, ...rk], replies)
-      d = { ...(again || d), readings: rk }
-      log(`subtask ${st.n}: ${rk.length} reading(s) of the spec; the chosen candidate breaks ${d.mismatches} example(s)`)
-    }
+  // Up to two rounds of readings while the best candidate breaks an example - and no checker
+  // or redo then: they only restate a mismatch the script measured. Measured (d12 he10): two
+  // checkers restated it, and the redo fitted the example by breaking the docstring's tie rule.
+  let all = []
+  for (const round of [1, 2]) {
+    if (!(byScript && d.mismatches > 0)) break
+    const rk = await readings(st, f, d.evidence, round)
+    if (!rk.length) break
+    all = all.concat(rk)
+    const again = await pickFunction(st, f, [...ks, ...all], replies)
+    d = { ...(again || d), readings: all }
+    log(`subtask ${st.n}: readings round ${round}; the chosen candidate breaks ${d.mismatches} example(s)`)
   }
+  if (byScript && d.mismatches > 0) return { st, ...d, check: `unsettled: the best candidate breaks ${d.mismatches} docstring example(s)` }
+  // An audit that changed nothing needs no checker.
+  if (byScript && d.changed === false && /^\W*Audit\b/i.test(st.title)) return { st, ...d, check: 'PASS (no change: the audit found nothing to fix)' }
   if (st.check && !late) {
+    // The runtime makes the checker's copy and shows the change. Measured (d12 c1913h): 11 of
+    // 17 FAILs never built their copy, read the project's old code, and failed fixed code.
+    const c = `${SCRATCH}/c${st.n}`
+    const make = testCopy(st, d, true)
+    const ready = make && /copy ready/.test(await runExactly(`copy-${st.n}`, `${make}\necho copy ready`, 'Check') || '')
+    const diff = ready ? await runExactly(`diff-${st.n}`, `cd ${q(c)} && diff -ru -x __pycache__ -x .git ${q(BASE)} . | head -150`, 'Check') : ''
     const checkOnce = n => ask(prompt('check', `Check subtask ${st.n}: ${st.title} (checker ${n})`, [
       '## The request', '```text', TASK, '```', '',
-      '## What was asked of this part', `**${st.title}**`, '', specOf(st), '', nest(st.task, 3), '',
-      testCopy(st, d), '',
+      '## What was asked of this part', `**${st.title}**`, '', specOf(st), '', specOnly(st) ? null : nest(st.task, 3), '',
+      ready ? `## The change under check - already in \`${c}\`; the project still holds the OLD code\n\`\`\`diff\n${diff || '(no difference)'}\n\`\`\`\nRun everything from \`${c}\`. Judge only this change: a problem in code it does not touch belongs to another subtask - name it, it is not a FAIL here.` : testCopy(st, d), '',
       card('The result to check', d.result, { top: 2, evidence: true }),
     ]), `check-${st.n}${n > 1 ? `.${n}` : ''}`, 'Check', md => !!VERDICT(md), { pri: -1 })
-    const check = await checkOnce(1)
+    const tested = md => !ready || String(md).includes(c)
+    let check = await checkOnce(1)
+    if (check && /fail/i.test(VERDICT(check)) && !tested(check)) return { st, ...d, check: 'FAIL not tested in the copy - kept' }
     // A failure is acted on only when a second checker, who has not seen the first, finds it
     // too. Measured: one checker's mistaken FAIL brought in a redo that replaced three
     // solvers' correct median.
@@ -982,23 +1091,100 @@ const deliverables = [...new Set(plan.deliverables.map(inProject).filter(Boolean
 const status = (cmd, n) => cmd.includes("<<'PY'")
   ? cmd.replace("<<'PY'", `<<'PY' && echo "applied subtask ${n}" || echo "FAILED subtask ${n}"`)
   : `{ ${cmd}; } && echo "applied subtask ${n}" || echo "FAILED subtask ${n}"`
+// A whole-copy change goes in region by region - each top-level statement it changed, never a
+// function another subtask owns. Measured (d12 c1913): a table audit's patch also rewrote
+// `short`; it half-applied, and the assembler stacked its `short` edit on a correct one.
+const REGIONS = `${SCRATCH}/regions.py`
+const REGIONS_PY = String.raw`import ast,os,sys
+base,cand,live=sys.argv[1:4]; owned=set(filter(None,sys.argv[4].split(','))) if len(sys.argv)>4 else set()
+def nodes(src):
+    t=src.splitlines(True); out={}; c={}
+    for n in ast.parse(src).body:
+        if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)): k='def:'+n.name
+        elif isinstance(n,ast.If) and '__main__' in ast.unparse(n.test): k='main'
+        elif isinstance(n,(ast.Import,ast.ImportFrom)): k='import:'+ast.unparse(n)
+        elif isinstance(n,(ast.Assign,ast.AnnAssign,ast.AugAssign)): k='set:'+ast.unparse(n.targets[0] if isinstance(n,ast.Assign) else n.target)
+        else:
+            kind=type(n).__name__; c[kind]=c.get(kind,0)+1; k=kind+'#'+str(c[kind])
+        out.setdefault(k,(n.lineno-1,n.end_lineno,''.join(t[n.lineno-1:n.end_lineno])))
+    return out
+done=[]; failed=[]
+for dp,dn,fs in os.walk(cand):
+    dn[:]=[x for x in dn if x not in ('.git','__pycache__')]
+    for f in fs:
+        if not f.endswith('.py'): continue
+        rel=os.path.relpath(os.path.join(dp,f),cand); b=os.path.join(base,rel); l=os.path.join(live,rel)
+        if not os.path.exists(b) or not os.path.exists(l): continue
+        cs=open(os.path.join(dp,f)).read(); bs=open(b).read()
+        if cs==bs: continue
+        try:
+            B,C=nodes(bs),nodes(cs); src=open(l).read(); L=nodes(src)
+        except SyntaxError as e:
+            failed.append(rel+': '+str(e)); continue
+        lines=src.splitlines(True)
+        todo=[k for k in C if k in B and C[k][2]!=B[k][2] and not (k.startswith('def:') and k[4:] in owned)]
+        new=[k for k in C if k not in B and not (k.startswith('def:') and k[4:] in owned)]
+        miss=[k for k in todo if k not in L]
+        if miss:
+            failed.append(rel+': '+', '.join(miss)); continue
+        for k in sorted(todo,key=lambda k:-L[k][0]):
+            s,e,_=L[k]; lines[s:e]=[C[k][2].rstrip(chr(10))+chr(10)]
+        for k in [k for k in new if k.startswith('import:')]:
+            last=max([v[1] for kk,v in L.items() if kk.startswith('import:')] or [0]); lines.insert(last,C[k][2].rstrip(chr(10))+chr(10))
+        tail=[C[k][2] for k in new if not k.startswith('import:')]
+        if tail:
+            at=L['main'][0] if 'main' in L else len(lines)
+            lines[at:at]=[chr(10).join(x.rstrip(chr(10)) for x in tail)+chr(10)*3]
+        open(l,'w').write(''.join(lines)); done.append(rel+': '+', '.join(todo+new))
+print('regions', '; '.join(done) or 'none')
+if failed:
+    print('could not place', '; '.join(failed)); sys.exit(1)
+`
+const owners = new Map()
+for (const st of plan.subtasks) { const f = functionOf(st); if (f) owners.set(f.fn, st.n) }
 const changeLines = plan.subtasks.filter(st => st.kind === 'code' && done[st.n] && done[st.n].result).map(st => {
   const f = functionOf(st)
   const d = done[st.n]
   const change = d.change || (f && (resultOf(st).match(new RegExp(`[^\\s\`'"]+\\/${f.fn}\\.py`)) || [])[0])
-  if (f && change) return status(replaceCommand(`${CWD}/${f.file}`, f.fn, change), st.n)
+  // An unchanged function is never put back. Measured (d12 c1913): a subtask whose chosen copy
+  // was the original's put the bug back over another subtask's fix.
+  if (f && change) return d.changed === false ? `echo "no change in subtask ${st.n}"` : status(replaceCommand(`${CWD}/${f.file}`, f.fn, change), st.n)
   if (!d.dir) return null
-  const made = `${d.dir}/made.patch`
-  return `(cd ${q(d.dir)} && diff -ru -x __pycache__ -x .git ${q(BASE)} repo | sed -e "s#^--- ${BASE}#--- a#" -e "s#^+++ repo#+++ b#" > made.patch); ` +
-    `if [ -s ${q(made)} ]; then (cd ${q(CWD)} && patch -p1 --forward -F 3 < ${q(made)} >/dev/null) && echo "applied subtask ${st.n}" || echo "FAILED subtask ${st.n}"; else echo "no change in subtask ${st.n}"; fi`
+  const others = [...owners].filter(([, n]) => n !== st.n).map(([fn]) => fn).join(',')
+  return `python3 ${q(REGIONS)} ${q(BASE)} ${q(d.dir + '/repo')} ${q(CWD)} ${q(others)} && echo "applied subtask ${st.n}" || echo "FAILED subtask ${st.n}"`
 }).filter(Boolean)
-const applied = changeLines.length ? (await runExactly('apply-changes', changeLines.join('\n'), 'Assemble') || '(the changes could not be applied)') : ''
+if (changeLines.length) changeLines.unshift(`mkdir -p ${q(SCRATCH)} && cat > ${q(REGIONS)} <<'AGENTAUS_REGIONS_END'\n${REGIONS_PY}AGENTAUS_REGIONS_END`)
+const applied = changeLines.length ? (await runExactly('apply-changes', changeLines.join('\n') + `\nfind ${q(CWD)} \\( -name '*.orig' -o -name '*.rej' \\) -newer ${q(SCRATCH + '/pristine')} -delete 2>/dev/null; true`, 'Assemble') || '(the changes could not be applied)') : ''
 // A change counts as applied only when its own line says so. Measured (d10): a reply that
 // dropped every FAILED line was read as "0 failed", and no one made the changes by hand.
 const changeNs = plan.subtasks.filter(st => st.kind === 'code' && done[st.n] && done[st.n].result).map(st => st.n)
 const okNs = new Set([...applied.matchAll(/^(?:applied|no change in) subtask (\d+)\s*$/gm)].map(m => Number(m[1])))
 const failedChanges = changeNs.filter(n => !okNs.has(n))
-if (changeLines.length) log(`assemble: ${changeLines.length} code change(s) put in place, ${failedChanges.length} failed`)
+// Every changed module still imports cleanly, with a command line that is not its own.
+// Measured (d13 c1913h): a feature's solver put `args = parser.parse_args()` at module level;
+// importing the module then parsed the importer's arguments and exited, and nothing could load it.
+const IMPORTS_PY = String.raw`import filecmp,importlib.util,io,os,sys,contextlib
+base,live=sys.argv[1:3]
+for dp,dn,fs in os.walk(live):
+    dn[:]=[x for x in dn if x not in ('.git','__pycache__','node_modules','.venv','venv')]
+    for f in fs:
+        if not f.endswith('.py'): continue
+        p=os.path.join(dp,f); rel=os.path.relpath(p,live); b=os.path.join(base,rel)
+        if os.path.exists(b) and filecmp.cmp(b,p,shallow=False): continue
+        sys.argv=['import-check','--agentaus-not-an-option']; out=io.StringIO(); here=os.getcwd()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                os.chdir(os.path.dirname(p)); s=importlib.util.spec_from_file_location('m_check',p); s.loader.exec_module(importlib.util.module_from_spec(s))
+            print('IMPORT OK',rel)
+        except BaseException as e:
+            print('IMPORT FAILED',rel,type(e).__name__,(out.getvalue() or str(e))[-300:].replace(chr(10),' '))
+        finally:
+            os.chdir(here)
+`
+const importCheck = changeLines.length ? (await runExactly('import-check', `python3 - ${q(BASE)} ${q(CWD)} <<'AGENTAUS_IMPORTS_END'\n${IMPORTS_PY}AGENTAUS_IMPORTS_END`, 'Assemble') || '') : ''
+const importFailed = importCheck.match(/^IMPORT FAILED .*$/gm) || []
+if (importFailed.length) log(`assemble: ${importFailed.length} changed module(s) do not import cleanly`)
+if (changeLines.length) log(`assemble: ${changeNs.length} code change(s) put in place, ${failedChanges.length} failed`)
 const patches = []
 const swaps = []
 // Prose deliverables built from one section per subtask are written section by section:
@@ -1026,7 +1212,7 @@ if (sectionMode) {
   for (const [k, st] of plan.subtasks.entries()) sectionsWritten.push(await writeSection(k, st))
   await joinSections(deliverables[0])
 }
-const codeOnly = changeLines.length > 0 && !failedChanges.length && deliverables.every(d => /\.(py|js|ts|mjs|cjs|sh)$/.test(d))
+const codeOnly = changeLines.length > 0 && !failedChanges.length && !importFailed.length && deliverables.every(d => /\.(py|js|ts|mjs|cjs|sh)$/.test(d))
   && plan.subtasks.every(st => st.kind === 'code')
 const assembled = sectionMode ? `## Written\n- \`${deliverables[0]}\` - ${sectionsWritten.filter(Boolean).length} of ${plan.subtasks.length} sections`
   : codeOnly ? `## Written\n${applied}`
@@ -1036,6 +1222,7 @@ const assembled = sectionMode ? `## Written\n- \`${deliverables[0]}\` - ${sectio
   deliverables.length ? deliverables.map(d => `- \`${d}\``).join('\n') : `(as the request names them - in \`${CWD}\`, never in a scratch folder)`, '',
   '## Assembly', plan.assembly || 'As the request describes.', '',
   changeLines.length ? `## Code changes - already put in place by the runtime\n\`\`\`text\n${applied}\n\`\`\`\n${failedChanges.length ? `**Make each FAILED change by hand**, with small \`Edit\`s, from that subtask's Answer below: ${failedChanges.map(n => `subtask ${n}`).join(', ')}.` : 'Do not change the code again.'}` : null, '',
+  importFailed.length ? `## A changed module does not import cleanly - fix this first\n\`\`\`text\n${importFailed.join('\n')}\n\`\`\`\nImporting a module must run nothing: move command-line code (argument parsing, printing, exiting) under \`if __name__ == "__main__":\`, keeping what it does. Then import it again to check.` : null, '',
   '## Checklist - every item must end up in a deliverable, exactly as written', CHECKLIST, '',
   '## Merged results', RESULTS,
 ]), 'assemble', 'Assemble', null, { wait: true })
@@ -1061,6 +1248,7 @@ const finalPrompt = n => prompt('check', `Check the finished work (checker ${n})
   '- Each deliverable exists at its path and has every part the request asks for, in the format it asks for.',
   '- Each value or section in it **matches the merged result below**. Do **not** recompute values: they were settled by several solvers and checked. A deliverable that matches its merged result PASSES on that point.',
   '- Code still runs: **run** every command the request names, exactly as written, and the program with no arguments too.',
+  '- Importing a changed module runs nothing: argument parsing, printing or exiting at module level, outside `if __name__ == "__main__":`, is a FAIL.',
   '- Output the request asks for as JSON or CSV: pipe the exact command into the real parser (`| python3 -c "import json,sys; json.load(sys.stdin)"`). Reading it by eye is not a check; a parse error is a FAIL.',
   '- Each Python file changed: `python3 -c "import ast,sys,collections as c; print([k for k,v in c.Counter(n.name for n in ast.parse(open(sys.argv[1]).read()).body if hasattr(n,\'name\')).items() if v>1])" FILE` must print `[]` - a name defined twice means code was pasted twice: FAIL.',
   EXAMPLES && PRISTINE && FUNCTIONS.length ? `- Each Python file with docstring examples: \`python3 ${q(EXAMPLES)} ${q(PRISTINE)}/FILE ${q(CWD)}/FILE\` - a \`MISMATCH\` line is a FAIL; quote it.` : null, '',
@@ -1130,6 +1318,22 @@ if (!sectionMode && finals.length >= 2 && failing.length === finals.length && !l
 }
 for (const t of timers) clearTimeout(t)
 
+// Settled: a function whose subtask passed, that only it changed, and whose live source is still
+// the frozen choice - checked in the file, not taken from a verdict. Measured (d12 c1913): the
+// list named `short`, which the assembler had changed after its check.
+let settledLine = null
+{
+  const cands = plan.subtasks.filter(st => st.kind === 'code' && functionOf(st) && done[st.n] && done[st.n].change
+    && /^PASS/i.test(String(done[st.n].check || '')) && owners.get(functionOf(st).fn) === st.n)
+  if (cands.length) {
+    const cmp = cands.map(st => { const f = functionOf(st)
+      return `python3 - ${q(`${CWD}/${f.file}`)} ${f.fn} ${q(done[st.n].change)} <<'PY'\nimport ast,sys\nt,fn,c=sys.argv[1:4]\ndef src(p):\n    s=open(p).read(); l=s.splitlines(True)\n    for n in ast.parse(s).body:\n        if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name==fn: return ''.join(l[n.body[1 if ast.get_docstring(n) is not None and len(n.body)>1 else 0].lineno-1:n.end_lineno]).strip()\ntry:\n    print('same' if src(t)==src(c) else 'differs', fn)\nexcept Exception as e:\n    print('differs', fn)\nPY` }).join('\n')
+    const out = await runExactly('settled', cmp, 'Final check') || ''
+    const same = [...out.matchAll(/^same (\w+)/gm)].map(m => `\`${m[1]}\``)
+    if (same.length) settledLine = `**Settled - do not edit:** ${same.join(', ')}. Each passed its checks and is still the chosen version; a test you write that disagrees with one is more likely wrong than the function. Never edit a docstring.`
+  }
+}
+
 const passed = finals.length > 0 && (failing.length < finals.length || !!(recheck && /pass/i.test(VERDICT(recheck))))
 const lines = [
   `# Result: ${passed ? 'checked' : 'needs attention'}`, '',
@@ -1137,7 +1341,7 @@ const lines = [
   '## Subtasks',
   ...plan.subtasks.map(st => `- ${st.n}. ${st.title} - ${st.difficulty}, ${st.solvers} solver(s), check: ${(done[st.n] && done[st.n].check) || 'n/a'}`),
   '', '## Assembly', assembled || '(the assembler returned nothing)',
-  '', '## Final check', ...finals.map((md, k) => `- Checker ${k + 1}: ${VERDICT(md)} - ${section(md, 'Problem').slice(0, 300)}`),
+  '', '## Final check', ...finals.map((md, k) => `- Checker ${k + 1}: ${VERDICT(md)} - ${section(md, 'Problem').slice(0, 1500)}`),
   repaired.length ? `- Sections solved again and rewritten: ${repaired.join(', ')}` : null,
   fix ? `- Fixer: ${section(fix, 'Fixed').slice(0, 300)}` : null,
   recheck ? `- Re-check: ${VERDICT(recheck)} - ${section(recheck, 'Problem').slice(0, 300)}` : null,
@@ -1145,10 +1349,7 @@ const lines = [
   '', '## Next step',
   passed ? 'Open each deliverable to confirm it is there, then report.' : 'Open each deliverable, check it against the request with your own tools, fix what is wrong, then report.',
   '**Never rewrite a deliverable whole with `Write`** - fix only what a checker named, with small `Edit`s. Each part above was solved and checked by several agents.',
-  (() => {
-    const settled = plan.subtasks.filter(st => st.kind === 'code' && functionOf(st) && /^PASS/i.test(String((done[st.n] && done[st.n].check) || ''))).map(st => `\`${functionOf(st).fn}\``)
-    return settled.length ? `**Settled - do not edit:** ${settled.join(', ')}. Each passed its docstring examples and a checker; a test you write that disagrees with one is more likely wrong than the function. Never edit a docstring.` : null
-  })(),
+  settledLine,
   sectionMode ? 'Keep exactly one `## ` heading per section, plain `-` hyphens, and every citation.' : null,
   EXAMPLES && PRISTINE && FUNCTIONS.length ? `Check code against its docstring examples with \`python3 ${q(EXAMPLES)} ${q(PRISTINE)}/FILE ${q(CWD)}/FILE\`; never add a special case for an example's values.` : null,
   'When you edit, copy `old_string` from the file itself - without the line-number prefix the Read tool shows.',

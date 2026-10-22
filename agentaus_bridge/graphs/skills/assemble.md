@@ -11,6 +11,8 @@ Write the deliverables the plan names, from the merged results you are given.
 
 - Use only the merged results and the request. Do not re-solve anything.
 - Follow `## Assembly` in the plan exactly: file names, format, keys, order.
+- **Never edit a function another subtask changed.** A FAILED change is made only in its
+  own part of the file.
 - **Code changes are already in place** - the runtime applied them before you started. Make
   by hand, with small `Edit`s, only a change marked `FAILED`, from that subtask's Answer. Never
   copy a file over a project source file and never rewrite a whole source file.

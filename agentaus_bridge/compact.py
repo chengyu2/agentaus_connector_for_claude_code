@@ -291,6 +291,38 @@ def _chunk(text: str, budget_tokens: int, *, overlap_ratio: float = 0.08) -> lis
     return chunks
 
 
+_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+_NOTIFICATION = re.compile(r"<task-notification>.*?</task-notification>", re.S)
+_VERBATIM_CHARS = 12_000
+
+
+def _cut(text: str, limit: int = _VERBATIM_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit * 2 // 3] + f"\n[... {len(text) - limit} characters ...]\n" + text[-limit // 3:]
+
+
+def verbatim_record(head: list) -> str:
+    """What compaction keeps whole from the messages it summarises: the first thing the user
+    said, and every `<task-notification>` (a background workflow's result). "" if neither."""
+    first, reports = "", []
+    for message in head:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        texts = [content] if isinstance(content, str) else [
+            b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text"]
+        for text in texts:
+            reports += _NOTIFICATION.findall(text or "")
+            if not first:
+                first = _REMINDER.sub("", text or "").strip()
+    parts = []
+    if first:
+        parts.append("The user's first message, word for word:\n" + _cut(first))
+    parts += ["A background task's report, word for word:\n" + _cut(r) for r in reports]
+    return ("\n\n[Kept whole from the summarised messages]\n" + "\n\n".join(parts)) if parts else ""
+
+
 class ConversationCompactor:
     """Replaces the head of a conversation with a summary produced by the model.
 
@@ -538,6 +570,13 @@ class ConversationCompactor:
         except Exception as exc:  # fall back rather than fail the turn
             log.warning("summarisation failed (%s); falling back to trimming", exc)
 
+        # The opening request and any background-task report, word for word, when they fit.
+        # Measured (d12 c1913h): one compaction summarised the "ultracode:" request, the
+        # Workflow call and its `<task-notification>` together, and the main loop worked on
+        # from a paraphrase of both.
+        pinned = verbatim_record(head)
+        if summary and pinned and total(tail, summary + pinned) <= limit:
+            summary = summary + pinned
         if summary and total(tail, summary) <= limit:
             return {
                 "messages": tail,

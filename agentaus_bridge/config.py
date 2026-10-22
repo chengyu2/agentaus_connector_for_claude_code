@@ -402,6 +402,12 @@ class Settings:
     agentaus_restore_max_bytes: int = field(
         default_factory=lambda: _int("AGENTAUS_RESTORE_MAX_BYTES", 400_000)
     )
+    # The most of the context window everything restored in one request may take. Measured
+    # (d12 c1913): a 705 KB `ls -R` was restored to 400 KB, the request never fitted the
+    # window again, and the main loop died with the graph's result unread.
+    agentaus_restore_window_share: float = field(
+        default_factory=lambda: _float("AGENTAUS_RESTORE_WINDOW_SHARE", 0.15)
+    )
 
     # --- Tool ledger -----------------------------------------------------------------
     # Derived from the conversation, never stored, and costs no Agentaus calls. Built
@@ -603,6 +609,12 @@ class Settings:
     )
     agentaus_graph_writer_max_s: int = field(
         default_factory=lambda: _int("AGENTAUS_GRAPH_WRITER_MAX_S", 1500)
+    )
+    # The dynamic graph's budget for solve, merge and check, in seconds (args.budget_ms).
+    # Measured (d12): on the graph's 3,600 s default a workflow ran 4,076-4,525 s, and a
+    # whole run with its main loop did not fit inside 2 hours. 45 minutes leaves room.
+    agentaus_graph_budget_s: int = field(
+        default_factory=lambda: _int("AGENTAUS_GRAPH_BUDGET_S", 2700)
     )
     # Who a commit written on an Agentaus turn credits, as `Name <email>`. Claude Code asks
     # an unknown model for `Co-Authored-By: Claude Code <noreply@anthropic.com>`; the bridge

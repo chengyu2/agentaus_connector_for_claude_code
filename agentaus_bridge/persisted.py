@@ -69,8 +69,17 @@ def _read(path: str, limit_bytes: int) -> str:
     return body
 
 
-def restore(body: dict) -> dict:
+# Bytes read per token of budget. Restored output is mostly listings and logs, which run
+# about three characters a token; the estimate below checks what was actually read.
+_BYTES_PER_TOKEN = 3
+
+
+def restore(body: dict, max_tokens: int | None = None) -> dict:
     """Replace truncated tool previews with the output the client actually saved.
+
+    `max_tokens` caps everything restored into this request together, newest result first.
+    Measured (d12 c1913): a 705 KB `ls -R ~/.claude/projects` was restored to 400 KB, the
+    request never fitted the window again, and every later request was rejected as too long.
 
     Never raises, and leaves a result alone unless there is a real file to read: a
     preview is bad, and a preview replaced by nothing is worse.
@@ -79,15 +88,16 @@ def restore(body: dict) -> dict:
         return body
 
     messages = body.get("messages") or []
+    left = max_tokens if max_tokens and max_tokens > 0 else None
     changed_any = False
     out = []
-    for message in messages:
+    for message in reversed(messages):
         content = message.get("content")
         if not isinstance(content, list):
             out.append(message)
             continue
         blocks, changed = [], False
-        for block in content:
+        for block in reversed(content):
             if not (isinstance(block, dict) and block.get("type") == "tool_result"):
                 blocks.append(block)
                 continue
@@ -99,10 +109,19 @@ def restore(body: dict) -> dict:
             if not path:
                 blocks.append(block)
                 continue
-            full = _read(path, settings.agentaus_restore_max_bytes)
+            budget = settings.agentaus_restore_max_bytes
+            if left is not None:
+                budget = min(budget, left * _BYTES_PER_TOKEN)
+            full = _read(path, budget) if budget > 0 else ""
+            if left is not None and full and estimate_tokens(full) > left:
+                # Denser than three bytes a token: read proportionally less.
+                fewer = int(budget * left / estimate_tokens(full) * 0.9)
+                full = _read(path, fewer) if fewer > 0 else ""
             if not full or estimate_tokens(full) <= estimate_tokens(text):
                 blocks.append(block)
                 continue
+            if left is not None:
+                left = max(left - estimate_tokens(full), 0)
             changed = changed_any = True
             blocks.append({
                 **block,
@@ -112,9 +131,9 @@ def restore(body: dict) -> dict:
                     f"output, not a preview.]\n" + full
                 ),
             })
-        out.append({**message, "content": blocks} if changed else message)
+        out.append({**message, "content": blocks[::-1]} if changed else message)
 
     if changed_any:
         log.info("restored truncated tool output from disk")
-        return {**body, "messages": out}
+        return {**body, "messages": out[::-1]}
     return body
