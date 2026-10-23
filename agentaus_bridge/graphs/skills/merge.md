@@ -26,6 +26,8 @@ Several solvers worked the same subtask independently. Write the one result the 
   or that edited the docstring, loses.
 - Never average numbers or blend two different values.
 - Never add a fact no solver showed.
+- Drop any figure, amount, date or name a solver gave only as an example or estimate ("e.g.
+  $5 million", "around 3 years") - only figures quoted from the documents stay.
 - If every answer is wrong or empty, say so plainly rather than choosing one.
 
 ## Write back, in Markdown

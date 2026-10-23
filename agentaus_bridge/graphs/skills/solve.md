@@ -29,6 +29,10 @@ the file after each, in the form the request uses (e.g. `[proposal]`).
 source file.** If you find it, answer from it - even if your subtask says otherwise - and say
 the subtask was wrong. Write amounts with comma thousands separators (`$80,000`) unless the
 request says otherwise. Where the documents do not hold the answer, say so - never invent.
+**Every figure, amount, date, name and number you write must appear in the documents** -
+not even as an example: never "e.g. $5 million", "such as policy 12345", "typically 3 years".
+Where something is missing, say it is not in the documents and what we would supply, with no
+figure.
 
 ## Code
 
