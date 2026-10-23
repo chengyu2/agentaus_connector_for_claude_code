@@ -542,6 +542,11 @@ You do **not** write the script. The bridge runs its own agent graph: many small
 1. **Read** its result: what was planned, what each check found, and what it says failed.
 2. **Open** each deliverable and confirm it is there and answers the request.
 3. **Fix** anything the result says failed, or anything you find wrong, with your own tools.
+   - **At most three attempts per item.** If it still fails, leave it as it is and say so in
+     your report.
+   - **Never change a rule the docstring or the request states** - tie order, what counts,
+     rounding - to make one example come out. A change must keep every stated rule *and* fix
+     the example; otherwise it is not a fix.
 4. **Run** the commands in the result's Next step and every command the request names; run
    them again after your last edit, before reporting.
 5. **Report** what was done, briefly.

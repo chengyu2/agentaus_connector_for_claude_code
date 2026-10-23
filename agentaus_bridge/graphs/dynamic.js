@@ -1178,7 +1178,7 @@ const installPick = `mkdir -p ${q(SCRATCH)} && { [ -s ${q(PICK)} ] || { cat > ${
 const isAudit = st => /^\W*Audit\b/i.test(st.title)
 async function pickFunction(st, f, ks, replies, audit) {
   const cands = ks.map(k => `${k}|${solverDir(st, k)}|${replies[k] ? 1 : 0}`)
-  const tests = ks.map(k => `${solverDir(st, k)}/tests.py`)
+  const tests = [...ks.map(k => `${solverDir(st, k)}/tests.py`), ...(st.specTests || [])]
   // The chosen function is frozen at once: a solver still running cannot change it afterwards.
   const frozen = `${SCRATCH}/chosen/s${st.n}/${f.fn}.py`
   const out = await runExactly(`pick-${st.n}`, `${installPick}\nPICK_OUT=${q(frozen)}${audit ? ' PICK_AUDIT=1' : ''} PICK_S=420 python3 ${q(PICK)} ${q(BASE)} ${q(f.file)} ${f.fn} ${EXAMPLES && PRISTINE ? q(EXAMPLES) : '-'} ${cands.map(q).join(' ')} -- ${tests.map(q).join(' ')}`, 'Pick')
@@ -1191,6 +1191,56 @@ async function pickFunction(st, f, ks, replies, audit) {
   return { result: `${reply}\n\n## Why\n${(out.match(/^candidate .*$/gm) || []).join('\n')}`, change: m[1], dir: k ? solverDir(st, k) : null, mismatches: Number(m[2]),
     changed: m[4] !== 'False', votes: Number(m[5] || 1), examples: Number(m[6] || 0), picked: true,
     evidence: (out.match(/^EXAMPLE .*$/gm) || []).map(l => l.replace(/^EXAMPLE\s+/, '')).join('\n') }
+}
+
+// Consensus spec tests: three agents each write test cases from the docstring alone; a case
+// counts only when two of them wrote it. A chosen function that fails one is handled like one
+// that breaks a docstring example - readings, with the failing cases as evidence - and the
+// picker counts them. Measured (d7-d15 he10): is_bored counted "Is ..." as the word "I" and
+// passed both docstring examples every round; nothing measured the trap the words name.
+const moduleOf = file => file.replace(/\.py$/, '').split('/').join('.')
+async function specTests(st, f) {
+  const inv = FUNCTIONS.find(x => x.fn === f.fn && x.file === f.file)
+  if (!inv || !inv.doc) return []
+  const ask1 = j => ask(prompt('check', `Write test cases for ${f.fn} from its spec (writer ${j})`, [
+    specOf(st), '',
+    `Write **8 test cases** for \`${f.fn}\` from its spec alone - one per line, each exactly \`assert ${f.fn}(...) == <expected>\`, all in one \`\`\`python block, nothing else in it.`,
+    '- Aim at the traps its words name: "the word X" versus "starts with the letters X", negative numbers and their digits, ties and their order, boundaries, empty input, rounding.',
+    '- Work each expected value out by hand from the words, and check that the same rule gives every docstring example its stated result.',
+  ], true), `spec-tests-${st.n}.${j}`, 'Solve', t => /assert\s/.test(t), { pri: 1 })
+  const outs = (await parallel([1, 2, 3].map(j => () => ask1(j)))).filter(Boolean)
+  const norm = l => l.replace(/\s+/g, '')
+  const examples = new Map([...String(inv.doc).matchAll(new RegExp(`>>>\\s*(${f.fn}\\([^\\n]*\\))\\s*\\n\\s*([^\\n]+)`, 'g'))].map(m => [norm(m[1]), norm(m[2])]))
+  const count = new Map()
+  for (const md of outs) {
+    const seen = new Set()
+    for (const m of md.matchAll(new RegExp(`^\\s*assert\\s+(${f.fn}\\(.*\\))\\s*==\\s*(.+?)\\s*$`, 'gm'))) {
+      const key = `${norm(m[1])}==${norm(m[2])}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      // A case that gives a docstring example a different result is wrong by definition.
+      if (examples.has(norm(m[1])) && examples.get(norm(m[1])) !== norm(m[2])) continue
+      const c = count.get(key) || { n: 0, line: `assert ${m[1].trim()} == ${m[2].trim()}` }
+      c.n += 1
+      count.set(key, c)
+    }
+  }
+  const agreed = [...count.values()].filter(c => c.n >= 2).map(c => c.line).slice(0, 12)
+  if (!agreed.length) return []
+  const dir = `${SCRATCH}/spec/s${st.n}`
+  const files = agreed.map((_, i) => `${dir}/spec_${i + 1}.py`)
+  await runExactly(`spec-tests-save-${st.n}`, `mkdir -p ${q(dir)}\n` + agreed.map((l, i) =>
+    `cat > ${q(files[i])} <<'AGENTAUS_SPEC_END'\nfrom ${moduleOf(f.file)} import ${f.fn}\n${l}\nAGENTAUS_SPEC_END`).join('\n') + '\necho saved', 'Solve')
+  log(`subtask ${st.n}: ${agreed.length} consensus spec test(s) for ${f.fn}`)
+  return files
+}
+// The agreed cases the chosen function fails, with what it returned.
+async function specFailures(st, f, d) {
+  if (!(st.specTests && st.specTests.length && d && d.change)) return []
+  const w = `${SCRATCH}/spec/s${st.n}/w`
+  const out = await runExactly(`spec-check-${st.n}`, `rm -rf ${q(w)} && mkdir -p ${q(w)} && cp -R ${q(BASE)}/. ${q(w)}/ && {\n${replaceCommand(`${w}/${f.file}`, f.fn, d.change)}\n} >/dev/null\n` +
+    st.specTests.map(t => `(cd ${q(w)} && PYTHONPATH=${q(w)} PYTHONDONTWRITEBYTECODE=1 perl -e 'alarm 20; exec @ARGV' python3 ${q(t)} >/dev/null 2>&1) || echo "SPEC FAIL $(tail -1 ${q(t)})"`).join('\n') + '\necho checked', 'Pick') || ''
+  return out.match(/^SPEC FAIL .*$/gm) || []
 }
 
 // Think-only drafts: the function written whole, from its spec and its code now, in one call.
@@ -1369,12 +1419,14 @@ async function runSubtask(st, deps, opts = {}) {
   // Every function subtask has two independent candidates, the solver cap notwithstanding.
   const nDrafts = byScript ? Math.max(0, 2 - solving.length) : 0
   const drafted = nDrafts ? drafts(st, f, nDrafts, ph).catch(() => []) : Promise.resolve([])
+  const specs = byScript && !opts.last && !st.specTests ? specTests(st, f).catch(() => []) : Promise.resolve(st.specTests || [])
   // A code solver needs no backup: its copy on disk is read whether or not it replies.
   const outs = await parallel(solving.map(k => () => ask(solvePrompt(st, k, deps), `solve-${st.n}.${opts.last ? 'last' : k}`, ph, shown,
     { pri: k - 1, once: st.kind === 'code', deadline: opts.last ? Math.min(DEADLINE_MS, 900000) : undefined })))
   const replies = {}
   solving.forEach((k, i) => { if (outs[i]) replies[k] = outs[i] })
   const dks = await drafted
+  st.specTests = await specs
   const pool = [...every, ...dks]
   let snapped = null
   if (st.kind === 'code' && !f) {
@@ -1403,7 +1455,13 @@ async function runSubtask(st, deps, opts = {}) {
     }
     return { result, dir, votes: 1 }
   }
-  let d = await decide(pool)
+  const withSpec = async x => {
+    if (!x || !byScript) return x
+    const fails = await specFailures(st, f, x)
+    return fails.length ? { ...x, mismatches: (x.mismatches || 0) + fails.length, specFails: fails.length,
+      evidence: [x.evidence, ...fails.map(l => l.replace(/^SPEC FAIL /, 'agreed spec case fails: '))].filter(Boolean).join('\n') } : x
+  }
+  let d = await withSpec(await decide(pool))
   const nReplied = () => Object.keys(replies).length
   if (!d) return { st, result: '', why: 'no solver returned a result', solved: nReplied(), drafts: dks.length }
   // Up to two rounds of readings while the best candidate breaks an example - and no checker
@@ -1415,7 +1473,7 @@ async function runSubtask(st, deps, opts = {}) {
     const rk = await readings(st, f, d.evidence, round)
     if (!rk.length) break
     all = all.concat(rk)
-    const again = await pickFunction(st, f, [...pool, ...all], replies, audit)
+    const again = await withSpec(await pickFunction(st, f, [...pool, ...all], replies, audit))
     d = { ...(again || d), readings: all }
     log(`subtask ${st.n}: readings round ${round}; the chosen candidate breaks ${d.mismatches} example(s)`)
   }
