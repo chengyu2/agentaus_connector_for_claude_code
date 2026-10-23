@@ -46,9 +46,18 @@ and what the spec gives.
 ## Checklist
 <only if you were given a checklist: every item, `[x]` if it is right, `[ ]` and what you found if not>
 
+## Repro
+<only when you check finished code and FAIL it: one ```bash block per problem, run from the
+project folder, that exits non-zero while the problem is there and zero once it is fixed>
+
 ## Evidence
 <the commands you ran and what they printed>
 ```
 
 `FAIL` only when your evidence **shows** a problem. If you could not check, say `PASS` and
 explain under Problem.
+
+A repro is run by a script before and after any repair, and a repair is kept only when fewer
+repros fail and nothing that passed before breaks. So each repro tests exactly one problem you
+showed, from the request, a docstring or the README - never a docstring example itself (those
+already run), and never a behaviour you only think is right.

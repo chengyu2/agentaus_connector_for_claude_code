@@ -1043,8 +1043,12 @@ class TheGraphRoundD9Fixes(unittest.TestCase):
         self.assertEqual(graph.exact_command(self.exact_body()), ("run", self.COMMAND))
         self.assertEqual(graph.exact_command(self.exact_body(*self.ran())), ("report", "3 /tmp/s/01.md"))
         self.assertEqual(graph.exact_command(self.exact_body(*self.ran(output=""))), ("report", "(no output)"))
-        long = graph.exact_command(self.exact_body(*self.ran(output="x" * 9000)))
-        self.assertEqual(len(long[1]), graph.EXACT_OUTPUT_CHARS)
+        long = graph.exact_command(self.exact_body(*self.ran(output="x" * 9000 + "\nCHOSEN s3 c2")))
+        # Both ends: the graph prints its status markers last.
+        self.assertTrue(long[1].startswith("x" * 1000 + "\n[... "), long[1][:1100])
+        self.assertTrue(long[1].endswith("\nCHOSEN s3 c2"))
+        self.assertIn("chars cut ...]", long[1])
+        self.assertLess(len(long[1]), 4100)
         # Any other shape goes to the model.
         self.assertIsNone(graph.exact_command(self.exact_body(tools=("Read",))))
         assistant, result = self.ran()

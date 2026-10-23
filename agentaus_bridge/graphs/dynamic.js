@@ -41,6 +41,23 @@ const WIDTH = Math.max(1, Number((args && args.width) || 8))
 const DEADLINE_MS = Math.max(60000, Number((args && args.deadline_ms) || 840000))
 // The budget for solving, merging and checking, counted from when solving starts.
 const BUDGET_MS = Math.max(1000, Number((args && args.budget_ms) || 3600000))
+// The whole graph's clock, from when the script starts: args.total_ms is the hard end the
+// bridge sets (its own limit, minus the session's time already spent). At HARD the graph
+// stops starting model work and only the closing steps run - putting decided work in place,
+// the final check and a measured repair - each clipped; at END every wait stops and the
+// result is returned. Measured (d13 c1913): twelve subtasks were decided and checked, two
+// stragglers held the solve phase for 75 minutes, and the 7200 s kill came before Assemble -
+// the project held none of it.
+const TOTAL_MS = Math.max(120000, Number((args && args.total_ms) || 5400000))
+const CLOSE_MS = Math.min(1500000, Math.max(Math.round(TOTAL_MS * 0.22), Math.min(300000, Math.round(TOTAL_MS * 0.4))))
+const END_MS = TOTAL_MS - Math.min(120000, Math.round(TOTAL_MS * 0.03))
+// A writer (assembler, fixer) gets the bridge's writer limit, then the give-up grace.
+const WRITER_MS = Math.max(DEADLINE_MS, Number((args && args.writer_ms) || 1620000))
+// How long a straggler past its deadline is still waited for. The bridge answers an agent this
+// far past its limit with "(out of time)"; nothing is waited for longer.
+const GRACE_MS = 300000
+// An exact command's own limit: the bridge's Bash limit is 600 s.
+const EXACT_MS = 720000
 const SCOUT_MS = 360000
 const MAX_SUBTASKS = 24
 // The plan chooses solver counts; the runtime keeps the total within what the upstream can
@@ -50,17 +67,44 @@ const MAX_SUBTASKS = 24
 const MAX_SOLVERS_TOTAL = Math.min(40, WIDTH * 4)
 
 let late = false
+let hard = false
+let ended = false
 let live = 0
+let busy = 0
 const waiting = []
 // Once the budget is spent, no new solving, merging of values or checking starts. Code is
 // still merged - by running the candidates - because without it the first solver wins blind.
 const LATE_SKIPS = new Set(['Solve', 'Merge', 'Check'])
+// Phases that still run after the hard stop: putting decided work in place, and the final check.
+const CLOSING = new Set(['Assemble', 'Final check'])
+// The harness runs at most min(16, CPUs - 2) agents at once, and an agent the graph stopped
+// waiting for still counts there until it settles. Model agents leave room for exact commands.
+const HCAP = Math.max(4, Number((args && args.harness_cap) || 14))
+const HROOM = 3
 const timers = []
 function later(ms, fn) {
   const t = setTimeout(fn, ms)
   timers.push(t)
   return t
 }
+const sleep = ms => new Promise(r => later(Math.max(0, ms), () => r(null)))
+let hardNow = () => {}
+let endNow = () => {}
+const hardStop = new Promise(r => { hardNow = r })
+const endStop = new Promise(r => { endNow = r })
+later(TOTAL_MS - CLOSE_MS, () => {
+  hard = true
+  late = true
+  log('the graph\'s time is up: putting in place everything already decided')
+  // Everyone waiting wakes: the rest give up, the closing phases go on.
+  for (const w of waiting.splice(0)) w.resolve()
+  hardNow(null)
+})
+later(END_MS, () => {
+  ended = true
+  for (const w of waiting.splice(0)) w.resolve()
+  endNow(null)
+})
 function startBudget() {
   later(BUDGET_MS, () => {
     late = true
@@ -68,6 +112,7 @@ function startBudget() {
     waiting.splice(0, waiting.length, ...waiting.filter(w => !LATE_SKIPS.has(w.ph)))
   })
 }
+const stopped = ph => ended || (hard && !CLOSING.has(ph)) || (late && LATE_SKIPS.has(ph))
 
 // ---------------------------------------------------------------------------------
 // Runtime helpers
@@ -77,25 +122,40 @@ function q(path) {
   return `'${String(path).replace(/'/g, "'\\''")}'`
 }
 
+// A slot for one model agent. `fn` gets `free`, which gives the slot back while the agent may
+// still run: the graph frees the slot of every agent it stops waiting for. Measured (d13
+// c1913): two solvers held 2 of 6 slots for 75 minutes, retrying every 5. After the hard stop
+// the closing phases never wait for a slot.
 async function slot(fn, ph, pri = 0) {
-  while (live >= WIDTH) {
+  while ((live >= WIDTH || busy >= HCAP - HROOM) && !(hard && CLOSING.has(ph))) {
     await new Promise(resolve => waiting.push({ resolve, ph, pri }))
-    if (late && LATE_SKIPS.has(ph)) return null
+    if (stopped(ph)) return null
   }
+  if (stopped(ph)) return null
   live += 1
-  try { return await fn() } finally {
-    live -= 1
-    if (waiting.length) {
-      // Lowest priority number first: solver 1 of every subtask runs before solver 2 of any,
-      // so a budget cut still leaves every subtask with a result.
-      let k = waiting.reduce((best, w, i) => (w.pri < waiting[best].pri ? i : best), 0)
-      if (late) {
-        const closing = waiting.findIndex(w => !LATE_SKIPS.has(w.ph))
-        if (closing >= 0) k = closing
-      }
-      waiting.splice(k, 1)[0].resolve()
+  let held = true
+  const free = () => { if (held) { held = false; live -= 1; wake() } }
+  try { return await fn(free) } finally { free() }
+}
+function wake() {
+  let room = Math.max(1, Math.min(WIDTH - live, HCAP - HROOM - busy))
+  while (waiting.length && room-- > 0) {
+    // Lowest priority number first: solver 1 of every subtask runs before solver 2 of any,
+    // so a budget cut still leaves every subtask with a result.
+    let k = waiting.reduce((best, w, i) => (w.pri < waiting[best].pri ? i : best), 0)
+    if (late) {
+      const closing = waiting.findIndex(w => !LATE_SKIPS.has(w.ph))
+      if (closing >= 0) k = closing
     }
+    waiting.splice(k, 1)[0].resolve()
   }
+}
+// Every agent the graph starts is counted until it settles, whether or not the graph still waits.
+function launch(body, opts) {
+  busy += 1
+  const a = Promise.resolve().then(() => agent(body, opts))
+  a.then(() => { busy -= 1; wake() }, () => { busy -= 1; wake() })
+  return a
 }
 
 const READ_ONLY = new Set(['scout', 'plan', 'review-plan', 'solve', 'merge', 'check'])
@@ -116,9 +176,14 @@ function prompt(skill, title, lines, think) {
 const PLAN_SHAPED = /^\s*(i|we)('ll| will| am going to| are going to)\b|^\s*(let me|next,? i|first,? i)\b/i
 // Measured (d9 tender): a merger replied "I'm sorry, but that request is too large and complex
 // for me to handle in a single step", and that went into the deliverable as the answer to Q2.
-const REFUSAL = /^\W{0,3}(I[’']m sorry|I am sorry|sorry,|I can(?:no|[’'])t|I[’']m unable|I am unable)\b[\s\S]{0,600}?\b(too (large|complex|big)|single step|separate (actions|steps)|unable to (complete|do|help)|break (it|the task|this|the request) (in|down))/i
+// (d13 c1913): both split planners replied "I'm sorry ... can't fit ... in a single turn".
+const REFUSAL = /^\W{0,3}(I[’']m sorry|I am sorry|sorry,|I can(?:no|[’'])t|I[’']m unable|I am unable)\b[\s\S]{0,600}?\b(too (large|complex|big)|single (step|turn|response|reply)|can(?:no|[’'])t fit|separate (actions|steps)|unable to (complete|do|help)|break (it|the task|this|the request) (in|down))/i
+// The bridge answers an agent far past its limit with this, and it is no answer - not even
+// from an exact command, whose shortest output is otherwise accepted.
+const OUT_OF_TIME = /^\W*out of time\W*$/i
 function usable(text, short) {
   const t = String(text || '').trim()
+  if (t.length < 20 && OUT_OF_TIME.test(t)) return false
   return t.length >= (short ? 1 : 20) && !PLAN_SHAPED.test(t) && !REFUSAL.test(t)
 }
 // Plain keyboard characters in everything an agent hands on, so the text a checker or fixer
@@ -126,17 +191,19 @@ function usable(text, short) {
 const plain = s => String(s).replace(/[‐-‒−]/g, '-').replace(/[    ]/g, ' ').replace(/【([^】\n]{1,80})】/g, '[$1]')
 
 // One agent with a backup: a dead, empty, plan-shaped or rejected reply is asked again,
-// once. The deadline stops the waiting, not the agent, so its slot is held until it settles.
-// opts.wait: a writer (assembler, fixer) is never raced against the deadline - a backup
-// running beside a live first attempt wrote the same files at the same time.
-// The deadline runs from when the agent gets its slot, not from when it was queued, and an
-// attempt that runs past it stays in the race beside its backup: the first usable answer
+// once. The deadline runs from when the agent gets its slot, not from when it was queued, and
+// an attempt that runs past it stays in the race beside its backup: the first usable answer
 // wins. Measured (d9): the deadline counted queue time, so with 40 solvers on 6 slots most
 // "timed out" before they started, ran anyway, and 57 of 82 answers were thrown away - among
 // them all three that fixed count_top.
+// Every wait is bounded: past its deadline an attempt is waited for GRACE_MS more at most, and
+// never past the graph's own clock. Measured (d13 c1913): a code solver's single attempt was
+// awaited with no bound, ran 4503 s, and held its subtask - and the whole wave - until the kill.
+// The slot of every attempt the graph stops waiting for is freed at once.
 function firstUsable(runs, ok) {
   return new Promise(resolve => {
     let left = runs.length
+    if (!left) resolve(null)
     const settle = out => {
       const t = typeof out === 'string' ? out : out ? JSON.stringify(out) : ''
       if (ok(t)) resolve(plain(t))
@@ -149,36 +216,55 @@ function firstUsable(runs, ok) {
 // A backup still queued when an answer arrives never starts. Measured (d10): five queued
 // backups ran 15-30 minutes after their first attempt had answered, in the same solver copy,
 // and two of them reverted a correct fix. opts.once: no backup at all.
+// opts.wait: a writer (assembler, fixer) is never raced against a backup of itself - a backup
+// running beside a live first attempt wrote the same files at the same time; past the writer
+// limit and the grace it is given up. opts.exact: an exact command, which the bridge runs
+// without the model - it takes no slot and is never stopped by the budget.
 async function ask(text, label, ph, accept, opts = {}) {
   const ok = t => usable(t, opts.short) && (!accept || accept(t))
   const runs = []
+  const frees = []
   let answered = false
-  const done = out => { if (out) answered = true; return out }
+  const finish = out => { if (out) answered = true; for (const f of frees) f(); return out }
+  // The graph's clock: model work stops at the hard stop, the closing steps at END. An exact
+  // command is never cut by it - its own deadline bounds it.
+  const clock = opts.exact ? new Promise(() => {}) : CLOSING.has(ph) ? endStop : Promise.race([hardStop, endStop])
+  const giveUpOn = (opts.exact ? false : stopped(ph))
+  if (giveUpOn) return null
   for (const attempt of [1, 2]) {
-    if (opts.once && attempt === 2) return done(runs.length ? await firstUsable(runs, ok) : null)
-    if (late && LATE_SKIPS.has(ph)) return done(runs.length ? await firstUsable(runs, ok) : null)
+    if (attempt === 2 && (opts.once || (!opts.exact && stopped(ph)))) {
+      // A straggler gets the grace, never an unbounded wait.
+      return finish(runs.length ? await Promise.race([firstUsable(runs, ok), sleep(GRACE_MS), clock]) : null)
+    }
     const body = attempt === 1 ? text
       : `${text}\n\n**Backup attempt:** the previous agent returned nothing usable or a plan instead of the result. Do the work now, then reply with the result.`
     let begin = () => {}
     const begun = new Promise(r => { begin = r })
-    runs.push(slot(() => {
-      if (answered) return null
-      begin()
-      return agent(body, { label: attempt === 1 ? label : `${label}:backup`, phase: ph })
-    }, ph, (opts.pri || 0) + (attempt === 2 ? 10 : 0)))
-    let timer = null
-    const timeout = opts.wait ? new Promise(() => {}) : begun.then(() => new Promise(r => { timer = setTimeout(() => r(null), opts.deadline || DEADLINE_MS) }))
-    const out = await Promise.race([firstUsable(runs, ok), timeout])
-    if (timer !== null) clearTimeout(timer)
-    if (out) return done(out)
+    const call = () => launch(body, { label: attempt === 1 ? label : `${label}:backup`, phase: ph })
+    if (opts.exact) { begin(); runs.push(call()) }
+    else {
+      runs.push(slot(free => {
+        if (answered) return null
+        frees.push(free)
+        begin()
+        return call()
+      }, ph, (opts.pri || 0) + (attempt === 2 ? 10 : 0)))
+    }
+    const limit = opts.deadline || (opts.wait ? WRITER_MS + GRACE_MS : DEADLINE_MS)
+    let timedOut = false
+    const timeout = begun.then(() => sleep(limit)).then(() => { timedOut = true; return null })
+    const out = await Promise.race([firstUsable(runs, ok), timeout, clock])
+    if (out) return finish(out)
+    if (ended || (!opts.exact && hard && !CLOSING.has(ph))) return finish(null)
+    if (opts.wait && timedOut) return finish(null)
   }
-  return null
+  return finish(null)
 }
 
 // The headings agents write back. A section runs to the next of these at its level or above,
 // not to the next heading of any kind: an answer holding its own `### Fee` or `## Q3` lost
 // everything after it.
-const KEYS = 'Answer|Key values|Evidence|Change|Tests|Why|Problem|Problems|Written|Fixed|Checklist|Verdict|Deliverables|Assembly|Plan|Brief|Subtask\\s*\\d+.*'
+const KEYS = 'Answer|Key values|Evidence|Change|Tests|Why|Problem|Problems|Repro|Written|Fixed|Checklist|Verdict|Deliverables|Assembly|Plan|Brief|Subtask\\s*\\d+.*'
 function section(md, heading) {
   const text = String(md || '')
   const m = text.match(new RegExp(`^(#{1,3})\\s*${heading}\\s*:?\\s*$`, 'im'))
@@ -244,9 +330,11 @@ function card(title, md, opts = {}) {
   ].filter(l => l !== null).join('\n')
 }
 
-const FILES_MISSING = /\b(files?|data|inputs?|xlsx|csv|docx|directory|project)\b[^.\n]{0,80}\b(missing|not present|absent|do(es)? not exist|not found)\b/i
 // A result must show its work, and must not claim the inputs are missing - that was always
-// written without looking.
+// written without looking. Only a claim about the files themselves: "the documents do not
+// state the fee" or "not found in the RFQ files" is an honest answer. Measured: the wider
+// pattern (any file word within 80 characters of "not found") rejected those.
+const FILES_MISSING = /\bno such file\b|\b(the )?(input )?(files?|directory|folder|xlsx|csv|docx|pdfs?)\b[^.\n]{0,30}\b(are|is|were|was) (missing|absent|not present|empty)\b|\b(files?|directory|folder)\b[^.\n]{0,30}\bdo(es)? not exist\b/i
 const shown = md => section(md, 'Evidence').length >= 20 && !FILES_MISSING.test(section(md, 'Answer'))
 
 // ---------------------------------------------------------------------------------
@@ -284,6 +372,17 @@ function parsePlan(md) {
       deps, task,
     })
   })
+  // A number used twice is two subtasks: the second gets a fresh number. Sharing one, they
+  // shared a result and a solver folder.
+  const seen = new Set()
+  let spare = Math.max(0, ...subtasks.map(st => st.n)) + 1
+  for (const st of subtasks) {
+    if (!seen.has(st.n)) { seen.add(st.n); continue }
+    const old = st.n
+    st.n = spare++
+    seen.add(st.n)
+    st.deps = st.deps.filter(d => d !== old)
+  }
   return { deliverables, subtasks: subtasks.slice(0, MAX_SUBTASKS), assembly: section(text, 'Assembly'), markdown: text }
 }
 
@@ -469,6 +568,12 @@ function specOf(st) {
   }
 }
 
+// Whether the request says there may be problems nobody reported.
+const AUDITING = /\b(more|other|further|any|every|all|hidden|unreported)\b[^.\n]{0,40}\b(bugs?|problems?|issues?|errors?|defects?)\b|\baudit\b/i.test(TASK)
+// Whole-file subtasks no planner could split: their symptoms are handed to the Audits.
+const unsplit = []
+// A sentence that only asks for an audit or names a flag is no symptom (flags get a Feature).
+const AUDITING_ONLY = /^\W*(there may be|also|please|and)\b|\b(more|other|further|hidden|unreported) (bugs?|problems?|issues?)\b|(?<![\w-])--[a-z]/i
 // A code subtask that is a whole file - "`tools/bank.py`", fix everything - is split by one
 // more planner into one subtask per reported symptom and per function to audit. Two rounds
 // of planners kept producing it whatever their skill said.
@@ -483,7 +588,26 @@ phase('Review')
       'Write only the `## Subtask N: ...` sections, numbered from 1.', '',
       '## The request', '```text', TASK, '```', '', '## The subtask', st.task, '', '## The brief from the scout', brief,
     ], true), `split-${st.n}`, 'Review', md => parsePlan(md).subtasks.length > 1)
-    if (!md) continue
+      // A refused split is asked once more, smaller: the request and the file's functions,
+      // without the brief. Measured (d13 c1913): both splitters replied "I'm sorry ... can't
+      // fit", the whole file went to five solvers for up to 1042 s and a merger for 833 s.
+      || await ask(prompt('plan', `Split the code subtask "${st.title}" (short)`, [
+        'Split this code subtask into subtasks in the plan format: one per symptom the request reports' + (AUDITING ? ', and one `Audit \\`function\\`` subtask per function below' : '') + '. Each is `Kind: code`, `Difficulty: medium`, `Merge: pick-change`, and its Task names the function and the file. Write only the `## Subtask N: ...` sections, numbered from 1.', '',
+        '## The request', '```text', TASK, '```', '',
+        FUNCTIONS.length ? ['## The functions', ...FUNCTIONS.slice(0, 60).map(f => `- \`${f.fn}\` in \`${f.file}\``)].join('\n') : null,
+      ], true), `split-${st.n}.short`, 'Review', md => parsePlan(md).subtasks.length > 1)
+    if (!md) {
+      // Still refused. When the request asks for an audit, the coverage pass below gives every
+      // function its own Audit, so the whole file is dropped and its symptoms go to the Audits
+      // they name; otherwise it stays - it may be the only subtask there is.
+      if (AUDITING && FUNCTIONS.length) {
+        unsplit.push(st)
+        plan.subtasks = plan.subtasks.filter(o => o !== st)
+        for (const o of plan.subtasks) o.deps = o.deps.filter(d => d !== st.n)
+        log(`plan: subtask ${st.n} could not be split - its symptoms go to the Audits of the functions they name`)
+      }
+      continue
+    }
     const parts = parsePlan(md).subtasks
     const base = Math.max(...plan.subtasks.map(o => o.n)) + 1
     parts.forEach((p, k) => { p.n = base + k; p.deps = []; p.kind = 'code' })
@@ -511,10 +635,10 @@ phase('Review')
     added.push({ n: next++, title: `\`${f.fn}\` in \`${f.file}\``, difficulty: 'medium', solvers: 2, check: true, merge: 'pick-change',
       kind: 'code', deps: [], task: `Implement \`${f.fn}\` in \`${f.file}\` so it does exactly what its docstring says, every example included.` })
   }
-  const codeFiles = [...new Set(plan.subtasks.filter(st => st.kind === 'code').flatMap(st => `${st.title}\n${st.task}`.match(/[\w./-]+\.py\b/g) || [])
+  const codeFiles = [...new Set(plan.subtasks.concat(unsplit).filter(st => st.kind === 'code').flatMap(st => `${st.title}\n${st.task}`.match(/[\w./-]+\.py\b/g) || [])
     .concat(TASK.match(/[\w./-]+\.py\b/g) || []).map(f => f.replace(CWD + '/', '').replace(/^\.\//, '')))]
   const inFixed = f => codeFiles.some(c => c === f.file || c.endsWith('/' + f.file) || f.file.endsWith('/' + c) || c.split('/').pop() === f.file.split('/').pop())
-  const auditing = /\b(more|other|further|any|every|all|hidden|unreported)\b[^.\n]{0,40}\b(bugs?|problems?|issues?|errors?|defects?)\b|\baudit\b/i.test(TASK)
+  const auditing = AUDITING
   if (auditing) {
     for (const f of FUNCTIONS.filter(f => !f.stub && inFixed(f) && !covered(f.fn) && !/^_*(main|cli)$/.test(f.fn))) {
       added.push({ n: next++, title: `Audit \`${f.fn}\` in \`${f.file}\``, difficulty: 'medium', solvers: 2, check: true, merge: 'pick-change',
@@ -566,6 +690,34 @@ phase('Review')
   if (added.length) {
     plan.subtasks = plan.subtasks.concat(added).slice(0, MAX_SUBTASKS)
     log(`plan: added ${added.length} subtask(s) so every function is covered`)
+  }
+}
+
+// The symptoms of a whole-file subtask no planner could split go to the Audits of the functions
+// they name, or of those functions' callers - never to every Audit, which invites changes in
+// correct functions. A symptom that names no function is its own subtask.
+if (unsplit.length) {
+  const sentences = [...new Set(unsplit.flatMap(st => `${st.task}\n${TASK}`.split(/(?<=[.!?])\s+|\n+/))
+    .map(x => x.trim()).filter(x => x.length > 12 && !/^#/.test(x)))]
+  // Which function calls which, read from the original code by a script.
+  const callsOut = PRISTINE ? await runExactly('callers', `python3 - ${q(BASE)} <<'PY'\nimport ast,os,sys\nroot=sys.argv[1]\nfor dp,dn,fs in os.walk(root):\n    dn[:]=[d for d in dn if d not in ('.git','__pycache__','node_modules','.venv','venv')]\n    for f in fs:\n        if not f.endswith('.py'): continue\n        try: t=ast.parse(open(os.path.join(dp,f)).read())\n        except Exception: continue\n        for n in t.body:\n            if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) or (isinstance(n,ast.If) and '__main__' in ast.unparse(n.test)):\n                me=getattr(n,'name','main')\n                for c in ast.walk(n):\n                    if isinstance(c,ast.Call) and isinstance(c.func,(ast.Name,ast.Attribute)): print('CALLS',me,getattr(c.func,'id',None) or c.func.attr)\nPY`, 'Review') : ''
+  const callers = new Map()
+  for (const m of String(callsOut || '').matchAll(/^CALLS (\w+) (\w+)$/gm)) {
+    if (!callers.has(m[2])) callers.set(m[2], new Set())
+    callers.get(m[2]).add(m[1])
+  }
+  const names = t => new Set((t.match(/[A-Za-z_]\w*/g) || []).concat(/__main__|command[- ]line|\bprints?\b|\boutput\b/i.test(t) ? ['main'] : []))
+  let next = Math.max(0, ...plan.subtasks.map(o => o.n)) + 1
+  const symptomLines = sentences.filter(x => /\b(returns?|prints?|shows?|gives?|outputs?|crash(es)?|wrong|instead|incorrect|missing|lacks?|errors?|fails?|breaks?|should)\b/i.test(x))
+  for (const line of symptomLines) {
+    const said = names(line)
+    const audits = plan.subtasks.filter(st => { const f = functionOf(st)
+      return f && (said.has(f.fn) || [...(callers.get(f.fn) || [])].some(c => said.has(c))) })
+    for (const st of audits) st.task += `\n\nA symptom the request reports - it may or may not come from this function:\n> ${line}`
+    if (!audits.length && plan.subtasks.length < MAX_SUBTASKS && !AUDITING_ONLY.test(line)) {
+      plan.subtasks.push({ n: next++, title: `Symptom: ${line.replace(/`/g, '').slice(0, 90)}`, difficulty: 'hard', solvers: 2, check: true,
+        merge: 'pick-change', kind: 'code', deps: [], task: `The request reports:\n\n> ${line}\n\nFind the line behind it and fix it.` })
+    }
   }
 }
 
@@ -658,7 +810,7 @@ for (const st of plan.subtasks) {
 // first. Measured (d12 c1913): three subtasks were bound to `lead_domain`; each began from the
 // original, and at apply the last one's untouched copy put the bug back.
 {
-  const auditing = /\b(more|other|further|any|every|all|hidden|unreported)\b[^.\n]{0,40}\b(bugs?|problems?|issues?|errors?|defects?)\b|\baudit\b/i.test(TASK)
+  const auditing = AUDITING
   const groups = new Map()
   for (const st of plan.subtasks) {
     const f = functionOf(st)
@@ -762,91 +914,298 @@ function solvePrompt(st, k, deps, feedback) {
   ])
 }
 
-// One agent that runs one exact command. The marker lets the bridge run it without the model.
+// One agent that runs one exact command. The marker lets the bridge run it without the model,
+// so it takes no upstream slot. Measured (d13 c1913): with stuck agents holding slots, a
+// restore or apply queued behind them.
 function runExactly(label, cmd, ph) {
   return ask(prompt('assemble', label, [
     'Run exactly this command - nothing else - then reply with what it printed:', '', '[exact-command]', '```bash', cmd, '```',
-  ]), label, ph, null, { wait: true, short: true, pri: -1 })
+  ]), label, ph, null, { wait: true, short: true, exact: true, deadline: EXACT_MS })
 }
 
 // A function's candidates are picked by a script, not an agent: each solver's copy of the
-// function goes into a fresh copy of the project, the docstring's examples run first, then
-// every solver's tests, pooled. A solver whose reply never arrived still has its copy on disk.
+// function goes into a fresh copy of the project and is measured - the docstring's examples,
+// every solver's tests pooled and pointed at that copy, a branch on an example's own input,
+// self-checks it added and inputs near the examples that make it raise, and which candidates
+// behave alike. A solver whose reply never arrived still has its copy on disk.
 // Measured (d9): every merge of a function was given up on or skipped, so the first solver
 // won blind; and three solvers that fixed count_top in their copies were never heard from.
-const PICK = `${SCRATCH}/pick.py`
-const PICK_PY = String.raw`import ast,os,shutil,subprocess,sys,tempfile
+// (d13 he10): `if nums == [1, 11, -1, -11, -12]` passed every example and won. (d13 he10)
+// a candidate ending `assert count1 == count2` raised on "Is the sky blue?" and won. (d12-d14)
+// 32 of 39 contested picks were ties broken by candidate number, compared as a string.
+const PICK = `${SCRATCH}/pick-v2.py`
+const PICK_PY = String.raw`import ast,hashlib,json,os,re,shutil,subprocess,sys,tempfile,time
+# The candidates of one function, measured. usage: pick.py ROOT REL FN EXAMPLES|- k|dir|replied ... -- tests...
+# env: PICK_OUT (the frozen choice), PICK_AUDIT=1 (the original competes, and a change must beat
+# it on a measurement), PICK_S (the whole pick's time, 420 s by default).
+T0=time.time(); LIMIT=float(os.environ.get('PICK_S') or 420)
+left=lambda: LIMIT-(time.time()-T0)
 root,rel,fn,ex=sys.argv[1:5]; rest=sys.argv[5:]; i=rest.index('--'); cands=rest[:i]; tests=[t for t in rest[i+1:] if os.path.exists(t)]
-def fnsrc(path):
-    code=open(path).read()
+AUDIT=os.environ.get('PICK_AUDIT')=='1'; frozen=os.environ.get('PICK_OUT')
+def node(code):
     for n in ast.parse(code).body:
-        if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name==fn:
-            lines=code.splitlines(True); s=(n.decorator_list[0].lineno if n.decorator_list else n.lineno)-1
-            return ''.join(lines[s:n.end_lineno])
+        if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name==fn: return n
+def fnsrc(path):
+    code=open(path).read(); n=node(code)
+    if n: l=code.splitlines(True); return ''.join(l[(n.decorator_list[0].lineno if n.decorator_list else n.lineno)-1:n.end_lineno])
 def put(path,new):
-    code=open(path).read(); lines=code.splitlines(True)
-    ns=[n for n in ast.parse(code).body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name==fn]
-    if ns:
-        n=ns[0]; s=(n.decorator_list[0].lineno if n.decorator_list else n.lineno)-1; lines[s:n.end_lineno]=[new.rstrip(chr(10))+chr(10)]
-    else:
-        lines.append(chr(10)*2+new)
-    open(path,'w').write(''.join(lines))
-orig=fnsrc(os.path.join(root,rel)) or ''
-rows=[]
-for c in cands:
-    k,d,replied=c.split('|')
-    # The function file, unless it is untouched and the copy holds a change.
+    code=open(path).read(); l=code.splitlines(True); n=node(code)
+    if n: l[(n.decorator_list[0].lineno if n.decorator_list else n.lineno)-1:n.end_lineno]=[new.rstrip(chr(10))+chr(10)]
+    else: l.append(chr(10)*2+new)
+    open(path,'w').write(''.join(l))
+spec_code=open(os.path.join(root,rel)).read(); spec=node(spec_code); orig=fnsrc(os.path.join(root,rel)) or ''
+doc=(ast.get_docstring(spec) or '') if spec else ''
+def calls(text):
+    out=[]
+    for m in re.finditer(r'(?<![\w.])'+re.escape(fn)+r'\(',text):
+        d=0
+        for j in range(m.end()-1,min(len(text),m.end()+400)):
+            d+=text[j]=='('; d-=text[j]==')'
+            if d==0:
+                c=text[m.start():j+1]
+                try: ast.parse(c,mode='eval'); out.append(c)
+                except SyntaxError: pass
+                break
+    return out
+EXAMPLE_CALLS=list(dict.fromkeys(calls(doc)))
+PARAMS=[a.arg for a in (spec.args.posonlyargs+spec.args.args+spec.args.kwonlyargs)] if spec else []
+def bound(c):
+    # The literal value each parameter takes in one call.
+    try: call=ast.parse(c,mode='eval').body
+    except SyntaxError: return {}
+    out={}
+    for k,a in enumerate(call.args):
+        if k<len(PARAMS):
+            try: out[PARAMS[k]]=ast.literal_eval(a)
+            except Exception: pass
+    for kw in call.keywords:
+        try: out[kw.arg]=ast.literal_eval(kw.value)
+        except Exception: pass
+    return out
+EX_VALUES={}
+for c in EXAMPLE_CALLS:
+    for p,v in bound(c).items(): EX_VALUES.setdefault(p,[]).append(v)
+def telling(v):
+    # A value worth naming only to hit one example: not 0, 1, an empty or one-item container.
+    if isinstance(v,bool) or v is None: return False
+    if isinstance(v,(int,float)): return v not in (-1,0,1,2)
+    if isinstance(v,str): return len(v)>=3
+    if isinstance(v,(list,tuple,dict,set)): return len(v)>=2
+    return False
+def hardcoded(src):
+    # A comparison of a bare parameter with that parameter's own example value. Never a
+    # constant against a local name: measured, "i < 10" in a correct generate_integers was
+    # flagged by a rule that matched any example scalar.
+    hits=[]
+    try: c=node(src)
+    except Exception: return hits
+    if not c: return hits
+    def names(x):
+        if isinstance(x,ast.Name) and x.id in EX_VALUES: return [x.id]
+        if isinstance(x,(ast.Tuple,ast.List)) and x.elts and all(isinstance(e,ast.Name) and e.id in EX_VALUES for e in x.elts): return [e.id for e in x.elts]
+        return []
+    for n in ast.walk(c):
+        if not isinstance(n,ast.Compare): continue
+        sides=[n.left,*n.comparators]
+        for k,op in enumerate(n.ops):
+            for a,b in ((sides[k],sides[k+1]),(sides[k+1],sides[k])):
+                ps=names(a)
+                if not ps: continue
+                try: v=ast.literal_eval(b)
+                except Exception: continue
+                want=[tuple(x) for x in zip(*[EX_VALUES[p] for p in ps])] if len(ps)>1 else EX_VALUES[ps[0]]
+                vals=[v] if isinstance(op,(ast.Eq,ast.NotEq,ast.Is,ast.IsNot)) else list(v) if isinstance(op,(ast.In,ast.NotIn)) and isinstance(v,(list,tuple,set,frozenset)) else []
+                for x in vals:
+                    x=tuple(x) if len(ps)>1 and isinstance(x,(list,tuple)) else x
+                    if any(x==w for w in want) and (len(ps)>1 or telling(x)): hits.append(n.lineno)
+    return sorted(set(hits))
+def selfchecks(src):
+    try: c=node(src)
+    except Exception: return 0
+    # Asserts and raises, not counting a stub's NotImplementedError.
+    stub=lambda x: isinstance(x,ast.Raise) and 'NotImplementedError' in ast.unparse(x)
+    return sum(isinstance(x,(ast.Assert,ast.Raise)) and not stub(x) for x in ast.walk(c)) if c else 0
+ORIG_CHECKS=selfchecks(orig) if orig else 0
+def variants(v):
+    out=[]
+    if isinstance(v,str):
+        out+=[p.strip() for p in re.split(r'(?<=[.!?])\s+',v) if p.strip() and p.strip()!=v][:3]
+        out+=[w for w in v.split()[:3] if w!=v]
+        out+=[v[:len(v)//2]] if len(v)>=4 else []
+    elif isinstance(v,(list,tuple)) and len(v)>=2:
+        out+=[type(v)(v[:-1]),type(v)(v[1:]),type(v)(list(v)[::-1])]
+    elif isinstance(v,int) and not isinstance(v,bool):
+        out+=[v+1,v-1]
+    return out
+PERTURBED=[]
+for c in EXAMPLE_CALLS:
+    try: call=ast.parse(c,mode='eval').body; vals=[ast.literal_eval(a) for a in call.args]
+    except Exception: continue
+    if call.keywords: continue
+    for k,v in enumerate(vals):
+        for x in variants(v):
+            args=vals[:k]+[x]+vals[k+1:]; PERTURBED.append(fn+'('+', '.join(repr(a) for a in args)+')')
+PERTURBED=list(dict.fromkeys(PERTURBED))[:40]
+TEST_CALLS=[c for t in tests for c in calls(open(t).read())]
+PROBES=list(dict.fromkeys(EXAMPLE_CALLS+TEST_CALLS))[:120]
+PROBE_PY=r'''import json,os,sys,io,contextlib,signal
+p,fn=sys.argv[1],sys.argv[2]; probes=json.loads(sys.stdin.read())
+def stop(*_): raise TimeoutError('slow')
+signal.signal(signal.SIGALRM,stop)
+os.chdir(os.path.dirname(p)); sys.path.insert(0,os.path.dirname(p)); sys.argv=[p,'--agentaus-not-an-option']; sys.dont_write_bytecode=True
+ns={'__name__':'candidate','__file__':p}
+try:
+    signal.alarm(10)
+    with contextlib.redirect_stdout(io.StringIO()): exec(compile(open(p).read(),p,'exec'),ns)
+    signal.alarm(0)
+except BaseException as e:
+    print(json.dumps(['IMPORT '+type(e).__name__]*len(probes))); sys.exit(0)
+out=[]
+for c in probes:
+    try:
+        signal.alarm(3)
+        with contextlib.redirect_stdout(io.StringIO()): out.append(repr(eval(c,ns)))
+    except BaseException as e: out.append('EXC '+type(e).__name__)
+    finally: signal.alarm(0)
+print(json.dumps(out))'''
+def probe(path,calls_):
+    if not calls_: return []
+    try:
+        r=subprocess.run([sys.executable,'-c',PROBE_PY,path,fn],input=json.dumps(calls_),capture_output=True,text=True,timeout=max(5,min(60,left()-5)))
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception as e:
+        return ['PROBE '+type(e).__name__]*len(calls_)
+dirs=[c.split('|')[1] for c in cands]
+def repoint(t,w,td):
+    # A solver's tests pin sys.path to its own copy; pointed at the candidate's copy instead,
+    # they test the candidate. Measured: a test that imported from s4/1/repo passed a candidate
+    # that returned [42].
+    s=open(t).read()
+    for d in sorted(set(dirs),key=len,reverse=True): s=s.replace(d.rstrip('/')+'/repo',w)
+    s=s.replace(root.rstrip('/'),w)
+    p=os.path.join(td,'t%d.py'%len(os.listdir(td))); open(p,'w').write(s); return p
+rows=[]; notes=[]; best=None
+def key(r,votes):
+    return (r['hard'],r['bad'],r['raises'],-r['passed'],-votes.get(r['sig'],0),-r['replied'],int(r['k']) if r['k'].isdigit() else 999)
+def rank():
+    votes={}
+    for r in rows:
+        if not r['hard']: votes[r['sig']]=votes.get(r['sig'],0)+1
+    pool=rows
+    if AUDIT:
+        o=[r for r in rows if r['k']=='0']
+        if o:
+            o=o[0]
+            # A change beats the original only on a measurement: fewer broken examples, or no
+            # new broken example and a pooled test that fails on the original and passes on it.
+            def wins(r):
+                if not r['changed'] or r['hard']: return False
+                if r['bad']<o['bad']: return True
+                return r['bad']<=o['bad'] and r['miss']<=o['miss'] and any(a and not b for a,b in zip(r['tests'],o['tests']))
+            pool=[o]+[r for r in rows if r['k']!='0' and (wins(r) or not r['changed'])]
+    pool=sorted(pool,key=lambda r:key(r,votes))
+    return pool,votes
+def report(r,votes,final=False):
+    print('CHOSEN',frozen if frozen else r['path'],'mismatches',99 if r['hard'] else r['bad'],'from',r['path'],'changed',r['changed'],'votes',votes.get(r['sig'],0),'examples',r['nex'],'candidate',r['k'],flush=True)
+order=([('0',os.path.join(root,'.'),'0')] if AUDIT else [])+[tuple(c.split('|')) for c in cands]
+td=tempfile.mkdtemp()
+for k,d,replied in order:
+    if left()<20:
+        notes.append(f'candidate {k}: not measured - the pick ran out of time'); continue
     path=None; new=None
-    for p in (os.path.join(d,fn+'.py'),os.path.join(d,'repo',rel)):
-        try:
-            s=fnsrc(p) if os.path.exists(p) else None
-        except Exception as e:
-            print('candidate',k,'unreadable:',p,e); s=None
-        if s and (new is None or (new.strip()==orig.strip() and s.strip()!=orig.strip())):
-            path,new=p,s
-    if not new:
-        print('candidate',k,'has no',fn); continue
-    w=tempfile.mkdtemp(); shutil.copytree(root,w,dirs_exist_ok=True); put(os.path.join(w,rel),new)
-    bad=0; out=''
+    if k=='0':
+        path,new=os.path.join(root,rel),orig
+    else:
+        for p in (os.path.join(d,fn+'.py'),os.path.join(d,'repo',rel)):
+            try: s=fnsrc(p) if os.path.exists(p) else None
+            except Exception as e: notes.append(f'candidate {k} unreadable: {p} {type(e).__name__}'); s=None
+            if s and (new is None or (new.strip()==orig.strip() and s.strip()!=orig.strip())): path,new=p,s
+    if not new: notes.append(f'candidate {k} has no {fn}'); continue
+    w=tempfile.mkdtemp(); shutil.copytree(root,w,dirs_exist_ok=True,ignore=shutil.ignore_patterns('__pycache__','.git')); put(os.path.join(w,rel),new)
+    bad=0; out=''; nex=0; miss=set()
     if ex!='-':
         try:
-            out=subprocess.run([sys.executable,ex,os.path.join(root,rel),os.path.join(w,rel),fn],capture_output=True,text=True,timeout=120).stdout
-            bad=out.count('MISMATCH')
-        except Exception:
-            bad=99
-    passed=0
-    for t in tests:
-        try:
-            passed+=subprocess.run([sys.executable,t],cwd=w,capture_output=True,timeout=120).returncode==0
-        except Exception:
-            pass
-    changed=new.strip()!=orig.strip()
-    print(f'candidate {k}: {path} - docstring example mismatches {bad}, pooled tests passed {passed}/{len(tests)}, replied {replied}, changed {changed}')
-    rows.append(((bad,-passed,-int(replied=='1')),k,path,out,changed))
-rows.sort()
-for l in (rows[0][3].splitlines() if rows else []):
-    if 'MISMATCH' in l: print('EXAMPLE', l)
-frozen=os.environ.get('PICK_OUT')
-if rows and frozen:
-    os.makedirs(os.path.dirname(frozen),exist_ok=True); open(frozen,'w').write(fnsrc(rows[0][2]))
-print('CHOSEN', frozen if rows and frozen else rows[0][2] if rows else 'none', 'mismatches', rows[0][0][0] if rows else -1, 'from', rows[0][2] if rows else '-', 'changed', rows[0][4] if rows else False)
+            out=subprocess.run([sys.executable,ex,os.path.join(root,rel),os.path.join(w,rel),fn],capture_output=True,text=True,timeout=max(5,min(60,left()-10))).stdout
+            bad=out.count('MISMATCH'); miss={l.split(' -> ')[0] for l in out.splitlines() if l.startswith('MISMATCH')}
+            m=re.search(r'(\d+)/(\d+) docstring examples pass',out); nex=int(m.group(2)) if m else 0
+        except Exception: bad=99
+        # An import failure is a full set of mismatches, never one.
+        if 'MISMATCH import' in out: bad=99
+    res=[]
+    for j,t in enumerate(tests):
+        try: res.append(subprocess.run([sys.executable,repoint(t,w,td)],cwd=w,env=dict(os.environ,PYTHONPATH=w,PYTHONDONTWRITEBYTECODE='1'),stdin=subprocess.DEVNULL,capture_output=True,timeout=max(3,min(60,(left()-10)/max(1,len(tests)-j)))).returncode==0)
+        except Exception: res.append(False)
+    outs=probe(os.path.join(w,rel),PROBES+PERTURBED)
+    raised=sum(1 for x in outs[len(PROBES):] if str(x).startswith(('EXC','IMPORT','PROBE')))
+    hard=hardcoded(new); changed=new.strip()!=orig.strip()
+    r=dict(k=k,path=path,out=out,bad=bad,miss=len(miss),nex=nex,tests=res,passed=sum(res),replied=replied=='1',hard=bool(hard),
+           raises=max(0,selfchecks(new)-ORIG_CHECKS)+raised,sig=hashlib.sha1(json.dumps(outs[:len(PROBES)]+outs[len(PROBES):]).encode()).hexdigest()[:8],changed=changed)
+    rows.append(r)
+    notes.append(f'candidate {k}: {path} - docstring example mismatches {bad}, pooled tests passed {sum(res)}/{len(tests)}, self-checks and raising probes {r["raises"]}, behaviour {r["sig"]}, replied {replied}, changed {changed}'+(f', BRANCHES ON AN EXAMPLE INPUT (line {hard[0]})' if hard else ''))
+    pool,votes=rank()
+    # The frozen choice and a CHOSEN line every time the best improves: a pick cut short still
+    # leaves its best so far.
+    if pool and (best is None or pool[0] is not best):
+        best=pool[0]
+        if frozen: os.makedirs(os.path.dirname(frozen),exist_ok=True); open(frozen,'w').write(fnsrc(best['path']) if best['k']!='0' else orig)
+        report(best,votes)
+pool,votes=rank()
+for n in notes: print(n[:400])
+if rows: print('behaviour groups:',', '.join(f'{s} x{n}' for s,n in sorted(votes.items(),key=lambda x:-x[1])))
+r0=pool[0] if pool else None
+for l in [l for l in (r0['out'].splitlines() if r0 else []) if 'MISMATCH' in l][:6]: print('EXAMPLE',l[:300])
+if r0:
+    if r0 is not best and frozen: open(frozen,'w').write(fnsrc(r0['path']) if r0['k']!='0' else orig)
+    report(r0,votes,True)
+else:
+    print('CHOSEN none mismatches -1 from - changed False votes 0 examples 0')
 `
 let pickReady = false
 const solverDir = (st, k) => `${SCRATCH}/s${st.n}/${k}`
-// The picker installs itself if it is not there yet: nothing waits on an install agent's word.
-const installPick = `mkdir -p ${q(SCRATCH)} && { [ -s ${q(PICK)} ] || cat > ${q(PICK)} <<'AGENTAUS_PICK_END'\n${PICK_PY}AGENTAUS_PICK_END\n}`
-async function pickFunction(st, f, ks, replies) {
+// The picker installs itself if it is not there yet - written whole, then moved into place,
+// so a pick running beside the install never reads half a file.
+const installPick = `mkdir -p ${q(SCRATCH)} && { [ -s ${q(PICK)} ] || { cat > ${q(PICK + '.part')}.$$ <<'AGENTAUS_PICK_END' && mv ${q(PICK + '.part')}.$$ ${q(PICK)}; }; }\n${PICK_PY}AGENTAUS_PICK_END`
+// An Audit's original competes, and a change replaces it only on a measurement.
+const isAudit = st => /^\W*Audit\b/i.test(st.title)
+async function pickFunction(st, f, ks, replies, audit) {
   const cands = ks.map(k => `${k}|${solverDir(st, k)}|${replies[k] ? 1 : 0}`)
   const tests = ks.map(k => `${solverDir(st, k)}/tests.py`)
   // The chosen function is frozen at once: a solver still running cannot change it afterwards.
   const frozen = `${SCRATCH}/chosen/s${st.n}/${f.fn}.py`
-  const out = await runExactly(`pick-${st.n}`, `${installPick}\nPICK_OUT=${q(frozen)} python3 ${q(PICK)} ${q(BASE)} ${q(f.file)} ${f.fn} ${EXAMPLES && PRISTINE ? q(EXAMPLES) : '-'} ${cands.map(q).join(' ')} -- ${tests.map(q).join(' ')}`, 'Pick')
-  const m = (out || '').match(/CHOSEN (\S+) mismatches (-?\d+) from (\S+)(?: changed (\w+))?/)
+  const out = await runExactly(`pick-${st.n}`, `${installPick}\nPICK_OUT=${q(frozen)}${audit ? ' PICK_AUDIT=1' : ''} PICK_S=420 python3 ${q(PICK)} ${q(BASE)} ${q(f.file)} ${f.fn} ${EXAMPLES && PRISTINE ? q(EXAMPLES) : '-'} ${cands.map(q).join(' ')} -- ${tests.map(q).join(' ')}`, 'Pick')
+  // The last CHOSEN line is the pick's best: it prints one each time the best improves.
+  const all = [...String(out || '').matchAll(/^CHOSEN (\S+) mismatches (-?\d+) from (\S+) changed (\w+)(?: votes (\d+) examples (\d+) candidate (\S+))?/gm)]
+  const m = all[all.length - 1]
   if (!m || m[1] === 'none') return null
-  const k = Number((m[3].match(new RegExp(`/s${st.n}/(\\d+)/`)) || [])[1])
-  const reply = replies[k] || `## Answer\nCandidate ${k}'s \`${f.fn}\` - chosen by the tests below.`
-  return { result: `${reply}\n\n## Why\n${(out.match(/^candidate .*$/gm) || []).join('\n')}`, change: m[1], dir: solverDir(st, k), mismatches: Number(m[2]),
-    changed: m[4] !== 'False', evidence: (out.match(/^EXAMPLE .*$/gm) || []).map(l => l.replace(/^EXAMPLE\s+/, '')).join('\n') }
+  const k = Number(m[7] || (m[3].match(new RegExp(`/s${st.n}/(\\d+)/`)) || [])[1] || 0)
+  const reply = (k && replies[k]) || (k ? `## Answer\nCandidate ${k}'s \`${f.fn}\` - chosen by the measurements below.` : `## Answer\n\`${f.fn}\` is kept as it is: no change beat the original on a measurement.`)
+  return { result: `${reply}\n\n## Why\n${(out.match(/^candidate .*$/gm) || []).join('\n')}`, change: m[1], dir: k ? solverDir(st, k) : null, mismatches: Number(m[2]),
+    changed: m[4] !== 'False', votes: Number(m[5] || 1), examples: Number(m[6] || 0), picked: true,
+    evidence: (out.match(/^EXAMPLE .*$/gm) || []).map(l => l.replace(/^EXAMPLE\s+/, '')).join('\n') }
+}
+
+// Think-only drafts: the function written whole, from its spec and its code now, in one call.
+// They are counted apart from the solver cap, so every function subtask has two independent
+// candidates. Measured (d13 c1913h at width 6): the cap trimmed every Audit to one solver
+// before any time pressure, and every wrong function was a single-candidate pick.
+async function drafts(st, f, n, ph) {
+  const src = `${SCRATCH}/s${st.n}/original-${f.fn}.py`
+  const now = await runExactly(`draft-source-${st.n}`, `mkdir -p ${q(`${SCRATCH}/s${st.n}`)} && ${extractCommand(`${BASE}/${f.file}`, f.fn, src)}`, ph)
+  const md = await ask(prompt('solve', `Draft \`${f.fn}\` for subtask ${st.n}: ${st.title}`, [
+    '**Kind:** code. You get no tools: write the function from what is below.', '',
+    '## The request', '```text', TASK, '```', '',
+    '## Your subtask', `**${st.title}**`, '', specOf(st), '',
+    specOnly(st) ? null : nest(st.task, 3), '',
+    now ? ['## The function now, in the original file', '```python', String(now).slice(0, 3000), '```'].join('\n') : null, '',
+    `Write ${n > 1 ? `${n} different versions` : 'one version'} of \`${f.fn}\`, each the whole function in its own \`\`\`python block - the same name, arguments and docstring, any import inside it. Where the function is already right, write it unchanged. Never branch on an example's literal input, and add no asserts.`,
+  ], true), `draft-${st.n}`, ph, t => new RegExp(`def ${f.fn}\\(`).test(t), { pri: 1 })
+  if (!md) return []
+  const blocks = [...md.matchAll(/```python\n([\s\S]*?)```/g)].map(x => x[1]).filter(b => new RegExp(`def ${f.fn}\\(`).test(b)).slice(0, n)
+  const dk = blocks.map((_, j) => 41 + j)
+  if (!blocks.length) return []
+  await runExactly(`draft-save-${st.n}`, blocks.map((b, j) =>
+    `mkdir -p ${q(solverDir(st, dk[j]))} && cat > ${q(`${solverDir(st, dk[j])}/${f.fn}.py`)} <<'AGENTAUS_DRAFT_END'\n${b}AGENTAUS_DRAFT_END`).join('\n') + '\necho saved', ph)
+  return dk
 }
 
 // When every candidate breaks a docstring example, the reading of the words is wrong. One
@@ -876,6 +1235,17 @@ async function readings(st, f, evidence, round) {
 
 // Answers that say the same thing need no merger. Measured: unanimous answers went through a
 // merger anyway, which rewrote them, dropped their citations and swapped in non-breaking hyphens.
+// Lines appended to the end of a result's Answer section, at whatever heading level it uses.
+function withAnswerLines(md, lines) {
+  const text = String(md || '')
+  const m = text.match(/^(#{1,3})\s*Answer\s*:?\s*$/im)
+  if (!m) return `${text.trimEnd()}\n\n${lines.join('\n')}\n`
+  const start = m.index + m[0].length
+  const rest = text.slice(start)
+  const end = rest.search(new RegExp(`^#{1,${m[1].length}}\\s*(${KEYS})\\s*:?\\s*$`, 'im'))
+  const at = end >= 0 ? start + end : text.length
+  return `${text.slice(0, at).trimEnd()}\n\n${lines.join('\n')}\n\n${text.slice(at).trimStart()}`.trimEnd()
+}
 const sameText = t => section(t, 'Answer').replace(/[‐-―]/g, '-').replace(/\s+/g, ' ').trim().toLowerCase()
 
 async function merge(st, results, strategy) {
@@ -907,9 +1277,19 @@ async function merge(st, results, strategy) {
     for (const r of results) for (const n of nums(r)) count.set(n, (count.get(n) || 0) + 1)
     const agreed = [...count].filter(([, c]) => c >= 2).map(([n]) => n)
     const lost = agreed.filter(n => !nums(merged).has(n))
+    // The merged answer stays, and each lost figure comes back with its solver's sentence.
+    // Measured (d11 tender): swapping in the fullest solver answer instead lost "1,122" and
+    // "Liesveld", which the merged text held.
     if (lost.length) {
-      log(`merge-${st.n}: the merged answer dropped ${lost.join(', ')}, given by two or more solvers - kept the fullest solver answer`)
-      return results.slice().sort((a, b) => agreed.filter(n => nums(b).has(n)).length - agreed.filter(n => nums(a).has(n)).length)[0]
+      const sentences = t => section(t, 'Answer').split(/(?<=[.!?])\s+|\n+/).map(x => x.trim()).filter(Boolean)
+      const holds = (x, n) => new RegExp(`(^|[^\\d.])${n.replace(/\./g, '\\.')}(?![\\d])`).test(x.replace(/,/g, ''))
+      const adds = []
+      for (const n of lost) {
+        const s = results.flatMap(sentences).find(x => holds(x, n))
+        if (s && !adds.includes(s) && !merged.includes(s)) adds.push(s)
+      }
+      log(`merge-${st.n}: the merged answer dropped ${lost.join(', ')}, given by two or more solvers - added back ${adds.length} sentence(s)`)
+      if (adds.length) return withAnswerLines(merged, adds.map(s => `- ${s.replace(/^[-*]\s*/, '')}`))
     }
   }
   // A merger that names no saved change keeps the first solver's, so the assembler still has
@@ -927,17 +1307,31 @@ const bestOf = results => results.filter(r => section(r, 'Answer'))
 
 const VERDICT = md => (String(md || '').match(/\*\*Verdict:\*\*\s*(PASS|FAIL)/i) || [])[1]
 
-// Where a code result's change lives: the solver copy it names, or the first that replied.
-function dirOf(st, result, ks, replies) {
-  const k = Number((String(result || '').match(new RegExp(`/s${st.n}/(\\d+)/`)) || [])[1])
-  if (k) return solverDir(st, k)
-  const first = ks.find(x => replies[x])
-  return first ? solverDir(st, first) : null
+
+// A whole-copy subtask's solver copies, read from disk: each is snapshotted at once - a solver
+// still running cannot change it afterwards - and counts as changed only when a Python file the
+// original has differs. Measured (mock, after the bounded waits): every solver the graph stops
+// waiting for leaves a reply-less copy, and a feature held only in such a copy was lost.
+const snapDir = (st, k) => `${SCRATCH}/snap/s${st.n}/${k}`
+async function readCopies(st, ks) {
+  const out = await runExactly(`copies-${st.n}`, `python3 - ${q(BASE)} ${ks.map(k => q(`${k}:${solverDir(st, k)}:${snapDir(st, k)}`)).join(' ')} <<'PY'\nimport filecmp,os,shutil,sys\nbase=sys.argv[1]; skip=('.git','__pycache__','node_modules','.venv','venv')\nfor a in sys.argv[2:]:\n    k,d,dst=a.split(':',2); repo=os.path.join(d,'repo')\n    if not os.path.isdir(repo): print('none',k); continue\n    shutil.rmtree(dst,ignore_errors=True); os.makedirs(dst,exist_ok=True)\n    try: shutil.copytree(repo,os.path.join(dst,'repo'),symlinks=True,ignore=shutil.ignore_patterns(*skip))\n    except Exception as e: print('none',k,type(e).__name__); continue\n    ch=[]\n    for dp,dn,fs in os.walk(base):\n        dn[:]=[x for x in dn if x not in skip]\n        for f in fs:\n            if not f.endswith('.py'): continue\n            rel=os.path.relpath(os.path.join(dp,f),base); c=os.path.join(dst,'repo',rel)\n            if os.path.exists(c) and not filecmp.cmp(os.path.join(dp,f),c,shallow=False): ch.append(rel)\n    print('changed' if ch else 'same',k,' '.join(ch[:5]))\nPY`, 'Pick')
+  const changed = new Set([...String(out || '').matchAll(/^changed (\d+)/gm)].map(m => Number(m[1])))
+  const seen = new Set([...String(out || '').matchAll(/^(?:changed|same) (\d+)/gm)].map(m => Number(m[1])))
+  return { changed, seen }
 }
 
-// A code result is tested in a copy holding that change - never in the project, which still
-// holds the old code. Measured (d9): a checker imported the project's module and failed a
-// correct change it had never loaded.
+// Where a code result's change lives: the solver copy it names, or the first that replied -
+// its snapshot where there is one.
+function dirOf(st, result, ks, replies, snapped) {
+  const named = Number((String(result || '').match(new RegExp(`/s${st.n}/(\\d+)/`)) || [])[1])
+  const k = ks.includes(named) ? named : ks.find(x => replies[x])
+  if (!k) return null
+  return snapped && snapped.has(k) ? snapDir(st, k) : solverDir(st, k)
+}
+
+// A code result is tested in a copy holding that change - never in the project, which holds
+// other subtasks' decided work. Measured (d9): a checker imported the project's module and
+// failed a correct change it had never loaded.
 function testCopy(st, d, bare) {
   if (st.kind !== 'code' || !d) return null
   const f = functionOf(st)
@@ -949,47 +1343,77 @@ function testCopy(st, d, bare) {
   return make ? `## Test it in a copy holding the change - never in the project\n\`\`\`bash\n${make}\n\`\`\`\nThen run everything from \`${c}\`.` : null
 }
 
-async function runSubtask(st, deps) {
+// Decided changes go into the project as soon as they are decided (see `checkpoint`).
+const provisional = {}
+let sealed = false
+
+// One subtask: its solvers (and, for a function, drafts), a pick or a merge, then a check.
+// opts.last: one last solver after the budget, for a subtask that has no result.
+async function runSubtask(st, deps, opts = {}) {
   const f = functionOf(st)
   const byScript = st.kind === 'code' && !!f && pickReady
+  const audit = byScript && isAudit(st)
+  const ph = opts.last ? 'Last' : 'Solve'
   const ks = Array.from({ length: st.solvers }, (_, k) => k + 1)
+  const solving = opts.last ? [st.solvers + 2] : ks
+  const every = opts.last ? [...ks, ...solving] : ks
+  // Every function subtask has two independent candidates, the solver cap notwithstanding.
+  const nDrafts = byScript ? Math.max(0, 2 - solving.length) : 0
+  const drafted = nDrafts ? drafts(st, f, nDrafts, ph).catch(() => []) : Promise.resolve([])
   // A code solver needs no backup: its copy on disk is read whether or not it replies.
-  const outs = await parallel(ks.map(k => () => ask(solvePrompt(st, k, deps), `solve-${st.n}.${k}`, 'Solve', shown, { pri: k - 1, once: st.kind === 'code' })))
+  const outs = await parallel(solving.map(k => () => ask(solvePrompt(st, k, deps), `solve-${st.n}.${opts.last ? 'last' : k}`, ph, shown,
+    { pri: k - 1, once: st.kind === 'code', deadline: opts.last ? Math.min(DEADLINE_MS, 900000) : undefined })))
   const replies = {}
-  ks.forEach((k, i) => { if (outs[i]) replies[k] = outs[i] })
+  solving.forEach((k, i) => { if (outs[i]) replies[k] = outs[i] })
+  const dks = await drafted
+  const pool = [...every, ...dks]
+  let snapped = null
+  if (st.kind === 'code' && !f) {
+    // Copies on disk: a reply-less changed copy is a candidate only when no solver that replied
+    // left a changed copy, and a reply is never dropped.
+    const { changed, seen } = await readCopies(st, every)
+    snapped = seen
+    if (![...changed].some(k => replies[k])) {
+      for (const k of every) {
+        if (changed.has(k) && !replies[k]) replies[k] = `## Answer\nSolver ${k}'s change, read from its copy - its reply never arrived.\n\n## Evidence\nThe runtime found Python files in its copy that differ from the original.\n\n## Change\n${snapDir(st, k)}/repo`
+      }
+    }
+  }
   const decide = async kset => {
     if (byScript) {
-      const picked = await pickFunction(st, f, kset, replies)
+      const picked = await pickFunction(st, f, kset, replies, audit)
       if (picked) return picked
     }
     const results = kset.map(k => replies[k]).filter(Boolean)
     if (!results.length) return null
     const result = await merge(st, results, st.merge)
-    let dir = st.kind === 'code' ? dirOf(st, result, kset, replies) : null
+    let dir = st.kind === 'code' ? dirOf(st, result, kset, replies, snapped) : null
     if (dir) {
       const frozen = `${SCRATCH}/chosen/s${st.n}`
       if (/frozen/.test(await runExactly(`freeze-${st.n}`, `rm -rf ${q(frozen)} && mkdir -p ${q(frozen)} && cp -R ${q(dir + '/repo')} ${q(frozen + '/repo')} && echo frozen`, 'Pick') || '')) dir = frozen
     }
-    return { result, dir }
+    return { result, dir, votes: 1 }
   }
-  let d = await decide(ks)
-  if (!d) return { st, result: '', why: 'no solver returned a result' }
+  let d = await decide(pool)
+  const nReplied = () => Object.keys(replies).length
+  if (!d) return { st, result: '', why: 'no solver returned a result', solved: nReplied(), drafts: dks.length }
   // Up to two rounds of readings while the best candidate breaks an example - and no checker
   // or redo then: they only restate a mismatch the script measured. Measured (d12 he10): two
   // checkers restated it, and the redo fitted the example by breaking the docstring's tie rule.
   let all = []
   for (const round of [1, 2]) {
-    if (!(byScript && d.mismatches > 0)) break
+    if (!(byScript && d.mismatches > 0) || late) break
     const rk = await readings(st, f, d.evidence, round)
     if (!rk.length) break
     all = all.concat(rk)
-    const again = await pickFunction(st, f, [...ks, ...all], replies)
+    const again = await pickFunction(st, f, [...pool, ...all], replies, audit)
     d = { ...(again || d), readings: all }
     log(`subtask ${st.n}: readings round ${round}; the chosen candidate breaks ${d.mismatches} example(s)`)
   }
-  if (byScript && d.mismatches > 0) return { st, ...d, check: `unsettled: the best candidate breaks ${d.mismatches} docstring example(s)` }
-  // An audit that changed nothing needs no checker.
-  if (byScript && d.changed === false && /^\W*Audit\b/i.test(st.title)) return { st, ...d, check: 'PASS (no change: the audit found nothing to fix)' }
+  const counts = { solved: nReplied(), drafts: dks.length }
+  // Decided: into the project now, before any check - a kill keeps it.
+  if (st.kind === 'code' && !sealed) { provisional[st.n] = { st, ...d, ...counts, check: 'not checked yet' }; checkpoint() }
+  if (byScript && d.mismatches > 0) return { st, ...d, ...counts, check: `unsettled: the best candidate breaks ${d.mismatches} docstring example(s)` }
   if (st.check && !late) {
     // The runtime makes the checker's copy and shows the change. Measured (d12 c1913h): 11 of
     // 17 FAILs never built their copy, read the project's old code, and failed fixed code.
@@ -1000,12 +1424,12 @@ async function runSubtask(st, deps) {
     const checkOnce = n => ask(prompt('check', `Check subtask ${st.n}: ${st.title} (checker ${n})`, [
       '## The request', '```text', TASK, '```', '',
       '## What was asked of this part', `**${st.title}**`, '', specOf(st), '', specOnly(st) ? null : nest(st.task, 3), '',
-      ready ? `## The change under check - already in \`${c}\`; the project still holds the OLD code\n\`\`\`diff\n${diff || '(no difference)'}\n\`\`\`\nRun everything from \`${c}\`. Judge only this change: a problem in code it does not touch belongs to another subtask - name it, it is not a FAIL here.` : testCopy(st, d), '',
+      ready ? `## The change under check - already in \`${c}\`\n\`\`\`diff\n${diff || '(no difference: the code is kept as it was)'}\n\`\`\`\nRun everything from \`${c}\`. The project folder holds other subtasks' decided work, not this change: judge only the copy. A problem in code this change does not touch belongs to another subtask - name it, it is not a FAIL here.` : testCopy(st, d), '',
       card('The result to check', d.result, { top: 2, evidence: true }),
     ]), `check-${st.n}${n > 1 ? `.${n}` : ''}`, 'Check', md => !!VERDICT(md), { pri: -1 })
     const tested = md => !ready || String(md).includes(c)
     let check = await checkOnce(1)
-    if (check && /fail/i.test(VERDICT(check)) && !tested(check)) return { st, ...d, check: 'FAIL not tested in the copy - kept' }
+    if (check && /fail/i.test(VERDICT(check)) && !tested(check)) return { st, ...d, ...counts, check: 'FAIL not tested in the copy - kept' }
     // A failure is acted on only when a second checker, who has not seen the first, finds it
     // too. Measured: one checker's mistaken FAIL brought in a redo that replaced three
     // solvers' correct median.
@@ -1013,40 +1437,418 @@ async function runSubtask(st, deps) {
     if (second && /fail/i.test(VERDICT(second))) {
       const k = st.solvers + 1
       const feedback = `What the checkers found:\n${section(check, 'Problem') || check}\n${section(second, 'Problem')}\n\nReply in your solve format - \`## Answer\`, \`## Key values\`, \`## Evidence\` - never a verdict.`
-      const redo = await ask(solvePrompt(st, k, deps, feedback), `solve-${st.n}.redo`, 'Solve', shown, { pri: 5 })
+      const redo = await ask(solvePrompt(st, k, deps, feedback), `solve-${st.n}.redo`, 'Solve', shown, { pri: 5, once: st.kind === 'code' })
       // The redo joins the original solvers rather than facing the merged result alone, so
       // one new answer cannot outvote three.
       if (redo) replies[k] = redo
-      const again = redo || byScript ? await decide([...ks, k, ...(d.readings || [])]) : null
+      const again = redo || byScript ? await decide([...pool, k, ...(d.readings || [])]) : null
       if (again) d = again
       else if (!section(d.result, 'Answer')) d = { ...d, result: bestOf(Object.values(replies)) }
-      return { st, ...d, check: redo ? 'FAIL (confirmed) then redone' : 'FAIL (confirmed); the redo returned nothing' }
+      if (st.kind === 'code' && !sealed) { provisional[st.n] = { st, ...d, ...counts }; checkpoint() }
+      return { st, ...d, ...counts, solved: nReplied(), check: redo ? 'FAIL (confirmed) then redone' : 'FAIL (confirmed); the redo returned nothing' }
     }
-    if (check && /fail/i.test(VERDICT(check))) return { st, ...d, check: 'FAIL not confirmed by a second checker - kept' }
-    return { st, ...d, check: check ? VERDICT(check) : 'not checked' }
+    if (check && /fail/i.test(VERDICT(check))) return { st, ...d, ...counts, check: 'FAIL not confirmed by a second checker - kept' }
+    return { st, ...d, ...counts, check: check ? (d.changed === false ? `${VERDICT(check)} (no change)` : VERDICT(check)) : 'not checked' }
   }
-  return { st, ...d, check: st.check ? 'skipped: time budget' : 'not needed' }
+  return { st, ...d, ...counts, check: st.check ? 'skipped: time budget' : 'not needed' }
 }
+
+// ---------------------------------------------------------------------------------
+// Putting decided changes into the project - at once, and again at assembly
+// ---------------------------------------------------------------------------------
+
+// Every code change goes in by exact command: a chosen function by name, any other change
+// region by region from the solver's copy. Measured (d9): solvers named patch files they never
+// wrote or wrote by hand, malformed; an assembler then copied one solver's whole file over the
+// project.
+const status = (cmd, n) => cmd.includes("<<'PY'")
+  ? cmd.replace("<<'PY'", `<<'PY' && echo "applied subtask ${n}" || echo "FAILED subtask ${n}"`)
+  : `{ ${cmd}; } && echo "applied subtask ${n}" || echo "FAILED subtask ${n}"`
+// A whole-copy change goes in region by region - each top-level statement it changed, never a
+// function another subtask owns. Measured (d12 c1913): a table audit's patch also rewrote
+// `short`; it half-applied, and the assembler stacked its `short` edit on a correct one.
+// A region an earlier change already rewrote is merged three ways; a true conflict is FAILED
+// for the later subtask, with its other regions still put in.
+const REGIONS = `${SCRATCH}/regions.py`
+const REGIONS_PY = String.raw`import ast,difflib,os,sys
+# A whole-copy change, put in region by region. usage: regions.py BASE CANDIDATE LIVE [owned,fns]
+base,cand,live=sys.argv[1:4]; owned=set(filter(None,sys.argv[4].split(','))) if len(sys.argv)>4 else set()
+def nodes(src):
+    t=src.splitlines(True); out={}; c={}
+    for n in ast.parse(src).body:
+        if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)): k='def:'+n.name
+        elif isinstance(n,ast.If) and '__main__' in ast.unparse(n.test): k='main'
+        elif isinstance(n,(ast.Import,ast.ImportFrom)): k='import:'+ast.unparse(n)
+        elif isinstance(n,(ast.Assign,ast.AnnAssign,ast.AugAssign)): k='set:'+ast.unparse(n.targets[0] if isinstance(n,ast.Assign) else n.target)
+        else:
+            kind=type(n).__name__; c[kind]=c.get(kind,0)+1; k=kind+'#'+str(c[kind])
+        s=(n.decorator_list[0].lineno if getattr(n,'decorator_list',None) else n.lineno)-1
+        out.setdefault(k,(s,n.end_lineno,''.join(t[s:n.end_lineno])))
+    return out
+def edits(B,X):
+    return [(i1,i2,X[j1:j2]) for op,i1,i2,j1,j2 in difflib.SequenceMatcher(None,B,X,autojunk=False).get_opcodes() if op!='equal']
+def overlap(a,b):
+    (a1,a2,_),(b1,b2,_)=a,b
+    if a1==a2 and b1==b2: return a1==b1
+    if a1==a2: return b1<a1<b2
+    if b1==b2: return a1<b1<a2
+    return a1<b2 and b1<a2
+def subseq(small,big):
+    it=iter(big); return all(any(x==y for y in it) for x in small)
+def merge3(b,l,c):
+    # Both sides' edits to one region, three ways. Compatible edits are kept: disjoint lines,
+    # one side already holding the other's change (a superset), or both adding lines at the
+    # same place (entries appended to one table). Anything else is a true conflict -> None.
+    if l==b or l==c: return c
+    if c==b: return l
+    B,L,C=b.splitlines(True),l.splitlines(True),c.splitlines(True)
+    el=[e+('L',) for e in edits(B,L)]; ec=[e+('C',) for e in edits(B,C)]
+    es=sorted(el+ec,key=lambda e:(e[0],e[1]))
+    clusters=[]
+    for e in es:
+        if clusters and any(overlap(e[:3],x[:3]) for x in clusters[-1]): clusters[-1].append(e)
+        else: clusters.append([e])
+    out=[]; i=0
+    for cl in clusters:
+        s=min(e[0] for e in cl); t=max(e[1] for e in cl)
+        ls=[e for e in cl if e[3]=='L']; cs=[e for e in cl if e[3]=='C']
+        def version(side):
+            v=[]; j=s
+            for e in sorted(side,key=lambda e:e[0]): v+=B[j:e[0]]+e[2]; j=e[1]
+            return v+B[j:t]
+        if not ls or not cs: new=version(ls or cs)
+        else:
+            lv,cv=version(ls),version(cs)
+            ladd=[x for e in ls for x in e[2]]; cadd=[x for e in cs for x in e[2]]
+            lrem={k for e in ls for k in range(e[0],e[1])}; crem={k for e in cs for k in range(e[0],e[1])}
+            if lv==cv: new=lv
+            elif lrem<=crem and subseq(ladd,cadd): new=cv
+            elif crem<=lrem and subseq(cadd,ladd): new=lv
+            elif not lrem and not crem: new=ladd+[x for x in cadd if x not in ladd]
+            else: return None
+        out+=B[i:s]+new; i=t
+    m=''.join(out+B[i:])
+    # Line edits merged into code that no longer parses are a conflict too.
+    try: ast.parse(m)
+    except SyntaxError: return None
+    return m
+done=[]; failed=[]
+for dp,dn,fs in os.walk(cand):
+    dn[:]=[x for x in dn if x not in ('.git','__pycache__','node_modules','.venv','venv')]
+    for f in fs:
+        if not f.endswith('.py'): continue
+        rel=os.path.relpath(os.path.join(dp,f),cand); b=os.path.join(base,rel); l=os.path.join(live,rel)
+        if not os.path.exists(b) or not os.path.exists(l): continue
+        cs=open(os.path.join(dp,f)).read(); bs=open(b).read()
+        if cs==bs: continue
+        try:
+            B,C=nodes(bs),nodes(cs); src=open(l).read(); L=nodes(src)
+        except SyntaxError as e:
+            failed.append(rel+': '+str(e)); continue
+        lines=src.splitlines(True)
+        # Conflicts are counted per file; a file's regions that do not conflict still go in.
+        conflicts=[]; put={}
+        todo=[k for k in C if k in B and C[k][2]!=B[k][2] and not (k.startswith('def:') and k[4:] in owned)]
+        for k in todo:
+            if k not in L: conflicts.append(k+' (gone from the project)'); continue
+            # A region an earlier change already rewrote is merged three ways, never overwritten.
+            # Measured (d13 c1913h): subtask 16 replaced 'main' from its own copy and the
+            # '--json' handling subtask 6 had put there was gone.
+            m=merge3(B[k][2],L[k][2],C[k][2])
+            if m is None: conflicts.append(k)
+            elif m!=L[k][2]: put[k]=m
+        new=[k for k in C if k not in B and not (k.startswith('def:') and k[4:] in owned)]
+        add=[]
+        for k in new:
+            if k in L:
+                # Two subtasks added the same region: the same text, or one holding the other.
+                if L[k][2]==C[k][2]: continue
+                m=merge3('',L[k][2],C[k][2])
+                if m is None: conflicts.append(k)
+                else: put[k]=m
+            else: add.append(k)
+        for k in sorted(put,key=lambda k:-L[k][0]):
+            s,e,_=L[k]; lines[s:e]=[put[k].rstrip(chr(10))+chr(10)]
+        L2=nodes(''.join(lines)) if put else L
+        for k in [k for k in add if k.startswith('import:')]:
+            last=max([v[1] for kk,v in L2.items() if kk.startswith('import:')] or [0]); lines.insert(last,C[k][2].rstrip(chr(10))+chr(10))
+        tail=[C[k][2] for k in add if not k.startswith('import:')]
+        if tail:
+            L3=nodes(''.join(lines))
+            at=L3['main'][0] if 'main' in L3 else len(lines)
+            lines[at:at]=[chr(10).join(x.rstrip(chr(10)) for x in tail)+chr(10)*3]
+        if put or add:
+            open(l,'w').write(''.join(lines)); done.append(rel+': '+', '.join(list(put)+add))
+        for k in conflicts:
+            failed.append(f'conflict {rel}: {k} - an earlier subtask changed it too; this subtask\'s version is in {os.path.join(dp,f)}')
+print('regions', '; '.join(done) or 'none')
+if failed:
+    for x in failed: print('could not place', x)
+    sys.exit(1)
+`
+// Every changed module still imports cleanly, with a command line that is not its own.
+// Measured (mock): a feature's solver put `args = parser.parse_args()` at module level, and
+// importing the module then parsed the importer's arguments and exited. (The d13 c1913h module
+// that did this was written by the main loop after the graph, not by a solver.)
+const IMPORTS = `${SCRATCH}/imports.py`
+const IMPORTS_PY = String.raw`import filecmp,json,os,subprocess,sys
+# Every module that differs between BEFORE and AFTER still imports, with a command line that is
+# not its own. usage: imports.py BEFORE AFTER PRISTINE
+# A failure counts only where the pristine module imported cleanly: a script that never
+# imported is not flagged. A module inside a package is imported by its dotted name, so its
+# relative imports work. Each import runs in its own process, with a time limit and no stdin.
+before,after,pristine=sys.argv[1:4]
+SKIP=('.git','__pycache__','node_modules','.venv','venv')
+PROBE=r'''import contextlib,importlib,importlib.util,io,os,sys
+root,p=sys.argv[1],sys.argv[2]; d=os.path.dirname(p); parts=[os.path.splitext(os.path.basename(p))[0]]; top=d
+while top!=root and top.startswith(root) and os.path.exists(os.path.join(top,'__init__.py')):
+    parts.insert(0,os.path.basename(top)); top=os.path.dirname(top)
+sys.argv=['import-check','--agentaus-not-an-option']; sys.dont_write_bytecode=True
+sys.path[:0]=[top,d]; os.chdir(d); out=io.StringIO()
+try:
+    with contextlib.redirect_stdout(out),contextlib.redirect_stderr(out):
+        if len(parts)>1: importlib.import_module('.'.join(parts))
+        else:
+            s=importlib.util.spec_from_file_location('m_check',p); s.loader.exec_module(importlib.util.module_from_spec(s))
+    print('OK')
+except BaseException as e:
+    print('FAILED',type(e).__name__,(out.getvalue() or str(e))[-300:].replace(chr(10),' '))'''
+def probe(root,p):
+    try:
+        r=subprocess.run([sys.executable,'-c',PROBE,os.path.abspath(root),os.path.abspath(p)],capture_output=True,text=True,timeout=30,stdin=subprocess.DEVNULL,env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1'))
+        last=(r.stdout.strip().splitlines() or ['FAILED no output '+r.stderr[-200:].replace(chr(10),' ')])[-1]
+        return last
+    except subprocess.TimeoutExpired:
+        return 'FAILED TimeoutExpired importing it ran for 30 s'
+cache_path=os.path.join(os.path.dirname(os.path.abspath(pristine)),'import-baseline.json')
+try: cache=json.load(open(cache_path))
+except Exception: cache={}
+for dp,dn,fs in os.walk(after):
+    dn[:]=[x for x in dn if x not in SKIP]
+    for f in sorted(fs):
+        if not f.endswith('.py'): continue
+        p=os.path.join(dp,f); rel=os.path.relpath(p,after); b=os.path.join(before,rel); o=os.path.join(pristine,rel)
+        if os.path.exists(b) and filecmp.cmp(b,p,shallow=False): continue
+        if not os.path.exists(o): continue
+        now=probe(after,p)
+        if now=='OK': print('IMPORT OK',rel); continue
+        if rel not in cache: cache[rel]=probe(pristine,o)
+        if cache[rel]!='OK': print('IMPORT WAS FAILING',rel,'- the original did not import either'); continue
+        print('IMPORT FAILED',rel,now[len('FAILED '):])
+try: json.dump(cache,open(cache_path,'w'))
+except Exception: pass
+`
+const MEASURE = `${SCRATCH}/measure.py`
+const MEASURE_PY = String.raw`import json,os,re,subprocess,sys,tempfile,time
+# What the project does now, measured: each final checker's repro, the docstring examples of
+# every changed file, every solver's tests (pointed at the project), and imports.
+# usage: measure.py MANIFEST.json OUT.json [BEFORE.json] - writes OUT.json and prints a summary
+# first; with BEFORE, also the verdict on a repair: ACCEPT only when fewer repros fail and
+# nothing that passed before fails now.
+m=json.load(open(sys.argv[1])); cwd=m['cwd']; T0=time.time(); left=lambda: m.get('limit',300)-(time.time()-T0)
+res={'repros':[],'examples':{},'tests':{},'imports':{}}; detail=[]
+env=dict(os.environ,PYTHONPATH=cwd,PYTHONDONTWRITEBYTECODE='1')
+for k,cmd in enumerate(m.get('repros',[])):
+    try:
+        r=subprocess.run(['/bin/bash','-c',cmd],cwd=cwd,capture_output=True,text=True,timeout=max(5,min(60,left()/2)),stdin=subprocess.DEVNULL,env=env)
+        ok=r.returncode==0; detail.append(f'repro {k+1}: {"passes" if ok else "FAILS"} - '+(r.stdout+r.stderr)[-300:].replace(chr(10),' '))
+    except Exception as e:
+        ok=False; detail.append(f'repro {k+1}: FAILS - {type(e).__name__}')
+    res['repros'].append(ok)
+if m.get('examples'):
+    for rel in m.get('files',[]):
+        spec=os.path.join(m['pristine'],rel); cur=os.path.join(cwd,rel)
+        if not (os.path.exists(spec) and os.path.exists(cur)) or left()<10: continue
+        try: out=subprocess.run([sys.executable,m['examples'],spec,cur],capture_output=True,text=True,timeout=max(5,min(60,left()/2)),stdin=subprocess.DEVNULL).stdout
+        except Exception as e: out='MISMATCH import timeout'
+        for l in out.splitlines():
+            if l.startswith(('ok','MISMATCH')):
+                res['examples'][rel+'::'+l.split(' -> ')[0].split(None,1)[-1]]=l.startswith('ok')
+td=tempfile.mkdtemp()
+for k,t in enumerate(m.get('tests',[])):
+    if not os.path.exists(t) or left()<10: continue
+    s=open(t).read()
+    for d in sorted(m.get('dirs',[]),key=len,reverse=True): s=s.replace(d.rstrip('/')+'/repo',cwd)
+    s=s.replace(m['pristine'].rstrip('/'),cwd)
+    p=os.path.join(td,f't{k}.py'); open(p,'w').write(s)
+    try: ok=subprocess.run([sys.executable,p],cwd=cwd,capture_output=True,timeout=max(3,min(30,left()/4)),stdin=subprocess.DEVNULL,env=env).returncode==0
+    except Exception: ok=False
+    res['tests'][t]=ok
+if m.get('imports'):
+    try:
+        out=subprocess.run([sys.executable,m['imports'],m['pristine'],cwd,m['pristine']],capture_output=True,text=True,timeout=max(10,min(120,left()))).stdout
+        for l in out.splitlines():
+            mm=re.match(r'IMPORT (OK|FAILED) (\S+)',l)
+            if mm: res['imports'][mm.group(2)]=mm.group(1)=='OK'
+    except Exception: pass
+json.dump(res,open(sys.argv[2],'w'))
+bad=lambda d: sum(1 for v in d.values() if not v)
+print(f"MEASURE repros failing {res['repros'].count(False)}/{len(res['repros'])}, examples failing {bad(res['examples'])}/{len(res['examples'])}, tests failing {bad(res['tests'])}/{len(res['tests'])}, imports failing {bad(res['imports'])}/{len(res['imports'])}")
+if len(sys.argv)>3:
+    b=json.load(open(sys.argv[3]))
+    # A module not listed before was the original, which imported: a failure now is lost too.
+    lost=[f'{kind} {k}' for kind in ('examples','tests','imports') for k,v in res[kind].items() if v is False and b[kind].get(k,kind=='imports')]
+    fewer=res['repros'].count(False)<b['repros'].count(False)
+    print('VERDICT','ACCEPT' if fewer and not lost else 'REJECT', '' if fewer else 'no fewer failing repros', ('now failing: '+'; '.join(lost[:5])) if lost else '')
+for l in detail: print(l[:400])
+`
+const PRE = `${SCRATCH}/pre-change`
+const owners = new Map()
+for (const st of plan.subtasks) { const f = functionOf(st); if (f) owners.set(f.fn, st.n) }
+const done = {}
+const decided = st => (done[st.n] && done[st.n].result) ? done[st.n] : (provisional[st.n] && provisional[st.n].result) ? provisional[st.n] : null
+function changeSet() {
+  const lines = []
+  const ns = []
+  for (const st of plan.subtasks.filter(st => st.kind === 'code' && decided(st))) {
+    const f = functionOf(st)
+    const d = decided(st)
+    const change = d.change || (f && (String(d.result || '').match(new RegExp(`[^\\s\`'"]+\\/${f.fn}\\.py`)) || [])[0])
+    let line = null
+    // An unchanged function is never put back. Measured (d12 c1913): a subtask whose chosen copy
+    // was the original's put the bug back over another subtask's fix.
+    if (f && change) line = d.changed === false ? `echo "no change in subtask ${st.n}"` : status(replaceCommand(`${CWD}/${f.file}`, f.fn, change), st.n)
+    else if (d.dir) {
+      const others = [...owners].filter(([, n]) => n !== st.n).map(([fn]) => fn).join(',')
+      line = `python3 ${q(REGIONS)} ${q(BASE)} ${q(d.dir + '/repo')} ${q(CWD)} ${q(others)} && echo "applied subtask ${st.n}" || echo "FAILED subtask ${st.n}"`
+    }
+    if (line) { lines.push(line); ns.push(st.n) }
+  }
+  return { lines, ns }
+}
+const PY_ONLY = `--exclude .git --exclude __pycache__ --exclude node_modules --exclude .venv --exclude venv --include='*/' --include='*.py' --exclude='*'`
+// Each change: the project's .py files are saved, the change is made, and every module it
+// touched is imported; a change that breaks an import that worked is undone at once and
+// reported. Status lines are printed as they happen and details only at the end: the bridge
+// keeps the head and the tail of a long output, and a lost "applied subtask N" line was a
+// change counted as failed.
+const guarded = (line, n) => `rsync -a --delete ${PY_ONLY} ${q(CWD)}/ ${q(PRE)}/
+r=$( {
+${line}
+} 2>&1 )
+printf '%s\\n' "--- subtask ${n}" "$r" >> "$APPLY_LOG"
+st=$(printf '%s\\n' "$r" | grep -E '^(applied|FAILED|no change in) subtask ${n}$' | tail -1)
+case "$st" in
+"no change"*) echo "$st" ;;
+*) imp=$(python3 ${q(IMPORTS)} ${q(PRE)} ${q(CWD)} ${q(PRISTINE || BASE)} 2>&1 | grep '^IMPORT FAILED' | head -1)
+   if [ -n "$imp" ]; then rsync -a ${PY_ONLY} ${q(PRE)}/ ${q(CWD)}/; echo "FAILED subtask ${n} - undone, it breaks an import: $(printf '%s' "$imp" | cut -c1-240)"
+   elif [ "$st" = "applied subtask ${n}" ]; then echo "applied subtask ${n}"
+   else echo "FAILED subtask ${n} - $(printf '%s\\n' "$r" | grep -E 'could not place|Error|error' | head -1 | cut -c1-300)"; fi ;;
+esac`
+// A same-size change in the same second as a restore was loaded from the stale .pyc (mock).
+const PYCACHE = `python3 - ${q(PRISTINE || BASE)} ${q(CWD)} <<'PY'\nimport glob,os,sys\np,c=sys.argv[1:3]\nfor dp,dn,fs in os.walk(p):\n    dn[:]=[x for x in dn if x not in ('.git','__pycache__','node_modules','.venv','venv')]\n    for f in fs:\n        if f.endswith('.py'):\n            for x in glob.glob(os.path.join(c,os.path.relpath(dp,p),'__pycache__',f[:-3]+'.*.pyc')):\n                try: os.remove(x)\n                except OSError: pass\nPY`
+let applied = ''
+let changeNs = []
+let failedChanges = []
+let restoreOk = !PRISTINE
+let puts = 0
+// The project from the original plus every decided change, built again each time - so a kill
+// at any moment leaves every change decided so far in place. Measured (d13 c1913): the kill
+// came before Assemble, and twelve decided, checked subtasks never reached the project.
+async function putInPlace(final) {
+  if (!PRISTINE) return
+  const { lines, ns } = changeSet()
+  const log_ = `${SCRATCH}/apply.log`
+  const cmd = [
+    `mkdir -p ${q(SCRATCH)} ${q(PRE)} && cat > ${q(REGIONS)} <<'AGENTAUS_REGIONS_END' && cat > ${q(IMPORTS)} <<'AGENTAUS_IMPORTS_END'\n${REGIONS_PY}AGENTAUS_REGIONS_END\n${IMPORTS_PY}AGENTAUS_IMPORTS_END`,
+    `APPLY_LOG=${q(log_)}; : > "$APPLY_LOG"`,
+    // The project goes back to how it was when the work began: every edit made since - by anyone -
+    // is undone, and only the decided changes go in. Files created since are left.
+    `out=$(rsync -ai --checksum --exclude .git --exclude __pycache__ --exclude node_modules --exclude .venv --exclude venv --exclude '*.pyc' ${q(PRISTINE)}/ ${q(CWD)}/ 2>&1); rc=$?; echo "restored rc=$rc"; printf '%s\\n' "--- restore" "$out" | grep -v '/$' | head -40 >> "$APPLY_LOG"`,
+    ...lines.map((l, k) => guarded(l, ns[k])),
+    `find ${q(CWD)} \\( -name '*.orig' -o -name '*.rej' \\) -newer ${q(SCRATCH + '/pristine')} -delete 2>/dev/null`,
+    PYCACHE,
+    `echo "--- details"; tail -c 2500 "$APPLY_LOG"`,
+  ].join('\n')
+  puts += 1
+  const out = await runExactly(final ? 'apply-changes' : `checkpoint-${puts}`, cmd, 'Assemble')
+  restoreOk = /^restored rc=0\s*$/m.test(out || '')
+  if (!restoreOk) log(`${final ? 'restore' : 'checkpoint'}: the restore failed - changes go in over whatever the project holds now`)
+  applied = out || '(the changes could not be applied)'
+  changeNs = ns
+  // A change counts as applied only when its own line says so. Measured (d10): a reply that
+  // dropped every FAILED line was read as "0 failed", and no one made the changes by hand.
+  const okNs = new Set([...applied.matchAll(/^(?:applied|no change in) subtask (\d+)\s*$/gm)].map(m => Number(m[1])))
+  failedChanges = changeNs.filter(n => !okNs.has(n))
+  if (!final) log(`checkpoint: ${okNs.size} of ${ns.length} decided change(s) in the project`)
+}
+// Checkpoints are coalesced: one runs at a time, and any number asked for meanwhile become one more.
+let cpRun = null
+let cpDirty = false
+function checkpoint() {
+  if (!PRISTINE || sealed) return cpRun
+  if (cpRun) { cpDirty = true; return cpRun }
+  cpRun = (async () => {
+    do {
+      cpDirty = false
+      try { await putInPlace(false) } catch (e) { log(`checkpoint: ${e}`) }
+    } while (cpDirty && !sealed)
+    cpRun = null
+  })()
+  return cpRun
+}
+
+// ---------------------------------------------------------------------------------
+// Running the plan: each subtask as soon as its own dependencies are done
+// ---------------------------------------------------------------------------------
 
 phase('Solve')
 startBudget()
 pickReady = plan.subtasks.some(st => st.kind === 'code' && functionOf(st))
-const done = {}
-const pending = plan.subtasks.slice()
-while (pending.length) {
-  // Every subtask whose dependencies are done runs now; one whose dependencies can never be
-  // met runs anyway rather than stalling the plan.
-  let ready = pending.filter(st => st.deps.every(d => done[d] || !plan.subtasks.some(o => o.n === d)))
-  if (!ready.length) ready = pending.slice()
-  for (const st of ready) pending.splice(pending.indexOf(st), 1)
-  const outs = await parallel(ready.map(st => () => runSubtask(st,
-    st.deps.filter(d => done[d]).map(d => card(`Subtask ${d}: ${done[d].st.title}`, done[d].result)))))
-  outs.forEach((o, k) => { done[ready[k].n] = o || { st: ready[k], result: '', why: 'failed' } })
-  if (late) break
+const byN = new Map(plan.subtasks.map(st => [st.n, st]))
+{
+  // A dependency on a missing subtask, or one that closes a cycle, is dropped.
+  const state = new Map()
+  const visit = st => {
+    state.set(st.n, 1)
+    st.deps = [...new Set(st.deps)].filter(d => {
+      if (!byN.has(d) || state.get(d) === 1) return false
+      if (!state.get(d)) visit(byN.get(d))
+      return true
+    })
+    state.set(st.n, 2)
+  }
+  for (const st of plan.subtasks) if (!state.get(st.n)) visit(st)
 }
+const hasResult = st => !!(done[st.n] && done[st.n].result)
+const depCards = st => st.deps.filter(d => hasResult(byN.get(d))).map(d => card(`Subtask ${d}: ${done[d].st.title}`, done[d].result))
+const record = (st, o, note) => {
+  if (sealed) return
+  done[st.n] = o && o.result ? { ...o, check: note ? `${o.check} - ${note}` : o.check } : { st, result: '', why: (o && o.why) || 'failed', solved: o && o.solved, drafts: o && o.drafts }
+  if (st.kind === 'code') checkpoint()
+}
+// One promise per subtask, waiting only on its own dependencies. Measured (d12 c1913h, the
+// wave loop): subtasks 9-12 waited for every subtask of the first wave, the budget ran out,
+// and they never ran.
+const startedRuns = new Map()
+function start(st) {
+  if (!startedRuns.has(st.n)) {
+    startedRuns.set(st.n, (async () => {
+      await Promise.all(st.deps.map(d => start(byN.get(d))))
+      // Once the budget is spent nothing new starts here; the last-chance pass below takes it.
+      if (late || hard) return
+      record(st, await runSubtask(st, depCards(st)).catch(e => { log(`subtask ${st.n}: ${e}`); return null }))
+    })())
+  }
+  return startedRuns.get(st.n)
+}
+const solving = (async () => {
+  await Promise.all(plan.subtasks.map(start))
+  // After the budget, every subtask with no result - of any kind - gets one last solver while
+  // the graph's own clock allows. Measured (d12 c1913h): subtasks queued behind the budget never
+  // ran, and "(no result)" went into the deliverable as their section.
+  const bare = plan.subtasks.filter(st => !hasResult(st) && !(provisional[st.n] && provisional[st.n].result))
+  if (bare.length && !hard) {
+    log(`last chance: one solver each for subtask(s) ${bare.map(st => st.n).join(', ')}`)
+    await Promise.all(bare.map(st => runSubtask(st, depCards(st), { last: true })
+      .then(o => record(st, o, 'solved after the budget'), e => log(`subtask ${st.n}: ${e}`))))
+  }
+})()
+await Promise.race([solving, hardStop])
+sealed = true
+for (const st of plan.subtasks) if (!hasResult(st) && provisional[st.n] && provisional[st.n].result) done[st.n] = provisional[st.n]
 
 const resultOf = st => (done[st.n] && done[st.n].result) || ''
-const RAW = plan.subtasks.map(resultOf).join('\n\n')
 const RESULTS = plan.subtasks.map(st => card(`Subtask ${st.n}: ${st.title}`, resultOf(st), { status: done[st.n] && done[st.n].check })).join('\n\n---\n\n')
 // Every key value, as one checklist the assembler fills and the final checkers tick off.
 // Paths are not values; a code change is one item; a value no checker passed is marked, and
@@ -1064,16 +1866,11 @@ const CHECKLIST = plan.subtasks.flatMap(st => {
 }).join('\n')
 
 // ---------------------------------------------------------------------------------
-// 6. Assemble, then a final check by two checkers and one fix if they find a problem
+// 6. Assemble, then a final check by two checkers and a measured repair
 // ---------------------------------------------------------------------------------
 
 phase('Assemble')
-// The project goes back to how it was when the work began, before anything is put in place:
-// every edit made before assembly - by anyone - is undone, and only the chosen changes go in.
-// Files created since are left; only changed files are put back.
-const restored0 = PRISTINE
-  ? await runExactly('restore', `rsync -ai --checksum --exclude .git --exclude __pycache__ --exclude node_modules --exclude .venv --exclude venv --exclude '*.pyc' ${q(PRISTINE)}/ ${q(CWD)}/ | grep -v '/$' | head -40; echo restored`, 'Assemble')
-  : null
+if (cpRun) await Promise.race([cpRun, endStop])
 // Every deliverable at its exact place in the project folder. Measured: an assembler wrote a
 // correct answers.json into the scout's scratch folder, and the main loop - finding none in
 // the project - computed its own, wrongly.
@@ -1084,109 +1881,10 @@ function inProject(d) {
   return `${CWD}/${p.startsWith('/') ? p.split('/').pop() : p}`
 }
 const deliverables = [...new Set(plan.deliverables.map(inProject).filter(Boolean))]
-// Every code change goes in by exact command: a chosen function by name, any other change as
-// a patch the runtime makes from the solver's copy. Measured (d9): solvers named patch files
-// they never wrote or wrote by hand, malformed; an assembler then copied one solver's whole
-// file over the project.
-const status = (cmd, n) => cmd.includes("<<'PY'")
-  ? cmd.replace("<<'PY'", `<<'PY' && echo "applied subtask ${n}" || echo "FAILED subtask ${n}"`)
-  : `{ ${cmd}; } && echo "applied subtask ${n}" || echo "FAILED subtask ${n}"`
-// A whole-copy change goes in region by region - each top-level statement it changed, never a
-// function another subtask owns. Measured (d12 c1913): a table audit's patch also rewrote
-// `short`; it half-applied, and the assembler stacked its `short` edit on a correct one.
-const REGIONS = `${SCRATCH}/regions.py`
-const REGIONS_PY = String.raw`import ast,os,sys
-base,cand,live=sys.argv[1:4]; owned=set(filter(None,sys.argv[4].split(','))) if len(sys.argv)>4 else set()
-def nodes(src):
-    t=src.splitlines(True); out={}; c={}
-    for n in ast.parse(src).body:
-        if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)): k='def:'+n.name
-        elif isinstance(n,ast.If) and '__main__' in ast.unparse(n.test): k='main'
-        elif isinstance(n,(ast.Import,ast.ImportFrom)): k='import:'+ast.unparse(n)
-        elif isinstance(n,(ast.Assign,ast.AnnAssign,ast.AugAssign)): k='set:'+ast.unparse(n.targets[0] if isinstance(n,ast.Assign) else n.target)
-        else:
-            kind=type(n).__name__; c[kind]=c.get(kind,0)+1; k=kind+'#'+str(c[kind])
-        out.setdefault(k,(n.lineno-1,n.end_lineno,''.join(t[n.lineno-1:n.end_lineno])))
-    return out
-done=[]; failed=[]
-for dp,dn,fs in os.walk(cand):
-    dn[:]=[x for x in dn if x not in ('.git','__pycache__')]
-    for f in fs:
-        if not f.endswith('.py'): continue
-        rel=os.path.relpath(os.path.join(dp,f),cand); b=os.path.join(base,rel); l=os.path.join(live,rel)
-        if not os.path.exists(b) or not os.path.exists(l): continue
-        cs=open(os.path.join(dp,f)).read(); bs=open(b).read()
-        if cs==bs: continue
-        try:
-            B,C=nodes(bs),nodes(cs); src=open(l).read(); L=nodes(src)
-        except SyntaxError as e:
-            failed.append(rel+': '+str(e)); continue
-        lines=src.splitlines(True)
-        todo=[k for k in C if k in B and C[k][2]!=B[k][2] and not (k.startswith('def:') and k[4:] in owned)]
-        new=[k for k in C if k not in B and not (k.startswith('def:') and k[4:] in owned)]
-        miss=[k for k in todo if k not in L]
-        if miss:
-            failed.append(rel+': '+', '.join(miss)); continue
-        for k in sorted(todo,key=lambda k:-L[k][0]):
-            s,e,_=L[k]; lines[s:e]=[C[k][2].rstrip(chr(10))+chr(10)]
-        for k in [k for k in new if k.startswith('import:')]:
-            last=max([v[1] for kk,v in L.items() if kk.startswith('import:')] or [0]); lines.insert(last,C[k][2].rstrip(chr(10))+chr(10))
-        tail=[C[k][2] for k in new if not k.startswith('import:')]
-        if tail:
-            at=L['main'][0] if 'main' in L else len(lines)
-            lines[at:at]=[chr(10).join(x.rstrip(chr(10)) for x in tail)+chr(10)*3]
-        open(l,'w').write(''.join(lines)); done.append(rel+': '+', '.join(todo+new))
-print('regions', '; '.join(done) or 'none')
-if failed:
-    print('could not place', '; '.join(failed)); sys.exit(1)
-`
-const owners = new Map()
-for (const st of plan.subtasks) { const f = functionOf(st); if (f) owners.set(f.fn, st.n) }
-const changeLines = plan.subtasks.filter(st => st.kind === 'code' && done[st.n] && done[st.n].result).map(st => {
-  const f = functionOf(st)
-  const d = done[st.n]
-  const change = d.change || (f && (resultOf(st).match(new RegExp(`[^\\s\`'"]+\\/${f.fn}\\.py`)) || [])[0])
-  // An unchanged function is never put back. Measured (d12 c1913): a subtask whose chosen copy
-  // was the original's put the bug back over another subtask's fix.
-  if (f && change) return d.changed === false ? `echo "no change in subtask ${st.n}"` : status(replaceCommand(`${CWD}/${f.file}`, f.fn, change), st.n)
-  if (!d.dir) return null
-  const others = [...owners].filter(([, n]) => n !== st.n).map(([fn]) => fn).join(',')
-  return `python3 ${q(REGIONS)} ${q(BASE)} ${q(d.dir + '/repo')} ${q(CWD)} ${q(others)} && echo "applied subtask ${st.n}" || echo "FAILED subtask ${st.n}"`
-}).filter(Boolean)
-if (changeLines.length) changeLines.unshift(`mkdir -p ${q(SCRATCH)} && cat > ${q(REGIONS)} <<'AGENTAUS_REGIONS_END'\n${REGIONS_PY}AGENTAUS_REGIONS_END`)
-const applied = changeLines.length ? (await runExactly('apply-changes', changeLines.join('\n') + `\nfind ${q(CWD)} \\( -name '*.orig' -o -name '*.rej' \\) -newer ${q(SCRATCH + '/pristine')} -delete 2>/dev/null; true`, 'Assemble') || '(the changes could not be applied)') : ''
-// A change counts as applied only when its own line says so. Measured (d10): a reply that
-// dropped every FAILED line was read as "0 failed", and no one made the changes by hand.
-const changeNs = plan.subtasks.filter(st => st.kind === 'code' && done[st.n] && done[st.n].result).map(st => st.n)
-const okNs = new Set([...applied.matchAll(/^(?:applied|no change in) subtask (\d+)\s*$/gm)].map(m => Number(m[1])))
-const failedChanges = changeNs.filter(n => !okNs.has(n))
-// Every changed module still imports cleanly, with a command line that is not its own.
-// Measured (d13 c1913h): a feature's solver put `args = parser.parse_args()` at module level;
-// importing the module then parsed the importer's arguments and exited, and nothing could load it.
-const IMPORTS_PY = String.raw`import filecmp,importlib.util,io,os,sys,contextlib
-base,live=sys.argv[1:3]
-for dp,dn,fs in os.walk(live):
-    dn[:]=[x for x in dn if x not in ('.git','__pycache__','node_modules','.venv','venv')]
-    for f in fs:
-        if not f.endswith('.py'): continue
-        p=os.path.join(dp,f); rel=os.path.relpath(p,live); b=os.path.join(base,rel)
-        if os.path.exists(b) and filecmp.cmp(b,p,shallow=False): continue
-        sys.argv=['import-check','--agentaus-not-an-option']; out=io.StringIO(); here=os.getcwd()
-        try:
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-                os.chdir(os.path.dirname(p)); s=importlib.util.spec_from_file_location('m_check',p); s.loader.exec_module(importlib.util.module_from_spec(s))
-            print('IMPORT OK',rel)
-        except BaseException as e:
-            print('IMPORT FAILED',rel,type(e).__name__,(out.getvalue() or str(e))[-300:].replace(chr(10),' '))
-        finally:
-            os.chdir(here)
-`
-const importCheck = changeLines.length ? (await runExactly('import-check', `python3 - ${q(BASE)} ${q(CWD)} <<'AGENTAUS_IMPORTS_END'\n${IMPORTS_PY}AGENTAUS_IMPORTS_END`, 'Assemble') || '') : ''
-const importFailed = importCheck.match(/^IMPORT FAILED .*$/gm) || []
-if (importFailed.length) log(`assemble: ${importFailed.length} changed module(s) do not import cleanly`)
-if (changeLines.length) log(`assemble: ${changeNs.length} code change(s) put in place, ${failedChanges.length} failed`)
-const patches = []
-const swaps = []
+await putInPlace(true)
+const importFailed = applied.match(/^FAILED subtask \d+ - undone, it breaks an import.*$/gm) || []
+if (importFailed.length) log(`assemble: ${importFailed.length} change(s) undone - they broke an import`)
+if (changeNs.length) log(`assemble: ${changeNs.length - failedChanges.length} of ${changeNs.length} code change(s) put in place${restoreOk ? '' : ' - THE RESTORE FAILED'}`)
 // Prose deliverables built from one section per subtask are written section by section:
 // one agent per section, each running one exact command. A single assembler asked to write
 // all nine answers claimed it had, and the file held two.
@@ -1196,7 +1894,7 @@ const sectionMode = deliverables.length === 1 && SECTION_FILE.test(deliverables[
 const sectionsWritten = []
 const sectionPart = k => `${SCRATCH}/sections/${String(k + 1).padStart(2, '0')}.md`
 async function writeSection(k, st) {
-  const body = section((done[st.n] && done[st.n].result) || '', 'Answer') || (done[st.n] && done[st.n].result) || '(no result)'
+  const body = section((done[st.n] && done[st.n].result) || '', 'Answer') || (done[st.n] && done[st.n].result) || 'NOT ANSWERED YET - the graph ran out of time for this question.'
   // Exactly one heading per section: the subtask's own. Measured (d9): an answer starting
   // `#### Q8` was given a `## Q8` above it, and the doubled heading hid the section.
   const strip = b => b.trim().replace(/^(#{1,6}[^\n]*\n+)+/, '').replace(/^#{1,6}\s+(.*)$/gm, '**$1**')
@@ -1212,20 +1910,25 @@ if (sectionMode) {
   for (const [k, st] of plan.subtasks.entries()) sectionsWritten.push(await writeSection(k, st))
   await joinSections(deliverables[0])
 }
-const codeOnly = changeLines.length > 0 && !failedChanges.length && !importFailed.length && deliverables.every(d => /\.(py|js|ts|mjs|cjs|sh)$/.test(d))
-  && plan.subtasks.every(st => st.kind === 'code')
+const allCode = deliverables.every(d => /\.(py|js|ts|mjs|cjs|sh)$/.test(d)) && plan.subtasks.every(st => st.kind === 'code')
+const codeOnly = changeNs.length > 0 && !failedChanges.length && restoreOk && allCode
+// After the hard stop no assembler starts on a code-only plan: every change is in place by
+// exact command, and the ones that are not are listed for the main loop. Measured (arithmetic):
+// an assembler with the writer's 1620 s after a late hard stop ran past the 7200 s kill.
+const skipWriter = hard && allCode && changeNs.length > 0
 const assembled = sectionMode ? `## Written\n- \`${deliverables[0]}\` - ${sectionsWritten.filter(Boolean).length} of ${plan.subtasks.length} sections`
-  : codeOnly ? `## Written\n${applied}`
+  : codeOnly || skipWriter ? `## Written\n${applied}${failedChanges.length ? `\n\n**Not in place - make these by hand:** ${failedChanges.map(n => `subtask ${n}`).join(', ')}` : ''}`
+  : ended ? null
   : await ask(prompt('assemble', 'Build the deliverables', [
   '## The request', '```text', TASK, '```', '',
   '## Deliverables - write each at exactly this path, in the project folder',
   deliverables.length ? deliverables.map(d => `- \`${d}\``).join('\n') : `(as the request names them - in \`${CWD}\`, never in a scratch folder)`, '',
   '## Assembly', plan.assembly || 'As the request describes.', '',
-  changeLines.length ? `## Code changes - already put in place by the runtime\n\`\`\`text\n${applied}\n\`\`\`\n${failedChanges.length ? `**Make each FAILED change by hand**, with small \`Edit\`s, from that subtask's Answer below: ${failedChanges.map(n => `subtask ${n}`).join(', ')}.` : 'Do not change the code again.'}` : null, '',
-  importFailed.length ? `## A changed module does not import cleanly - fix this first\n\`\`\`text\n${importFailed.join('\n')}\n\`\`\`\nImporting a module must run nothing: move command-line code (argument parsing, printing, exiting) under \`if __name__ == "__main__":\`, keeping what it does. Then import it again to check.` : null, '',
+  changeNs.length ? `## Code changes - already put in place by the runtime\n\`\`\`text\n${applied}\n\`\`\`\n${failedChanges.length ? `**Make each FAILED change by hand**, with small \`Edit\`s, from that subtask's Answer below - for a conflict, merge both changes into that region by hand: ${failedChanges.map(n => `subtask ${n}`).join(', ')}.` : 'Do not change the code again.'}` : null, '',
+  importFailed.length ? `## Changes undone because they broke an import - make each by hand\n\`\`\`text\n${importFailed.join('\n')}\n\`\`\`\nImporting a module must run nothing: put command-line code (argument parsing, printing, exiting) under \`if __name__ == "__main__":\`, keeping what it does. Then import it again to check.` : null, '',
   '## Checklist - every item must end up in a deliverable, exactly as written', CHECKLIST, '',
   '## Merged results', RESULTS,
-]), 'assemble', 'Assemble', null, { wait: true })
+]), 'assemble', 'Assemble', null, { wait: true, deadline: hard ? Math.round(CLOSE_MS / 3) : undefined })
 
 // Text deliverables in plain characters: hyphens, spaces and brackets as typed on a keyboard.
 // Measured: mergers wrote `GST‑registered` and `355‑30` with non-breaking hyphens, and cited
@@ -1237,40 +1940,48 @@ const normalise = async () => {
 await normalise()
 
 phase('Final check')
+const codeMode = !!PRISTINE && plan.subtasks.some(st => st.kind === 'code')
 // The final checkers check the deliverables against the merged results - present, complete,
-// matching, in the right format - and do not recompute them. Every value was already
-// settled by several solvers, a merger and its own check. Measured: two final checkers
+// matching, in the right format - and do not recompute them. Measured: two final checkers
 // recomputed four correct values, both fell into the same trap, and the fixer overwrote them.
 const finalPrompt = n => prompt('check', `Check the finished work (checker ${n})`, [
   '## What was asked', '```text', TASK, '```', '',
   EXAMPLES && PRISTINE && FUNCTIONS.length ? `**First, run the docstring examples on each changed Python file and paste the last line:** \`python3 ${q(EXAMPLES)} ${q(PRISTINE)}/FILE ${q(CWD)}/FILE\` - a \`MISMATCH\` line is a FAIL.\n` : null,
   '## Your job here',
   '- Each deliverable exists at its path and has every part the request asks for, in the format it asks for.',
-  '- Each value or section in it **matches the merged result below**. Do **not** recompute values: they were settled by several solvers and checked. A deliverable that matches its merged result PASSES on that point.',
+  '- Each value or section in it **matches the merged result below**. Do **not** recompute values. A deliverable that matches its merged result PASSES on that point.',
   '- Code still runs: **run** every command the request names, exactly as written, and the program with no arguments too.',
   '- Importing a changed module runs nothing: argument parsing, printing or exiting at module level, outside `if __name__ == "__main__":`, is a FAIL.',
   '- Output the request asks for as JSON or CSV: pipe the exact command into the real parser (`| python3 -c "import json,sys; json.load(sys.stdin)"`). Reading it by eye is not a check; a parse error is a FAIL.',
   '- Each Python file changed: `python3 -c "import ast,sys,collections as c; print([k for k,v in c.Counter(n.name for n in ast.parse(open(sys.argv[1]).read()).body if hasattr(n,\'name\')).items() if v>1])" FILE` must print `[]` - a name defined twice means code was pasted twice: FAIL.',
-  EXAMPLES && PRISTINE && FUNCTIONS.length ? `- Each Python file with docstring examples: \`python3 ${q(EXAMPLES)} ${q(PRISTINE)}/FILE ${q(CWD)}/FILE\` - a \`MISMATCH\` line is a FAIL; quote it.` : null, '',
+  EXAMPLES && PRISTINE && FUNCTIONS.length ? `- Each Python file with docstring examples: \`python3 ${q(EXAMPLES)} ${q(PRISTINE)}/FILE ${q(CWD)}/FILE\` - a \`MISMATCH\` line is a FAIL; quote it.` : null,
+  codeMode ? '- **For each problem in code, give a repro** under `## Repro`: one ```bash block per problem, run from the project folder, that exits non-zero while the problem is there and zero once it is fixed - e.g. `python3 -c "from tools.x import f; assert f(3) == 6, f(3)"` or `python3 prog.py --json | python3 -c "import json,sys; json.load(sys.stdin)"`. Base it on the request, a docstring or the README - never on a docstring example (those already run), and never on what you think the code should do beyond them.' : null, '',
   '## Checklist - copy it under `## Checklist` in your reply, ticking `[x]` each item the deliverable holds and leaving `[ ]` with what you found for each it does not',
   CHECKLIST, '',
   '## Merged results', RESULTS, '',
   `Check every deliverable in \`${CWD}\` against every part of the request.`,
   deliverables.length ? `The deliverables: ${deliverables.map(d => `\`${d}\``).join(', ')}. A deliverable that is not at its path is a FAIL.` : null,
 ])
-const finals = (await parallel([1, 2].map(n => () => ask(finalPrompt(n), `final-check-${n}`, 'Final check', md => !!VERDICT(md))))).filter(Boolean)
+// After the hard stop each final checker gets one attempt, clipped.
+const finalOpts = hard ? { once: true, deadline: Math.min(420000, Math.round(CLOSE_MS / 3)) } : {}
+const finals = ended ? [] : (await parallel([1, 2].map(n => () => ask(finalPrompt(n), `final-check-${n}`, 'Final check', md => !!VERDICT(md), finalOpts)))).filter(Boolean)
 const failing = finals.filter(md => /fail/i.test(VERDICT(md)))
 let fix = null
 let recheck = null
 let restored = false
-// The fixer runs only when both checkers find a problem, starts from a backup, and is
-// undone if a fresh checker still finds one. Measured: a fixer acting on one checker's word
-// recomputed four correct values the wrong way and overwrote them.
+let repairNote = null
+let reprosLeft = null
 let repaired = []
+const backupDir = `${SCRATCH}/before-fix`
+const takeBackup = () => runExactly('backup', `rm -rf ${q(backupDir)} && mkdir -p ${q(backupDir)} && cp -R ${q(CWD)}/. ${q(backupDir)}/ && echo saved`, 'Final check')
+const undo = async why => {
+  restored = /undone/.test(await runExactly('undo', `rsync -a --delete --exclude .git ${q(backupDir)}/ ${q(CWD)}/ && echo undone`, 'Final check') || '')
+  log(`final repair: ${why}${restored ? ' - undone' : ' - THE UNDO FAILED'}`)
+}
 // A sectioned document is repaired section by section: the failing subtasks are solved again
 // and their sections rewritten. Measured (d9): a whole-file fixer spent 17 minutes editing
 // text that did not match the file, and was undone.
-if (sectionMode && finals.length >= 2 && failing.length === finals.length && !late) {
+if (sectionMode && finals.length >= 2 && failing.length === finals.length && !hard) {
   const named = new Set()
   for (const md of failing) {
     for (const m of section(md, 'Checklist').matchAll(/^\s*[-*]\s*\[ \]\s*Subtask\s+(\d+)/gim)) named.add(Number(m[1]))
@@ -1279,76 +1990,141 @@ if (sectionMode && finals.length >= 2 && failing.length === finals.length && !la
       if (st) named.add(st.n)
     }
   }
-  const backup = `${SCRATCH}/before-fix`
   const targets = plan.subtasks.filter(st => named.has(st.n)).slice(0, 4)
-  if (targets.length && await runExactly('backup', `rm -rf ${q(backup)} && mkdir -p ${q(backup)} && cp -R ${q(CWD)}/. ${q(backup)}/ && echo saved`, 'Final check')) {
+  if (targets.length && await takeBackup()) {
     const problems = failing.map(md => section(md, 'Problem')).join('\n')
+    // The repair's solvers run past the budget: within the graph's own clock, they are the point.
+    const wasLate = late
+    late = false
     for (const st of targets) {
-      const again = await runSubtask({ ...st, task: `${st.task}\n\n**The final checkers found a problem with this part:**\n${problems}` }, [])
+      const again = await runSubtask({ ...st, check: false, task: `${st.task}\n\n**The final checkers found a problem with this part:**\n${problems}` }, [], { last: true })
       if (again && again.result && section(again.result, 'Answer')) { done[st.n] = again; repaired.push(st.title) }
     }
+    late = wasLate
     if (repaired.length) {
       for (const [k, st] of plan.subtasks.entries()) if (repaired.includes(st.title)) await writeSection(k, st)
       await joinSections(deliverables[0])
       await normalise()
-      recheck = await ask(finalPrompt(3), 'final-check-3', 'Final check', md => !!VERDICT(md))
-      if (recheck && /fail/i.test(VERDICT(recheck))) {
-        restored = !!(await runExactly('undo', `cp -R ${q(backup)}/. ${q(CWD)}/ && echo undone`, 'Final check'))
-      }
+      recheck = ended ? null : await ask(finalPrompt(3), 'final-check-3', 'Final check', md => !!VERDICT(md), { once: true })
+      if (recheck && /fail/i.test(VERDICT(recheck))) await undo('the rewritten sections failed the re-check')
     }
   }
 }
-if (!sectionMode && finals.length >= 2 && failing.length === finals.length && !late) {
-  const backup = `${SCRATCH}/before-fix`
-  const saved = await runExactly('backup', `rm -rf ${q(backup)} && mkdir -p ${q(backup)} && cp -R ${q(CWD)}/. ${q(backup)}/ && echo saved`, 'Final check')
-  if (saved) {
+// Code is repaired against measurements: each final checker's repro, the docstring examples,
+// every solver's tests and the imports, before and after. A repair is kept only when fewer
+// repros fail and nothing that passed before fails now - and a repro that runs a docstring
+// example is dropped, since the examples are the spec. Measured (d10-d13): final checkers
+// named real bugs (`len(same)`, "twelve", `--json`) and no fixer ran in any late run; (d9) two
+// checkers fell into the same trap and an unmeasured fixer acted on it.
+const exampleCalls = FUNCTIONS.flatMap(f => (String(f.doc || '').match(new RegExp(`\\b${f.fn}\\([^\\n]*\\)`, 'g')) || []).map(c => c.replace(/\s+/g, '')))
+const reprosOf = md => [...section(md, 'Repro').matchAll(/```[a-z]*\n([\s\S]*?)```/g)].map(m => m[1].trim()).filter(Boolean)
+if (codeMode && !sectionMode && failing.length && !ended) {
+  const all = [...new Set(failing.flatMap(reprosOf))]
+  const repros = all.filter(r => !exampleCalls.some(c => r.replace(/\s+/g, '').includes(c))).slice(0, 8)
+  if (all.length > repros.length) log(`final repair: ${all.length - repros.length} repro(s) dropped - they run a docstring example`)
+  const tests = plan.subtasks.filter(st => st.kind === 'code').flatMap(st => Array.from({ length: st.solvers + 2 }, (_, k) => `${solverDir(st, k + 1)}/tests.py`))
+  const dirs = plan.subtasks.filter(st => st.kind === 'code').flatMap(st => Array.from({ length: st.solvers + 2 }, (_, k) => solverDir(st, k + 1)))
+  const files = [...new Set(FUNCTIONS.map(f => f.file))]
+  const manifest = JSON.stringify({ cwd: CWD, pristine: PRISTINE, examples: EXAMPLES || null, imports: IMPORTS, repros, tests, dirs, files, limit: 240 })
+  const measure = (out, before) => runExactly(before ? 'measure-after' : 'measure-before',
+    `cat > ${q(MEASURE)} <<'AGENTAUS_MEASURE_END' && cat > ${q(SCRATCH + '/measure.json')} <<'AGENTAUS_MANIFEST_END'\n${MEASURE_PY}AGENTAUS_MEASURE_END\n${manifest}\nAGENTAUS_MANIFEST_END\npython3 ${q(MEASURE)} ${q(SCRATCH + '/measure.json')} ${q(out)}${before ? ` ${q(before)}` : ''}`, 'Final check')
+  // With no repro, both checkers must have failed, as before; a repro measures on its own.
+  const enough = repros.length || (finals.length >= 2 && failing.length === finals.length)
+  const m0 = enough ? await measure(`${SCRATCH}/measure-before.json`) : null
+  const failingRepros = Number((String(m0 || '').match(/repros failing (\d+)\//) || [])[1] || 0)
+  if (m0 && (failingRepros > 0 || !repros.length) && !ended && await takeBackup()) {
+    const lines = String(m0).split('\n').filter(l => /^repro \d+: FAILS/.test(l))
     fix = await ask(prompt('fix', 'Fix the problem the checkers found', [
       '## What was asked', '```text', TASK, '```', '',
-      '## What both checkers found', ...failing.map(md => section(md, 'Problem') || md), '',
-      '## Items the checkers found missing', ...[...new Set(failing.flatMap(md => section(md, 'Checklist').split('\n').filter(l => /^\s*[-*]\s*\[ \]/.test(l))))], '',
-      '## Merged results - locked', 'Each was reached by several solvers and a merger. A deliverable value that matches one of these is correct: **do not change it**, whatever a recomputation says. Fix only what is missing, misplaced or malformed.', '',
-      RESULTS,
-    ]), 'fix', 'Final check', null, { wait: true })
-    if (fix) await normalise()
-    recheck = fix ? await ask(finalPrompt(3), 'final-check-3', 'Final check', md => !!VERDICT(md)) : null
-    if (fix && recheck && /fail/i.test(VERDICT(recheck))) {
-      restored = !!(await runExactly('undo', `cp -R ${q(backup)}/. ${q(CWD)}/ && echo undone`, 'Final check'))
+      '## What the checkers found', ...failing.map(md => section(md, 'Problem') || md), '',
+      repros.length ? ['## Repros - each must exit 0 when you are done; run each before and after', ...repros.map((r, k) => `### Repro ${k + 1}\n\`\`\`bash\n${r}\n\`\`\``), '', '## What they print now', '```text', lines.join('\n') || '(see above)', '```'].join('\n') : null, '',
+      '## Rules',
+      '- Change only what a failing repro needs, with small `Edit`s, in the project folder.',
+      '- The docstring examples are the spec: never change a function so that one of its examples breaks, and never edit a docstring. A repro that disagrees with a docstring example is wrong - leave it failing and say so.',
+      '- Your change is measured: kept only if fewer repros fail and every docstring example, import and solver test that passed before still passes.', '',
+      '## Merged results', RESULTS,
+    ]), 'fix', 'Final check', null, { wait: true, deadline: hard ? Math.round(CLOSE_MS / 3) : undefined })
+    if (!fix) await undo('the fixer returned nothing')
+    else if (ended) await undo('the graph\'s time ran out before the fix could be measured')
+    else {
+      const m1 = await measure(`${SCRATCH}/measure-after.json`, `${SCRATCH}/measure-before.json`)
+      const verdict = (String(m1 || '').match(/^VERDICT .*$/m) || ['VERDICT REJECT the measurement did not run'])[0]
+      reprosLeft = Number((String(m1 || '').match(/repros failing (\d+)\//) || [])[1])
+      // With no repro, the old rule: a fresh checker must not still fail it.
+      if (/ACCEPT/.test(verdict) && !repros.length) recheck = await ask(finalPrompt(3), 'final-check-3', 'Final check', md => !!VERDICT(md), { once: true })
+      if (!/ACCEPT/.test(verdict)) await undo(verdict.replace(/^VERDICT\s*/, ''))
+      else if (recheck && /fail/i.test(VERDICT(recheck))) await undo('the re-check still failed it')
+      else repairNote = `kept: ${String(m1).split('\n')[0]}`
     }
   }
 }
-for (const t of timers) clearTimeout(t)
+// Prose and values: the fixer runs only when both checkers find a problem, and is undone if a
+// fresh checker still finds one - or if it returned nothing.
+if (!codeMode && !sectionMode && finals.length >= 2 && failing.length === finals.length && !hard && await takeBackup()) {
+  fix = await ask(prompt('fix', 'Fix the problem the checkers found', [
+    '## What was asked', '```text', TASK, '```', '',
+    '## What both checkers found', ...failing.map(md => section(md, 'Problem') || md), '',
+    '## Items the checkers found missing', ...[...new Set(failing.flatMap(md => section(md, 'Checklist').split('\n').filter(l => /^\s*[-*]\s*\[ \]/.test(l))))], '',
+    '## Merged results - locked', 'A deliverable value that matches one of these is correct: **do not change it**, whatever a recomputation says. Fix only what is missing, misplaced or malformed.', '',
+    RESULTS,
+  ]), 'fix', 'Final check', null, { wait: true })
+  if (fix) await normalise()
+  recheck = fix && !ended ? await ask(finalPrompt(3), 'final-check-3', 'Final check', md => !!VERDICT(md), { once: true }) : null
+  if (!fix) await undo('the fixer returned nothing')
+  else if (recheck && /fail/i.test(VERDICT(recheck))) await undo('the re-check still failed it')
+}
 
-// Settled: a function whose subtask passed, that only it changed, and whose live source is still
-// the frozen choice - checked in the file, not taken from a verdict. Measured (d12 c1913): the
-// list named `short`, which the assembler had changed after its check.
+// Settled: a function whose subtask was measured - a PASS from a check of a real change, and two
+// or more candidates behaving alike or a script pick that ran docstring examples - that only it
+// changed, that no failing final checker names, and whose live source is still the frozen
+// choice. Measured (d13 c1913h): the list named `_clean` and `parse`, the two wrong functions -
+// one a single opinion PASS, the other "no change" - while a final checker named `_clean`; the
+// main loop never touched it.
 let settledLine = null
 {
+  const namedByFinal = fn => failing.some(md => new RegExp(`\\b${fn}\\b`).test(`${section(md, 'Problem')}\n${section(md, 'Repro')}`))
+  const measured = d => /^PASS/i.test(String(d.check || '')) && !/no change/i.test(String(d.check || '')) && d.changed !== false
+    && ((d.votes || 1) >= 2 || (d.picked && d.examples > 0 && d.mismatches === 0))
   const cands = plan.subtasks.filter(st => st.kind === 'code' && functionOf(st) && done[st.n] && done[st.n].change
-    && /^PASS/i.test(String(done[st.n].check || '')) && owners.get(functionOf(st).fn) === st.n)
-  if (cands.length) {
+    && measured(done[st.n]) && owners.get(functionOf(st).fn) === st.n && !namedByFinal(functionOf(st).fn))
+  if (cands.length && !ended) {
     const cmp = cands.map(st => { const f = functionOf(st)
       return `python3 - ${q(`${CWD}/${f.file}`)} ${f.fn} ${q(done[st.n].change)} <<'PY'\nimport ast,sys\nt,fn,c=sys.argv[1:4]\ndef src(p):\n    s=open(p).read(); l=s.splitlines(True)\n    for n in ast.parse(s).body:\n        if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name==fn: return ''.join(l[n.body[1 if ast.get_docstring(n) is not None and len(n.body)>1 else 0].lineno-1:n.end_lineno]).strip()\ntry:\n    print('same' if src(t)==src(c) else 'differs', fn)\nexcept Exception as e:\n    print('differs', fn)\nPY` }).join('\n')
     const out = await runExactly('settled', cmp, 'Final check') || ''
     const same = [...out.matchAll(/^same (\w+)/gm)].map(m => `\`${m[1]}\``)
-    if (same.length) settledLine = `**Settled - do not edit:** ${same.join(', ')}. Each passed its checks and is still the chosen version; a test you write that disagrees with one is more likely wrong than the function. Never edit a docstring.`
+    if (same.length) settledLine = `**Settled - do not edit:** ${same.join(', ')}. Each was measured - its docstring examples or two agreeing candidates - passed its check, and is still the chosen version; a test you write that disagrees with one is more likely wrong than the function. Never edit a docstring.`
   }
 }
+for (const t of timers) clearTimeout(t)
 
-const passed = finals.length > 0 && (failing.length < finals.length || !!(recheck && /pass/i.test(VERDICT(recheck))))
+const missing = plan.subtasks.filter(st => !hasResult(st))
+const repairedOk = !!repairNote && reprosLeft === 0
+const passed = restoreOk && !failedChanges.length && !missing.length && finals.length > 0
+  && (failing.length < finals.length || !!(recheck && /pass/i.test(VERDICT(recheck))) || repairedOk)
+// What each part really had: solvers that replied, drafts, and its check - never "several agents"
+// where there was one.
+const candidatesOf = st => { const d = done[st.n] || {}; return (d.solved || 0) + (d.drafts || 0) }
+const thin = plan.subtasks.filter(st => candidatesOf(st) < 2 || !/^PASS/i.test(String((done[st.n] && done[st.n].check) || '')))
 const lines = [
   `# Result: ${passed ? 'checked' : 'needs attention'}`, '',
   `Plan: ${plan.subtasks.length} subtask(s), ${total} solver(s).${late ? ' **The time budget ran out:** check the deliverables yourself.' : ''}`, '',
   '## Subtasks',
-  ...plan.subtasks.map(st => `- ${st.n}. ${st.title} - ${st.difficulty}, ${st.solvers} solver(s), check: ${(done[st.n] && done[st.n].check) || 'n/a'}`),
+  ...plan.subtasks.map(st => { const d = done[st.n] || {}
+    return `- ${st.n}. ${st.title} - ${st.difficulty}, ${d.solved || 0} solver answer(s) (${st.solvers} planned)${d.drafts ? `, ${d.drafts} draft(s)` : ''}${d.votes > 1 ? `, ${d.votes} candidates agree` : ''}, check: ${d.check || 'n/a'}` }),
   '', '## Assembly', assembled || '(the assembler returned nothing)',
   '', '## Final check', ...finals.map((md, k) => `- Checker ${k + 1}: ${VERDICT(md)} - ${section(md, 'Problem').slice(0, 1500)}`),
+  !finals.length ? '- No final checker answered.' : null,
   repaired.length ? `- Sections solved again and rewritten: ${repaired.join(', ')}` : null,
   fix ? `- Fixer: ${section(fix, 'Fixed').slice(0, 300)}` : null,
   recheck ? `- Re-check: ${VERDICT(recheck)} - ${section(recheck, 'Problem').slice(0, 300)}` : null,
-  restored ? '- The fix did not pass the re-check and was undone.' : null,
+  repairNote ? `- The repair was measured and ${repairNote}` : null,
+  restored ? '- The repair did not pass its measurement or re-check and was undone.' : null,
+  missing.length ? `\n**No result - do these yourself:** ${missing.map(st => `${st.n}. ${st.title}`).join('; ')}` : null,
+  failedChanges.length ? `**Changes not in place:** ${failedChanges.map(n => `subtask ${n}`).join(', ')} - see the apply output above.` : null,
+  hard ? '**The graph ran out of time:** everything decided is in place; the rest is listed above.' : null,
   '', '## Next step',
   passed ? 'Open each deliverable to confirm it is there, then report.' : 'Open each deliverable, check it against the request with your own tools, fix what is wrong, then report.',
-  '**Never rewrite a deliverable whole with `Write`** - fix only what a checker named, with small `Edit`s. Each part above was solved and checked by several agents.',
+  `**Never rewrite a deliverable whole with \`Write\`** - fix only what a checker named, with small \`Edit\`s. ${thin.length ? `Parts with one candidate or no passing check: ${thin.map(st => st.n).join(', ')} - treat them as unverified.` : 'Each part above had two or more candidates and passed its check.'}`,
   settledLine,
   sectionMode ? 'Keep exactly one `## ` heading per section, plain `-` hyphens, and every citation.' : null,
   EXAMPLES && PRISTINE && FUNCTIONS.length ? `Check code against its docstring examples with \`python3 ${q(EXAMPLES)} ${q(PRISTINE)}/FILE ${q(CWD)}/FILE\`; never add a special case for an example's values.` : null,

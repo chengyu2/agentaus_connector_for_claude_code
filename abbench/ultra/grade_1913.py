@@ -1,23 +1,44 @@
-"""Grade a 1913 bank.py fix: compare against the original module's behaviour. Usage: grade_1913.py <workdir> <original_bank.py>"""
-import importlib.util, json, os, subprocess, sys
-wd, orig = sys.argv[1], sys.argv[2]
+"""Grade a 1913 bank.py fix: compare against the original module's behaviour. Usage: grade_1913.py <workdir> <original_bank.py> [--hard]"""
+import contextlib, importlib.util, io, json, os, subprocess, sys
+# Absolute: the original is staged under <wd>/.orig and reads ../strength_reports through a
+# symlink; a relative link target resolves against .orig/, not the cwd. Measured: a relative
+# wd scored 0.385 where the absolute one scored 0.538.
+wd, orig = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])
+HARD = '--hard' in sys.argv[3:]
 def load(path, name):
+    """Import as another tool would: neutral argv, stdout captured, cwd always restored.
+    Measured (d13 c1913h): the candidate called parser.parse_args() at module level, read the
+    grader's own argv, and SystemExit (not an Exception) took the whole grade to 0."""
     spec = importlib.util.spec_from_file_location(name, path); m = importlib.util.module_from_spec(spec)
-    cwd = os.getcwd(); os.chdir(os.path.dirname(path)); spec.loader.exec_module(m); os.chdir(cwd); return m
+    cwd, argv = os.getcwd(), sys.argv
+    sys.argv = [path]
+    try:
+        os.chdir(os.path.dirname(path))
+        with contextlib.redirect_stdout(io.StringIO()):
+            spec.loader.exec_module(m)
+    finally:
+        os.chdir(cwd); sys.argv = argv
+    return m
 # The original reads ../strength_reports relative to its own file, so stage it beside the candidate.
 os.makedirs(os.path.join(wd, '.orig', 'tools'), exist_ok=True)
 open(os.path.join(wd, '.orig', 'tools', 'bank.py'), 'w').write(open(orig).read())
-if not os.path.exists(os.path.join(wd, '.orig', 'strength_reports')):
+if not os.path.lexists(os.path.join(wd, '.orig', 'strength_reports')):
     os.symlink(os.path.join(wd, 'strength_reports'), os.path.join(wd, '.orig', 'strength_reports'))
 out = {}
 try:
     o = load(os.path.join(wd, '.orig', 'tools', 'bank.py'), 'bank_orig')
+    # Every check compares against the original; if it staged nothing, `all(... for n in o.BANK)`
+    # passes vacuously. Fail loudly instead: a grader error, not a score.
+    assert len(o.BANK) == 12, f'original failed to stage: {len(o.BANK)} profiles, want 12'
+except BaseException as e:
+    print(json.dumps({'score': None, 'grader_error': 'original: ' + repr(e)[:300]})); sys.exit()
+try:
     c = load(os.path.join(wd, 'tools', 'bank.py'), 'bank_cand')
-except Exception as e:
+except BaseException as e:
     print(json.dumps({'score': 0.0, 'error': repr(e)[:300]})); sys.exit()
 def same(f):
     try: return bool(f())
-    except Exception: return False
+    except BaseException: return False
 checks = {
  'prefers_fuller_report': lambda: {n: p['depth'] for n, p in c.BANK.items()} == {n: p['depth'] for n, p in o.BANK.items()} and set(c.FULL) == set(o.FULL),
  'au_spelling': lambda: all(c.BANK[n]['seq'] == o.BANK[n]['seq'] for n in o.BANK) and c.SPELLING.get('Maximiser') == 'Maximizer',
@@ -26,7 +47,7 @@ checks = {
  'count_top_inclusive': lambda: all(c.count_top(t, k) == o.count_top(t, k) for t in o.THEMES for k in (1, 5, 10)),
  'no_regression': lambda: all(c.mean_rank(t) == o.mean_rank(t) for t in o.THEMES) and c.domain_slots() == o.domain_slots() and c.THEMES == o.THEMES and c.DOMAIN == o.DOMAIN,
 }
-if '--hard' in sys.argv:
+if HARD:
     # c1913h's four further bugs, each its own check rather than one "no regression".
     checks.update({
         'names_cleaned': lambda: set(c.BANK) == set(o.BANK),
@@ -51,4 +72,21 @@ try:  # the human summary must still work
 except Exception: out['summary_still_runs'] = False
 keys = [k for k in out if not k.endswith('_error')]
 out['score'] = round(sum(bool(out[k]) for k in keys) / len(keys), 3)
+# Diagnostic, outside the score so the denominator (8, or 12 with --hard) and every historical
+# score stay comparable: seven tools in tools/ import bank, so importing it under another
+# tool's argv must neither exit nor print.
+def _import_safe():
+    spec = importlib.util.spec_from_file_location('bank_probe', os.path.join(wd, 'tools', 'bank.py'))
+    m = importlib.util.module_from_spec(spec); cwd, argv = os.getcwd(), sys.argv
+    sys.argv = ['viz.py', '--some-other-tool-flag']
+    try:
+        os.chdir(os.path.join(wd, 'tools'))
+        with contextlib.redirect_stdout(io.StringIO()) as buf, contextlib.redirect_stderr(io.StringIO()):
+            spec.loader.exec_module(m)
+        return buf.getvalue() == ''
+    except BaseException:
+        return False
+    finally:
+        os.chdir(cwd); sys.argv = argv
+out['diagnostics'] = {'import_safe': _import_safe()}
 print(json.dumps(out))

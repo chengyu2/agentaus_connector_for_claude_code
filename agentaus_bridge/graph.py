@@ -33,6 +33,7 @@ from collections import OrderedDict
 from pathlib import Path
 from xml.etree import ElementTree
 
+from . import throttle
 from .config import settings
 
 log = logging.getLogger("agentaus-bridge")
@@ -51,8 +52,20 @@ def script_for() -> str:
     return DYNAMIC_SCRIPT if settings.agentaus_graph_kind == "dynamic" else SCRIPT
 
 
-def expand(call: dict, task: str, cwd: str | None) -> dict:
-    """`call` with the graph in place of the script Agentaus wrote, or unchanged."""
+def total_ms(started_at: float | None = None, now: float | None = None) -> int:
+    """The graph's hard end (args.total_ms): AGENTAUS_GRAPH_TOTAL_S, less the time the session
+    has already spent when its start is known. Measured (d12-d14): graphs started 10-95 s into
+    their session, and the harness kills a run at 7,200 s from the session's start."""
+    total = settings.agentaus_graph_total_s
+    if started_at:
+        total -= max(0.0, (time.time() if now is None else now) - started_at)
+    return int(max(60.0, total) * 1000)
+
+
+def expand(call: dict, task: str, cwd: str | None, started_at: float | None = None) -> dict:
+    """`call` with the graph in place of the script Agentaus wrote, or unchanged.
+
+    `started_at` is when the session began (time.time()), if the bridge saw it."""
     if call.get("name") != "Workflow":
         return call
     arguments = call.get("arguments")
@@ -79,6 +92,10 @@ def expand(call: dict, task: str, cwd: str | None) -> dict:
                  # workflow 1 ran 4,076-4,525 s, and with the main loop after it a run did
                  # not fit inside 7,200 s.
                  "budget_ms": settings.agentaus_graph_budget_s * 1000,
+                 # The hard end for the whole graph: it must return a result before this.
+                 "total_ms": total_ms(started_at),
+                 # A writer's limit as the bridge enforces it, plus the same 120 s margin.
+                 "writer_ms": (settings.agentaus_graph_writer_max_s + 120) * 1000,
                  **({"skills": SKILLS, **prepare(cwd)} if dynamic else {})},
     }
     log.info("workflow: running the agent graph for a %d-char request", len(task or ""))
@@ -562,17 +579,83 @@ def _keep(key: str, entry: dict) -> dict:
     return entry
 
 
+# The record also goes to the graph's scratch folder, so a bridge restarted mid-run still knows
+# the graph ran. Without it the run state reads "none" once Claude Code's own compaction has
+# dropped the Workflow call, and the "Call Workflow first" refusals (d12) come back.
+SESSION_FILE = "session.json"
+_WRITTEN: set = set()
+
+
+def _session_path(key: str) -> str | None:
+    cwd = key.split("\x00", 1)[1] if "\x00" in key else ""
+    return os.path.join(scratch_of(cwd), SESSION_FILE) if cwd else None
+
+
+def _persist(key: str, entry: dict) -> None:
+    path = _session_path(key)
+    if not path or not os.path.isdir(os.path.dirname(path)):
+        return   # no graph has prepared this folder: nothing to come back to
+    try:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                stored = json.load(fh)
+        except (OSError, ValueError):
+            stored = {}
+        stored = stored if isinstance(stored, dict) else {}
+        stored[key] = {**entry, "launched": sorted(entry["launched"]),
+                       "reported": sorted(entry["reported"])}
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(stored, fh)
+        os.replace(tmp, path)
+        _WRITTEN.add(path)
+    except OSError as exc:
+        log.warning("graph session record not saved to %s (%s)", path, exc)
+
+
+def _restore(key: str) -> dict | None:
+    path = _session_path(key)
+    try:
+        with open(path or "", encoding="utf-8") as fh:
+            stored = (json.load(fh) or {}).get(key)
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(stored, dict) or "task" not in stored:
+        return None
+    entry = {**stored, "launched": set(stored.get("launched") or []),
+             "reported": set(stored.get("reported") or [])}
+    log.info("graph session record restored from %s", path)
+    return _keep(key, entry)
+
+
 def remember_run(body: dict, task: str, said: str | None) -> None:
     """Record that the graph was put in place of this session's Workflow call."""
     key = run_key(body)
     if key:
-        _keep(key, {"task": task, "said": said, "at": time.time(), "launched": set(),
-                    "reported": set(), "found_at": None})
+        _persist(key, _keep(key, {"task": task, "said": said, "at": time.time(),
+                                  "launched": set(), "reported": set(), "found_at": None}))
 
 
 def forget_runs() -> None:
-    """Clear every session's record. For tests: it is module state."""
+    """Clear every session's record, and the record files this process wrote. For tests: it is
+    module state."""
     _RUNS.clear()
+    _STARTED.clear()
+    for path in list(_WRITTEN):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        _WRITTEN.discard(path)
+
+
+# When the bridge first saw each session's main loop (time.time()), for args.total_ms.
+_STARTED: "OrderedDict[str, float]" = OrderedDict()
+
+
+def session_started(body: dict) -> float | None:
+    key = run_key(body)
+    return _STARTED.get(key) if key else None
 
 
 def _texts_in(content) -> list:
@@ -603,7 +686,11 @@ def note_run(body: dict) -> dict | None:
     key = run_key(body)
     if not key or is_subagent_turn(body):
         return None
-    entry = _RUNS.get(key)
+    if key not in _STARTED:
+        _STARTED[key] = time.time()
+        while len(_STARTED) > _RUNS_LIMIT:
+            _STARTED.popitem(last=False)
+    entry = _RUNS.get(key) or _restore(key)
     uses: dict = {}
     launched, reported = set(), set()
     first_use = None
@@ -636,8 +723,11 @@ def note_run(body: dict) -> dict | None:
             return None
         entry = _keep(key, {"task": first_use[1], "said": None, "at": time.time(),
                             "launched": set(), "reported": set(), "found_at": first_use[0]})
+    before = (len(entry["launched"]), len(entry["reported"]))
     entry["launched"] |= launched
     entry["reported"] |= reported & (entry["launched"] | {_NO_ID})
+    if (len(entry["launched"]), len(entry["reported"])) != before:
+        _persist(key, entry)
     return entry
 
 
@@ -1266,6 +1356,11 @@ def overdue(body: dict, now: float | None = None) -> tuple[float, bool]:
     An agent is known by its prompt's title (see _agent_key). Its first request - nothing
     but that prompt - starts the clock again, so a retry launched with the same prompt gets
     its own time. Call it with the request as received, before fitting or compaction.
+
+    Only time the upstream could serve counts: seconds it was down (throttle.Health) are left
+    out. Measured (d14): agents hit their 720 s limit during an outage, were told "time is
+    up", and the time-up request itself got a 524 - half-done answers, from wall-clock time
+    the agent never had.
     """
     now = time.monotonic() if now is None else now
     key, title = _agent_key(body)
@@ -1274,15 +1369,87 @@ def overdue(body: dict, now: float | None = None) -> tuple[float, bool]:
     entry = _FIRST_SEEN.get(key)
     if entry is None or fresh:
         log.info("graph agent clock started: %s", title[:200])
-        entry = _FIRST_SEEN[key] = [now, False]
+        entry = _FIRST_SEEN[key] = [now, False, throttle.down_total()]
     _FIRST_SEEN.move_to_end(key)
     while len(_FIRST_SEEN) > _FIRST_SEEN_LIMIT:
         _FIRST_SEEN.popitem(last=False)
-    over = now - entry[0] - agent_limit(body)
+    over = _over(entry, body, now)
     if over <= 0:
         return 0.0, False
     news, entry[1] = not entry[1], True
     return over, news
+
+
+def _over(entry: list, body: dict, now: float) -> float:
+    down = max(0.0, throttle.down_total() - (entry[2] if len(entry) > 2 else 0.0))
+    return now - entry[0] - down - agent_limit(body)
+
+
+def seconds_over(body: dict, now: float | None = None) -> float:
+    """How far past its limit this graph agent is now (0 when not, or unknown) - like
+    `overdue`, but it starts no clock and records nothing: safe to ask between retries."""
+    entry = _FIRST_SEEN.get(hashlib.sha256(_agent_key(body)[0].encode()).hexdigest())
+    if entry is None:
+        return 0.0
+    return max(0.0, _over(entry, body, time.monotonic() if now is None else now))
+
+
+# What the bridge hands back when a time-up turn cannot be answered upstream. Each role's own
+# result heading, so the graph reads it where it reads a real reply (skills/*.md).
+_RESULT_HEADING = {"solve": "Answer", "merge": "Answer", "check": "Evidence", "fix": "Evidence",
+                   "assemble": "Problems", "scout": "What is in them"}
+TIME_UP_PARTIAL = "(time up; partial, assembled by the bridge)"
+OUT_OF_TIME = "(out of time)"
+
+
+def time_up_fallback(body: dict, *, text_chars: int = 4000, result_chars: int = 1500,
+                     results: int = 3) -> str:
+    """A graph agent's result put together from what it already has: its last assistant text
+    and its last few tool results, under its role's result heading.
+
+    Measured (d10-d14): "time is up, report now" turns got a 524 20-50% of the time (ordinary
+    turns about 0.1%), and the identical doomed prompt was replayed five times and copied ten
+    more by Claude Code's fallback. What the agent found is already in its conversation.
+    """
+    messages = body.get("messages") or []
+    said: list = []
+    calls: dict = {}
+    outputs: list = []
+    for message in messages:
+        content = message.get("content")
+        if message.get("role") == "assistant":
+            if isinstance(content, str) and content.strip():
+                said.append(content.strip())
+            for block in content if isinstance(content, list) else []:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text" and (block.get("text") or "").strip():
+                    said.append(block["text"].strip())
+                elif block.get("type") == "tool_use":
+                    args = block.get("input") or {}
+                    what = next((str(args[k]) for k in ("command", "file_path", "pattern", "path")
+                                 if isinstance(args, dict) and args.get(k)), "")
+                    calls[block.get("id")] = f"{block.get('name') or '?'}: {what}".strip(": ")
+        elif message.get("role") == "user" and isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    out = _tool_result_text(block).strip()
+                    if out and TIME_UP not in out:
+                        outputs.append((calls.get(block.get("tool_use_id"), "tool"), out))
+    heading = _RESULT_HEADING.get(role_of(body) or "", "Answer")
+    parts = [TIME_UP_PARTIAL, "", f"## {heading}", ""]
+    text = "\n\n".join(said[-3:]).strip()
+    if len(text) > text_chars:
+        text = "[...]\n" + text[-text_chars:]
+    parts.append(text or "Time ran out before this agent wrote a result. What its tools "
+                         "returned last is below.")
+    if outputs:
+        parts += ["", "## What its last tool calls returned", ""]
+        for name, out in outputs[-results:]:
+            if len(out) > result_chars:
+                out = out[:result_chars // 3] + "\n[...]\n" + out[-(result_chars - result_chars // 3):]
+            parts += [f"`{name[:200]}`", "```text", out, "```", ""]
+    return "\n".join(parts).strip() + "\n"
 
 
 def time_up(body: dict) -> dict:
@@ -1379,6 +1546,7 @@ _EXACT_BLOCK = re.compile(
     r"^([ \t]*)" + re.escape(EXACT) + r"[ \t]*\n(?:[ \t]*\n)?([ \t]*)```(?:bash|sh)?[ \t]*\n(.*)\n[ \t]*```[ \t]*$",
     re.M | re.S)   # greedy: a section's own ``` fences sit inside its heredoc
 EXACT_OUTPUT_CHARS = 4000
+EXACT_HEAD_CHARS, EXACT_TAIL_CHARS = 1000, 3000
 
 
 def _texts_of(message: dict) -> list:
@@ -1458,4 +1626,14 @@ def exact_command(body: dict) -> tuple[str, str] | None:
         log.info("graph exact command: follow-up not recognised (no tool result for the call)")
         return None
     output = _tool_result_text(results[0]).strip("\n")
-    return "report", (output[:EXACT_OUTPUT_CHARS] if output.strip() else "(no output)")
+    return "report", (exact_output(output) if output.strip() else "(no output)")
+
+
+def exact_output(output: str, head: int = EXACT_HEAD_CHARS, tail: int = EXACT_TAIL_CHARS) -> str:
+    """The first `head` and last `tail` characters of an exact command's output. Measured: the
+    graph prints its status markers - CHOSEN, restored, applied subtask N - last, and keeping
+    only the first 4,000 characters could cut them."""
+    if len(output) <= head + tail:
+        return output
+    cut = len(output) - head - tail
+    return f"{output[:head]}\n[... {cut} chars cut ...]\n{output[-tail:]}"

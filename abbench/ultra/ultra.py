@@ -8,6 +8,9 @@ in a fresh directory outside any repository, graded afterwards with no model in 
     ./ultra.py run --arms agentaus,opus --tasks rdti,c1913,tender --reps 2 --label u1
     ./ultra.py report --label u1
 
+For benchmark rounds use loop.py: it gates launches on upstream health, voids and reruns
+runs an outage spoiled, and keeps a ledger tied to the code the bridge loaded.
+
 Tasks - each the kind of work ultracode is for:
     rdti    data analysis across four spreadsheets of the public ATO R&D Tax Incentive
             report: ABNs written three ways, an amendment file that overrides (one
@@ -38,6 +41,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -159,7 +163,8 @@ def cmd_setup(args):
 # Grading
 # --------------------------------------------------------------------------------------
 
-def grade(task: str, wd: Path) -> dict:
+def grade(task: str, wd: Path, graders_dir: Path = HERE) -> dict:
+    """`graders_dir` lets `loop.py regrade` compare against an older copy of the graders."""
     py = str(_python())
     if task == "rdti":
         key = json.loads((FIXTURES / "rdti_answer_key.json").read_text())
@@ -170,20 +175,31 @@ def grade(task: str, wd: Path) -> dict:
         right = [k for k, v in key.items() if got.get(k) == v]
         return {"score": round(len(right) / len(key), 3), "wrong": [k for k in key if k not in right]}
     if task in ("c1913", "c1913h"):
-        r = subprocess.run([py, str(HERE / "grade_1913.py"), str(wd), str(FIXTURES / "bank_original.py")]
+        r = subprocess.run([py, str(Path(graders_dir) / "grade_1913.py"), str(wd), str(FIXTURES / "bank_original.py")]
                            + (["--hard"] if task == "c1913h" else []),
                            capture_output=True, text=True, timeout=600)
         shutil.rmtree(wd / ".orig", ignore_errors=True)
     elif task == "he10":
-        r = subprocess.run([py, str(HERE / "grade_he.py"), str(wd), str(FIXTURES / "he10_key.json")],
+        r = subprocess.run([py, str(Path(graders_dir) / "grade_he.py"), str(wd), str(FIXTURES / "he10_key.json")],
                            capture_output=True, text=True, timeout=900)
     else:
-        r = subprocess.run([py, str(HERE / "grade_tender.py"), str(wd)],
+        r = subprocess.run([py, str(Path(graders_dir) / "grade_tender.py"), str(wd)],
                            capture_output=True, text=True, timeout=120)
     try:
         return json.loads(r.stdout.strip().splitlines()[-1])
     except (IndexError, ValueError):
         return {"score": 0.0, "grader_error": (r.stderr or "")[-300:]}
+
+
+def safe_grade(task: str, wd: Path) -> dict:
+    """`grade`, but a grader crash or timeout is recorded instead of losing the run: the
+    record is still written, with score None so it is reported as ungraded, not as 0."""
+    try:
+        return grade(task, wd)
+    except BaseException as exc:  # noqa: BLE001 - TimeoutExpired, KeyboardInterrupt in a worker
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return {"score": None, "grader_error": repr(exc)[:300]}
 
 
 # --------------------------------------------------------------------------------------
@@ -204,7 +220,85 @@ def clean_env(port: int) -> dict:
     # and its session scored zero. An open VS Code session never does that, so neither
     # does this one; the run's own timeout still bounds it.
     env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = "0"
+    # A graph turn can wait for minutes on Agentaus with only keepalive pings; measured
+    # (cc_probe mock_idle1800) a 650 s streamed turn completes with this and falls back to a
+    # non-streaming re-send without it.
+    env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = "1800000"
+    # Measured (d8, d11): one stalled request was re-sent non-streaming 9 times, and a run
+    # launched into an outage died on its first request after 62 min. Measured against a mock
+    # whose non-streaming reply never comes (API_TIMEOUT_MS=20000): 10 sends over 320 s by
+    # default, 2 sends with this. One retry rides out a blip; the bridge retries the rest.
+    env["CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES"] = "1"
     return env
+
+
+def kill_session(proc: subprocess.Popen, wd: Path | None = None) -> None:
+    """Kill the run's whole process group, then anything still working inside its directory:
+    Bash-tool children outlive a kill of the parent and keep writing while the run is graded,
+    and a child that called setsid has left the group."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        # The leader may exit on SIGTERM while a member of its group ignores it.
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    if wd is not None:
+        for pid in pids_in(wd):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+def pids_in(wd: Path) -> list[int]:
+    """Processes whose working directory is `wd` or below it (lsof's cwd records; `+D` would
+    walk every file in the tree)."""
+    root = str(Path(wd).resolve())
+    try:
+        out = subprocess.run(["lsof", "-a", "-d", "cwd", "-F", "pn"], capture_output=True,
+                             text=True, timeout=60).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    pids, pid = [], None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n") and pid not in (None, os.getpid()):
+            path = line[1:]
+            if path == root or path.startswith(root + os.sep):
+                pids.append(pid)
+    return sorted(set(pids))
+
+
+def launch(cmd: list, wd: Path, env: dict, prompt: str, transcript: Path) -> subprocess.Popen:
+    """The session as its own process group, so a timeout or abort can kill all of it."""
+    out = open(transcript, "w")
+    try:
+        proc = subprocess.Popen(cmd, cwd=wd, env=env, stdin=subprocess.PIPE, stdout=out,
+                                stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+    finally:
+        out.close()  # the child holds its own copy
+    proc.stdin.write(prompt)
+    proc.stdin.close()
+    return proc
+
+
+def session_cmd(arm: str, port: int) -> list:
+    settings = json.dumps({"env": {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
+                                   "ANTHROPIC_CUSTOM_MODEL_OPTION": "agentaus"},
+                           "autoMemoryEnabled": False})
+    return [_newest_claude_code(), "-p", "--model", ARMS[arm], "--settings", settings,
+            "--output-format", "stream-json", "--verbose",
+            "--permission-mode", "bypassPermissions", "--max-turns", "80",
+            "--disallowedTools", "WebSearch", "WebFetch"]
 
 
 def prompt_for(task: str, variant: str) -> str:
@@ -244,28 +338,26 @@ def run_one(arm: str, task: str, variant: str, rep: int, label: str, port: int,
     wd = RUNS / label / f"{arm}-{task}-{variant}-{rep}"
     shutil.rmtree(wd, ignore_errors=True)
     shutil.copytree(FIXTURES / task, wd)
-    settings = json.dumps({"env": {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
-                                   "ANTHROPIC_CUSTOM_MODEL_OPTION": "agentaus"},
-                           "autoMemoryEnabled": False})
-    cmd = [_newest_claude_code(), "-p", "--model", ARMS[arm], "--settings", settings,
-           "--output-format", "stream-json", "--verbose",
-           "--permission-mode", "bypassPermissions", "--max-turns", "80",
-           "--disallowedTools", "WebSearch", "WebFetch"]
     transcript = wd.with_suffix(".jsonl")
     started, timed_out = time.time(), False
-    with open(transcript, "w") as out:
-        try:
-            subprocess.run(cmd, cwd=wd, env=clean_env(port), input=prompt_for(task, variant),
-                           text=True, stdout=out, stderr=subprocess.DEVNULL, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+    proc = launch(session_cmd(arm, port), wd, clean_env(port), prompt_for(task, variant), transcript)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    finally:
+        # Also on a clean exit: background Bash children can outlive the session.
+        kill_session(proc, wd)
+    ended = time.time()
     rec = {"arm": arm, "task": task, "variant": variant, "rep": rep, "label": label,
-           "wall_s": round(time.time() - started, 1), "timed_out": timed_out,
-           **transcript_stats(transcript.read_text().splitlines()), "grade": grade(task, wd)}
+           "started_at": round(started, 1), "ended_at": round(ended, 1),
+           "wall_s": round(ended - started, 1), "timed_out": timed_out,
+           **transcript_stats(transcript.read_text(errors="replace").splitlines()),
+           "grade": safe_grade(task, wd)}
     # A limit can land mid-run, so it is read from the transcript's last words, not the wall.
     # Only the session's own last words: the whole transcript quotes tool docs and
     # results that mention limits, which flagged five timed-out runs as infrastructure.
-    tail = rec["result_text"][:300] or "\n".join(transcript.read_text().splitlines()[-3:])
+    tail = rec["result_text"][:300] or "\n".join(transcript.read_text(errors="replace").splitlines()[-3:])
     rec["infra_error"] = bool(INFRA.search(tail))
     wd.with_suffix(".json").write_text(json.dumps(rec, indent=1))
     return rec
@@ -285,7 +377,9 @@ def cmd_run(args):
             a, t, v, r = futures[f]
             try:
                 rec = f.result()
-                print(f"[{args.label}] {a:9s} {t:7s} {v:8s} #{r} score={rec['grade'].get('score', 0):.2f} "
+                score = rec["grade"].get("score")
+                print(f"[{args.label}] {a:9s} {t:7s} {v:8s} #{r} "
+                      f"score={'ungraded' if score is None else format(score, '.2f')} "
                       f"{rec['wall_s']:6.0f}s workflow={rec['workflow_calls']} "
                       f"rejected={rec['workflow_rejected']}{' TIMEOUT' if rec['timed_out'] else ''}"
                       f"{' INFRA' if rec.get('infra_error') else ''}",
@@ -303,6 +397,10 @@ def cmd_report(args):
     if infra:
         print(f"EXCLUDED {len(infra)} run(s) that failed on infrastructure, not the model")
     recs = [r for r in recs if not r.get("infra_error")]
+    ungraded = [r for r in recs if r["grade"].get("score") is None]
+    if ungraded:
+        print(f"EXCLUDED {len(ungraded)} run(s) whose grader failed (regrade them: loop.py regrade)")
+    recs = [r for r in recs if r["grade"].get("score") is not None]
     by: dict = {}
     for r in recs:
         by.setdefault((r["task"], r["variant"], r["arm"]), []).append(r)

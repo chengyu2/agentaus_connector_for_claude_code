@@ -837,7 +837,32 @@ Headless Claude Code stops waiting for background work after a ceiling and kills
 workflow ended ten minutes in with "[Request interrupted by user]" and its run scored
 zero. An open VS Code session never does that, so the harness sets
 `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`. Set it yourself to drive ultracode from
-`claude -p`.
+`claude -p`. It also sets `CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000` and
+`CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES=1`: measured against a mock, a request whose
+non-streaming fallback times out is otherwise sent 10 times, which is how five runs died on
+their first request after 62 minutes during an outage.
+
+Rounds are run with `loop.py`, not `ultra.py run`:
+
+```bash
+../../.venv/bin/python loop.py run --label d15 --valid 3 --manage-bridge   # one bridge on 8800, width 6
+../../.venv/bin/python loop.py report --labels d15
+../../.venv/bin/python loop.py regrade --out regrade.jsonl                  # copies; run folders untouched
+```
+
+It launches an Agentaus run only when the bridge's `/healthz/upstream` and a realistic
+streamed probe say Agentaus is serving, aborts a run whose last 15 minutes were an outage
+(at least half the calls failing, or under 2 good calls a minute, at a throttle limit of 2
+or less), and voids runs whose window degraded, rerunning them until each task has N valid
+runs. Runs that finish through a moderate slump stay valid and are counted as "survived
+degraded". Every attempt goes to `~/agentaus_ultra_runs/ledger.jsonl` with the bridge's
+loaded-source hash, the upstream's health over the run, the score and each check. The
+report shows valid runs only: the mean, a bootstrap interval and the range against the
+rolling Opus mean (an Opus arm runs every round), with the old bars second. Replayed
+against the d1-d13 bridge logs, the rules abort and void all 10 outage zeros that have a
+record, and no run from a healthy window. They also abort d8 tender: it had written a
+1.0 answer before the outage, then sat in it until the 7200 s cap. The ledger keeps an
+aborted run's score, but the run does not count.
 
 ### Results
 

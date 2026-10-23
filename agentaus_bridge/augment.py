@@ -512,6 +512,10 @@ return { runs: ok, agree: ok.length === 2 && ok[0].total === ok[1].total }
 ```
 """
 
+# After the result: the dynamic graph's result has no `open_issues` (it was named here and never
+# existed), and nothing told the main loop to run the request's own commands. Measured (d13
+# c1913h): a post-graph Edit left `parse_args()` at module level, nothing ran the tool again,
+# and the run scored 0; d9/d10 show the post-graph turn is worth keeping (0.625 -> 0.875).
 GRAPH_GUIDANCE = """\
 
 --- Multi-agent workflows ---
@@ -535,10 +539,12 @@ You do **not** write the script. The bridge runs its own agent graph: many small
 
 ### When the `<task-notification>` arrives
 
-1. **Read** its result: what was planned, what each check found, and any open issue.
+1. **Read** its result: what was planned, what each check found, and what it says failed.
 2. **Open** each deliverable and confirm it is there and answers the request.
-3. **Fix** anything in `open_issues`, or anything you find wrong, with your own tools.
-4. **Report** what was done, briefly.
+3. **Fix** anything the result says failed, or anything you find wrong, with your own tools.
+4. **Run** the commands in the result's Next step and every command the request names; run
+   them again after your last edit, before reporting.
+5. **Report** what was done, briefly.
 """
 
 SUBAGENT_GUIDANCE = """\

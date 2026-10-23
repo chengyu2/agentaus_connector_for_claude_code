@@ -63,10 +63,20 @@ class Settings:
     system_prompt_overwrite: bool = field(
         default_factory=lambda: _bool("AGENTAUS_SYSTEM_PROMPT_OVERWRITE", True)
     )
-    # Ask Agentaus to stream. Its stream is currently buffered (one chunk), but
-    # honouring it means the bridge benefits automatically if that improves.
+    # Ask Agentaus to stream - for every call, whether or not the client asked for a stream:
+    # a buffered client turn is assembled from the upstream stream. Measured (d13/d14 slumps):
+    # buffered calls got 524 about 76 times in 109, streamed ones 7 in 38 over the same
+    # windows, and d12 streamed successes ran up to 263 s - so the stream is not one buffered
+    # chunk, whatever it once was.
     upstream_stream: bool = field(
         default_factory=lambda: _bool("AGENTAUS_UPSTREAM_STREAM", True)
+    )
+    # The longest an Agentaus stream may go without sending a byte, once its headers have
+    # arrived, before the call is treated as a dead connection (a retryable read timeout) and
+    # its slot freed. Streaming helpers were turned off once because a stalled stream held its
+    # socket for the whole read timeout; this is the bound that makes streaming them safe.
+    agentaus_stream_idle_seconds: float = field(
+        default_factory=lambda: _float("AGENTAUS_STREAM_IDLE_S", 120.0)
     )
 
     # --- Anthropic passthrough ----------------------------------------------------
@@ -96,6 +106,15 @@ class Settings:
     # until the whole answer is ready, so the bridge emits its own ping events.
     ping_interval_seconds: float = field(
         default_factory=lambda: float(_int("BRIDGE_PING_INTERVAL", 10))
+    )
+    # Pings are not enough past 600 s: Claude Code cuts a stream that has carried only
+    # message_start and pings for 600 s and re-sends the turn without streaming. Measured: of
+    # 17 d14 disconnects 13 were at 600-640 s, each followed by ~10 buffered copies; a probe
+    # with pings only fell back at 601.7 s, one with a thinking delta every 60 s completed a
+    # 650 s turn. So every this many seconds of silence the bridge sends a thinking delta. 0
+    # sends pings only.
+    heartbeat_seconds: float = field(
+        default_factory=lambda: _float("BRIDGE_HEARTBEAT_SECONDS", 60.0)
     )
     # Re-chunk buffered text so the terminal renders progressively. 0 disables.
     chunk_chars: int = field(default_factory=lambda: _int("BRIDGE_CHUNK_CHARS", 60))
@@ -142,8 +161,27 @@ class Settings:
     # Claude Code's own idle timeout from ever firing, so without this a turn wedged in
     # the bridge shows a spinner forever. Real turns measured p99 220s, max 277s. When it
     # fires the client receives an error event and the user can retry. 0 disables.
+    # Counted only while Agentaus can serve (see throttle.Health): a turn that waits out an
+    # outage is not wedged.
     turn_timeout_seconds: float = field(
         default_factory=lambda: _float("BRIDGE_TURN_TIMEOUT", 900.0)
+    )
+    # How long a non-streaming client is kept waiting before it is told to retry. Claude
+    # Code's buffered requests time out and are re-sent about every 300 s (d14: ten copies of
+    # one body, 300 s apart), so the answer has to come before that; the turn itself keeps
+    # running, and the re-send joins it (see flight.py). Measured p99 for a whole turn: 220 s.
+    nonstream_deadline_seconds: float = field(
+        default_factory=lambda: _float("BRIDGE_NONSTREAM_DEADLINE", 280.0)
+    )
+    # How long a turn keeps running after its last client left, for a retry to join it.
+    # Measured (d14): a non-streaming fallback arrives the moment a stream is cut, and its own
+    # re-sends follow at once after each failure. A stopped run's turns end this long after.
+    flight_grace_seconds: float = field(
+        default_factory=lambda: _float("BRIDGE_FLIGHT_GRACE", 120.0)
+    )
+    # How long a turn that finished after its client had left is kept for a late re-send.
+    flight_keep_done_seconds: float = field(
+        default_factory=lambda: _float("BRIDGE_FLIGHT_KEEP_DONE", 600.0)
     )
 
     # --- retries ------------------------------------------------------------------
@@ -247,8 +285,11 @@ class Settings:
     # turn, so the call sat for as long as the timeout allowed. Six of those and a batch
     # run stops making any upstream calls at all while looking perfectly healthy.
     # Enable it once the timeout below has been exercised under load.
+    # On by default now that every Agentaus stream has an idle bound
+    # (AGENTAUS_STREAM_IDLE_S): a silent socket is freed after 120 s instead of the read
+    # timeout, and buffered calls were the ones that drew 524s (see upstream_stream).
     agentaus_stream_helpers: bool = field(
-        default_factory=lambda: _bool("AGENTAUS_STREAM_HELPERS", False)
+        default_factory=lambda: _bool("AGENTAUS_STREAM_HELPERS", True)
     )
     # Hard ceiling on ONE bridge-initiated call, streamed or buffered. Generous on
     # purpose: a slow call is not a failed one, and abandoning work that was still
@@ -270,6 +311,12 @@ class Settings:
     # The least time between two steps up, so a lucky burst does not undo a failure.
     agentaus_upstream_ramp_seconds: float = field(
         default_factory=lambda: _float("AGENTAUS_UPSTREAM_RAMP_SECONDS", 20.0)
+    )
+    # The adaptive limit never goes below this. A failure halves it rather than dropping it to
+    # one: at one call at a time a single doomed request held the only slot for 125 s per
+    # 524, and the d14 collapse fed on that.
+    agentaus_upstream_floor: int = field(
+        default_factory=lambda: _int("AGENTAUS_UPSTREAM_FLOOR", 2)
     )
     max_concurrency_is_explicit: bool = field(
         default_factory=lambda: bool(
@@ -615,6 +662,26 @@ class Settings:
     # whole run with its main loop did not fit inside 2 hours. 45 minutes leaves room.
     agentaus_graph_budget_s: int = field(
         default_factory=lambda: _int("AGENTAUS_GRAPH_BUDGET_S", 2700)
+    )
+    # The hard end for the whole graph (args.total_ms), less the session's time already spent
+    # when the bridge knows it. Measured (d13 c1913): stragglers held a graph past the 7,200 s
+    # kill and nothing it had decided reached the project.
+    agentaus_graph_total_s: int = field(
+        default_factory=lambda: _int("AGENTAUS_GRAPH_TOTAL_S", 5400)
+    )
+    # A graph agent this far past its limit gets "(out of time)" from the bridge, with no
+    # upstream call: the graph has stopped waiting, and the agent still holds a harness slot.
+    # Measured (d13, d14): stuck agents ran 68-81 min before Claude Code failed them.
+    agentaus_graph_give_up_s: int = field(
+        default_factory=lambda: _int("AGENTAUS_GRAPH_GIVE_UP_S", 300)
+    )
+    # Check a graph main loop's .py edits still import (see import_guard.py).
+    agentaus_import_guard: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_IMPORT_GUARD", True)
+    )
+    # Repair an Edit's old_string against the file on disk (see repair.repair_edit).
+    agentaus_edit_repair: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_EDIT_REPAIR", True)
     )
     # Who a commit written on an Agentaus turn credits, as `Name <email>`. Claude Code asks
     # an unknown model for `Co-Authored-By: Claude Code <noreply@anthropic.com>`; the bridge

@@ -172,6 +172,7 @@ def collect_with_output(messages: list) -> list[tuple[str, str, str, str]]:
     """
     calls: dict[str, list] = {}
     order: list[str] = []
+    written: dict[str, str] = {}
 
     for message in messages or []:
         content = message.get("content")
@@ -186,13 +187,40 @@ def collect_with_output(messages: list) -> list[tuple[str, str, str, str]]:
                     block.get("name") or "?", _digest(block.get("input")), "pending", ""
                 ]
                 order.append(call_id)
+                what = _written(block.get("name"), block.get("input"))
+                if what:
+                    written[call_id] = what
             elif block.get("type") == "tool_result":
                 call_id = block.get("tool_use_id") or ""
                 if call_id in calls:
                     calls[call_id][2] = _outcome(block)
                     calls[call_id][3] = _result_text(block)
 
+    for call_id, what in written.items():
+        result = calls[call_id][3]
+        calls[call_id][3] = f"wrote:\n{what}" + (f"\nresult: {result}" if result.strip() else "")
     return [tuple(calls[cid]) for cid in order]
+
+
+# How much of an edit's new text the evidence shows. Measured (d13): the ledger held only the
+# Edit's file path, the grounding check flagged "no edit diff verifies this change", and a true
+# report of the fix was rewritten as "may have been changed... I did not verify".
+_WRITTEN_CHARS = 1500
+
+
+def _written(name, args) -> str:
+    """What an Edit, MultiEdit or Write put in the file - the start of it."""
+    if not isinstance(args, dict):
+        return ""
+    if name == "Write" and isinstance(args.get("content"), str):
+        text = args["content"]
+    elif name == "Edit" and isinstance(args.get("new_string"), str):
+        text = args["new_string"]
+    elif name == "MultiEdit" and isinstance(args.get("edits"), list):
+        text = "\n...\n".join(e.get("new_string") or "" for e in args["edits"] if isinstance(e, dict))
+    else:
+        return ""
+    return text[:_WRITTEN_CHARS] + ("\n[...]" if len(text) > _WRITTEN_CHARS else "")
 
 
 def render_evidence(

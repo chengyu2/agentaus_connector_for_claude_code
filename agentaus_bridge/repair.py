@@ -15,12 +15,14 @@ path, which tells the model what was wrong.
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import os
 import re
 
 from . import workflow_script
+from .config import settings
 
 log = logging.getLogger("agentaus-bridge")
 
@@ -168,8 +170,241 @@ def _python_command(code: str) -> str:
     return f"python3 - <<'{fence}'\n{code.rstrip()}\n{fence}"
 
 
-def repair(call: dict, asked_as: str, schema: dict | None, cwd: str | None) -> dict:
-    """Return `call` with its arguments repaired where the meaning is unambiguous."""
+# --- Edit old_string, against the file on disk --------------------------------------------
+#
+# Measured (d12 c1913h): every post-graph Edit's old_string used 8 spaces where the file had 4,
+# Claude Code refused each with "String to replace not found", and the run shipped 0.5 where
+# the same file with line 69 fixed grades 1.0. Edit notices in 6 post-graph turns of d9-d13.
+# The bridge runs on the machine the file is on, so it can match the call against the file.
+
+# Characters a model types for the ones in the file, all one-for-one so offsets survive.
+_UNI = str.maketrans({"\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-",
+                      "\u2212": "-", "\u00a0": " ", "\u202f": " ", "\u2018": "'",
+                      "\u2019": "'", "\u201c": '"', "\u201d": '"'})
+_LINENO = re.compile(r"^ *\d+\t", re.M)       # a Read prefix pasted into old_string
+_EDIT_FILE_BYTES = 2_000_000
+APPLIED = "applied"
+
+
+def _lead(line: str) -> str:
+    return line[:len(line) - len(line.lstrip(" \t"))]
+
+
+def _block_at(text: str, lines: list) -> list:
+    """Line indexes where `lines` (compared stripped of indentation and trailing space)
+    start in `text`."""
+    key = [l.translate(_UNI).strip() for l in lines]
+    if not any(key):
+        return []
+    tl = text.split("\n")
+    return [i for i in range(len(tl) - len(lines) + 1)
+            if all(tl[i + k].translate(_UNI).strip() == key[k] for k in range(len(lines)))]
+
+
+def _is_long(new: str) -> bool:
+    return sum(1 for l in new.split("\n") if l.strip()) >= 2 or len(new.strip()) >= 30
+
+
+def repair_edit(text: str, old: str, new: str):
+    """(old, new, how) that applies where the model meant, (APPLIED, line, how) when the edit
+    is already in the file, or None when there is no single answer.
+
+    Only a unique match is used: a Read line prefix pasted in, typographic characters typed
+    as ASCII, or the whole block shifted by one indentation step - every line by the same
+    number of spaces, so the new text is shifted with it. Tabs are never converted.
+    """
+    if not old or text.count(old) >= 1:
+        return None
+    how = []
+    if all(_LINENO.match(l) for l in old.split("\n") if l.strip()):
+        old, new = _LINENO.sub("", old), _LINENO.sub("", new)
+        how.append("Read line prefix removed")
+        if text.count(old) == 1:
+            return old, new, ", ".join(how)
+    flat = text.translate(_UNI)
+    if flat.count(old.translate(_UNI)) == 1:
+        at = flat.index(old.translate(_UNI))
+        return text[at:at + len(old)], new, ", ".join(how + ["typographic characters"])
+    first_nl = len(old) - len(old.lstrip("\n"))
+    last_nl = len(old) - len(old.rstrip("\n"))
+    lines = old.strip("\n").split("\n")
+    hits = _block_at(text, lines)
+    if len(hits) == 1:
+        real = text.split("\n")[hits[0]:hits[0] + len(lines)]
+        pairs = [(o, r) for o, r in zip(lines, real) if o.strip()]
+        if any("\t" in _lead(o) + _lead(r) for o, r in pairs):
+            return None
+        delta = len(_lead(pairs[0][1])) - len(_lead(pairs[0][0]))
+        if any(len(_lead(r)) - len(_lead(o)) != delta for o, r in pairs):
+            return None
+
+        def shift(line: str) -> str:
+            if not line.strip():
+                return line
+            return " " * delta + line if delta > 0 else line[min(-delta, len(_lead(line))):]
+
+        fixed_old = "\n" * first_nl + "\n".join(real) + "\n" * last_nl
+        if text.count(fixed_old) != 1:
+            return None
+        return (fixed_old, "\n".join(shift(l) for l in new.split("\n")),
+                ", ".join(how + [f"indentation {delta:+d}"]))
+    if hits:
+        return None
+    # Not in the file in any form. If the new text is, uniquely and at length, the edit was
+    # made already (d13 c1913h re-applied one). A short new_string proves nothing: "return
+    # None" is in most files.
+    if new and _is_long(new):
+        if text.count(new) == 1:
+            return APPLIED, text[:text.index(new)].count("\n") + 1, "already in the file"
+        placed = _block_at(text, new.strip("\n").split("\n"))
+        if len(placed) == 1:
+            return APPLIED, placed[0] + 1, "already in the file"
+    return None
+
+
+def _file_text(path: str, pending: dict | None) -> str | None:
+    if pending is not None and path in pending:
+        return pending[path]
+    try:
+        if os.path.getsize(path) > _EDIT_FILE_BYTES:
+            return None
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+
+
+def _repair_edits(name: str, args: dict, pending: dict | None) -> tuple[list, str | None]:
+    """Repair an Edit's or MultiEdit's old_string against the file - or against the text the
+    calls before it in this response leave, held in `pending` by path. In place. Returns
+    (what changed, a correction for an edit that is already in the file)."""
+    path = args.get("file_path")
+    if not isinstance(path, str) or not os.path.isabs(path):
+        return [], None
+    text = _file_text(path, pending)
+    if text is None:
+        return [], None
+    edits = [args] if name == "Edit" else [e for e in args.get("edits") or [] if isinstance(e, dict)]
+    changed = []
+    for edit in edits:
+        old, new = edit.get("old_string"), edit.get("new_string")
+        if not isinstance(old, str) or not isinstance(new, str) or text is None:
+            text = None
+            continue
+        if edit.get("replace_all"):
+            text = text.replace(old, new) if old and old in text else None
+            continue
+        fixed = repair_edit(text, old, new)
+        if fixed and fixed[0] == APPLIED:
+            return changed, (f"This edit is already in `{path}` (line {fixed[1]}): the file has "
+                             "your new text and not the old. Do not apply it again; `Read` the "
+                             "lines if you are unsure what is there.")
+        if fixed:
+            edit["old_string"], edit["new_string"] = old, new = fixed[0], fixed[1]
+            changed.append(f"old_string: {fixed[2]}")
+        text = text.replace(old, new, 1) if old and text.count(old) == 1 else None
+    if pending is not None:
+        if text is None:
+            pending.pop(path, None)
+        else:
+            pending[path] = text
+    return changed, None
+
+
+_NOT_FOUND = re.compile(r"String to replace not found|String not found in file|old_string.{0,40}not found",
+                        re.I)
+
+
+def _closest_lines(text: str, old: str, n: int = 3) -> list:
+    """(line number, line) of the `n` lines in `text` most like old_string's longest line."""
+    probe = max((l.strip() for l in old.split("\n")), key=len, default="")
+    if not probe:
+        return []
+    scored = []
+    for number, line in enumerate(text.split("\n"), 1):
+        if line.strip():
+            ratio = difflib.SequenceMatcher(None, probe, line.strip()).quick_ratio()
+            if ratio >= 0.5:
+                scored.append((ratio, number, line))
+    scored.sort(key=lambda r: -r[0])
+    best = []
+    for _, number, line in scored[: n * 4]:
+        ratio = difflib.SequenceMatcher(None, probe, line.strip()).ratio()
+        if ratio >= 0.6:
+            best.append((ratio, number, line))
+    best.sort(key=lambda r: -r[0])
+    return sorted((number, line) for _, number, line in best[:n])
+
+
+def edit_hints(body: dict) -> tuple[dict, int]:
+    """`body` with the closest real lines added to each Edit refused as "not found" in the
+    newest message - exact indentation shown - so the next try copies them instead of
+    re-reading. Only for a call no repair could place (repair_edit gave no single answer)."""
+    messages = list(body.get("messages") or [])
+    if len(messages) < 2 or messages[-1].get("role") != "user":
+        return body, 0
+    content = messages[-1].get("content")
+    previous = next((m for m in reversed(messages[:-1]) if m.get("role") == "assistant"), None)
+    if not isinstance(content, list) or not previous or not isinstance(previous.get("content"), list):
+        return body, 0
+    uses = {b.get("id"): b for b in previous["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_use"
+            and b.get("name") in ("Edit", "MultiEdit")}
+    added, blocks = 0, []
+    for block in content:
+        if (isinstance(block, dict) and block.get("type") == "tool_result"
+                and block.get("tool_use_id") in uses and _NOT_FOUND.search(_result_of(block))):
+            args = uses[block["tool_use_id"]].get("input") or {}
+            path = args.get("file_path") if isinstance(args, dict) else None
+            text = _file_text(path, None) if isinstance(path, str) else None
+            olds = [args.get("old_string")] + [e.get("old_string") for e in args.get("edits") or []
+                                               if isinstance(e, dict)]
+            old = next((o for o in olds if isinstance(o, str) and o and text and o not in text), None)
+            near = _closest_lines(text, old) if text and old else []
+            if near:
+                width = max(len(str(n)) for n, _ in near)
+                shown = "\n".join(f"{n:>{width}}: {line}    ({_describe_indent(line)})"
+                                   for n, line in near)
+                note = ("[bridge] old_string matches nothing in this file. The lines most like "
+                        f"it, as they are now in `{path}` (line number, then the line with its "
+                        f"exact indentation):\n```\n{shown}\n```\nCopy old_string from these "
+                        "lines exactly - indentation included - and Edit again.")
+                inner = block.get("content")
+                inner = [{"type": "text", "text": inner}] if isinstance(inner, str) else list(inner or [])
+                block = {**block, "content": inner + [{"type": "text", "text": note}]}
+                added += 1
+        blocks.append(block)
+    if not added:
+        return body, 0
+    messages[-1] = {**messages[-1], "content": blocks}
+    return {**body, "messages": messages}, added
+
+
+def _describe_indent(line: str) -> str:
+    lead = _lead(line)
+    if not lead:
+        return "no indentation"
+    if set(lead) == {" "}:
+        return f"{len(lead)} spaces"
+    if set(lead) == {"\t"}:
+        return f"{len(lead)} tab(s)"
+    return f"indentation {lead!r}"
+
+
+def _result_of(block: dict) -> str:
+    content = block.get("content")
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content if isinstance(b, dict))
+    return content if isinstance(content, str) else ""
+
+
+def repair(call: dict, asked_as: str, schema: dict | None, cwd: str | None,
+           pending: dict | None = None) -> dict:
+    """Return `call` with its arguments repaired where the meaning is unambiguous.
+
+    `pending` (path -> text) carries what the Edit calls before this one in the same
+    response leave in each file. An Edit that is already in the file comes back with a
+    "correction" key: the message to send the model instead of forwarding the call."""
     args = _as_dict(call.get("arguments"))
     if args is None or not isinstance(schema, dict):
         return call
@@ -218,6 +453,14 @@ def repair(call: dict, asked_as: str, schema: dict | None, cwd: str | None) -> d
             args["file_path"] = moved
             changed.append("mangled working-directory path -> working directory")
 
+    correction = None
+    if name in ("Edit", "MultiEdit") and settings.agentaus_edit_repair:
+        edited, correction = _repair_edits(name, args, pending)
+        changed += edited
+
+    if correction:
+        log.info("edit already applied: %s", args.get("file_path"))
+        return {**call, "correction": correction}
     if not changed:
         return call
     log.info("repaired %s call: %s", name, "; ".join(changed))

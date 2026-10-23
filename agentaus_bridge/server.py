@@ -29,7 +29,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import attribution
 from . import documents
+from . import flight
 from . import graph
+from . import import_guard
 from . import harmony
 from . import persisted
 from . import sessions
@@ -108,6 +110,10 @@ _STRIP_RESPONSE_HEADERS = {
 
 @app.on_event("startup")
 async def _startup() -> None:
+    # Flights belong to one event loop: a test client's, or the server's.
+    flight.reset()
+    global _SOURCE_HASH
+    _SOURCE_HASH = _source_hash()
     # Every Agentaus call takes a slot from one adaptive limit, beneath every caller.
     app.state.client = httpx.AsyncClient(
         timeout=httpx.Timeout(
@@ -147,6 +153,7 @@ async def _startup() -> None:
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    flight.cancel_all()
     await app.state.client.aclose()
     await app.state.anthropic_client.aclose()
 
@@ -179,6 +186,43 @@ async def healthz() -> JSONResponse:
             },
         }
     )
+
+
+def _source_hash() -> str:
+    """A hash of the code this process runs: the graph script and skills as graph.py loaded
+    them, and the bridge's own modules. Measured (d13): the bridge started at 19:25, dynamic.js
+    was edited at 22:20, and the round's code was no commit - a score must name what ran."""
+    import sys
+    digest = hashlib.sha256()
+    for text in (graph.SCRIPT, graph.DYNAMIC_SCRIPT, *(graph.SKILLS[k] for k in sorted(graph.SKILLS))):
+        digest.update(text.encode())
+    for name in sorted(n for n in sys.modules if n.startswith(__package__ or "agentaus_bridge")):
+        path = getattr(sys.modules[name], "__file__", None)
+        if path and path.endswith(".py"):
+            try:
+                with open(path, "rb") as fh:
+                    digest.update(fh.read())
+            except OSError:
+                pass
+    return digest.hexdigest()[:16]
+
+
+_SOURCE_HASH: str | None = None
+
+
+@app.get("/healthz/upstream")
+async def healthz_upstream() -> JSONResponse:
+    """Agentaus as the bridge has seen it over the last ten minutes: outcomes (request-specific
+    failures - time-up turns, retries of a failed request - left out), the adaptive limit,
+    whether it is down and for how long in all, and the hash of the code this process loaded.
+    For the harness: a round launched into a slump, or scored on a bridge running other code,
+    says nothing about the graph."""
+    global _SOURCE_HASH
+    if _SOURCE_HASH is None:
+        _SOURCE_HASH = _source_hash()
+    gate = throttle.limit()
+    return JSONResponse({**throttle.health().snapshot(gate.limit, gate.ceiling, gate.busy),
+                         "flights": flight.running(), "source_hash": _SOURCE_HASH})
 
 
 @app.get("/v1/models")
@@ -424,6 +468,11 @@ async def _watching_for_stall(label: str):
         return
 
     started = time.monotonic()
+    # The transport notes here when the call got its slot (see throttle.WAIT_STATE). Measured
+    # (d14): "attempt 3 still waiting after 7380s - upstream has not responded" was time in the
+    # bridge's own queue - the read timeout is 300 s - and read as an upstream outage.
+    state: dict = {"queued_at": None, "sent_at": None, "queued_s": 0.0}
+    throttle.WAIT_STATE.set(state)
 
     async def announce():
         # The task inherits the current context, so the request id is the one that
@@ -432,9 +481,17 @@ async def _watching_for_stall(label: str):
         while True:
             await asyncio.sleep(interval)
             waited += interval
-            rlog(logging.WARNING,
-                 "%s still waiting after %.1fs - upstream has not responded",
-                 label, waited)
+            if state["queued_at"] is not None and state["sent_at"] is None:
+                gate = throttle.limit()
+                rlog(logging.WARNING,
+                     "%s still queued after %.1fs - waiting for an upstream slot (%d busy, "
+                     "limit %d); not sent yet", label, waited, gate.busy, gate.limit)
+            else:
+                sent = state["sent_at"] or started
+                rlog(logging.WARNING,
+                     "%s still waiting after %.1fs - upstream has not responded in %.1fs "
+                     "(%.1fs queued first)", label, waited,
+                     time.monotonic() - sent, state["queued_s"])
 
     watcher = asyncio.ensure_future(announce())
     try:
@@ -443,7 +500,8 @@ async def _watching_for_stall(label: str):
         watcher.cancel()
         elapsed = time.monotonic() - started
         if elapsed > interval:
-            rlog(logging.INFO, "%s completed after %.1fs", label, elapsed)
+            rlog(logging.INFO, "%s completed after %.1fs (%.1fs of it queued)", label, elapsed,
+                 state["queued_s"])
 
 
 async def _post_with_retry(
@@ -453,6 +511,9 @@ async def _post_with_retry(
     json_body: dict,
     headers: dict,
     retry_capacity: bool = True,
+    stream_upstream: bool = False,
+    kind: str = "normal",
+    give_up: Callable[[], bool] | None = None,
 ) -> httpx.Response:
     """POST, retrying transient connection faults and gateway status codes.
 
@@ -462,18 +523,33 @@ async def _post_with_retry(
     `retry_capacity=False` surfaces a gateway timeout immediately instead of replaying
     it. Callers that can make the request smaller - split a chunk, truncate a passage,
     recompact a conversation - want the failure now, not four timeouts later.
+
+    `stream_upstream` asks Agentaus to stream and assembles the reply into the response a
+    buffered call returns (see _post_streamed). `kind` is what the request is to the throttle
+    (see throttle.REQUEST_KIND); after a gateway failure every retry is a "retry". `give_up`
+    is asked before each replay of a gateway failure: True returns the failure instead -
+    a graph agent past its limit, whose turn the caller will answer itself.
     """
     last_exc: Exception | None = None
+    failed_before = False
     for attempt in range(settings.max_retries + 1):
+        throttle.REQUEST_KIND.set(kind if not failed_before or kind != "normal" else "retry")
         try:
             async with _watching_for_stall(f"upstream POST (attempt {attempt + 1})"):
-                response = await client.post(url, json=json_body, headers=headers)
+                if stream_upstream:
+                    response = await _post_streamed(client, url, json_body, headers)
+                else:
+                    response = await client.post(url, json=json_body, headers=headers)
         except httpx.HTTPError as exc:
             last_exc = exc
-            if not _is_retryable_exception(exc) or attempt == settings.max_retries:
+            failed_before = True
+            if (not _is_retryable_exception(exc) or attempt == settings.max_retries
+                    or (give_up is not None and give_up())):
                 raise
             await _sleep_before_retry(attempt, _describe(exc))
             continue
+        finally:
+            throttle.REQUEST_KIND.set("normal")
 
         if not retry_capacity and response.status_code in _CAPACITY_STATUS:
             await response.aread()
@@ -483,6 +559,12 @@ async def _post_with_retry(
             return response
 
         if response.status_code in _RETRYABLE_STATUS and attempt < settings.max_retries:
+            failed_before = True
+            if give_up is not None and give_up():
+                await response.aread()
+                rlog(logging.WARNING, "HTTP %d on a graph agent past its limit; not replaying "
+                     "it", response.status_code)
+                return response
             await response.aread()  # release the connection before sleeping
             await _sleep_before_retry(attempt, f"HTTP {response.status_code}")
             continue
@@ -500,6 +582,89 @@ async def _post_with_retry(
         return response
 
     raise last_exc if last_exc else RuntimeError("retry loop exited without a response")
+
+
+async def _completion_chunks(upstream: httpx.Response) -> AsyncIterator[dict]:
+    """The chunks of an Agentaus reply: its SSE `data:` objects, or - when it answered a
+    stream request with one JSON body anyway - that body as a single chunk in delta form."""
+    content_type = (upstream.headers.get("content-type") or "").lower()
+    if "event-stream" not in content_type:
+        raw = await upstream.aread()
+        try:
+            data = json.loads(raw or b"{}")
+        except ValueError:
+            return
+        if not isinstance(data, dict):
+            return
+        if isinstance(data.get("error"), dict) or "choices" not in data:
+            yield data
+            return
+        choices = []
+        for i, choice in enumerate(data.get("choices") or []):
+            message = (choice or {}).get("message") or {}
+            delta = {"content": message.get("content")} if message.get("content") else {}
+            if message.get("tool_calls"):
+                delta["tool_calls"] = [{"index": k, **call}
+                                       for k, call in enumerate(message["tool_calls"])]
+            choices.append({"index": choice.get("index", i), "delta": delta,
+                            "finish_reason": choice.get("finish_reason")})
+        yield {"choices": choices, **({"usage": data["usage"]} if data.get("usage") else {})}
+        return
+    async for line in upstream.aiter_lines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        body = line[5:].strip()
+        if body == "[DONE]":
+            return
+        try:
+            chunk = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(chunk, dict):
+            yield chunk
+
+
+async def _post_streamed(client: httpx.AsyncClient, url: str, json_body: dict,
+                         headers: dict) -> httpx.Response:
+    """One Agentaus call made as a stream and returned as the buffered response it replaces:
+    the status and body of a failure, or the chunks assembled into one completion. Measured
+    (d13, d14 slumps): buffered calls drew 524 about 76 times in 109, streamed ones 7 in 38."""
+    async with client.stream("POST", url, json={**json_body, "stream": True},
+                             headers=headers) as upstream:
+        if upstream.status_code >= 400:
+            raw = await upstream.aread()
+            return httpx.Response(upstream.status_code, content=raw,
+                                  headers={"content-type": upstream.headers.get(
+                                      "content-type", "text/plain")},
+                                  request=upstream.request)
+        text: list = []
+        accumulator = ToolCallAccumulator()
+        finish, usage = None, None
+        async for chunk in _completion_chunks(upstream):
+            if isinstance(chunk.get("error"), dict) or "choices" not in chunk:
+                return httpx.Response(200, json=chunk, request=upstream.request)
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    text.append(delta["content"])
+                if delta.get("tool_calls"):
+                    accumulator.add(delta["tool_calls"])
+                if choice.get("finish_reason"):
+                    finish = choice["finish_reason"]
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+        message: dict = {"role": "assistant", "content": "".join(text) or None}
+        calls = accumulator.drain()
+        if calls:
+            message["tool_calls"] = [{"id": c["id"], "type": "function",
+                                      "function": {"name": c["name"],
+                                                   "arguments": c["arguments"] or "{}"}}
+                                     for c in calls]
+        assembled = {"choices": [{"index": 0, "message": message, "finish_reason": finish}]}
+        if usage:
+            assembled["usage"] = usage
+        return httpx.Response(200, json=assembled, request=upstream.request)
 
 
 # --------------------------------------------------------------------------------------
@@ -638,17 +803,7 @@ async def _stream_helper(
             detail = (await upstream.aread()).decode("utf-8", "replace")[:300]
             _learn_limit_from(detail)
             raise RuntimeError(f"HTTP {upstream.status_code}: {detail}")
-        async for line in upstream.aiter_lines():
-            line = line.strip()
-            if not line.startswith("data:"):
-                continue
-            body = line[5:].strip()
-            if body == "[DONE]":
-                break
-            try:
-                chunk = json.loads(body)
-            except json.JSONDecodeError:
-                continue
+        async for chunk in _completion_chunks(upstream):
             # Agentaus reports some failures as HTTP 200 with an error object inside the
             # stream; without this the reply looks empty and successful.
             if isinstance(chunk.get("error"), dict):
@@ -1264,6 +1419,9 @@ def _validate_tool_calls(calls: list, schemas: dict, cwd: str | None = None) -> 
     on, because the client will reject them and the turn is spent either way.
     """
     broken = []
+    # What the Edits before each one in this response leave in their files: a second Edit to
+    # a file is matched against the text after the first, not the disk. See repair.repair.
+    pending: dict = {}
     for call in calls:
         schema = schemas.get(call.get("name") or "")
         if not schema:
@@ -1271,8 +1429,12 @@ def _validate_tool_calls(calls: list, schemas: dict, cwd: str | None = None) -> 
         # Unambiguous slips first - a field under another name, a relative path - so
         # they cost nothing rather than a correction round. See repair.py.
         try:
-            call["arguments"] = repair.repair(
-                call, call.get("asked_as") or call.get("name") or "", schema, cwd)["arguments"]
+            repaired = repair.repair(
+                call, call.get("asked_as") or call.get("name") or "", schema, cwd, pending)
+            if repaired.get("correction"):
+                broken.append((call, repaired["correction"]))
+                continue
+            call["arguments"] = repaired["arguments"]
             fixed, problems = tool_schema.validate(call.get("arguments"), schema)
         except Exception as exc:
             # A schema this subset cannot read is the client's to judge. Forwarding the
@@ -1289,6 +1451,14 @@ def _validate_tool_calls(calls: list, schemas: dict, cwd: str | None = None) -> 
             log.debug("repaired arguments for %s", call.get("name"))
         call["arguments"] = encoded
     return broken
+
+
+def _guard_imports(calls: list, received: dict, cwd: str | None) -> None:
+    """Snapshot the .py files a graph main loop's calls are about to change, so the next request
+    can tell whether the change broke importing them. See import_guard.py."""
+    if settings.agentaus_import_guard and calls and _graph_main_loop(received):
+        if import_guard.remember(calls, cwd):
+            rlog(logging.INFO, "import guard: watching this turn's .py edits")
 
 
 def _with_coerced_calls(data: dict, calls: list) -> dict:
@@ -2019,6 +2189,66 @@ def _synthetic_response(body: dict, model: str, wants_stream: bool, started: flo
     })
 
 
+# --------------------------------------------------------------------------------------
+# Heartbeat: something Claude Code counts as progress while the bridge waits
+# --------------------------------------------------------------------------------------
+
+def _heartbeat(builder: AnthropicStreamBuilder | None, waited: float) -> bytes:
+    """A thinking delta saying the turn is still waiting - or b"" when one would split a text or
+    tool block the client is reading (pings cover that). Built by the producer, the one task
+    that owns `builder`, so its block indexes stay in order."""
+    if builder is None or builder.open_kind not in (None, "thinking"):
+        return b""
+    return builder.live_thinking(f"_Still waiting for Agentaus ({waited:.0f}s)._\n\n")
+
+
+async def _waiting(aw, builder: AnthropicStreamBuilder | None, box: dict,
+                   every: float | None = None) -> AsyncIterator[bytes]:
+    """Await `aw`, putting its result in box["value"] (its exception propagates), and yield a
+    heartbeat for every `every` seconds (BRIDGE_HEARTBEAT_SECONDS) it stays silent. Measured:
+    Claude Code cuts a stream carrying only message_start and pings after 600 s (d14: 13 of 17
+    disconnects at 600-640 s) and re-sends the turn without streaming; one thinking delta a
+    minute kept a 650 s turn alive."""
+    every = settings.heartbeat_seconds if every is None else every
+    task = asyncio.ensure_future(aw)
+    started = time.monotonic()
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=every if every > 0 else None)
+            if done:
+                break
+            beat = _heartbeat(builder, time.monotonic() - started)
+            if beat:
+                yield beat
+        box["value"] = task.result()
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+async def _lines_beating(upstream: httpx.Response, builder: AnthropicStreamBuilder | None,
+                         every: float | None = None) -> AsyncIterator[tuple[str, object]]:
+    """An upstream stream's lines as ("line", text), with ("beat", bytes) between them while it
+    is silent. The transport bounds the silence itself (AGENTAUS_STREAM_IDLE_S)."""
+    lines = upstream.aiter_lines().__aiter__()
+
+    async def following() -> tuple[bool, str]:
+        # StopAsyncIteration must not escape into _waiting, an async generator itself.
+        try:
+            return True, await lines.__anext__()
+        except StopAsyncIteration:
+            return False, ""
+
+    while True:
+        box: dict = {}
+        async for beat in _waiting(following(), builder, box, every):
+            yield "beat", beat
+        more, line = box["value"]
+        if not more:
+            return
+        yield "line", line
+
+
 GRAPH_WAITING = ("The workflow is running in the background; I will check its result when it "
                  "finishes.")
 
@@ -2085,13 +2315,37 @@ async def _handle_agentaus(
     # How far past its time a graph agent is, read off the request as received: fitting and
     # compaction rewrite the messages the agent is known by. See graph.overdue.
     clock = {"over": 0.0}
-    if graph.is_graph_task(body) and is_subagent_turn(body):
+    graph_agent = graph.is_graph_task(body) and is_subagent_turn(body)
+    if graph_agent:
         over, news = graph.overdue(body)
         clock["over"] = over
+        if over > settings.agentaus_graph_give_up_s:
+            # The graph has stopped waiting for this agent, and the agent still holds a slot in
+            # the harness. Measured (d13, d14): stuck agents ran 68-81 min before Claude Code
+            # failed them; one request was retried for 2,627 s. The graph reads this short reply
+            # as no answer.
+            rlog(logging.WARNING, "graph agent (%s) is %.0fs past its %ds limit; giving up on "
+                 "it without an upstream call", graph.role_of(body) or "?", over,
+                 graph.agent_limit(body))
+            return _synthetic_response(body, display_model, wants_stream, started,
+                                       "graph agent past its limit", text=graph.OUT_OF_TIME)
         if over and news:
             rlog(logging.WARNING, "graph agent (%s) is %.0fs past its %ds limit; "
                  "asking for its result with no tools", graph.role_of(body) or "?",
                  over, graph.agent_limit(body))
+
+    def stop_retrying() -> bool:
+        """Whether a gateway failure on this turn is answered by the bridge, not replayed: a
+        time-up turn (its 524s are about the request - see throttle.REQUEST_KIND), or a graph
+        agent that has run past its limit while its request was being retried."""
+        return graph_agent and (clock["over"] > 0 or graph.seconds_over(received) > 0)
+
+    def time_up_text() -> str:
+        rlog(logging.WARNING, "graph agent (%s): a gateway failure past its limit; answering "
+             "with what it already has", graph.role_of(received) or "?")
+        return graph.time_up_fallback(received)
+
+    request_kind = "time_up" if clock["over"] else "normal"
     # Decided on the request as received, before compaction can drop the opt-in.
     plain_text = _writes_plain_text(body)
 
@@ -2126,6 +2380,20 @@ async def _handle_agentaus(
         current = await asyncio.to_thread(
             persisted.restore, current,
             int(limit * settings.agentaus_restore_window_share) if limit > 0 else None)
+
+        # An Edit refused as "not found" gets the closest real lines, indentation exact, so the
+        # next try copies them instead of re-reading. See repair.edit_hints.
+        if settings.agentaus_edit_repair:
+            current, hinted = await asyncio.to_thread(repair.edit_hints, current)
+            if hinted:
+                rlog(logging.INFO, "edit repair: showed the closest lines for %d refused "
+                     "Edit(s)", hinted)
+        # A graph main loop's .py edit that broke importing the module is said so in its
+        # result. See import_guard.py.
+        if settings.agentaus_import_guard and _graph_main_loop(current):
+            current, broke = await asyncio.to_thread(import_guard.check, current)
+            if broke:
+                rlog(logging.WARNING, "import guard: %d edit(s) broke a module's import", broke)
 
         # The graph script the bridge put in a Workflow call is ~115 KB, resent upstream on
         # every later main-loop request. The model never needs it again.
@@ -2261,13 +2529,15 @@ async def _handle_agentaus(
         built = anthropic_request_to_agentaus(
             fitted,
             system_prompt_overwrite=settings.system_prompt_overwrite,
-            stream=settings.upstream_stream and wants_stream,
+            # Streamed upstream whatever the client asked: see config.upstream_stream.
+            stream=settings.upstream_stream,
         )
         if settings.log_bodies:
             rlog(logging.INFO, "-> agentaus payload: %s", json.dumps(built)[: settings.log_body_chars])
         return fitted, built
 
-    if not wants_stream:
+    async def run_buffered() -> Response:
+        nonlocal body
         body, payload = await prepare(body)
         scale = 1.0
         data: dict = {}
@@ -2286,10 +2556,16 @@ async def _handle_agentaus(
                     upstream = await _post_with_retry(
                         client,
                         settings.agentaus_url,
-                        json_body={**payload, "stream": False},
+                        json_body=payload,
                         headers=_agentaus_headers(),
+                        stream_upstream=bool(payload.get("stream")),
+                        kind=request_kind,
+                        give_up=stop_retrying,
                     )
                 except httpx.HTTPError as exc:
+                    if stop_retrying():
+                        return _synthetic_response(body, display_model, False, started,
+                                                   "time up", text=time_up_text())
                     return _error_response(502, "api_error", f"Agentaus request failed: {exc}")
 
                 # A timeout is treated like an over-length rejection: both mean the
@@ -2313,10 +2589,13 @@ async def _handle_agentaus(
                 payload = anthropic_request_to_agentaus(
                     body,
                     system_prompt_overwrite=settings.system_prompt_overwrite,
-                    stream=False,
+                    stream=settings.upstream_stream,
                 )
 
             if upstream.status_code >= 400:
+                if upstream.status_code in _RETRYABLE_STATUS and stop_retrying():
+                    return _synthetic_response(body, display_model, False, started,
+                                               "time up", text=time_up_text())
                 return _upstream_error_response(upstream.status_code, upstream.text)
 
             try:
@@ -2375,6 +2654,7 @@ async def _handle_agentaus(
             if broken:
                 rlog(logging.WARNING, "forwarding %d malformed tool call(s) - out of "
                      "rounds to correct them", len(broken))
+            _guard_imports(_theirs, received, cwd)
             data = _with_coerced_calls(data, mine + _theirs)
             if not mine:
                 if invented:
@@ -2465,6 +2745,13 @@ async def _handle_agentaus(
         )
         return JSONResponse(message)
 
+    if not wants_stream:
+        # A buffered client: Claude Code's fallback after a cut stream, or its re-send of one.
+        # It joins the turn already running for the same request - the stream it replaces, or
+        # an earlier buffered copy - and waits BRIDGE_NONSTREAM_DEADLINE at most. See flight.py.
+        return await _answer_buffered(request, flight.key_of(received, request.headers),
+                                      run_buffered, display_model)
+
     async def _refit(scale: float) -> dict:
         """Recompact against a tighter target and rebuild the upstream payload."""
         nonlocal body
@@ -2486,19 +2773,20 @@ async def _handle_agentaus(
     # flow while the summarising happens.
     async def stream_with_compaction() -> AsyncIterator[bytes]:
         try:
-            builder = None
+            # message_start goes out at once, whatever happens next: what the client sees until
+            # the answer is that, the plan or notes as they are written, and a heartbeat while
+            # nothing else comes (see _waiting).
+            builder = AnthropicStreamBuilder(
+                display_model, input_tokens=estimate_request_tokens(body),
+                chunk_chars=settings.chunk_chars,
+            )
+            yield builder.start()
             streamed_plan = False
             if settings.agentaus_live_draft and settings.agentaus_thinking_visible:
-                # The response starts NOW, and what preparation produces - the plan as it
-                # is written, a note when compaction starts - streams into a live
-                # thinking block. Before this the client saw nothing but pings until
-                # planning finished, so its token counter sat at zero for 5-15 seconds
-                # on every agent turn.
-                builder = AnthropicStreamBuilder(
-                    display_model, input_tokens=estimate_request_tokens(body),
-                    chunk_chars=settings.chunk_chars,
-                )
-                yield builder.start()
+                # What preparation produces - the plan as it is written, a note when
+                # compaction starts - streams into a live thinking block. Before this the
+                # client saw nothing but pings until planning finished, so its token counter
+                # sat at zero for 5-15 seconds on every agent turn.
                 pieces: asyncio.Queue = asyncio.Queue()
                 seen_plan = []
 
@@ -2510,12 +2798,20 @@ async def _handle_agentaus(
                     pieces.put_nowait(f"_{text}_\n\n")
 
                 work = asyncio.ensure_future(prepare(body, 1.0, on_plan_piece, on_note))
+                quiet_since = time.monotonic()
                 try:
                     while not (work.done() and pieces.empty()):
                         try:
                             piece = await asyncio.wait_for(pieces.get(), timeout=0.25)
                         except asyncio.TimeoutError:
+                            quiet = time.monotonic() - quiet_since
+                            if 0 < settings.heartbeat_seconds <= quiet:
+                                beat = _heartbeat(builder, time.monotonic() - started)
+                                if beat:
+                                    yield beat
+                                quiet_since = time.monotonic()
                             continue
+                        quiet_since = time.monotonic()
                         yield builder.live_thinking(piece)
                 finally:
                     if not work.done():
@@ -2527,7 +2823,10 @@ async def _handle_agentaus(
                     yield builder.live_thinking(plan_holder["text"])
                     streamed_plan = True
             else:
-                prepared_body, prepared_payload = await prepare(body)
+                box: dict = {}
+                async for beat in _waiting(prepare(body), builder, box):
+                    yield beat
+                prepared_body, prepared_payload = box["value"]
 
             async def refit(scale: float) -> dict:
                 _, rebuilt = await prepare(prepared_body, scale)
@@ -2539,34 +2838,88 @@ async def _handle_agentaus(
                 client, prepared_payload, prepared_body, display_model, started, refit,
                 plan=None if streamed_plan else plan_holder["text"], builder=builder,
                 library=library_holder["names"], plain_text=plain_text,
-                client_body=received,
+                client_body=received, stop_retrying=stop_retrying,
+                time_up_text=time_up_text, request_kind=request_kind,
             ):
                 yield chunk
         except asyncio.CancelledError:
-            # The client hung up. Worth a line of its own: previously this produced
-            # no log at all, so a turn the user abandoned looked identical to one
-            # still in flight. The turn deadline cancels through here too, and has
-            # already logged its own line.
-            elapsed = time.monotonic() - started
-            if not (0 < settings.turn_timeout_seconds <= elapsed):
-                rlog(logging.WARNING, "client disconnected after %.1fs", elapsed)
+            # No client is left, or the turn ran out its deadline - flight.py logs which.
+            rlog(logging.WARNING, "turn stopped after %.1fs", time.monotonic() - started)
             raise
         except GeneratorExit:
             rlog(logging.WARNING, "stream closed early after %.1fs",
                  time.monotonic() - started)
             raise
 
+    # The turn runs as a flight: a client that leaves does not stop it at once, and an
+    # identical request - Claude Code's re-send, or its buffered fallback - joins it instead of
+    # starting another. The flight holds the BRIDGE_TURN_TIMEOUT deadline. See flight.py.
+    key = flight.key_of(received, request.headers)
+    running = flight.find(key, flight.STREAM)
+    if running is not None:
+        rlog(logging.INFO, "streamed request joins the turn already running for it (%.0fs in)",
+             time.monotonic() - running.started)
+    else:
+        running = flight.start_stream(key, stream_with_compaction(),
+                                      deadline=settings.turn_timeout_seconds)
     generator = _keepalive(
-        stream_with_compaction(),
+        _relay(running),
         settings.ping_interval_seconds,
         AnthropicStreamBuilder.ping,
-        deadline=settings.turn_timeout_seconds,
     )
     return StreamingResponse(
         generator,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+async def _relay(running: "flight.Flight") -> AsyncIterator[bytes]:
+    """A streamed client's view of its turn's flight. Its leaving is worth a line: without it
+    a turn the user abandoned looks identical to one still in flight."""
+    try:
+        async for chunk in flight.subscribe(running):
+            yield chunk
+    except (asyncio.CancelledError, GeneratorExit):
+        if not running.done:
+            rlog(logging.WARNING, "client disconnected after %.1fs; the turn keeps running "
+                 "for a retry to join", time.monotonic() - running.started)
+        raise
+
+
+async def _answer_buffered(request: Request, key: str, run, model: str) -> Response:
+    """A buffered client's answer: from the turn already running for its request, or from a
+    new one, waiting BRIDGE_NONSTREAM_DEADLINE at most and no longer than the client stays.
+
+    Measured (d11, d14): abandoned buffered requests ran up to 8,107 s, each re-send queued for
+    a slot and made up to five attempts, and one first turn's graph went to a closed socket."""
+    joined = flight.find(key)
+    if joined is not None:
+        rlog(logging.INFO, "buffered request joins the %s turn already running for it "
+             "(%.0fs in)", joined.kind, time.monotonic() - joined.started)
+    else:
+        joined = flight.start_buffered(key, run, deadline=settings.turn_timeout_seconds)
+    deadline = settings.nonstream_deadline_seconds
+    gone = request.is_disconnected
+    if joined.kind == flight.STREAM:
+        events = await flight.collect_stream(joined, deadline, gone)
+        if events is not None:
+            status, message = flight.assemble(events)
+            if status == 200:
+                rlog(logging.INFO, "POST /v1/messages model=%s route=agentaus stream=false -> "
+                     "200 (assembled from the streamed turn)", model)
+            return JSONResponse(message, status_code=status)
+    else:
+        result = await flight.wait_buffered(joined, deadline, gone)
+        if result is not None:
+            status, raw, media = result
+            return Response(raw, status_code=status, media_type=media)
+    rlog(logging.WARNING, "buffered request: answering after %.0fs that the turn is still "
+         "running; a re-send will join it", time.monotonic() - joined.started)
+    return _error_response(
+        504, "api_error",
+        f"The Agentaus turn is still running ({time.monotonic() - joined.started:.0f}s so "
+        "far). The bridge keeps it going: retry the request and it will get this turn's answer.")
 
 
 async def _agentaus_event_stream(
@@ -2581,6 +2934,9 @@ async def _agentaus_event_stream(
     library: frozenset = frozenset(),
     plain_text: bool = False,
     client_body: dict | None = None,
+    stop_retrying: Callable[[], bool] | None = None,
+    time_up_text: Callable[[], str] | None = None,
+    request_kind: str = "normal",
 ) -> AsyncIterator[bytes]:
     """Produce a valid Anthropic SSE stream from an Agentaus response.
 
@@ -2588,6 +2944,10 @@ async def _agentaus_event_stream(
     the plan streamed live - so this continues it rather than beginning a second one.
     `original` is the prepared (fitted, possibly compacted) body; `client_body` the body as
     the client sent it, which the write guards and the graph's task are read from.
+
+    `stop_retrying()` True means a gateway failure is not replayed: the turn is answered with
+    `time_up_text()` instead (a graph agent past its limit - see _handle_agentaus).
+    `request_kind` is what this turn is to the throttle (throttle.REQUEST_KIND).
     """
     received = client_body if client_body is not None else original
     if builder is None:
@@ -2653,6 +3013,17 @@ async def _agentaus_event_stream(
     ran: dict = {}
     # The tool_choice to put back after a stall re-ask that forced one. See below.
     forced_from = None
+
+    def giving_up() -> bool:
+        return stop_retrying is not None and stop_retrying()
+
+    def time_up_answer() -> list:
+        text = time_up_text() if time_up_text is not None else graph.TIME_UP_PARTIAL
+        return [builder.text(text), builder.finish("stop", None)]
+
+    # Whether this request has had a gateway failure: its retries are evidence about it, not
+    # about the upstream (throttle.REQUEST_KIND).
+    failed_once = False
     while True:
         attempt = 0
         while True:
@@ -2662,119 +3033,157 @@ async def _agentaus_event_stream(
             usage = None
             accumulator = ToolCallAccumulator()
             retry_reason: str | None = None
+            throttle.REQUEST_KIND.set(
+                "retry" if failed_once and request_kind == "normal" else request_kind)
 
             try:
                 if payload.get("stream"):
-                    async with _watching_for_stall("upstream stream"), client.stream(
-                        "POST", settings.agentaus_url, json=payload, headers=_agentaus_headers()
-                    ) as upstream:
-                        if upstream.status_code >= 400:
-                            detail = (await upstream.aread()).decode("utf-8", "replace")[:500]
-                            rlog(logging.WARNING,
-                                 "agentaus rejected the streamed request: HTTP %d %s",
-                                 upstream.status_code, detail)
-                            if (
-                                _is_over_length(detail)
-                                and refit is not None
-                                and fit_attempt < settings.agentaus_fit_attempts
-                            ):
-                                # Nothing has been emitted yet, so the request can be
-                                # recompacted and replayed invisibly.
-                                _learn_limit_from(detail)
-                                fit_attempt += 1
-                                fit_scale *= settings.agentaus_fit_shrink
-                                payload = await refit(fit_scale)
-                                retry_reason = f"prompt too long, refitting to {fit_scale:.0%}"
-                            elif (
-                                upstream.status_code in _RETRYABLE_STATUS
-                                and attempt < settings.max_retries
-                            ):
-                                retry_reason = f"HTTP {upstream.status_code}"
-                            else:
-                                yield builder.error(
-                                    f"Agentaus returned HTTP {upstream.status_code}: {detail}",
-                                    _error_type_for_status(upstream.status_code),
-                                )
-                                yield builder.finish("stop", None)
-                                return
-                        else:
-                            async for line in upstream.aiter_lines():
-                                line = line.strip()
-                                if not line or not line.startswith("data:"):
-                                    continue
-                                data = line[5:].strip()
-                                if data == "[DONE]":
-                                    break
-                                try:
-                                    chunk = json.loads(data)
-                                except json.JSONDecodeError:
-                                    continue
-
-                                # Agentaus reports some failures - an over-length
-                                # prompt among them - as HTTP 200 with an error object
-                                # inside the SSE body. Nothing here has "choices", so
-                                # without this branch the error is skipped and the turn
-                                # ends as an empty, successful-looking message.
-                                if isinstance(chunk.get("error"), dict):
-                                    message = str(chunk["error"].get("message") or "")
-                                    # Nothing final has reached the client yet, so both
-                                    # of these can be replayed invisibly.
-                                    if (not emitted and _is_transient(message)
-                                            and attempt < settings.max_retries):
-                                        rlog(logging.WARNING, "agentaus in-band transient "
-                                             "error, retrying: %s", message[:200])
-                                        retry_reason = f"upstream dropped ({message[:60]})"
-                                        break
-                                    if (not emitted and _is_over_length(message)
-                                            and refit is not None
-                                            and fit_attempt < settings.agentaus_fit_attempts):
-                                        _learn_limit_from(message)
-                                        fit_attempt += 1
-                                        fit_scale *= settings.agentaus_fit_shrink
-                                        payload = await refit(fit_scale)
-                                        retry_reason = (f"prompt too long (in-band), "
-                                                        f"refitting to {fit_scale:.0%}")
-                                        break
+                    async with _watching_for_stall("upstream stream"):
+                        opening = client.stream("POST", settings.agentaus_url, json=payload,
+                                                headers=_agentaus_headers())
+                        box: dict = {}
+                        # Waiting for the first byte - the throttle's queue, then up to 125 s
+                        # before a 524 - is the long silence the heartbeat is for.
+                        async for beat in _waiting(opening.__aenter__(), builder, box):
+                            yield beat
+                        upstream = box["value"]
+                        try:
+                            if upstream.status_code >= 400:
+                                detail = (await upstream.aread()).decode("utf-8", "replace")[:500]
+                                rlog(logging.WARNING,
+                                     "agentaus rejected the streamed request: HTTP %d %s",
+                                     upstream.status_code, detail)
+                                if (
+                                    _is_over_length(detail)
+                                    and refit is not None
+                                    and fit_attempt < settings.agentaus_fit_attempts
+                                ):
+                                    # Nothing has been emitted yet, so the request can be
+                                    # recompacted and replayed invisibly.
+                                    _learn_limit_from(detail)
+                                    fit_attempt += 1
+                                    fit_scale *= settings.agentaus_fit_shrink
+                                    payload = await refit(fit_scale)
+                                    retry_reason = f"prompt too long, refitting to {fit_scale:.0%}"
+                                elif upstream.status_code in _RETRYABLE_STATUS and giving_up():
+                                    # A time-up turn, or an agent now past its limit: the same
+                                    # prompt would fail the same way. See throttle.REQUEST_KIND.
+                                    rlog(logging.WARNING, "HTTP %d on a graph agent past its "
+                                         "limit; not replaying it", upstream.status_code)
+                                    for piece in time_up_answer():
+                                        yield piece
+                                    return
+                                elif (
+                                    upstream.status_code in _RETRYABLE_STATUS
+                                    and attempt < settings.max_retries
+                                ):
+                                    failed_once = True
+                                    retry_reason = f"HTTP {upstream.status_code}"
+                                else:
                                     yield builder.error(
-                                        _agentaus_error_text(chunk["error"]),
-                                        chunk["error"].get("type") or "api_error",
+                                        f"Agentaus returned HTTP {upstream.status_code}: {detail}",
+                                        _error_type_for_status(upstream.status_code),
                                     )
                                     yield builder.finish("stop", None)
-                                    rlog(logging.WARNING, 
-                                        "agentaus in-band error: %s",
-                                        _agentaus_error_text(chunk["error"]),
-                                    )
                                     return
+                            else:
+                                async for kind, line in _lines_beating(upstream, builder):
+                                    if kind == "beat":
+                                        yield line
+                                        continue
+                                    line = line.strip()
+                                    if not line or not line.startswith("data:"):
+                                        continue
+                                    data = line[5:].strip()
+                                    if data == "[DONE]":
+                                        break
+                                    try:
+                                        chunk = json.loads(data)
+                                    except json.JSONDecodeError:
+                                        continue
 
-                                for choice in chunk.get("choices") or []:
-                                    delta = choice.get("delta") or {}
-                                    text = delta.get("content")
-                                    if text:
-                                        if buffering:
-                                            # Held back rather than streamed: an answer
-                                            # already on screen cannot be revised. Its
-                                            # tokens are still shown live, as a draft.
-                                            pending.append(text)
-                                            live_bytes = draft(text)
-                                            if live_bytes:
-                                                yield live_bytes
-                                        else:
+                                    # Agentaus reports some failures - an over-length
+                                    # prompt among them - as HTTP 200 with an error object
+                                    # inside the SSE body. Nothing here has "choices", so
+                                    # without this branch the error is skipped and the turn
+                                    # ends as an empty, successful-looking message.
+                                    if isinstance(chunk.get("error"), dict):
+                                        message = str(chunk["error"].get("message") or "")
+                                        # Nothing final has reached the client yet, so both
+                                        # of these can be replayed invisibly.
+                                        if not emitted and _is_transient(message) and giving_up():
+                                            for piece in time_up_answer():
+                                                yield piece
+                                            return
+                                        if (not emitted and _is_transient(message)
+                                                and attempt < settings.max_retries):
+                                            rlog(logging.WARNING, "agentaus in-band transient "
+                                                 "error, retrying: %s", message[:200])
+                                            failed_once = True
+                                            retry_reason = f"upstream dropped ({message[:60]})"
+                                            break
+                                        if (not emitted and _is_over_length(message)
+                                                and refit is not None
+                                                and fit_attempt < settings.agentaus_fit_attempts):
+                                            _learn_limit_from(message)
+                                            fit_attempt += 1
+                                            fit_scale *= settings.agentaus_fit_shrink
+                                            payload = await refit(fit_scale)
+                                            retry_reason = (f"prompt too long (in-band), "
+                                                            f"refitting to {fit_scale:.0%}")
+                                            break
+                                        yield builder.error(
+                                            _agentaus_error_text(chunk["error"]),
+                                            chunk["error"].get("type") or "api_error",
+                                        )
+                                        yield builder.finish("stop", None)
+                                        rlog(logging.WARNING, 
+                                            "agentaus in-band error: %s",
+                                            _agentaus_error_text(chunk["error"]),
+                                        )
+                                        return
+
+                                    for choice in chunk.get("choices") or []:
+                                        delta = choice.get("delta") or {}
+                                        text = delta.get("content")
+                                        if text:
+                                            if buffering:
+                                                # Held back rather than streamed: an answer
+                                                # already on screen cannot be revised. Its
+                                                # tokens are still shown live, as a draft.
+                                                pending.append(text)
+                                                live_bytes = draft(text)
+                                                if live_bytes:
+                                                    yield live_bytes
+                                            else:
+                                                emitted = True
+                                                yield builder.text(text)
+                                        if delta.get("tool_calls"):
                                             emitted = True
-                                            yield builder.text(text)
-                                    if delta.get("tool_calls"):
-                                        emitted = True
-                                        accumulator.add(delta["tool_calls"])
-                                    if choice.get("finish_reason"):
-                                        finish_reason = choice["finish_reason"]
-                                if chunk.get("usage"):
-                                    usage = chunk["usage"]
+                                            accumulator.add(delta["tool_calls"])
+                                        if choice.get("finish_reason"):
+                                            finish_reason = choice["finish_reason"]
+                                    if chunk.get("usage"):
+                                        usage = chunk["usage"]
+                        finally:
+                            await opening.__aexit__(None, None, None)
                 else:
-                    upstream = await _post_with_retry(
+                    box = {}
+                    async for beat in _waiting(_post_with_retry(
                         client,
                         settings.agentaus_url,
                         json_body={**payload, "stream": False},
                         headers=_agentaus_headers(),
-                    )
+                        kind=request_kind,
+                        give_up=stop_retrying,
+                    ), builder, box):
+                        yield beat
+                    upstream = box["value"]
+                    if upstream.status_code >= 400 and (
+                            upstream.status_code in _RETRYABLE_STATUS and giving_up()):
+                        for piece in time_up_answer():
+                            yield piece
+                        return
                     if upstream.status_code >= 400:
                         yield builder.error(
                             f"Agentaus returned HTTP {upstream.status_code}: {upstream.text[:500]}",
@@ -2808,6 +3217,13 @@ async def _agentaus_event_stream(
                     usage = data.get("usage")
 
             except httpx.HTTPError as exc:
+                if not emitted and _is_retryable_exception(exc) and giving_up():
+                    rlog(logging.WARNING, "agentaus stream failed on a graph agent past its "
+                         "limit (%s); not replaying it", _describe(exc))
+                    for piece in time_up_answer():
+                        yield piece
+                    return
+                failed_once = True
                 if emitted or not _is_retryable_exception(exc) or attempt >= settings.max_retries:
                     rlog(logging.WARNING, "agentaus stream failed: %s", exc)
                     yield builder.error(f"Agentaus request failed: {exc}", "api_error")
@@ -2885,13 +3301,17 @@ async def _agentaus_event_stream(
         if broken:
             rlog(logging.WARNING, "forwarding %d malformed tool call(s) - out of rounds",
                  len(broken))
+        _guard_imports(theirs, received, cwd)
         if mine and tool_round < settings.agentaus_tool_rounds:
             tool_round += 1
             rlog(logging.INFO, "running %d bridge tool call(s): %s",
                  len(mine), ", ".join(c["name"] for c in mine))
             yield progress("running " + ", ".join(c["name"] for c in mine))
-            payload = await _run_bridge_tools(
-                client, payload, mine, working_directory_of(original), ran)
+            box = {}
+            async for beat in _waiting(_run_bridge_tools(
+                    client, payload, mine, working_directory_of(original), ran), builder, box):
+                yield beat
+            payload = box["value"]
             # Whatever the model said on its way to calling the tool is superseded by
             # the answer it is about to give with the result in hand, so it is dropped
             # rather than shown - otherwise the user reads "let me search..." followed
@@ -2917,16 +3337,21 @@ async def _agentaus_event_stream(
                 called_a_tool=bool(mine or theirs),
             )
         ):
-            try:
+            async def classify() -> str:
                 async with hold("refusal check", "urgent"):
-                    verdict = await _agentaus_summarise(
+                    return await _agentaus_summarise(
                         client, CLASSIFY_REFUSAL_INSTRUCTION.format(
                             request=_original_request(received)[:4000],
                             ran=ledger.render(original.get("messages") or [], limit=40)
                             or "(nothing yet)",
                             answer=_head_and_tail(answer_so_far, 2500, 1500))
                     )
-                turn_verdict = read_turn_verdict(verdict)
+
+            try:
+                box = {}
+                async for beat in _waiting(classify(), builder, box):
+                    yield beat
+                turn_verdict = read_turn_verdict(box["value"])
                 is_refusal = turn_verdict == "refusal"
             except Exception as exc:
                 # Cannot classify it, so forward it. Re-asking a good answer is worse
@@ -2976,7 +3401,10 @@ async def _agentaus_event_stream(
                 # Observed: a locatable symbol spent twelve rounds being searched for and
                 # the turn ended "I ran out of search rounds", with the answer sitting in
                 # the conversation the whole time.
-                forced = await _answer_without_tools(client, payload)
+                box = {}
+                async for beat in _waiting(_answer_without_tools(client, payload), builder, box):
+                    yield beat
+                forced = box["value"]
                 pending = [forced] if forced else [
                     "I searched without reaching an answer. Narrow the question and I "
                     "will try again."
@@ -2991,23 +3419,30 @@ async def _agentaus_event_stream(
         # "200 in 94.8s in=0 out=0" on a question it had every means to answer. An empty
         # reply is never right, so ask once more before forwarding silence.
         rlog(logging.WARNING, "upstream returned an empty answer; asking once more")
-        retried = await _answer_without_tools(client, payload)
+        box = {}
+        async for beat in _waiting(_answer_without_tools(client, payload), builder, box):
+            yield beat
+        retried = box["value"]
         if retried:
             answer = retried
             pending = [answer]
 
     if (buffering and answer and settings.agentaus_syntax_check and not theirs
             and not is_subagent_turn(original)):
-        answer = await _fix_syntax(client, answer)
+        box = {}
+        async for beat in _waiting(_fix_syntax(client, answer), builder, box):
+            yield beat
+        answer = box["value"]
         pending = [answer]
 
     if buffering and answer:
         if live_started and not theirs:
             yield progress("checking the answer")
+        check = None
         if not theirs and not ran and worth_reviewing_turn(original) and worth_reviewing(
             answer, min_chars=settings.agentaus_review_min_chars
         ):
-            answer = await _self_review(client, _last_user_text(original), answer)
+            check = _self_review(client, _last_user_text(original), answer)
         elif (
             not theirs
             and settings.agentaus_grounding_check
@@ -3015,7 +3450,12 @@ async def _agentaus_event_stream(
         ):
             # The turns review has to sit out are the turns where a claim can outrun the
             # evidence. This checks against the tools actually run instead of guessing.
-            answer = await _check_grounding(client, original, answer, ran)
+            check = _check_grounding(client, original, answer, ran)
+        if check is not None:
+            box = {}
+            async for beat in _waiting(check, builder, box):
+                yield beat
+            answer = box["value"]
         yield builder.text(answer)
 
     for call in theirs:
@@ -3047,11 +3487,18 @@ async def _keepalive(
     The pings are also why `deadline` exists. They defeat the client's idle timeout by
     design, so a turn wedged inside the bridge would otherwise keep the connection alive,
     and the VS Code spinner turning, forever. Past `deadline` seconds the stream ends
-    with an error event the client can show. 0 disables it.
+    with an error event the client can show. 0 disables it. Only seconds the upstream could
+    serve count (throttle.Health): a turn waiting out an outage is not wedged.
+
+    A turn from _handle_agentaus passes no deadline here: its flight holds it (flight.py).
     """
     queue: asyncio.Queue = asyncio.Queue()
     sentinel = object()
     started = time.monotonic()
+    down_at_start = throttle.down_total()
+
+    def served() -> float:
+        return time.monotonic() - started - max(0.0, throttle.down_total() - down_at_start)
 
     async def pump() -> None:
         try:
@@ -3070,7 +3517,7 @@ async def _keepalive(
                 getter = asyncio.ensure_future(queue.get())
             wait = interval
             if deadline > 0:
-                remaining = deadline - (time.monotonic() - started)
+                remaining = deadline - served()
                 if remaining <= 0:
                     rlog(logging.WARNING,
                          "turn exceeded BRIDGE_TURN_TIMEOUT (%.0fs); ending it", deadline)
@@ -3083,7 +3530,7 @@ async def _keepalive(
                 wait = min(interval, remaining)
             done, _ = await asyncio.wait({getter}, timeout=wait)
             if not done:
-                if deadline > 0 and time.monotonic() - started >= deadline:
+                if deadline > 0 and served() >= deadline:
                     continue            # the deadline branch above reports it
                 yield make_ping()
                 continue
