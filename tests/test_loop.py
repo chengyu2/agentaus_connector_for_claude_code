@@ -223,7 +223,20 @@ class GateTests(unittest.TestCase):
         # 120 (pass) + 300 (fail) + 2 x 120 (passes) before the third pass lands
         self.assertEqual(clock[0], 120 + 300 + 120 + 120)
         g.consume()
-        self.assertFalse(g.ready(cold=False))   # every launch needs fresh evidence
+        self.assertEqual(g.good, 0)             # every launch needs fresh evidence
+
+    def test_beside_a_running_run_live_counts_stand_in_for_the_probe(self):
+        # Measured (d15): the probe queued behind a running graph's agents and timed out on a
+        # healthy upstream, so the second job never launched.
+        probed = []
+        healthy = {"ok_10m": 300, "fail_10m": 1, "ok_rate_10m": 0.99}
+        c = types.SimpleNamespace(upstream=lambda: healthy, probe=lambda n: probed.append(1) or False)
+        g = loop.Gate(c, need_cold=3, clock=lambda: 0.0, say=lambda m: None)
+        self.assertTrue(g.ready(cold=False))
+        self.assertEqual(probed, [])
+        cold = loop.Gate(c, need_cold=1, clock=lambda: 0.0, say=lambda m: None)
+        self.assertFalse(cold.ready(cold=True))   # a cold start still needs a real probe
+        self.assertEqual(probed, [1])
 
     def test_unhealthy_endpoint_blocks_without_probing(self):
         probed = []

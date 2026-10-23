@@ -646,7 +646,7 @@ phase('Review')
     }
     for (const c of CONSTANTS.filter(c => inFixed({ file: c.file }))) {
       added.push({ n: next++, title: `Audit the module-level tables in ${c.file}`, difficulty: 'medium', solvers: 2, check: true, merge: 'pick-change',
-        kind: 'code', deps: [], task: `Audit every module-level table, mapping and threshold in \`${c.file}\` - ${c.names.map(n => `\`${n}\``).join(', ')} - against the README and any model or standard the request names. The project's own documents often print these groups (a chart or a table by group): find them in the plain-text copies (\`grep -n -i -A60 '<a group name>' <copy>\`), copy that listing with its \`file:line\` as the expected table, then print the code's groups and compare member by member. Memory of a model is not a source. Fix only entries that are wrong.` })
+        kind: 'code', deps: [], task: `Audit every module-level table, mapping and threshold in \`${c.file}\` - ${c.names.map(n => `\`${n}\``).join(', ')} - against the README and any model or standard the request names. The project's own documents often print these groups (a chart or a table by group): find them in the plain-text copies (\`grep -n -i -A60 '<a group name>' <copy>\`), copy that listing with its \`file:line\` as the expected table, then print the code's groups and compare member by member. Memory of a model is not a source. Fix only entries that are wrong. **Never change a table's keys to match what the code produces now** - the code that produces them may be the bug; and keep every entry the rest of the code looks up.` })
     }
   }
   // A flag or option the request asks to add is a feature, with its own subtask. Measured
@@ -1026,6 +1026,15 @@ def selfchecks(src):
     stub=lambda x: isinstance(x,ast.Raise) and 'NotImplementedError' in ast.unparse(x)
     return sum(isinstance(x,(ast.Assert,ast.Raise)) and not stub(x) for x in ast.walk(c)) if c else 0
 ORIG_CHECKS=selfchecks(orig) if orig else 0
+# Module-level names the function assigns again: a local copy of a table shadows the real one.
+# Measured (d15 c1913h): an audited parse() pasted in SPELLING with the old bug, overriding the
+# fixed module-level table.
+try: MODULE_NAMES={t.id for n in ast.parse(open(os.path.join(root,rel)).read()).body if isinstance(n,(ast.Assign,ast.AnnAssign)) for t in (n.targets if isinstance(n,ast.Assign) else [n.target]) if isinstance(t,ast.Name)}
+except Exception: MODULE_NAMES=set()
+def shadows(src):
+    try: c=node(src)
+    except Exception: return 0
+    return len({x.id for x in ast.walk(c) if isinstance(x,ast.Name) and isinstance(x.ctx,ast.Store) and x.id in MODULE_NAMES}) if c else 0
 def variants(v):
     out=[]
     if isinstance(v,str):
@@ -1139,7 +1148,7 @@ for k,d,replied in order:
     raised=sum(1 for x in outs[len(PROBES):] if str(x).startswith(('EXC','IMPORT','PROBE')))
     hard=hardcoded(new); changed=new.strip()!=orig.strip()
     r=dict(k=k,path=path,out=out,bad=bad,miss=len(miss),nex=nex,tests=res,passed=sum(res),replied=replied=='1',hard=bool(hard),
-           raises=max(0,selfchecks(new)-ORIG_CHECKS)+raised,sig=hashlib.sha1(json.dumps(outs[:len(PROBES)]+outs[len(PROBES):]).encode()).hexdigest()[:8],changed=changed)
+           raises=max(0,selfchecks(new)-ORIG_CHECKS)+raised+3*max(0,shadows(new)-(shadows(orig) if orig else 0)),sig=hashlib.sha1(json.dumps(outs[:len(PROBES)]+outs[len(PROBES):]).encode()).hexdigest()[:8],changed=changed)
     rows.append(r)
     notes.append(f'candidate {k}: {path} - docstring example mismatches {bad}, pooled tests passed {sum(res)}/{len(tests)}, self-checks and raising probes {r["raises"]}, behaviour {r["sig"]}, replied {replied}, changed {changed}'+(f', BRANCHES ON AN EXAMPLE INPUT (line {hard[0]})' if hard else ''))
     pool,votes=rank()
@@ -1697,10 +1706,10 @@ const owners = new Map()
 for (const st of plan.subtasks) { const f = functionOf(st); if (f) owners.set(f.fn, st.n) }
 const done = {}
 const decided = st => (done[st.n] && done[st.n].result) ? done[st.n] : (provisional[st.n] && provisional[st.n].result) ? provisional[st.n] : null
-function changeSet() {
+function changeSet(exclude) {
   const lines = []
   const ns = []
-  for (const st of plan.subtasks.filter(st => st.kind === 'code' && decided(st))) {
+  for (const st of plan.subtasks.filter(st => st.kind === 'code' && decided(st) && !(exclude && exclude.has(st.n)))) {
     const f = functionOf(st)
     const d = decided(st)
     const change = d.change || (f && (String(d.result || '').match(new RegExp(`[^\\s\`'"]+\\/${f.fn}\\.py`)) || [])[0])
@@ -1745,9 +1754,9 @@ let puts = 0
 // The project from the original plus every decided change, built again each time - so a kill
 // at any moment leaves every change decided so far in place. Measured (d13 c1913): the kill
 // came before Assemble, and twelve decided, checked subtasks never reached the project.
-async function putInPlace(final) {
+async function putInPlace(final, exclude) {
   if (!PRISTINE) return
-  const { lines, ns } = changeSet()
+  const { lines, ns } = changeSet(exclude)
   const log_ = `${SCRATCH}/apply.log`
   const cmd = [
     `mkdir -p ${q(SCRATCH)} ${q(PRE)} && cat > ${q(REGIONS)} <<'AGENTAUS_REGIONS_END' && cat > ${q(IMPORTS)} <<'AGENTAUS_IMPORTS_END'\n${REGIONS_PY}AGENTAUS_REGIONS_END\n${IMPORTS_PY}AGENTAUS_IMPORTS_END`,
@@ -1882,6 +1891,67 @@ function inProject(d) {
 }
 const deliverables = [...new Set(plan.deliverables.map(inProject).filter(Boolean))]
 await putInPlace(true)
+// The program still runs: every command the request names, and each changed script, run on the
+// project and on the original. A command that ran cleanly on the original and now crashes is a
+// regression; the change behind it is found by taking changes back one at a time - tables and
+// audits first, reported symptoms and features last - and is left out. Measured (d15 c1913h): a
+// table audit dropped a theme from DOMAIN; `--json` then died with KeyError, every check failed,
+// and the import check passed - importing never ran the code.
+const SMOKE_PY = String.raw`import json,os,subprocess,sys
+cwd,pristine,cmds,cache=sys.argv[1],sys.argv[2],json.loads(sys.argv[3]),sys.argv[4]
+def run(root,c):
+    try:
+        r=subprocess.run(['/bin/bash','-c',c],cwd=root,capture_output=True,text=True,timeout=90,stdin=subprocess.DEVNULL,env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1'))
+        bad=r.returncode!=0 or 'Traceback (most recent call last)' in r.stderr
+        return bad,(r.stderr.strip().splitlines() or r.stdout.strip().splitlines() or [''])[-1][:200]
+    except subprocess.TimeoutExpired:
+        return True,'timed out after 90 s'
+try: base=json.load(open(cache))
+except Exception: base={}
+for c in cmds:
+    if c not in base: base[c]=run(pristine,c)[0]
+json.dump(base,open(cache,'w'))
+new=[]
+for c in cmds:
+    bad,why=run(cwd,c)
+    if bad and not base[c]: new.append(c); print('SMOKE CRASH',c,'-',why)
+print('SMOKE OK' if not new else f'SMOKE {len(new)} new crash(es)')
+`
+const SMOKE_CMDS = (() => {
+  if (!PRISTINE || !plan.subtasks.some(st => st.kind === 'code')) return []
+  const asked = [...TASK.matchAll(/\`(python3?\s+[^\`\n]+)\`/g)].map(m => m[1].replace(/^python\s/, 'python3 ').trim())
+  const scripts = FUNCTIONS.length ? [...new Set(FUNCTIONS.map(f => f.file))].filter(f => asked.every(c => !c.includes(f))).map(f => `python3 ${f}`) : []
+  return [...new Set([...asked, ...scripts])].slice(0, 6)
+})()
+let takenBack = []
+async function smokeCheck() {
+  const out = await runExactly(`smoke-${takenBack.length}-${puts}`, `python3 - ${q(CWD)} ${q(PRISTINE)} ${q(JSON.stringify(SMOKE_CMDS))} ${q(`${SCRATCH}/smoke-baseline.json`)} <<'AGENTAUS_SMOKE_END'
+${SMOKE_PY}AGENTAUS_SMOKE_END`, 'Assemble') || ''
+  return { crash: /^SMOKE CRASH/m.test(out), ok: /^SMOKE OK/m.test(out), out }
+}
+if (SMOKE_CMDS.length && changeNs.length && !ended) {
+  let s = await smokeCheck()
+  const rank = n => { const st = byN.get(n); const t = (st && st.title) || ''
+    return /^\W*Audit the module-level/i.test(t) ? 0 : /^\W*Audit\b/i.test(t) ? 1 : /^\W*Docs:/i.test(t) ? 2 : /^\W*Feature\b|--[a-z]/i.test(t) ? 4 : 3 }
+  for (let round = 0; s.crash && round < 3 && !ended; round++) {
+    const cands = changeNs.filter(n => !failedChanges.includes(n) && !takenBack.includes(n)).sort((a, b) => rank(a) - rank(b))
+    let found = null
+    for (const n of cands) {
+      if (ended) break
+      await putInPlace(true, new Set([...takenBack, n]))
+      const t = await smokeCheck()
+      if (!t.crash) { found = n; break }
+    }
+    if (found === null) break
+    takenBack.push(found)
+    log(`smoke: subtask ${found} taken back - ${(s.out.match(/^SMOKE CRASH .*$/m) || ['a command crashed with it'])[0].slice(0, 200)}`)
+    s = { crash: false, out: '' }
+  }
+  // The project as decided, less what was taken back.
+  await putInPlace(true, new Set(takenBack))
+  if (takenBack.length) failedChanges = [...new Set([...failedChanges, ...takenBack])]
+  if (!takenBack.length && s.crash) log('smoke: a command crashes and no single change is behind it')
+}
 const importFailed = applied.match(/^FAILED subtask \d+ - undone, it breaks an import.*$/gm) || []
 if (importFailed.length) log(`assemble: ${importFailed.length} change(s) undone - they broke an import`)
 if (changeNs.length) log(`assemble: ${changeNs.length - failedChanges.length} of ${changeNs.length} code change(s) put in place${restoreOk ? '' : ' - THE RESTORE FAILED'}`)
@@ -1925,6 +1995,7 @@ const assembled = sectionMode ? `## Written\n- \`${deliverables[0]}\` - ${sectio
   deliverables.length ? deliverables.map(d => `- \`${d}\``).join('\n') : `(as the request names them - in \`${CWD}\`, never in a scratch folder)`, '',
   '## Assembly', plan.assembly || 'As the request describes.', '',
   changeNs.length ? `## Code changes - already put in place by the runtime\n\`\`\`text\n${applied}\n\`\`\`\n${failedChanges.length ? `**Make each FAILED change by hand**, with small \`Edit\`s, from that subtask's Answer below - for a conflict, merge both changes into that region by hand: ${failedChanges.map(n => `subtask ${n}`).join(', ')}.` : 'Do not change the code again.'}` : null, '',
+  takenBack.length ? `## Changes taken back - with each in place, a command the request names crashed\n${takenBack.map(n => `- subtask ${n}: ${(byN.get(n) || {}).title || ''}`).join('\n')}\nRedo each by hand only in a form that keeps every command running.` : null, '',
   importFailed.length ? `## Changes undone because they broke an import - make each by hand\n\`\`\`text\n${importFailed.join('\n')}\n\`\`\`\nImporting a module must run nothing: put command-line code (argument parsing, printing, exiting) under \`if __name__ == "__main__":\`, keeping what it does. Then import it again to check.` : null, '',
   '## Checklist - every item must end up in a deliverable, exactly as written', CHECKLIST, '',
   '## Merged results', RESULTS,

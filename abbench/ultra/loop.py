@@ -202,7 +202,11 @@ class Gate:
             return False
         up = self.client.upstream()
         ep = endpoint_healthy(up)
-        ok = ep and self.client.probe(self.concurrency)
+        # Beside a running run, the bridge's own live counts are the evidence: a probe queues
+        # behind that run's agents for a slot and times out on a healthy upstream. Measured
+        # (d15): 300 ok and 1 failure in 10 minutes, and every probe failed, so one job ran.
+        live = not cold and up and (up.get("ok_10m") or 0) >= 20 and (up.get("ok_rate_10m") or 0) >= 0.9
+        ok = ep and (live or self.client.probe(self.concurrency))
         self.good = self.good + 1 if ok else 0
         self.next_at = self.clock() + (self.gap_ok if ok else self.gap_bad)
         brief = {k: up.get(k) for k in ("ok_10m", "fail_10m", "limit", "down")} if up else "unreadable"
