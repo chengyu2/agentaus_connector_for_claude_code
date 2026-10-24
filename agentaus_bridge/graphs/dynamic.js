@@ -751,7 +751,7 @@ if (unsplit.length) {
     const notes = String(groupTask || '').split('\n').filter(l => new RegExp(`\\bQ${k}\\b`).test(l) && !/\b(create|write|begin|ends?|heading|file)\b/i.test(l))
     return [`Answer **Q${k}** of the request, and only Q${k}.`, '',
       found ? `The question, word for word (\`${found.file}\` line ${found.line}):\n\n> ${found.text}` : 'Quote the question word for word from the file that asks it.', '',
-      'Answer every part of it from the documents, citing each fact. Where the documents lack something it asks for, say so plainly and say what we would supply.',
+      'Answer every part of it from the documents, citing each fact. Where the documents lack something it asks for, say so plainly and say what we would supply - never a sample, example or placeholder value in its place: no "e.g. $10 million", no made-up policy, reference or contract number.',
       notes.length ? `\nThe planner's notes on Q${k} (context only - the question and the documents win):\n${notes.join('\n')}` : ''].join('\n')
   }
   let next = Math.max(0, ...plan.subtasks.map(o => o.n)) + 1
@@ -2053,12 +2053,22 @@ const sectionMode = deliverables.length === 1 && SECTION_FILE.test(deliverables[
   && plan.subtasks.length > 1 && plan.subtasks.every(st => st.kind === 'text')
 const sectionsWritten = []
 const sectionPart = k => `${SCRATCH}/sections/${String(k + 1).padStart(2, '0')}.md`
+// A figure offered "for example" in place of one the documents lack is still a figure the
+// reader takes as ours. Measured (d16 tender): Q8 said the documents hold no insurance cover,
+// then gave "(e.g., **$10 million**)" and "(e.g., **PI-2023-00123**)" - an invented amount and
+// policy number in a signed response. Each such parenthetical is dropped from the section.
+const SAMPLE = /\s*\((?:e\.\s?g\.?|for example|for instance|such as|say)[,:]?\s[^()\n]*\d[^()\n]*\)/gi
+function dropSamples(text, st) {
+  const dropped = String(text).match(SAMPLE) || []
+  if (dropped.length) log(`section ${st.title}: dropped ${dropped.length} sample value(s) ${dropped.map(d => d.trim()).join(' ')}`)
+  return String(text).replace(SAMPLE, '')
+}
 async function writeSection(k, st) {
   const body = section((done[st.n] && done[st.n].result) || '', 'Answer') || (done[st.n] && done[st.n].result) || 'NOT ANSWERED YET - the graph ran out of time for this question.'
   // Exactly one heading per section: the subtask's own. Measured (d9): an answer starting
   // `#### Q8` was given a `## Q8` above it, and the doubled heading hid the section.
   const strip = b => b.trim().replace(/^(#{1,6}[^\n]*\n+)+/, '').replace(/^#{1,6}\s+(.*)$/gm, '**$1**')
-  const text = plain(`## ${st.title}\n\n${strip(body)}`)
+  const text = plain(`## ${st.title}\n\n${dropSamples(strip(body), st)}`)
   // Each section is its own file, written with `>`: running the command twice cannot write
   // it twice. Measured: a section writer ran its `>>` append twice, and the duplicate failed
   // both final checkers.
