@@ -4,6 +4,7 @@ import logging
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from agentaus_bridge import documents, pdf
 from agentaus_bridge.config import settings
@@ -98,7 +99,8 @@ class Ladder(unittest.TestCase):
 
         pdf.TEXT_TIERS = (("t", lambda p: [READABLE, "", READABLE, "x"]),)
         pdf.OCR_TIERS = (("stub", ocr),)
-        pdf.extract(self.path)
+        with mock.patch.object(pdf, "ocr_available", return_value=True):   # the stub is the OCR
+            pdf.extract(self.path)
         self.assertEqual(asked, [[1, 3]], "OCR must not be spent on readable pages")
 
     def test_ocr_output_is_rejected_when_it_is_worse_than_what_it_replaces(self):
@@ -112,7 +114,8 @@ class Ladder(unittest.TestCase):
         original = settings.agentaus_pdf_ocr_max_pages
         settings.agentaus_pdf_ocr_max_pages = 3
         try:
-            with self.assertLogs("agentaus-bridge", level=logging.WARNING) as caught:
+            with self.assertLogs("agentaus-bridge", level=logging.WARNING) as caught, \
+                    mock.patch.object(pdf, "ocr_available", return_value=True):
                 pdf.extract(self.path)
             self.assertTrue(any("first 3" in line for line in caught.output))
         finally:
@@ -150,7 +153,9 @@ class Routing(unittest.TestCase):
                 with open(os.path.join(root, name), "wb") as handle:
                     handle.write(b"x" * big)
 
-            found = {os.path.basename(f) for f in tools.enumerate_files(root)}
+            # Whether this machine has LibreOffice is not the question here.
+            with mock.patch.object(documents, "available", return_value=True):
+                found = {os.path.basename(f) for f in tools.enumerate_files(root)}
             self.assertIn("report.pdf", found, "an oversized PDF must still be a candidate")
             self.assertIn("deck.pptx", found)
             self.assertNotIn("notes.md", found, "a 1MB text file really is too large")
