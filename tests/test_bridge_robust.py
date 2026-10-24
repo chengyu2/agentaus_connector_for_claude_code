@@ -730,3 +730,33 @@ class SessionRecord(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetryForever(unittest.TestCase):
+    def test_retries_are_unbounded_by_default_and_back_off_to_a_cap(self):
+        from agentaus_bridge.config import Settings
+        from agentaus_bridge.server import _retry_delay
+        s = Settings()
+        self.assertGreater(s.max_retries, 1000)
+        self.assertGreaterEqual(s.retry_max_delay_seconds, 300)
+        from agentaus_bridge.config import settings
+        saved = (settings.retry_backoff_seconds, settings.retry_max_delay_seconds)
+        try:
+            settings.retry_backoff_seconds, settings.retry_max_delay_seconds = 1.0, 300.0
+            self.assertLess(_retry_delay(0), 3)
+            self.assertGreaterEqual(_retry_delay(50), 300)
+            self.assertLessEqual(_retry_delay(50), 301)
+        finally:
+            settings.retry_backoff_seconds, settings.retry_max_delay_seconds = saved
+
+    def test_time_spent_retrying_is_not_served_time(self):
+        import asyncio
+        from agentaus_bridge import flight
+
+        async def go():
+            f = flight.Flight("k", "stream")
+            flight.CURRENT.set(f)
+            f.started -= 1000
+            flight.note_wait(900)
+            return f.served()
+        self.assertLess(run_coro(go()) if False else asyncio.run(go()), 150)

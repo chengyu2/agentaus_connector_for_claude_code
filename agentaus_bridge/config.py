@@ -189,14 +189,21 @@ class Settings:
     # gateway) otherwise surface in Claude Code as a hard "API Error 502" that kills
     # the turn. Retrying is only safe before any content has been emitted, which the
     # streaming path enforces.
-    max_retries: int = field(default_factory=lambda: _int("BRIDGE_MAX_RETRIES", 4))
+    #
+    # By default a transient failure is retried until Agentaus answers: an outage costs the
+    # user time, never the turn. The wait doubles from BRIDGE_RETRY_BACKOFF up to
+    # BRIDGE_RETRY_MAX_DELAY, with jitter, so a night-long outage is tried a few times an hour
+    # rather than hammered. It is safe to wait that long: the streaming heartbeat keeps Claude
+    # Code from dropping the turn, an abandoned request is cancelled, and a graph agent past its
+    # time limit is answered by the bridge instead of retried. Measured (d8-d15): Agentaus
+    # slumped for hours on most nights and every turn that gave up after four tries was lost.
+    # BRIDGE_MAX_RETRIES caps it again for anyone who wants a fast error.
+    max_retries: int = field(default_factory=lambda: _int("BRIDGE_MAX_RETRIES", 1_000_000))
     retry_backoff_seconds: float = field(
-        default_factory=lambda: _float("BRIDGE_RETRY_BACKOFF", 0.5)
+        default_factory=lambda: _float("BRIDGE_RETRY_BACKOFF", 1.0)
     )
-    # Ceiling on a single backoff wait. Claude Code gives up on a silent stream at
-    # 300s, so unbounded doubling would trade a fast error for a hung turn.
     retry_max_delay_seconds: float = field(
-        default_factory=lambda: _float("BRIDGE_RETRY_MAX_DELAY", 30.0)
+        default_factory=lambda: _float("BRIDGE_RETRY_MAX_DELAY", 300.0)
     )
 
     # --- Agentaus context window ---------------------------------------------------

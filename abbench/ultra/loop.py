@@ -189,10 +189,12 @@ class Gate:
     the gate waits through an outage."""
 
     def __init__(self, client: BridgeClient, need_cold: int = 3, gap_ok: float = 120,
-                 gap_bad: float = 300, concurrency: int = 2, clock=time.time, say=log):
+                 gap_bad: float = 120, concurrency: int = 2, clock=time.time, say=log,
+                 gap_max: float = 1800, jitter=None):
         self.client, self.need_cold, self.gap_ok, self.gap_bad = client, need_cold, gap_ok, gap_bad
-        self.concurrency, self.clock, self.say = concurrency, clock, say
-        self.good, self.next_at = 0, 0.0
+        self.concurrency, self.clock, self.say, self.gap_max = concurrency, clock, say, gap_max
+        self.jitter = jitter or (lambda: random.uniform(0.85, 1.15))
+        self.good, self.next_at, self.fails = 0, 0.0, 0
 
     def ready(self, cold: bool) -> bool:
         need = self.need_cold if cold else 1
@@ -206,18 +208,29 @@ class Gate:
         # behind that run's agents for a slot and times out on a healthy upstream. Measured
         # (d15): 300 ok and 1 failure in 10 minutes, and every probe failed, so one job ran.
         live = not cold and up and (up.get("ok_10m") or 0) >= 20 and (up.get("ok_rate_10m") or 0) >= 0.9
-        ok = ep and (live or self.client.probe(self.concurrency))
+        # While the bridge says down, a probe is still sent: a success is the only thing that clears
+        # "down". Measured (d15): the gate skipped the probe whenever the endpoint said down, nothing
+        # reached Agentaus, and a recovered upstream sat "down" for 19 hours.
+        down = bool(up and up.get("down"))
+        ok = (ep and (live or self.client.probe(self.concurrency))) or (down and self.client.probe(1)
+                                                                         and endpoint_healthy(self.client.upstream()))
         self.good = self.good + 1 if ok else 0
-        self.next_at = self.clock() + (self.gap_ok if ok else self.gap_bad)
+        # Backing off: each failed check in a row doubles the wait, up to gap_max, with jitter; a
+        # pass resets it. An outage that lasts all night is checked a few times an hour, not
+        # every few minutes, and a recovery is still seen within the cap.
+        self.fails = 0 if ok else self.fails + 1
+        wait = self.gap_ok if ok else min(self.gap_max, self.gap_bad * 2 ** (self.fails - 1)) * self.jitter()
+        self.next_at = self.clock() + wait
         brief = {k: up.get(k) for k in ("ok_10m", "fail_10m", "limit", "down")} if up else "unreadable"
-        self.say(f"gate: upstream={brief} endpoint_ok={ep} probe_ok={ok} good={self.good}/{need}")
+        self.say(f"gate: upstream={brief} endpoint_ok={ep} probe_ok={ok} good={self.good}/{need}"
+                 + ("" if ok else f" - next check in {wait / 60:.0f} min"))
         return self.good >= need
 
     def consume(self) -> None:
         self.good = 0
 
     def reset(self) -> None:
-        self.good, self.next_at = 0, 0.0
+        self.good, self.next_at, self.fails = 0, 0.0, 0
 
 
 def _pids_listening(port: int) -> set[int]:
@@ -923,6 +936,9 @@ def main(argv=None):
                    if (REPO / ".venv" / "bin" / "python").exists() else sys.executable)
     r.add_argument("--strays", choices=("kill", "refuse"), default="kill")
     r.add_argument("--ledger", default=str(LEDGER))
+    r.add_argument("--once", dest="forever", action="store_false",
+                   help="stop after this round (the default runs round after round: d15 -> d16 ...,"
+                        " each on the code then on disk)")
     p = sub.add_parser("report", help="valid runs only, against the rolling Opus mean")
     p.add_argument("--labels", default="")
     p.add_argument("--ledger", default=str(LEDGER))
@@ -942,7 +958,13 @@ def main(argv=None):
         bridge.check_strays()
         if not args.manage_bridge and not bridge.client.alive():
             raise SystemExit(f"no bridge on {args.port}; start one or pass --manage-bridge")
-        Loop(args, bridge=bridge).run()
+        while True:
+            Loop(args, bridge=bridge).run()
+            if not args.forever:
+                break
+            m = re.match(r"^(.*?)(\d+)$", args.label)
+            args.label = f"{m.group(1)}{int(m.group(2)) + 1}" if m else f"{args.label}-2"
+            log(f"forever: round over - next round {args.label}")
     elif args.cmd == "report":
         rows = read_ledger(Path(args.ledger))
         overrides = {r["wd"]: r.get("new") for r in read_ledger(Path(args.regrade))} if args.regrade else None

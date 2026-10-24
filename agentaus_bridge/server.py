@@ -423,21 +423,28 @@ def _describe(exc: BaseException) -> str:
 
 
 def _retry_delay(attempt: int) -> float:
-    """Exponential backoff with jitter, capped so a long outage still ends the turn.
+    """Exponential backoff with jitter, capped so a long outage is retried a few times an hour.
 
     Jitter matters when several requests fail at once - Claude Code fires background
     calls alongside the main turn, and without it they would all retry in lockstep and
     re-hammer an upstream that is already struggling.
     """
-    base = settings.retry_backoff_seconds * (2**attempt)
+    base = settings.retry_backoff_seconds * (2 ** min(attempt, 30))
     return min(base, settings.retry_max_delay_seconds) + random.uniform(
         0, settings.retry_backoff_seconds
     )
 
 
+# A failed gateway attempt usually took Agentaus's ~125 s timeout before it failed.
+_FAILED_ATTEMPT_S = 125.0
+
+
 async def _sleep_before_retry(attempt: int, why: str) -> None:
     delay = _retry_delay(attempt)
     rlog(logging.WARNING, "upstream attempt %d failed (%s); retrying in %.2fs", attempt + 1, why, delay)
+    # Neither the failed attempt nor this wait counts against the turn's timeout: retrying
+    # through a slump is waiting, not being wedged (see flight.Flight.served).
+    flight.note_wait(delay + (_FAILED_ATTEMPT_S if why.startswith(("HTTP 52", "HTTP 504", "ReadTimeout")) else 0.0))
     await asyncio.sleep(delay)
 
 

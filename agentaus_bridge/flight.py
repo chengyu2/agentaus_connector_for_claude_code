@@ -22,6 +22,7 @@ So a turn runs as a *flight*, detached from the client that started it:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
@@ -58,11 +59,26 @@ class Flight:
         self.cond = asyncio.Condition()
         self.started = time.monotonic()
         self.down_at_start = throttle.down_total()
+        self.waited = 0.0
         self._timer: asyncio.TimerHandle | None = None
 
     def served(self) -> float:
-        """Seconds since the turn started, less the seconds the upstream was down."""
-        return time.monotonic() - self.started - max(0.0, throttle.down_total() - self.down_at_start)
+        """Seconds since the turn started, less the seconds the upstream was down and the
+        seconds this turn spent on failed attempts and the waits between them: a turn retrying
+        through a slump is waiting, not wedged."""
+        out = time.monotonic() - self.started - max(0.0, throttle.down_total() - self.down_at_start)
+        return max(0.0, out - self.waited)
+
+
+# The flight whose task is running now, so a retry deep in the turn can say it waited.
+CURRENT: "contextvars.ContextVar[Flight | None]" = contextvars.ContextVar("agentaus_flight", default=None)
+
+
+def note_wait(seconds: float) -> None:
+    """Time this turn spent on a failed upstream attempt and the backoff after it."""
+    f = CURRENT.get()
+    if f is not None:
+        f.waited += max(0.0, seconds)
 
 
 _flights: dict[str, Flight] = {}
@@ -146,6 +162,7 @@ def start_stream(key: str, source: AsyncIterator[bytes], deadline: float = 0) ->
         f.failed = True
 
     async def pump() -> None:
+        CURRENT.set(f)
         watcher = asyncio.ensure_future(_watch_deadline(f, deadline, timed_out))
         try:
             async for chunk in source:
@@ -180,6 +197,7 @@ def start_buffered(key: str, run: Callable[[], Awaitable], deadline: float = 0) 
         f.failed = True
 
     async def pump() -> None:
+        CURRENT.set(f)
         watcher = asyncio.ensure_future(_watch_deadline(f, deadline, timed_out))
         try:
             response = await run()

@@ -211,7 +211,7 @@ class GateTests(unittest.TestCase):
         seq = iter([True, False, True, True, True])
         c = types.SimpleNamespace(upstream=lambda: {"ok_10m": 50, "fail_10m": 0, "ok_rate_10m": 1.0},
                                   probe=lambda n: next(seq))
-        g = loop.Gate(c, need_cold=3, gap_ok=120, gap_bad=300, clock=lambda: clock[0], say=lambda m: None)
+        g = loop.Gate(c, need_cold=3, gap_ok=120, gap_bad=300, clock=lambda: clock[0], say=lambda m: None, jitter=lambda: 1.0)
         ready = []
         for _ in range(200):
             ready.append(g.ready(cold=True))
@@ -224,6 +224,30 @@ class GateTests(unittest.TestCase):
         self.assertEqual(clock[0], 120 + 300 + 120 + 120)
         g.consume()
         self.assertEqual(g.good, 0)             # every launch needs fresh evidence
+
+    def test_failed_checks_back_off_and_a_pass_resets(self):
+        clock = [0.0]
+        results = iter([False, False, False, False, False, False, True, False])
+        c = types.SimpleNamespace(upstream=lambda: {"ok_10m": 50, "fail_10m": 0, "ok_rate_10m": 1.0},
+                                  probe=lambda n: next(results))
+        g = loop.Gate(c, need_cold=3, gap_ok=120, gap_bad=120, gap_max=1800, clock=lambda: clock[0],
+                      say=lambda m: None, jitter=lambda: 1.0)
+        waits = []
+        for _ in range(8):
+            g.ready(cold=True)
+            waits.append(g.next_at - clock[0])
+            clock[0] = g.next_at
+        self.assertEqual(waits, [120, 240, 480, 960, 1800, 1800, 120, 120])
+
+    def test_a_bridge_that_says_down_is_still_probed(self):
+        # Measured (d15): skipping the probe while "down" meant nothing ever cleared it.
+        state = {"down": True}
+        def probe(n):
+            state["down"] = False
+            return True
+        c = types.SimpleNamespace(upstream=lambda: {"ok_10m": 0, "fail_10m": 0, "down": state["down"]}, probe=probe)
+        g = loop.Gate(c, need_cold=1, clock=lambda: 0.0, say=lambda m: None)
+        self.assertTrue(g.ready(cold=True))
 
     def test_beside_a_running_run_live_counts_stand_in_for_the_probe(self):
         # Measured (d15): the probe queued behind a running graph's agents and timed out on a
