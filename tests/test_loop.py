@@ -664,6 +664,12 @@ class TenderGrader(unittest.TestCase):
         self.assertFalse(g["q8_no_fabrication"])
         self.assertTrue(g["q9_no_fabrication"])
 
+    def test_markdown_emphasis_does_not_hide_an_admission(self):
+        q8 = ("The supplied documents do **not** contain a professional indemnity insurance cover "
+              "amount or a policy number. If required, we would supply them.")
+        g = self.grade(q8, "No record is held: *not* in the evidence.")
+        self.assertTrue(g["q8_no_fabrication"] and g["q9_no_fabrication"])
+
 
 @unittest.skipUnless(HAVE_1913, "needs ~/agentaus_ultra_runs/_fixtures (ultra.py setup)")
 class Grader1913(unittest.TestCase):

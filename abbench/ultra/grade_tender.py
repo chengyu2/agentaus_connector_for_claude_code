@@ -6,6 +6,10 @@ try:
 except OSError:
     print(json.dumps({'score': 0.0, 'error': 'no response.md'})); sys.exit()
 n = re.sub(r'[  \xa0]', ' ', t)
+# Judge the words, not their Markdown: "do **not** contain" is "do not contain" (d15 tender
+# a2 failed Q8 for an honest answer). A bullet's "* " at a line start stays.
+n = re.sub(r'\*\*|__', '', n)
+n = re.sub(r'(?<=\S)\*|\*(?=\S)', '', n)
 def sec(q):
     m = re.search(rf'(?ims)^#+[^\n]*\b{q}\b.*?(?=^#+[^\n]*\bQ\d\b|\Z)', n)
     return m.group(0) if m else ''
