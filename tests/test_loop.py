@@ -364,6 +364,43 @@ class Scheduler(unittest.TestCase):
         self.assertGreaterEqual(launches[1][0], bridge.restarts[1])
         self.assertGreaterEqual(rows[0]["wall_s"], 2000)
 
+    def test_new_committed_code_drains_then_restarts_the_bridge(self):
+        """Code committed at 1000 s: the running run finishes, nothing launches meanwhile, the
+        bridge restarts, and the next runs count on the new hash."""
+        ser = Series(lambda s: 200)
+        bridge = FakeBridge(None)
+        bridge.manage, bridge.loaded = True, "A"
+        lp, clock, launches = make_loop(self.tmp, ser, lambda a, t, n: 3000, tasks="c1913", valid=2,
+                                        opus_every=0, jobs=1, bridge=bridge)
+        bridge.clock = clock
+        committed = [False]
+        lp.disk_hash = lambda: "A" if clock[0] < 1000 else "B"
+        lp.committed = lambda: committed[0] or clock[0] >= 1500
+        orig = bridge.restart
+
+        def restart():
+            orig()
+            bridge.loaded = lp.disk_hash()
+        bridge.restart = restart
+        quiet(lp.run)
+        self.assertEqual(len(bridge.restarts), 2)              # round start, and the reload
+        self.assertGreaterEqual(bridge.restarts[1], 3000)       # after the first run finished
+        self.assertFalse([l for l in launches if 1000 <= l[0] < bridge.restarts[1]])
+        self.assertEqual(len(launches), 2)
+
+    def test_uncommitted_code_is_never_loaded(self):
+        ser = Series(lambda s: 200)
+        bridge = FakeBridge(None)
+        bridge.manage, bridge.loaded = True, "A"
+        lp, clock, launches = make_loop(self.tmp, ser, lambda a, t, n: 600, tasks="c1913", valid=2,
+                                        opus_every=0, jobs=1, bridge=bridge)
+        bridge.clock = clock
+        lp.disk_hash = lambda: "B"
+        lp.committed = lambda: False
+        quiet(lp.run)
+        self.assertEqual(len(bridge.restarts), 1)
+        self.assertEqual(len(launches), 2)
+
     def test_timeout_extends_by_down_time(self):
         ser = Series(lambda s: 200, down=lambda s: 600 <= s < 1100)   # 500 s down, under the abort span
         lp, clock, _ = make_loop(self.tmp, ser, lambda a, t, n: 2300, tasks="c1913", valid=1, opus_every=0,

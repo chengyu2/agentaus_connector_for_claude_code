@@ -291,6 +291,7 @@ class Bridge:
         self.port, self.manage, self.log_path, self.python, self.width = port, manage, log_path, python, width
         self.strays = strays
         self.client = client or BridgeClient(f"http://127.0.0.1:{port}")
+        self.loaded: str | None = None  # disk_source_hash() when this loop last started it
 
     def check_strays(self) -> None:
         strays = find_strays(self.port)
@@ -314,6 +315,7 @@ class Bridge:
                 _kill(pid)
         env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "ANTHROPIC_BASE_URL"))}
         env["AGENTAUS_GRAPH_WIDTH"] = str(self.width)
+        self.loaded = disk_source_hash()
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.log_path, "a") as fh:
             fh.write(f"\n==== loop.py started this bridge at {time.strftime('%Y-%m-%d %H:%M:%S')} ====\n")
@@ -433,6 +435,16 @@ def disk_source_hash() -> str:
     return "disk:" + h.hexdigest()[:10]
 
 
+def bridge_committed() -> bool:
+    """No uncommitted change under agentaus_bridge/: a commit is what deploys new code to a
+    running round, so a half-made edit is never loaded."""
+    try:
+        return subprocess.run(["git", "status", "--porcelain", "--", "agentaus_bridge"], cwd=REPO,
+                              capture_output=True, text=True, timeout=30).stdout.strip() == ""
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def git_version() -> dict:
     def git(*a):
         return subprocess.run(["git", "-C", str(REPO), *a], capture_output=True, text=True).stdout
@@ -535,6 +547,9 @@ class Loop:
         self.running: list[Run] = []
         self.grading: dict = {}
         self.pending_restart = False
+        self.reload = False
+        self.disk_hash = disk_source_hash
+        self.committed = bridge_committed
         self.last_alive = clock()
         self.graders = graders_hash()
         self.git = git_version()
@@ -717,6 +732,18 @@ class Loop:
                 f" wall={rec['wall_s']:.0f}s health=ok {h.get('ok')}/fail {h.get('fail')} "
                 f"degraded {h.get('degraded_frac')} down {h.get('down_s')}s")
 
+    def check_reload(self):
+        """New committed code on disk: launch nothing more, and restart the bridge on it once
+        the running runs finish - so a fix reaches the next runs, not the next round. Valid runs
+        count per source hash, so the new code collects its own. Measured (d15): the judges were
+        committed at 21:58 and three runs launched after it on the 20:14 bridge's old graph."""
+        b = self.bridge
+        if self.reload or not (b and getattr(b, "manage", False) and getattr(b, "loaded", None)) or self.disk_hash() == b.loaded or not self.committed():
+            return
+        self.reload = self.pending_restart = True
+        log(f"new committed code on disk (git {git_version().get('commit')}): no new launches; "
+            f"the bridge restarts on it when the {len(self.running)} running run(s) finish")
+
     def run(self):
         if self.bridge:
             self.bridge.restart()   # between rounds: a fresh bridge, no zombies from the last
@@ -730,11 +757,14 @@ class Loop:
             self.sample()
             self.check_runs()
             self.collect()
-            if self.pending_restart and not self.running and not self.grading:
+            self.check_reload()
+            if self.pending_restart and not self.running and not self.grading and not (self.reload and not self.committed()):
                 if self.bridge:
                     self.bridge.restart()
                 self.gate.reset()
-                self.pending_restart = False
+                if self.reload:
+                    self.git = git_version()
+                self.pending_restart = self.reload = False
             todo = self.plan()
             if not todo and not self.running and not self.grading:
                 break
