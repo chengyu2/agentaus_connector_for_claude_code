@@ -547,6 +547,31 @@ class EditRepair(unittest.TestCase):
         self.assertIsNone(repair.repair_edit(FILE, "    if depth < 6:", "    if depth < 5:"),
                           "an exact match needs no repair")
 
+    def test_tabs_typed_where_the_file_has_four_spaces(self):
+        # d15 he10: the post-graph Edit of order_by_points came back with tab indentation.
+        src = "def f(xs):\n    # pair them\n    out = sorted(xs)\n    return out\n"
+        fixed = repair.repair_edit(src, "\t# pair them\n\tout = sorted(xs)", "\tout = sorted(xs, key=abs)")
+        self.assertEqual(fixed[:2], ("    # pair them\n    out = sorted(xs)", "    out = sorted(xs, key=abs)"))
+
+    def test_a_word_slipped_in_a_retyped_block_is_taken_from_the_file(self):
+        # d15 he10: 8 Edits retyped "based on their index" as "based on the index"; all refused.
+        src = ('def order(nums):\n    """\n    Sort by digit sum.\n    Ties: order them based on their index in original list.\n'
+               '    """\n    return sorted(nums, key=abs)\n')
+        old = ('def order(nums):\n    """\n    Sort by digit sum.\n    Ties: order them based on the index in original list.\n'
+               '    """\n    return sorted(nums, key=abs)')
+        new = old.replace("key=abs", "key=digits")
+        fixed = repair.repair_edit(src, old, new)
+        self.assertEqual(src.count(fixed[0]), 1)
+        self.assertIn("based on their index", fixed[1], "the docstring keeps the file's words")
+        self.assertIn("key=digits", fixed[1])
+
+    def test_a_near_match_in_two_places_or_too_different_is_not_used(self):
+        two = "def a():\n    x = 1\n    y = 2\n    z = 3\n\ndef b():\n    x = 1\n    y = 2\n    z = 3\n"
+        self.assertIsNone(repair.repair_edit(two, "    x = 1\n    y = 9\n    z = 3", "    x = 1"))
+        src = "def a():\n    x = 1\n    y = 2\n    z = 3\n"
+        self.assertIsNone(repair.repair_edit(src, "    x = 1\n    w = q + r\n    z = 3", "    x = 1"))
+        self.assertIsNone(repair.repair_edit(src, "    x = 1\n    y = 9", "    x = 1"), "under three lines")
+
     def test_already_applied_only_for_a_long_new_string(self):
         short = "def a():\n    return None\ndef b(x):\n    if x:\n        return 1\n"
         self.assertIsNone(repair.repair_edit(short, "    if x:\n        return 2", "    return None"))

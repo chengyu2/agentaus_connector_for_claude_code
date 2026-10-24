@@ -201,6 +201,40 @@ def _block_at(text: str, lines: list) -> list:
             if all(tl[i + k].translate(_UNI).strip() == key[k] for k in range(len(lines)))]
 
 
+def _near_block(text: str, lines: list) -> list:
+    """[(line index, {k: file line})] where `lines` match `text` line for line but for a few
+    lines that differ by a word or two - a model retyping a docstring "their index" as "the
+    index". At least three non-blank lines, at most one in five differing, each differing
+    line at least 85% alike."""
+    key = [l.translate(_UNI).strip() for l in lines]
+    body = [k for k in key if k]
+    if len(body) < 3:
+        return []
+    allow = max(1, len(body) // 5)
+    tl = text.split("\n")
+    out = []
+    for i in range(len(tl) - len(lines) + 1):
+        diff = {}
+        for k, want in enumerate(key):
+            have = tl[i + k].translate(_UNI).strip()
+            if have == want:
+                continue
+            if not want or not have or len(diff) >= allow or \
+                    difflib.SequenceMatcher(None, want, have).ratio() < 0.85:
+                diff = None
+                break
+            diff[k] = tl[i + k]
+        if diff:
+            out.append((i, diff))
+    return out
+
+
+def _detab(block: str) -> str:
+    """Leading tabs as four spaces each, for a model that indents with tabs where the file
+    has spaces (d15 he10: every Edit of order_by_points failed)."""
+    return "\n".join(_lead(l).replace("\t", "    ") + l.lstrip(" \t") for l in block.split("\n"))
+
+
 def _is_long(new: str) -> bool:
     return sum(1 for l in new.split("\n") if l.strip()) >= 2 or len(new.strip()) >= 30
 
@@ -225,10 +259,26 @@ def repair_edit(text: str, old: str, new: str):
     if flat.count(old.translate(_UNI)) == 1:
         at = flat.index(old.translate(_UNI))
         return text[at:at + len(old)], new, ", ".join(how + ["typographic characters"])
+    if any("\t" in _lead(l) for l in old.split("\n")) and not re.search(r"^ *\t", text, re.M):
+        old, new = _detab(old), _detab(new)
+        how.append("tabs as four spaces")
+        if text.count(old) == 1:
+            return old, new, ", ".join(how)
     first_nl = len(old) - len(old.lstrip("\n"))
     last_nl = len(old) - len(old.rstrip("\n"))
     lines = old.strip("\n").split("\n")
     hits = _block_at(text, lines)
+    if not hits:
+        near = _near_block(text, lines)
+        if len(near) == 1:
+            # The file's words, in the old text and wherever the new text kept the slipped line.
+            at, diff = near[0]
+            slipped = {lines[k].translate(_UNI).strip(): real.strip() for k, real in diff.items()}
+            lines = [_lead(l) + diff[k].strip() if k in diff else l for k, l in enumerate(lines)]
+            new = "\n".join(_lead(l) + slipped[l.translate(_UNI).strip()] if l.translate(_UNI).strip() in slipped else l
+                            for l in new.split("\n"))
+            how.append(f"{len(diff)} line(s) retyped with a slip, taken from the file")
+            hits = [at]
     if len(hits) == 1:
         real = text.split("\n")[hits[0]:hits[0] + len(lines)]
         pairs = [(o, r) for o, r in zip(lines, real) if o.strip()]
