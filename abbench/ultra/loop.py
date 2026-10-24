@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -315,19 +316,25 @@ class Bridge:
                 _kill(pid)
         env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "ANTHROPIC_BASE_URL"))}
         env["AGENTAUS_GRAPH_WIDTH"] = str(self.width)
-        self.loaded = disk_source_hash()
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.log_path, "a") as fh:
-            fh.write(f"\n==== loop.py started this bridge at {time.strftime('%Y-%m-%d %H:%M:%S')} ====\n")
-            fh.flush()
-            subprocess.Popen([self.python, "-u", "-m", "agentaus_bridge", "--port", str(self.port)],
-                             cwd=REPO, env=env, stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                             start_new_session=True)
-        end = time.time() + 120
-        while time.time() < end and not self.client.alive():
-            time.sleep(1)
-        if not self.client.alive():
-            raise SystemExit(f"bridge on {self.port} did not come up; see {self.log_path}")
+        # A bridge that will not start (a requirement missing, a bad commit) is waited out,
+        # not fatal: the loop runs forever, and the cause is in the bridge log.
+        for attempt in itertools.count():
+            self.loaded = disk_source_hash()
+            with open(self.log_path, "a") as fh:
+                fh.write(f"\n==== loop.py started this bridge at {time.strftime('%Y-%m-%d %H:%M:%S')} ====\n")
+                fh.flush()
+                subprocess.Popen([self.python, "-u", "-m", "agentaus_bridge", "--port", str(self.port)],
+                                 cwd=REPO, env=env, stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                 start_new_session=True)
+            end = time.time() + 120
+            while time.time() < end and not self.client.alive():
+                time.sleep(1)
+            if self.client.alive():
+                break
+            wait = min(1800, 60 * 2 ** attempt)
+            log(f"bridge on {self.port} did not come up (see {self.log_path}); trying again in {wait // 60} min")
+            time.sleep(wait)
         up = self.client.upstream()
         log(f"bridge up on {self.port} (width {self.width}, log {self.log_path}, "
             f"source_hash {(up or {}).get('source_hash', '?')})")
