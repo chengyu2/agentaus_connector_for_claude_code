@@ -1194,7 +1194,7 @@ async function pickFunction(st, f, ks, replies, audit) {
 }
 
 // Consensus spec tests: three agents each write test cases from the docstring alone; a case
-// counts only when two of them wrote it. A chosen function that fails one is handled like one
+// counts when two of them wrote it, or when three judges all work out the same result. A chosen function that fails one is handled like one
 // that breaks a docstring example - readings, with the failing cases as evidence - and the
 // picker counts them. Measured (d7-d15 he10): is_bored counted "Is ..." as the word "I" and
 // passed both docstring examples every round; nothing measured the trap the words name.
@@ -1225,7 +1225,39 @@ async function specTests(st, f) {
       count.set(key, c)
     }
   }
-  const agreed = [...count.values()].filter(c => c.n >= 2).map(c => c.line).slice(0, 12)
+  // Writers seldom pick the same inputs, so a lone writer's case goes to three judges who see
+  // only the call: it counts when every judge works out the same result. Measured (d15 he10):
+  // only the empty and docstring cases had two writers, and "Is ..." and the tie order went
+  // untested.
+  const agreed = [...count.values()].filter(c => c.n >= 2).map(c => c.line)
+  const done = new Set(agreed.map(l => norm(l.replace(/^assert\s+/, '').replace(/\s*==.*$/, ''))))
+  const calls = [...new Map([...count.values()].filter(c => c.n < 2).map(c => {
+    const call = c.line.replace(/^assert\s+/, '').replace(/\s*==\s*.+$/, '')
+    return [norm(call), call]
+  })).entries()].filter(([k]) => !done.has(k) && !examples.has(k)).slice(0, 16).map(([, call]) => call)
+  if (calls.length) {
+    const judge = j => ask(prompt('check', `Work out ${f.fn} by hand (judge ${j})`, [
+      specOf(st), '',
+      `Work out by hand, from the spec's words alone, what \`${f.fn}\` returns for each call below.`,
+      '- First find the one reading of the words that gives **every** docstring example its stated result - work each example through. Then apply that reading, word for word: "the word X" is not "starts with the letters X", and a stated tie order is kept.',
+      `- Answer with one line per call, each exactly \`assert <call> == <result>\`, all in one \`\`\`python block - every call, in this order.`, '',
+      '```python', ...calls, '```',
+    ], true), `spec-judge-${st.n}.${j}`, 'Solve', t => /assert\s/.test(t), { pri: 1 })
+    const verdicts = (await parallel([1, 2, 3].map(j => () => judge(j)))).filter(Boolean)
+    const said = new Map()
+    for (const md of verdicts) {
+      const mine = new Map()
+      for (const m of md.matchAll(new RegExp(`^\\s*assert\\s+(${f.fn}\\(.*\\))\\s*==\\s*(.+?)\\s*$`, 'gm'))) {
+        if (!mine.has(norm(m[1]))) mine.set(norm(m[1]), { call: m[1].trim(), want: m[2].trim() })
+      }
+      for (const [k, v] of mine) said.set(k, [...(said.get(k) || []), v])
+    }
+    for (const call of calls) {
+      const vs = said.get(norm(call)) || []
+      if (vs.length >= 2 && vs.length === verdicts.length && new Set(vs.map(v => norm(v.want))).size === 1) agreed.push(`assert ${vs[0].call} == ${vs[0].want}`)
+    }
+  }
+  agreed.splice(12)
   if (!agreed.length) return []
   const dir = `${SCRATCH}/spec/s${st.n}`
   const files = agreed.map((_, i) => `${dir}/spec_${i + 1}.py`)
