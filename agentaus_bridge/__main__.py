@@ -82,6 +82,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    # Every document reader is required: a bridge that cannot open a .docx or a scanned
+    # page would still answer, just without the evidence those files hold.
+    from . import requirements
+
+    lacking = requirements.missing()
+    if lacking:
+        log.error("%s", requirements.report(lacking))
+        return 3
+
     if args.check:
         return _check(settings)
 

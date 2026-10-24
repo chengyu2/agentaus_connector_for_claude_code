@@ -223,7 +223,7 @@ def _tesseract_ocr(path: str, wanted: list[int]) -> dict[int, str]:
         try:
             page = subprocess.run(
                 [render, "-f", str(index + 1), "-l", str(index + 1),
-                 "-r", str(settings.agentaus_pdf_dpi), "-png", path, "-"],
+                 "-r", str(settings.agentaus_pdf_dpi), "-png", path],  # no root: stdout
                 capture_output=True,
                 timeout=settings.agentaus_pdf_timeout_seconds,
                 check=True,

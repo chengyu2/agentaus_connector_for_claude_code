@@ -65,10 +65,24 @@ which is fine — but `scripts/claude-agentaus.sh` cannot work for you, because 
 
 ## Quick start
 
+### Requirements
+
+All of these are required. The bridge checks for every one at startup and refuses to
+start, naming what is missing and the command that installs it, rather than run without
+the documents they read. `./scripts/install.sh` installs them all.
+
+| Requirement | Reads | macOS | Debian / Ubuntu |
+| --- | --- | --- | --- |
+| Python 3.11+ | - | `brew install python` | `sudo apt install python3 python3-venv` |
+| **LibreOffice** | `.docx`, `.xlsx`, `.pptx`, tables intact | `brew install --cask libreoffice` | `sudo apt install libreoffice-writer libreoffice-calc libreoffice-impress` |
+| **poppler** (`pdftotext`, `pdftoppm`) | PDF text with its layout; scanned pages for OCR | `brew install poppler` | `sudo apt install poppler-utils` |
+| **tesseract** | Scanned PDF pages | `brew install tesseract` | `sudo apt install tesseract-ocr` |
+| Python packages in `requirements.txt` | PDF fallbacks (`pdfminer.six`, `pypdf`), the code outline (`tree-sitter`), macOS Vision OCR (`pyobjc`) | `pip install -r requirements.txt` | same |
+
 ```bash
 git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git
 cd agentaus_connector_for_claude_code
-./scripts/install.sh                           # virtualenv, dependencies, .env scaffold
+./scripts/install.sh                           # document readers, virtualenv, dependencies, .env scaffold
 $EDITOR .env                                   # paste your AGENTAUS_API_KEY
 ./.venv/bin/python -m agentaus_bridge --check   # verify the key with a live call
 ./scripts/start-bridge.sh                      # start the bridge (leave this terminal open)
@@ -1307,7 +1321,7 @@ That meant `agentaus_search` and `agentaus_zoom` could not see a tender response
 requirements matrix or a specification — which is exactly where that material lives.
 
 They are read by default now, converted with **LibreOffice**, which knows the format.
-Nothing to configure if LibreOffice is installed; `soffice` is found in the usual places
+LibreOffice is a [requirement](#requirements); `soffice` is found in the usual places
 or on `$PATH`, `AGENTAUS_SOFFICE_PATH` overrides it, and `AGENTAUS_OFFICE_EXTRACT=false`
 goes back to skipping them.
 
@@ -1326,8 +1340,8 @@ a spreadsheet exactly as it cites into source code.
 
 ### One reader, on purpose
 
-If LibreOffice is absent, the bridge says so and tells you how to install it. It does not
-fall back to a lighter library.
+If LibreOffice is absent, the bridge refuses to start and tells you how to install it. It
+does not fall back to a lighter library.
 
 `python-docx` and `openpyxl` would handle `.docx` and `.xlsx` in 496 KB against
 LibreOffice's 795 MB, so the temptation is obvious. They are also a **second
@@ -1391,8 +1405,9 @@ twenty-page report with two scanned pages costs two OCR calls, not twenty.
 | **macOS Vision** | pyobjc | Neural OCR built into the OS. No model download, ~0.5s/page, rasterises through Quartz so it adds no imaging dependency |
 | **tesseract** | `brew install tesseract` | Cross-platform OCR tier |
 
-Every tier is optional and the ladder degrades: with no system binaries and no OCR at
-all, an ordinary text-layer PDF still reads.
+Every tier is [required](#requirements): the bridge refuses to start without poppler,
+tesseract, the Python tiers and, on macOS, Vision. The ladder still degrades at run time -
+a tier that fails on one file hands it to the next - but no tier is missing by design.
 
 ### One bug worth recording
 
@@ -1594,13 +1609,13 @@ There is a strict quality ordering rather than competing implementations, and ea
 runs only when the one above cannot:
 
 ```
-1. Tree-sitter       exact, 19 languages, optional dependency
+1. Tree-sitter       exact, 19 languages, required
 2. Python `ast`      exact, one language, always available
 3. declaration pass  approximate, any language, always available
 ```
 
-`pip install tree-sitter tree-sitter-language-pack` gets rung one. Without it the outline
-still works — just approximately, for languages other than Python.
+Tree-sitter is a [requirement](#requirements), installed from `requirements.txt`, so rung
+one is always there. The lower rungs remain for a grammar that fails on one file.
 
 ---
 
