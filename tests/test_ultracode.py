@@ -659,6 +659,22 @@ class TheDynamicGraph(unittest.TestCase):
         self.assertFalse(graph.guarded_writes(call("Write", os.path.join(cwd, "answers.json")), body("assemble"), cwd))
         self.assertFalse(graph.guarded_writes(call("Edit", src), {"messages": [user("fix it")]}, cwd))
 
+    def test_graph_agents_stay_out_of_other_runs_scratch(self):
+        # Measured (d16 c1913h): a solver listed /tmp/agentaus-graph and worked in the scratch
+        # of an earlier attempt at the same task.
+        cwd = "/Users/x/runs/d16/agentaus-c1913h-ui-a3"
+        own = "/tmp/agentaus-graph/Users_x_runs_d16_agentaus-c1913h-ui-a3-dyn"
+        other = "/tmp/agentaus-graph/Users_x_runs_d16_agentaus-c1913h-ui-a1-dyn"
+        body = {"messages": [user(f"{graph.MARK}\n# Job\n\n## Your skill: solve\n")]}
+        def bash(command):
+            return [{"name": "Bash", "arguments": {"command": command}}]
+        self.assertFalse(graph.guarded_writes(bash(f'cd "{own}/s3/1/repo" && python3 tests.py'), body, cwd))
+        self.assertFalse(graph.guarded_writes(bash(f"cat /private{own}/s3/1/bank.py"), body, cwd))
+        self.assertTrue(graph.guarded_writes(bash("ls /tmp/agentaus-graph"), body, cwd))
+        self.assertTrue(graph.guarded_writes(bash("find /tmp/agentaus-graph -name bank.py"), body, cwd))
+        self.assertTrue(graph.guarded_writes([{"name": "Read", "arguments": {"file_path": f"{other}/s14/1/repo/tools/bank.py"}}], body, cwd))
+        self.assertFalse(graph.guarded_writes(bash(f"ls {other}"), {"messages": [user("look around")]}, cwd))
+
     def test_the_role_is_read_from_an_indented_prompt(self):
         # The harness indents every prompt line by two spaces; the heading never sat at column 0.
         body = {"messages": [user(f"{graph.MARK}\n  # Job\n\n  ---\n  ## Your skill: solve\n")]}

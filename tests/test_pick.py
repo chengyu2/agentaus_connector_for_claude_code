@@ -40,8 +40,28 @@ class PytestStyleTests(unittest.TestCase):
         chosen = self.pick("\nimport bank\nassert bank.mean_rank('a') == 4\n", bare=True)
         self.assertIn("changed True", chosen)
 
-    def pick(self, test_body: str, bare: bool = False) -> str:
+    def test_a_test_that_loads_the_solvers_own_file_tests_the_candidate(self):
+        # Measured (d16 c1913h): count_top's test loaded s16/1/count_top.py by path.
+        chosen = self.pick("\nimport importlib.util\n"
+                           "s = importlib.util.spec_from_file_location('mine', __OWN__)\n"
+                           "m = importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+                           "assert m.mean_rank('a') == 4\n")
+        self.assertIn("changed True", chosen)
+
+    def test_an_exact_copy_of_a_module_table_is_dropped_not_penalised(self):
+        # Measured (d16 c1913h): _clean's fix pasted in FIX and lost on the shadow penalty.
+        chosen = self.pick("\n\ndef test_mean():\n    assert mean_rank('a') == 4\n",
+                           fixed='''def mean_rank(theme):
+    RANKS = {"a": [1, 2, 9], "b": [3, 4, 5]}
+    return statistics.mean(RANKS[theme])
+''')
+        self.assertIn("changed True", chosen)
+        with open(self.frozen) as fh:
+            self.assertNotIn("RANKS = ", fh.read())
+
+    def pick(self, test_body: str, bare: bool = False, fixed: str = FIXED) -> str:
         td = tempfile.mkdtemp(prefix="pick-")
+        self.frozen = os.path.join(td, "chosen", "mean_rank.py")
         root = os.path.join(td, "pristine")
         os.makedirs(os.path.join(root, "tools"))
         with open(os.path.join(root, "tools", "bank.py"), "w") as fh:
@@ -51,17 +71,18 @@ class PytestStyleTests(unittest.TestCase):
         with open(os.path.join(solver, "repo", "tools", "bank.py"), "w") as fh:
             fh.write(ORIGINAL)
         with open(os.path.join(solver, "mean_rank.py"), "w") as fh:
-            fh.write(FIXED)
+            fh.write(fixed)
         tests = os.path.join(solver, "tests.py")
         with open(tests, "w") as fh:
             fh.write(f"import sys\nsys.path.insert(0, {os.path.join(solver, 'repo')!r})\n"
-                     + ("" if bare else "from tools.bank import mean_rank\n") + test_body)
+                     + ("" if bare else "from tools.bank import mean_rank\n")
+                     + test_body.replace("__OWN__", repr(os.path.join(solver, "mean_rank.py"))))
         pick = os.path.join(td, "pick.py")
         with open(pick, "w") as fh:
             fh.write(pick_source())
         out = subprocess.run(
             [sys.executable, pick, root, "tools/bank.py", "mean_rank", "-", f"1|{solver}|1", "--", tests],
-            env=dict(os.environ, PICK_AUDIT="1"), capture_output=True, text=True, timeout=120).stdout
+            env=dict(os.environ, PICK_AUDIT="1", PICK_OUT=self.frozen), capture_output=True, text=True, timeout=120).stdout
         return [l for l in out.splitlines() if l.startswith("CHOSEN")][-1]
 
     def test_a_never_called_test_function_is_run(self):

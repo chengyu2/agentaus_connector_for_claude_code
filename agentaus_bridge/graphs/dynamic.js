@@ -1031,6 +1031,24 @@ ORIG_CHECKS=selfchecks(orig) if orig else 0
 # fixed module-level table.
 try: MODULE_NAMES={t.id for n in ast.parse(open(os.path.join(root,rel)).read()).body if isinstance(n,(ast.Assign,ast.AnnAssign)) for t in (n.targets if isinstance(n,ast.Assign) else [n.target]) if isinstance(t,ast.Name)}
 except Exception: MODULE_NAMES=set()
+# A local copy identical to the module's own table is dropped, not penalised: the function then
+# reads the real table - and any fix to it. Measured (d16 c1913h): _clean's fix pasted in an
+# exact copy of FIX, lost on the shadow penalty to the original's .capitalize(), and every name
+# came out with a lower-case surname.
+try: MODULE_VALUES={n.targets[0].id:ast.unparse(n.value) for n in ast.parse(open(os.path.join(root,rel)).read()).body if isinstance(n,ast.Assign) and len(n.targets)==1 and isinstance(n.targets[0],ast.Name)}
+except Exception: MODULE_VALUES={}
+def unshadow(src):
+    try: c=node(src)
+    except Exception: return src
+    if not c: return src
+    drop=set()
+    for x in ast.walk(c):
+        if isinstance(x,ast.Assign) and len(x.targets)==1 and isinstance(x.targets[0],ast.Name) and MODULE_VALUES.get(x.targets[0].id)==ast.unparse(x.value):
+            drop.update(range(x.lineno-1,x.end_lineno))
+    if not drop: return src
+    out=''.join(l for i,l in enumerate(src.splitlines(True)) if i not in drop)
+    try: return out if node(out) else src
+    except SyntaxError: return src
 def shadows(src):
     try: c=node(src)
     except Exception: return 0
@@ -1091,6 +1109,15 @@ def repoint(t,w,td):
     # that returned [42].
     s=open(t).read()
     for d in sorted(set(dirs),key=len,reverse=True): s=s.replace(d.rstrip('/')+'/repo',w)
+    # A test that loads a solver's own function file by path tests that file, whoever the
+    # candidate is: pointed at a shim holding the candidate module's names instead. Measured
+    # (d16 c1913h): count_top's test loaded s16/1/count_top.py, passed every candidate, and
+    # the original kept its \`< k\`.
+    own=[os.path.join(d,fn+'.py') for d in dirs if os.path.join(d,fn+'.py') in s]
+    if own:
+        shim=os.path.join(td,'shim%d_%s.py'%(len(os.listdir(td)),fn)); target=os.path.join(w,rel)
+        open(shim,'w').write('import importlib.util,sys\nsys.path[:0]=[%r,%r]\n_s=importlib.util.spec_from_file_location("candidate_module",%r)\n_m=importlib.util.module_from_spec(_s)\n_s.loader.exec_module(_m)\nglobals().update({k:v for k,v in vars(_m).items() if not k.startswith("__")})\n'%(w,os.path.dirname(target),target))
+        for o in own: s=s.replace(o,shim)
     s=s.replace(root.rstrip('/'),w)
     # A pytest-style file run as a script only defines its tests: each is called here, unless
     # the file calls them itself. Measured (d16 c1913h): the one test that told the mean from
@@ -1144,6 +1171,7 @@ for k,d,replied in order:
             except Exception as e: notes.append(f'candidate {k} unreadable: {p} {type(e).__name__}'); s=None
             if s and (new is None or (new.strip()==orig.strip() and s.strip()!=orig.strip())): path,new=p,s
     if not new: notes.append(f'candidate {k} has no {fn}'); continue
+    if k!='0': new=unshadow(new)
     w=tempfile.mkdtemp(); shutil.copytree(root,w,dirs_exist_ok=True,ignore=shutil.ignore_patterns('__pycache__','.git')); put(os.path.join(w,rel),new)
     bad=0; out=''; nex=0; miss=set()
     if ex!='-':
@@ -1161,7 +1189,7 @@ for k,d,replied in order:
     outs=probe(os.path.join(w,rel),PROBES+PERTURBED)
     raised=sum(1 for x in outs[len(PROBES):] if str(x).startswith(('EXC','IMPORT','PROBE')))
     hard=hardcoded(new); changed=new.strip()!=orig.strip()
-    r=dict(k=k,path=path,out=out,bad=bad,miss=len(miss),nex=nex,tests=res,passed=sum(res),replied=replied=='1',hard=bool(hard),
+    r=dict(k=k,path=path,new=new,out=out,bad=bad,miss=len(miss),nex=nex,tests=res,passed=sum(res),replied=replied=='1',hard=bool(hard),
            raises=max(0,selfchecks(new)-ORIG_CHECKS)+raised+3*max(0,shadows(new)-(shadows(orig) if orig else 0)),sig=hashlib.sha1(json.dumps(outs[:len(PROBES)]+outs[len(PROBES):]).encode()).hexdigest()[:8],changed=changed)
     rows.append(r)
     notes.append(f'candidate {k}: {path} - docstring example mismatches {bad}, pooled tests passed {sum(res)}/{len(tests)}, self-checks and raising probes {r["raises"]}, behaviour {r["sig"]}, replied {replied}, changed {changed}'+(f', BRANCHES ON AN EXAMPLE INPUT (line {hard[0]})' if hard else ''))
@@ -1170,7 +1198,7 @@ for k,d,replied in order:
     # leaves its best so far.
     if pool and (best is None or pool[0] is not best):
         best=pool[0]
-        if frozen: os.makedirs(os.path.dirname(frozen),exist_ok=True); open(frozen,'w').write(fnsrc(best['path']) if best['k']!='0' else orig)
+        if frozen: os.makedirs(os.path.dirname(frozen),exist_ok=True); open(frozen,'w').write(best['new'] if best['k']!='0' else orig)
         report(best,votes)
 pool,votes=rank()
 for n in notes: print(n[:400])
@@ -1178,7 +1206,7 @@ if rows: print('behaviour groups:',', '.join(f'{s} x{n}' for s,n in sorted(votes
 r0=pool[0] if pool else None
 for l in [l for l in (r0['out'].splitlines() if r0 else []) if 'MISMATCH' in l][:6]: print('EXAMPLE',l[:300])
 if r0:
-    if r0 is not best and frozen: open(frozen,'w').write(fnsrc(r0['path']) if r0['k']!='0' else orig)
+    if r0 is not best and frozen: open(frozen,'w').write(r0['new'] if r0['k']!='0' else orig)
     report(r0,votes,True)
 else:
     print('CHOSEN none mismatches -1 from - changed False votes 0 examples 0')

@@ -889,6 +889,27 @@ NO_APPLY_PATCH = ("`apply_patch` is not installed here. Write the file you were 
 _APPLY_PATCH = re.compile(r"\s*(?:cd\s+[^;&|\n]+?\s*(?:&&|;)\s*)?apply_patch\b")
 
 
+# Every graph run keeps its scratch under /tmp/agentaus-graph, named after its project folder as
+# the graph names it. Measured (d16 c1913h): a solver listed /tmp/agentaus-graph, found the
+# scratch of an earlier attempt at the same task, did all its work there, and its subtask
+# was decided with no candidate at all.
+_SCRATCH_REF = re.compile(r"(?:/private)?/tmp/agentaus-graph(?:/([^\s'\"`/;|&)\\]*))?")
+
+
+def own_scratch(cwd: str) -> str:
+    """The scratch folder name the graph gives the run in `cwd` (dynamic.js SCRATCH)."""
+    return (re.sub(r"[^\w.-]+", "_", cwd.lstrip("/")) or "task") + "-dyn"
+
+
+def foreign_scratch(text: str, cwd: str) -> str | None:
+    """The first /tmp/agentaus-graph path in `text` that is not this run's own scratch."""
+    own = own_scratch(cwd)
+    for m in _SCRATCH_REF.finditer(text or ""):
+        if m.group(1) != own:
+            return m.group(0)
+    return None
+
+
 def guarded_writes(calls: list, body: dict, cwd: str | None) -> list:
     """(call, correction) for each write a graph agent may not make.
 
@@ -903,14 +924,22 @@ def guarded_writes(calls: list, body: dict, cwd: str | None) -> list:
     out = []
     for call in calls:
         name = call.get("name")
-        if name not in ("Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"):
-            continue
         args = call.get("arguments")
         if isinstance(args, str):
             try:
                 args = json.loads(args or "{}")
             except ValueError:
                 continue
+        elsewhere = foreign_scratch(json.dumps(args), cwd) if cwd else None
+        if elsewhere:
+            out.append((call, f"Your call to `{name}` was not run: `{elsewhere}` is not yours - "
+                              "other runs keep their work under /tmp/agentaus-graph, and none "
+                              "of it is your task's. Use only the paths your task names: the "
+                              "project folder and your own copy under "
+                              f"`/tmp/agentaus-graph/{own_scratch(cwd)}`."))
+            continue
+        if name not in ("Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"):
+            continue
         if name == "Bash":
             command = (args or {}).get("command") if isinstance(args, dict) else None
             # Measured (d12 he10): solvers ran `apply_patch` again and again - exit 127 each
