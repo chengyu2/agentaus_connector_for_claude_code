@@ -874,6 +874,16 @@ const METHOD = [
   'Solve it, then try hard to break your own answer, and fix it if it breaks.',
 ]
 
+// The copy a code solver works in - and, for a function, the function alone in its own file.
+// Made by the runtime before the solver starts, and safe to repeat. Measured (d16 c1913h): all
+// three lead_domain solvers assumed their copy was there, found nothing, read another
+// subtask's copy, and ran out of time - the subtask had no candidate at all, twice.
+function seedCommand(st, dir) {
+  const f = functionOf(st)
+  const made = `mkdir -p ${q(dir)} && { [ -f ${q(dir + '/.copied')} ] || { rm -rf ${q(dir + '/repo')} && mkdir -p ${q(dir + '/repo')} && cp -R ${q(BASE)}/. ${q(dir + '/repo')}/ && chmod -R u+w ${q(dir + '/repo')} && touch ${q(dir + '/.copied')}`
+  return f ? `${made} && ${extractCommand(`${dir}/repo/${f.file}`, f.fn, `${dir}/${f.fn}.py`).replace("<<'PY'", ">/dev/null <<'PY'")}\n}; }\necho seeded` : `${made}; }; }\necho seeded`
+}
+
 function codeSteps(st, dir) {
   const f = functionOf(st)
   // Made once: a backup continues in the same copy rather than wiping the first attempt's work.
@@ -1571,8 +1581,9 @@ async function runSubtask(st, deps, opts = {}) {
   const drafted = nDrafts ? drafts(st, f, nDrafts, ph).catch(() => []) : Promise.resolve([])
   const specs = byScript && !opts.last && !st.specTests ? specTests(st, f).catch(() => []) : Promise.resolve(st.specTests || [])
   // A code solver needs no backup: its copy on disk is read whether or not it replies.
-  const outs = await parallel(solving.map(k => () => ask(solvePrompt(st, k, deps), `solve-${st.n}.${opts.last ? 'last' : k}`, ph, shown,
-    { pri: k - 1, once: st.kind === 'code', deadline: opts.last ? Math.min(DEADLINE_MS, 900000) : undefined })))
+  const seeded = k => st.kind === 'code' ? runExactly(`seed-${st.n}.${k}`, seedCommand(st, solverDir(st, k)), ph).catch(() => null) : Promise.resolve(null)
+  const outs = await parallel(solving.map(k => () => seeded(k).then(() => ask(solvePrompt(st, k, deps), `solve-${st.n}.${opts.last ? 'last' : k}`, ph, shown,
+    { pri: k - 1, once: st.kind === 'code', deadline: opts.last ? Math.min(DEADLINE_MS, 900000) : undefined }))))
   const replies = {}
   solving.forEach((k, i) => { if (outs[i]) replies[k] = outs[i] })
   const dks = await drafted
