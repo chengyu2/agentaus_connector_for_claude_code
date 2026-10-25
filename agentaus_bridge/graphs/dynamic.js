@@ -1348,19 +1348,34 @@ async function drafts(st, f, n, ph) {
 // ranks example mismatches first - chooses among solvers and readings alike. Measured (d9,
 // d10): every order_by_points candidate kept the planner's "absolute value" reading and failed
 // the docstring's own example; agents then patched the example's values in by hand.
-async function readings(st, f, evidence, round) {
-  const md = await ask(prompt('solve', `Read the spec of ${f.fn} five ways${round > 1 ? ' (again)' : ''}`, [
+// Measured (d16 he10): told only what the best candidate returned, one agent wrote five copies
+// of that candidate's own reading (digit sums of abs(n)), and every one broke the example the
+// same way. The agents now see the failing code, must work each reading through the failing
+// example by hand, and two of them read from different angles.
+async function readings(st, f, evidence, round, change) {
+  const failing = change && /\.py$/.test(change) ? await runExactly(`readings-show-${st.n}${round > 1 ? `.${round}` : ''}`, `cat ${q(change)}`, 'Readings') : ''
+  const ANGLES = [
+    'Start from what the words most plainly say, then vary the main computation.',
+    'Start from the failing example\'s expected output and reason backwards; favour readings the obvious one rules out - signed digits, the sign kept on the first digit, position or index mattering, "the word" versus "the letters".',
+  ]
+  const one = a => ask(prompt('solve', `Read the spec of ${f.fn} five ways${round > 1 ? ' (again)' : ''}${a ? ` - angle ${a + 1}` : ''}`, [
     specOf(st), '',
-    evidence ? `## The best candidate so far breaks these examples (what it returned is shown)\n\`\`\`text\n${evidence}\n\`\`\`` : null, '',
+    evidence ? `## The best candidate so far breaks these examples (what it returned is shown)\n\`\`\`text\n${evidence}\n\`\`\`` : null,
+    failing ? `## The best candidate so far - this reading is WRONG\n\`\`\`python\n${String(failing).replace(/```[a-z]*\n?/g, '').trim()}\n\`\`\`\nA reading that computes what this code computes is worthless, however it is written.` : null, '',
     '## Method',
     '1. List every rule the docstring states in plain words - how ties are ordered, what is included - and keep each one fixed. A reading may change only what the words leave open.',
     '2. Work each failing example backwards: under those fixed rules, write what the function must compute for each input element for the expected output to come out (inequalities are enough).',
     '3. Find readings of the open words that give exactly those values - the main computation (how a sign, a digit, a boundary, "the word" versus "the letters", a rounding rule is meant), not only the tie order.',
-    '4. Check every reading by hand on every example before you write it.', '',
+    '4. For every reading, write under it, worked by hand, what it gives for each failing example. Drop a reading that does not give the expected output.',
+    ANGLES[a || 0], '',
     `Write **five different readings**, each as one complete Python function named \`${f.fn}\`, imports inside it, in its own \`\`\`python block. Never branch on an example's literal input.`,
-  ], true), `readings-${st.n}${round > 1 ? `.${round}` : ''}`, 'Readings', t => (t.match(/```python/g) || []).length >= 2)
-  if (!md) return []
-  const blocks = [...md.matchAll(/```python\n([\s\S]*?)```/g)].map(x => x[1]).filter(b => new RegExp(`def ${f.fn}\\(`).test(b)).slice(0, 6)
+  ], true), `readings-${st.n}${round > 1 ? `.${round}` : ''}${a ? `-${a + 1}` : ''}`, 'Readings', t => (t.match(/```python/g) || []).length >= 2)
+  const mds = (await parallel([0, 1].map(a => () => one(a)))).filter(Boolean)
+  const seen = new Set()
+  const blocks = mds.flatMap(md => [...md.matchAll(/```python\n([\s\S]*?)```/g)].map(x => x[1]))
+    .filter(b => new RegExp(`def ${f.fn}\\(`).test(b))
+    .filter(b => { const k = b.replace(/#.*$/gm, '').replace(/\s+/g, ''); return !seen.has(k) && seen.add(k) })
+    .slice(0, 9)
   const rk = blocks.map((_, j) => 10 * (round + 1) + 1 + j)
   if (!blocks.length) return []
   await runExactly(`readings-save-${st.n}`, blocks.map((b, j) =>
@@ -1550,7 +1565,7 @@ async function runSubtask(st, deps, opts = {}) {
   let all = []
   for (const round of [1, 2]) {
     if (!(byScript && d.mismatches > 0) || hard || (late && round > 1)) break
-    const rk = await readings(st, f, d.evidence, round)
+    const rk = await readings(st, f, d.evidence, round, d.change)
     if (!rk.length) break
     all = all.concat(rk)
     const again = await withSpec(await pickFunction(st, f, [...pool, ...all], replies, audit))
