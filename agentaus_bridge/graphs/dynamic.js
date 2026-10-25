@@ -651,12 +651,14 @@ phase('Review')
   }
   // A flag or option the request asks to add is a feature, with its own subtask. Measured
   // (d10): the split planned one subtask per symptom and per function, and `--json` was in none.
+  // Its fields hold stored values whole. Measured (d16 c1913): `--json` gave the summary's
+  // short label (a first name) as the `name` of a profile stored under a full name.
   if (plan.subtasks.some(st => st.kind === 'code')) {
     for (const flag of new Set(TASK.match(/(?<![\w-])--[a-z][\w-]*/g) || [])) {
       if (plan.subtasks.concat(added).some(st => `${st.title}\n${st.task}`.includes(flag))) continue
       const sentence = TASK.split(/(?<=[.!?])\s+|\n+/).find(x => x.includes(flag)) || flag
       added.push({ n: next++, title: `Feature: \`${flag}\``, difficulty: 'medium', solvers: 2, check: true, merge: 'pick-change',
-        kind: 'code', deps: [], task: `Add what the request asks for, word for word:\n\n> ${sentence.trim()}\n\nKeep every existing behaviour, and run the program both with and without it.` })
+        kind: 'code', deps: [], task: `Add what the request asks for, word for word:\n\n> ${sentence.trim()}\n\nKeep every existing behaviour, and run the program both with and without it. A field named after something the data already stores holds that stored value, whole and unformatted - \`name\` is the record's own key, not a shortened label a report prints.` })
     }
   }
   // A count the docs state that the program does not print is a bug to find, not a line to
