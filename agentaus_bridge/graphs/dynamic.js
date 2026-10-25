@@ -1103,6 +1103,9 @@ def repoint(t,w,td):
         called={n.func.id for x in top for n in ast.walk(x) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name)}
         if defined and not called.intersection(defined) and not re.search(r'__main__|unittest\.main|pytest\.main',s):
             s+='\n\n'+''.join(f'{n}()\n' for n in defined)
+    # Tests also find the module by its bare name (PYTHONPATH holds its folder): measured (d16
+    # c1913), the one test of count_top's fix did \`import bank\` for tools/bank.py, failed on
+    # every candidate, and the original kept its \`< k\`.
     p=os.path.join(td,'t%d.py'%len(os.listdir(td))); open(p,'w').write(s); return p
 rows=[]; notes=[]; best=None
 def key(r,votes):
@@ -1153,7 +1156,7 @@ for k,d,replied in order:
         if 'MISMATCH import' in out: bad=99
     res=[]
     for j,t in enumerate(tests):
-        try: res.append(subprocess.run([sys.executable,repoint(t,w,td)],cwd=w,env=dict(os.environ,PYTHONPATH=w,PYTHONDONTWRITEBYTECODE='1'),stdin=subprocess.DEVNULL,capture_output=True,timeout=max(3,min(60,(left()-10)/max(1,len(tests)-j)))).returncode==0)
+        try: res.append(subprocess.run([sys.executable,repoint(t,w,td)],cwd=w,env=dict(os.environ,PYTHONPATH=os.pathsep.join(dict.fromkeys([w,os.path.dirname(os.path.join(w,rel))])),PYTHONDONTWRITEBYTECODE='1'),stdin=subprocess.DEVNULL,capture_output=True,timeout=max(3,min(60,(left()-10)/max(1,len(tests)-j)))).returncode==0)
         except Exception: res.append(False)
     outs=probe(os.path.join(w,rel),PROBES+PERTURBED)
     raised=sum(1 for x in outs[len(PROBES):] if str(x).startswith(('EXC','IMPORT','PROBE')))

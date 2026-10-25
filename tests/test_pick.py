@@ -35,7 +35,12 @@ class PytestStyleTests(unittest.TestCase):
     `def test_...():` never called, so run as a script it passed every candidate and the
     unchanged original won the audit."""
 
-    def pick(self, test_body: str) -> str:
+    def test_a_test_importing_the_module_by_its_bare_name_runs(self):
+        # Measured (d16 c1913): `import bank` for tools/bank.py failed on every candidate.
+        chosen = self.pick("\nimport bank\nassert bank.mean_rank('a') == 4\n", bare=True)
+        self.assertIn("changed True", chosen)
+
+    def pick(self, test_body: str, bare: bool = False) -> str:
         td = tempfile.mkdtemp(prefix="pick-")
         root = os.path.join(td, "pristine")
         os.makedirs(os.path.join(root, "tools"))
@@ -50,7 +55,7 @@ class PytestStyleTests(unittest.TestCase):
         tests = os.path.join(solver, "tests.py")
         with open(tests, "w") as fh:
             fh.write(f"import sys\nsys.path.insert(0, {os.path.join(solver, 'repo')!r})\n"
-                     "from tools.bank import mean_rank\n" + test_body)
+                     + ("" if bare else "from tools.bank import mean_rank\n") + test_body)
         pick = os.path.join(td, "pick.py")
         with open(pick, "w") as fh:
             fh.write(pick_source())
