@@ -59,7 +59,25 @@ class PytestStyleTests(unittest.TestCase):
         with open(self.frozen) as fh:
             self.assertNotIn("RANKS = ", fh.read())
 
-    def pick(self, test_body: str, bare: bool = False, fixed: str = FIXED) -> str:
+    def test_a_function_importing_from_its_own_module_has_that_import_dropped(self):
+        # Measured (d16 c1913): count_top's fix began `from tools.bank import rank, FULL`.
+        chosen = self.pick("\n\ndef test_mean():\n    assert mean_rank('a') == 4\n",
+                           fixed='''def mean_rank(theme):
+    from tools.bank import RANKS
+    return statistics.mean(RANKS[theme])
+''')
+        self.assertIn("changed True", chosen)
+        with open(self.frozen) as fh:
+            self.assertNotIn("import RANKS", fh.read())
+
+    def test_a_change_judged_a_fix_wins_where_nothing_measured_it(self):
+        self.assertIn("changed False", self.pick("\n"))
+        self.assertIn("changed True", self.pick("\n", prefer="1"))
+
+    def test_a_judged_fix_still_loses_to_a_test_the_original_passes(self):
+        self.assertIn("changed False", self.pick("\nassert mean_rank('b') == 4\nassert mean_rank('a') == 2\n", prefer="1"))
+
+    def pick(self, test_body: str, bare: bool = False, fixed: str = FIXED, prefer: str = "") -> str:
         td = tempfile.mkdtemp(prefix="pick-")
         self.frozen = os.path.join(td, "chosen", "mean_rank.py")
         root = os.path.join(td, "pristine")
@@ -82,7 +100,7 @@ class PytestStyleTests(unittest.TestCase):
             fh.write(pick_source())
         out = subprocess.run(
             [sys.executable, pick, root, "tools/bank.py", "mean_rank", "-", f"1|{solver}|1", "--", tests],
-            env=dict(os.environ, PICK_AUDIT="1", PICK_OUT=self.frozen), capture_output=True, text=True, timeout=120).stdout
+            env=dict(os.environ, PICK_AUDIT="1", PICK_OUT=self.frozen, PICK_PREFER=prefer), capture_output=True, text=True, timeout=120).stdout
         return [l for l in out.splitlines() if l.startswith("CHOSEN")][-1]
 
     def test_a_never_called_test_function_is_run(self):

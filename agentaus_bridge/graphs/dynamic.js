@@ -1051,6 +1051,29 @@ def unshadow(src):
     out=''.join(l for i,l in enumerate(src.splitlines(True)) if i not in drop)
     try: return out if node(out) else src
     except SyntaxError: return src
+# A function that imports names from its own module runs another copy of that module, and
+# fails wherever the module is loaded by path. Measured (d16 c1913): count_top's fix began
+# \`from tools.bank import rank, FULL\`, raised ImportError when bank.py was loaded by path,
+# and every count came out wrong. Those names are the function's own globals: the import goes.
+try:
+    TOP_NAMES=set(MODULE_NAMES)
+    for n in ast.parse(open(os.path.join(root,rel)).read()).body:
+        if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)): TOP_NAMES.add(n.name)
+        elif isinstance(n,(ast.Import,ast.ImportFrom)): TOP_NAMES.update((a.asname or a.name).split('.')[0] for a in n.names)
+except Exception: TOP_NAMES=set()
+SELF_MODULES={rel[:-3].replace('/','.'),os.path.basename(rel)[:-3]}
+def unself(src):
+    try: c=node(src)
+    except Exception: return src
+    if not c: return src
+    drop=set()
+    for x in ast.walk(c):
+        if isinstance(x,ast.ImportFrom) and x.module in SELF_MODULES and not x.level and all(a.name in TOP_NAMES and not a.asname for a in x.names):
+            drop.update(range(x.lineno-1,x.end_lineno))
+    if not drop: return src
+    out=''.join(l for i,l in enumerate(src.splitlines(True)) if i not in drop)
+    try: return out if node(out) else src
+    except SyntaxError: return src
 def shadows(src):
     try: c=node(src)
     except Exception: return 0
@@ -1153,6 +1176,9 @@ def rank():
             def wins(r):
                 if not r['changed'] or r['hard']: return False
                 if r['bad']<o['bad']: return True
+                # Judges read the change as a fix where nothing measured it (PICK_PREFER): it
+                # wins unless it breaks more examples, raises, or fails a test the original passes.
+                if os.environ.get('PICK_PREFER')==r['k'] and r['bad']<=o['bad'] and not r['raises'] and not any(b and not a for a,b in zip(r['tests'],o['tests'])): return True
                 return r['bad']<=o['bad'] and r['miss']<=o['miss'] and any(a and not b for a,b in zip(r['tests'],o['tests']))
             pool=[o]+[r for r in rows if r['k']!='0' and (wins(r) or not r['changed'])]
     pool=sorted(pool,key=lambda r:key(r,votes))
@@ -1173,7 +1199,7 @@ for k,d,replied in order:
             except Exception as e: notes.append(f'candidate {k} unreadable: {p} {type(e).__name__}'); s=None
             if s and (new is None or (new.strip()==orig.strip() and s.strip()!=orig.strip())): path,new=p,s
     if not new: notes.append(f'candidate {k} has no {fn}'); continue
-    if k!='0': new=unshadow(new)
+    if k!='0': new=unself(unshadow(new))
     w=tempfile.mkdtemp(); shutil.copytree(root,w,dirs_exist_ok=True,ignore=shutil.ignore_patterns('__pycache__','.git')); put(os.path.join(w,rel),new)
     bad=0; out=''; nex=0; miss=set()
     if ex!='-':
@@ -1220,21 +1246,52 @@ const solverDir = (st, k) => `${SCRATCH}/s${st.n}/${k}`
 const installPick = `mkdir -p ${q(SCRATCH)} && { [ -s ${q(PICK)} ] || { cat > ${q(PICK + '.part')}.$$ <<'AGENTAUS_PICK_END' && mv ${q(PICK + '.part')}.$$ ${q(PICK)}; }; }\n${PICK_PY}AGENTAUS_PICK_END`
 // An Audit's original competes, and a change replaces it only on a measurement.
 const isAudit = st => /^\W*Audit\b/i.test(st.title)
-async function pickFunction(st, f, ks, replies, audit) {
+async function pickFunction(st, f, ks, replies, audit, prefer) {
   const cands = ks.map(k => `${k}|${solverDir(st, k)}|${replies[k] ? 1 : 0}`)
   const tests = [...ks.map(k => `${solverDir(st, k)}/tests.py`), ...(st.specTests || [])]
   // The chosen function is frozen at once: a solver still running cannot change it afterwards.
   const frozen = `${SCRATCH}/chosen/s${st.n}/${f.fn}.py`
-  const out = await runExactly(`pick-${st.n}`, `${installPick}\nPICK_OUT=${q(frozen)}${audit ? ' PICK_AUDIT=1' : ''} PICK_S=420 python3 ${q(PICK)} ${q(BASE)} ${q(f.file)} ${f.fn} ${EXAMPLES && PRISTINE ? q(EXAMPLES) : '-'} ${cands.map(q).join(' ')} -- ${tests.map(q).join(' ')}`, 'Pick')
+  const out = await runExactly(`pick-${st.n}${prefer ? '-judged' : ''}`, `${installPick}\nPICK_OUT=${q(frozen)}${audit ? ' PICK_AUDIT=1' : ''}${prefer ? ` PICK_PREFER=${prefer}` : ''} PICK_S=420 python3 ${q(PICK)} ${q(BASE)} ${q(f.file)} ${f.fn} ${EXAMPLES && PRISTINE ? q(EXAMPLES) : '-'} ${cands.map(q).join(' ')} -- ${tests.map(q).join(' ')}`, 'Pick')
   // The last CHOSEN line is the pick's best: it prints one each time the best improves.
   const all = [...String(out || '').matchAll(/^CHOSEN (\S+) mismatches (-?\d+) from (\S+) changed (\w+)(?: votes (\d+) examples (\d+) candidate (\S+))?/gm)]
   const m = all[all.length - 1]
   if (!m || m[1] === 'none') return null
+  if (audit && !prefer && m[4] === 'False') {
+    const judged = await judgeAudit(st, f, out)
+    if (judged) return (await pickFunction(st, f, ks, replies, audit, judged)) || null
+  }
   const k = Number(m[7] || (m[3].match(new RegExp(`/s${st.n}/(\\d+)/`)) || [])[1] || 0)
   const reply = (k && replies[k]) || (k ? `## Answer\nCandidate ${k}'s \`${f.fn}\` - chosen by the measurements below.` : `## Answer\n\`${f.fn}\` is kept as it is: no change beat the original on a measurement.`)
   return { result: `${reply}\n\n## Why\n${(out.match(/^candidate .*$/gm) || []).join('\n')}`, change: m[1], dir: k ? solverDir(st, k) : null, mismatches: Number(m[2]),
     changed: m[4] !== 'False', votes: Number(m[5] || 1), examples: Number(m[6] || 0), picked: true,
     evidence: (out.match(/^EXAMPLE .*$/gm) || []).map(l => l.replace(/^EXAMPLE\s+/, '')).join('\n') }
+}
+
+// An Audit's original wins unless a change beats it on a measurement - and solvers often write
+// no test that measures. Then three judges read the original and the change against the spec:
+// when two call it a fix, the picker prefers it, still only if no measurement says otherwise.
+// Measured (d16 c1913h): the solvers of count_top (\`< k\` to \`<= k\`) and mean_rank (median to
+// mean) fixed them, wrote no tests, and both originals were kept.
+async function judgeAudit(st, f, out) {
+  const rows = [...String(out || '').matchAll(/^candidate (\d+): (\S+) - docstring example mismatches (\d+), pooled tests passed (\d+)\/(\d+), self-checks and raising probes (\d+), behaviour \w+, replied \d, changed True/gm)]
+  const orig = String(out || '').match(/^candidate 0: .* docstring example mismatches (\d+), pooled tests passed (\d+)\//m)
+  if (!orig) return null
+  const c = rows.find(r => r[1] !== '0' && Number(r[3]) <= Number(orig[1]) && Number(r[6]) === 0 && Number(r[4]) >= Number(orig[2]))
+  if (!c) return null
+  const shown = await runExactly(`audit-diff-${st.n}`, `python3 - ${q(`${BASE}/${f.file}`)} ${q(c[2])} ${f.fn} <<'PY'\nimport ast,difflib,sys\ndef src(p):\n    t=open(p).read()\n    for n in ast.parse(t).body:\n        if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name==sys.argv[3]: return ''.join(t.splitlines(True)[n.lineno-1:n.end_lineno])\n    return t\na,b=src(sys.argv[1]),src(sys.argv[2])\nprint(''.join(difflib.unified_diff(a.splitlines(True),b.splitlines(True),'original','change')) or 'NO DIFFERENCE')\nPY`, 'Pick')
+  if (!shown || /NO DIFFERENCE/.test(shown) || !/^[-+]/m.test(shown)) return null
+  const judge = j => ask(prompt('check', `Is this change to ${f.fn} a fix? (judge ${j})`, [
+    specOf(st), '',
+    `## The change a solver made to \`${f.fn}\`, as a diff from the original`, '```diff', String(shown).replace(/```[a-z]*\n?/g, '').trim(), '```', '',
+    'Decide from the spec - the function\'s name, its docstring, the README and any model or standard the request names - whether the original is wrong and the change makes it right.',
+    '- FIX: the original disagrees with the spec (a mean that is a median, a "top k" that leaves out the k-th, a tie broken the wrong way) and the change corrects it without breaking anything else.',
+    '- KEEP: the original already does what the spec says, the change is only style, or it changes behaviour the spec does not ask to change.',
+    'Work one concrete input through both versions before you decide. End with exactly one line: `**Verdict:** FIX` or `**Verdict:** KEEP`.',
+  ], true), `audit-judge-${st.n}.${j}`, 'Pick', t => /\*\*Verdict:\*\*\s*(FIX|KEEP)/i.test(t))
+  const votes = (await parallel([1, 2, 3].map(j => () => judge(j)))).filter(Boolean)
+  const fix = votes.filter(v => /\*\*Verdict:\*\*\s*FIX/i.test(v)).length
+  log(`subtask ${st.n}: no measurement decided ${f.fn}; judges call candidate ${c[1]}'s change a fix ${fix} of ${votes.length}`)
+  return fix >= 2 ? c[1] : null
 }
 
 // Consensus spec tests: three agents each write test cases from the docstring alone; a case
