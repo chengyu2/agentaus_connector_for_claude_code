@@ -1216,7 +1216,9 @@ async function specTests(st, f) {
   const ask1 = j => ask(prompt('check', `Write test cases for ${f.fn} from its spec (writer ${j})`, [
     specOf(st), '',
     `Write **8 test cases** for \`${f.fn}\` from its spec alone - one per line, each exactly \`assert ${f.fn}(...) == <expected>\`, all in one \`\`\`python block, nothing else in it.`,
-    '- Aim at the traps its words name: "the word X" versus "starts with the letters X", negative numbers and their digits, ties and their order, boundaries, empty input, rounding.',
+    '- First write down, in one line each, two or three readings of the words that every docstring example allows - e.g. "the word I" versus "starts with the letter I", a negative number\'s digits signed or not, ties kept in input order or not.',
+    '- **At least four of your cases must be inputs on which those readings give different results** (a sentence starting "Is ...", a negative number, a tie). A case every reading agrees on tests nothing.',
+    '- Then the other traps: boundaries, empty input, rounding.',
     '- Work each expected value out by hand from the words, and check that the same rule gives every docstring example its stated result.',
   ], true), `spec-tests-${st.n}.${j}`, 'Solve', t => /assert\s/.test(t), { pri: 1 })
   const outs = (await parallel([1, 2, 3].map(j => () => ask1(j)))).filter(Boolean)
@@ -1510,9 +1512,13 @@ async function runSubtask(st, deps, opts = {}) {
   // Up to two rounds of readings while the best candidate breaks an example - and no checker
   // or redo then: they only restate a mismatch the script measured. Measured (d12 he10): two
   // checkers restated it, and the redo fitted the example by breaking the docstring's tie rule.
+  // A late graph still gets one round: it is one agent, and a candidate that breaks an
+  // example is a known-wrong answer. Measured (d16 he10): two runs shared the upstream,
+  // order_by_points' second solver started 52 minutes in, the budget had run out, and the
+  // readings that fix its sign were never asked for.
   let all = []
   for (const round of [1, 2]) {
-    if (!(byScript && d.mismatches > 0) || late) break
+    if (!(byScript && d.mismatches > 0) || hard || (late && round > 1)) break
     const rk = await readings(st, f, d.evidence, round)
     if (!rk.length) break
     all = all.concat(rk)
