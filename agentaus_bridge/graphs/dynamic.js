@@ -646,7 +646,7 @@ phase('Review')
     }
     for (const c of CONSTANTS.filter(c => inFixed({ file: c.file }))) {
       added.push({ n: next++, title: `Audit the module-level tables in ${c.file}`, difficulty: 'medium', solvers: 2, check: true, merge: 'pick-change',
-        kind: 'code', deps: [], task: `Audit every module-level table, mapping and threshold in \`${c.file}\` - ${c.names.map(n => `\`${n}\``).join(', ')} - against the README and any model or standard the request names. The project's own documents often print these groups (a chart or a table by group): find them in the plain-text copies (\`grep -n -i -A60 '<a group name>' <copy>\`), copy that listing with its \`file:line\` as the expected table, then print the code's groups and compare member by member. Memory of a model is not a source. Fix only entries that are wrong. **Never change a table's keys to match what the code produces now** - the code that produces them may be the bug; and keep every entry the rest of the code looks up.` })
+        kind: 'code', deps: [], task: `Audit every module-level table, mapping and threshold in \`${c.file}\` - ${c.names.map(n => `\`${n}\``).join(', ')} - against the README and any model or standard the request names. The project's own documents often print these groups (a chart or a table by group): find them in the plain-text copies by grepping for two members you expect in the same group (\`grep -n -E '<member>|<member>' <copy>\`) and for a chart title, not for a group's name alone - a heading in PDF text may be letter-spaced (\`E XECUTING\`) or share a line with unrelated words. **A word on the same line as a heading is not in that group** unless it sits in that heading's column: copied PDF pages run side by side, and a ranked list's line can end with a sidebar heading (\`13. Analytical   EXECUTING themes help you\` puts nothing in Executing). In a chart, give each member the heading above its column by character position; a group may span several columns, up to the next heading. Copy that listing with its \`file:line\` as the expected table, then print the code's groups and compare member by member. A published model the request names is a second witness: where the chart and the model agree, that is the table. Never add a line that reassigns an entry after the table - fix the entry where it is defined. Fix only entries that are wrong. **Never change a table's keys to match what the code produces now** - the code that produces them may be the bug; and keep every entry the rest of the code looks up.` })
     }
   }
   // A flag or option the request asks to add is a feature, with its own subtask. Measured
@@ -1092,6 +1092,17 @@ def repoint(t,w,td):
     s=open(t).read()
     for d in sorted(set(dirs),key=len,reverse=True): s=s.replace(d.rstrip('/')+'/repo',w)
     s=s.replace(root.rstrip('/'),w)
+    # A pytest-style file run as a script only defines its tests: each is called here, unless
+    # the file calls them itself. Measured (d16 c1913h): the one test that told the mean from
+    # the median was a never-called test_ function, passed every candidate, and the original won.
+    try: tree=ast.parse(s)
+    except SyntaxError: tree=None
+    if tree:
+        defined=[x.name for x in tree.body if isinstance(x,ast.FunctionDef) and x.name.startswith('test')]
+        top=[x for x in tree.body if not isinstance(x,(ast.FunctionDef,ast.ClassDef,ast.Import,ast.ImportFrom))]
+        called={n.func.id for x in top for n in ast.walk(x) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name)}
+        if defined and not called.intersection(defined) and not re.search(r'__main__|unittest\.main|pytest\.main',s):
+            s+='\n\n'+''.join(f'{n}()\n' for n in defined)
     p=os.path.join(td,'t%d.py'%len(os.listdir(td))); open(p,'w').write(s); return p
 rows=[]; notes=[]; best=None
 def key(r,votes):
