@@ -394,8 +394,11 @@ class _Phase:
 # Status codes worth a second attempt. These are gateway/capacity signals rather than
 # anything about the request itself, so replaying the identical body is safe.
 # 520-527 are Cloudflare's own errors; Agentaus sits behind it and 524 (origin
-# timed out) is common on a long summarisation request.
-_RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504,
+# timed out) is common on a long summarisation request. 402 is a spent quota: nothing
+# succeeds until it is topped up, so it is waited out like an outage - the throttle marks
+# the upstream down and the backoff tries a few times an hour. Measured (d16): passed
+# through, a 402 ended two runs' sessions mid-graph with "API Error: 402".
+_RETRYABLE_STATUS = {402, 408, 425, 429, 500, 502, 503, 504,
                      520, 521, 522, 523, 524, 525, 526, 527}
 
 # Connection-level faults that never reached the application upstream. A DNS blip

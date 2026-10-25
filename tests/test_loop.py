@@ -198,6 +198,9 @@ class HealthRules(unittest.TestCase):
         h = {"known": True, "down_s": 0, "degraded_frac": 0.0}
         self.assertEqual(loop.classify("opus", "You've hit your spend limit", h, None), "void:infra")
         self.assertEqual(loop.classify("agentaus", "API Error: 529 overloaded", h, None), "void:infra")
+        # Measured (d16): a spent Agentaus quota ended two runs that were scored as valid.
+        self.assertEqual(loop.classify("agentaus", 'API Error: 402 Agentaus error: {"data":"You exceeded '
+                                       'your current quota, please check your balance"}', h, None), "void:infra")
         # A hang under healthy upstream is the bridge's own - the thing under test.
         self.assertEqual(loop.classify("agentaus", "Request timed out", h, None), "valid")
         self.assertEqual(loop.classify("agentaus", "API Error: 400 ... maximum context length", h, None), "valid")

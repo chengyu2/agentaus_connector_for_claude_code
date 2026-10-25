@@ -63,8 +63,10 @@ ARMS = {"agentaus": "agentaus", "opus": "claude-opus-5-5"}
 # A run that ended for a reason that is not the model's: excluded from scores, not zeroed.
 # A context-length 400 is the bridge's failure to fit the conversation - the thing under
 # test - so it counts against the run; only limits and refused connections are excluded.
-INFRA = re.compile(r"^API Error: (?:5\d\d|529)|Connection refused|ECONNREFUSED|overloaded_error|"
-                   r"rate_limit|spend limit|usage limit|session limit|hit your .* limit", re.I)
+# A spent Agentaus quota (402) is infrastructure too. Measured (d16): two runs ended on
+# "API Error: 402 ... exceeded your current quota" and were scored 0.0 and 0.375 as valid.
+INFRA = re.compile(r"^API Error: (?:402|5\d\d|529)|Connection refused|ECONNREFUSED|overloaded_error|"
+                   r"rate_limit|spend limit|usage limit|session limit|hit your .* limit|exceeded your current quota", re.I)
 
 # The five injected bugs: (original, broken). The README and docstrings describe the
 # original behaviour, so each is findable without seeing this list.

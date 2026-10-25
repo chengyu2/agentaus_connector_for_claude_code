@@ -28,7 +28,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 PORT = 9931
 
 # Mutated per-test to drive the stub's behaviour.
-STATE = {"fail_times": 0, "calls": 0, "mode": "ok"}
+STATE = {"fail_times": 0, "calls": 0, "mode": "ok", "fail_status": 502}
 
 COMPLETION = {
     "id": "chatcmpl-stub",
@@ -53,7 +53,7 @@ class _FlakyUpstream(BaseHTTPRequestHandler):
         STATE["calls"] += 1
 
         if STATE["calls"] <= STATE["fail_times"]:
-            self.send_response(502)
+            self.send_response(STATE["fail_status"])
             self.send_header("content-type", "text/plain")
             self.end_headers()
             self.wfile.write(b"bad gateway")
@@ -125,7 +125,7 @@ class _RetryTestBase(unittest.TestCase):
     def setUp(self) -> None:
         from agentaus_bridge.config import settings
 
-        STATE.update({"fail_times": 0, "calls": 0, "mode": "ok"})
+        STATE.update({"fail_times": 0, "calls": 0, "mode": "ok", "fail_status": 502})
         self._saved = (
             settings.agentaus_base_url,
             settings.agentaus_api_key,
@@ -201,6 +201,17 @@ class TestStreamingRetry(_RetryTestBase):
         self.assertEqual(STATE["calls"], 3)
         self.assertIn("hello from agentaus", body)
         # The retry must stay invisible: no error event should reach the client.
+        self.assertNotIn('"type": "error"', body)
+
+    def test_a_spent_quota_is_waited_out_not_passed_through(self):
+        # Measured (d16): a 402 "exceeded your current quota" ended two sessions mid-graph.
+        STATE.update({"fail_times": 2, "mode": "stream", "fail_status": 402})
+
+        response = self._post(stream=True)
+        body = response.text
+
+        self.assertEqual(STATE["calls"], 3)
+        self.assertIn("hello from agentaus", body)
         self.assertNotIn('"type": "error"', body)
 
     def test_failure_after_first_delta_is_not_retried(self):
