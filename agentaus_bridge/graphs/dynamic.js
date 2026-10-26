@@ -439,6 +439,7 @@ let planMd = plans.length > 1
   : null
 planMd = planMd || plans.find(planOk) || null
 let plan = planMd ? parsePlan(planMd) : null
+let smokeCmdsMemo = null   // see smokeCmds()
 if (!plan || !plan.subtasks.length) {
   // No plan could be read: one hard subtask, the whole request, solved three ways.
   plan = { deliverables: [], subtasks: [{ n: 1, title: 'The whole request', difficulty: 'hard', solvers: 3, check: true,
@@ -1653,10 +1654,17 @@ async function runSubtask(st, deps, opts = {}) {
     const make = testCopy(st, d, true)
     const ready = make && /copy ready/.test(await runExactly(`copy-${st.n}`, `${make}\necho copy ready`, 'Check') || '')
     const diff = ready ? await runExactly(`diff-${st.n}`, `cd ${q(c)} && diff -ru -x __pycache__ -x .git ${q(BASE)} . | head -150`, 'Check') : ''
+    // What the program prints on the project's own data, before and after: a change can pass
+    // its tests and still garble the real output. Measured (d16 c1913h a6): _clean's change
+    // passed its test on title-cased names, and the summary printed every name the PDFs give
+    // in capitals split and garbled - the checkers saw only the code diff.
+    const runs = ready && smokeCmds().length ? await runExactly(`outputs-${st.n}`, smokeCmds().map(cmd =>
+      `echo "\$ ${cmd.replace(/["\\$`]/g, '')}"; diff <(cd ${q(BASE)} && PYTHONDONTWRITEBYTECODE=1 perl -e 'alarm 60; exec @ARGV' /bin/bash -c ${q(cmd)} 2>&1 | head -40) <(cd ${q(c)} && PYTHONDONTWRITEBYTECODE=1 perl -e 'alarm 60; exec @ARGV' /bin/bash -c ${q(cmd)} 2>&1 | head -40) && echo '(output unchanged)'`).join('\n'), 'Check') : ''
     const checkOnce = n => ask(prompt('check', `Check subtask ${st.n}: ${st.title} (checker ${n})`, [
       '## The request', '```text', TASK, '```', '',
       '## What was asked of this part', `**${st.title}**`, '', specOf(st), '', specOnly(st) ? null : nest(st.task, 3), '',
       ready ? `## The change under check - already in \`${c}\`\n\`\`\`diff\n${diff || '(no difference: the code is kept as it was)'}\n\`\`\`\nRun everything from \`${c}\`. The project folder holds other subtasks' decided work, not this change: judge only the copy. A problem in code this change does not touch belongs to another subtask - name it, it is not a FAIL here.` : testCopy(st, d), '',
+      runs ? `## What the program prints on the project's own data - before (\`<\`) and after (\`>\`) this change\n\`\`\`diff\n${String(runs).replace(/```[a-z]*\n?/g, '').trim().slice(0, 4000)}\n\`\`\`\nCheck the after lines against the README and the docs: names, counts, labels. A change that makes a real output line wrong FAILS, whatever its tests say.` : null,
       card('The result to check', d.result, { top: 2, evidence: true }),
     ]), `check-${st.n}${n > 1 ? `.${n}` : ''}`, 'Check', md => !!VERDICT(md), { pri: -1 })
     const tested = md => !ready || String(md).includes(c)
@@ -2140,12 +2148,18 @@ for c in cmds:
     if bad and not base[c]: new.append(c); print('SMOKE CRASH',c,'-',why)
 print('SMOKE OK' if not new else f'SMOKE {len(new)} new crash(es)')
 `
-const SMOKE_CMDS = (() => {
+// A function, not a constant: the checkers need it while solving, before this point runs.
+function smokeCmds() {
+  if (smokeCmdsMemo) return smokeCmdsMemo
+  smokeCmdsMemo = (() => {
   if (!PRISTINE || !plan.subtasks.some(st => st.kind === 'code')) return []
   const asked = [...TASK.matchAll(/\`(python3?\s+[^\`\n]+)\`/g)].map(m => m[1].replace(/^python\s/, 'python3 ').trim())
   const scripts = FUNCTIONS.length ? [...new Set(FUNCTIONS.map(f => f.file))].filter(f => asked.every(c => !c.includes(f))).map(f => `python3 ${f}`) : []
   return [...new Set([...asked, ...scripts])].slice(0, 6)
-})()
+  })()
+  return smokeCmdsMemo
+}
+const SMOKE_CMDS = smokeCmds()
 let takenBack = []
 async function smokeCheck() {
   const out = await runExactly(`smoke-${takenBack.length}-${puts}`, `python3 - ${q(CWD)} ${q(PRISTINE)} ${q(JSON.stringify(SMOKE_CMDS))} ${q(`${SCRATCH}/smoke-baseline.json`)} <<'AGENTAUS_SMOKE_END'
