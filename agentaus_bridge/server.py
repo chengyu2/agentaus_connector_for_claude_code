@@ -2263,6 +2263,47 @@ GRAPH_WAITING = ("The workflow is running in the background; I will check its re
                  "finishes.")
 
 
+def _graph_launch(body: dict) -> dict | None:
+    """The Workflow call that starts the agent graph, when an opted-in main loop has not
+    started it and the newest message is the user's; None otherwise.
+
+    Measured (d16 tender a5): the model read three files and wrote its answer in the chat -
+    no Workflow call, no response.md, a 0.0. Whether the graph runs is the user's choice
+    ("ultracode"), not the model's, so the bridge makes the call itself.
+    """
+    if not _graph_main_loop(body):
+        return None
+    if "Workflow" not in {(t or {}).get("name") for t in body.get("tools") or []}:
+        return None
+    messages = [m for m in body.get("messages") or [] if m.get("role") != "system"]
+    for message in messages:
+        content = message.get("content")
+        if message.get("role") == "assistant" and isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Workflow"
+                for b in content):
+            return None
+    if not messages or messages[-1].get("role") != "user":
+        return None
+    last = messages[-1].get("content")
+    typed = _without_reminders(last) if isinstance(last, str) else _without_reminders("\n".join(
+        b.get("text", "") for b in last or [] if isinstance(b, dict) and b.get("type") == "text"))
+    if not typed or "<task-notification>" in typed:
+        return None
+    first, latest = _original_request(body), _last_user_text(body)
+    task = first if not latest or latest == first else f"{first}\n\nFollow-up:\n{latest}"
+    cwd = working_directory_of(body)
+    if not task.strip() or not graph.suits(task, cwd):
+        return None
+    call = graph.expand({"name": "Workflow", "arguments": {"description": "Agentaus agent graph"}},
+                        task, cwd)
+    arguments = call.get("arguments")
+    arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+    if not isinstance(arguments, dict) or not arguments.get("script"):
+        return None
+    graph.remember_run(body, task, latest)
+    return arguments
+
+
 def _graph_waiting_reply(body: dict) -> str | None:
     """The reply to a graph main loop's "Workflow launched in background" turn, or None.
 
@@ -2315,6 +2356,12 @@ async def _handle_agentaus(
     if _graph_main_loop(body):
         # Fold this request's launches and reports into the session's graph record first.
         _graph_session(body)
+        launch = _graph_launch(body)
+        if launch:
+            rlog(logging.INFO, "graph main loop: no workflow has run; launching the agent "
+                 "graph without the model")
+            return _synthetic_response(body, display_model, wants_stream, started,
+                                       "graph launch", tool=("Workflow", launch))
         waiting = _graph_waiting_reply(body)
         if waiting:
             rlog(logging.INFO, "graph main loop: the workflow is launched; replying without "

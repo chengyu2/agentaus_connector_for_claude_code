@@ -898,7 +898,7 @@ _SCRATCH_REF = re.compile(r"(?:/private)?/tmp/agentaus-graph(?:/([^\s'\"`/;|&)\\
 
 def own_scratch(cwd: str) -> str:
     """The scratch folder name the graph gives the run in `cwd` (dynamic.js SCRATCH)."""
-    return (re.sub(r"[^\w.-]+", "_", cwd.lstrip("/")) or "task") + "-dyn"
+    return os.path.basename(scratch_of(cwd))
 
 
 def foreign_scratch(text: str, cwd: str) -> str | None:

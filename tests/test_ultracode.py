@@ -1368,6 +1368,24 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
                 TestClient(server.app) as client:
             return client.post("/v1/messages", json={**body, "stream": stream})
 
+    def test_an_opted_in_request_launches_the_graph_without_the_model(self):
+        # Measured (d16 tender a5): the model answered in chat and never called Workflow.
+        body = self.body()
+        with mock.patch.object(graph, "prepare", return_value={}):
+            launch = server._graph_launch(body)
+            self.assertEqual(launch["script"], graph.DYNAMIC_SCRIPT)
+            self.assertEqual(launch["args"]["task"], "ultracode: implement the functions in solutions.py")
+            r = self.post(body, stream=False)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["stop_reason"], "tool_use")
+        self.assertEqual(r.json()["content"][0]["name"], "Workflow")
+
+    def test_no_launch_once_a_workflow_ran_or_on_a_tool_result(self):
+        with mock.patch.object(graph, "prepare", return_value={}):
+            self.assertIsNone(server._graph_launch(self.body(*self.launch())))
+            self.assertIsNone(server._graph_launch(self.body(*self.read())))
+            self.assertIsNone(server._graph_launch(self.body(request="explain this repo")))
+
     def test_the_launched_turn_is_answered_without_the_model(self):
         body = self.body(*self.launch())
         self.assertEqual(server._graph_waiting_reply(body), server.GRAPH_WAITING)
