@@ -1444,7 +1444,7 @@ async function readings(st, f, evidence, round, change) {
     'Start from what the words most plainly say, then vary the main computation.',
     'Start from the failing example\'s expected output and reason backwards; favour readings the obvious one rules out - signed digits, the sign kept on the first digit, position or index mattering, "the word" versus "the letters".',
   ]
-  const one = a => ask(prompt('solve', `Read the spec of ${f.fn} five ways${round > 1 ? ' (again)' : ''}${a ? ` - angle ${a + 1}` : ''}`, [
+  const one = (a, extra = [], tag = '') => ask(prompt('solve', `Read the spec of ${f.fn} five ways${round > 1 ? ' (again)' : ''}${a ? ` - angle ${a + 1}` : ''}${tag ? ` (${tag})` : ''}`, [
     specOf(st), '',
     evidence ? `## The best candidate so far breaks these examples (what it returned is shown)\n\`\`\`text\n${evidence}\n\`\`\`` : null,
     failing ? `## The best candidate so far - this reading is WRONG\n\`\`\`python\n${String(failing).replace(/```[a-z]*\n?/g, '').trim()}\n\`\`\`\nA reading that computes what this code computes is worthless, however it is written.` : null, '',
@@ -1455,9 +1455,32 @@ async function readings(st, f, evidence, round, change) {
     '4. For every reading, write under it, worked by hand, what it gives for each failing example. Drop a reading that does not give the expected output.',
     ANGLES[a || 0], '',
     a && EXAMPLES && PRISTINE ? `**Run every reading before you write it down.** Save it as \`${SCRATCH}/s${st.n}/try/${f.fn}.py\` and run the examples on it:\n\`\`\`bash\nmkdir -p ${q(`${SCRATCH}/s${st.n}/try/repo`)} && cp -R ${q(BASE)}/. ${q(`${SCRATCH}/s${st.n}/try/repo`)}/ && ${replaceCommand(`${SCRATCH}/s${st.n}/try/repo/${f.file}`, f.fn, `${SCRATCH}/s${st.n}/try/${f.fn}.py`)}\npython3 ${q(EXAMPLES)} ${q(`${PRISTINE}/${f.file}`)} ${q(`${SCRATCH}/s${st.n}/try/repo/${f.file}`)} ${f.fn}\n\`\`\`\nKeep trying readings until one gives every example \`ok\`${(st.specTests || []).length ? ', and run the agreed cases too: ' + st.specTests.map(t => `\`cd ${q(`${SCRATCH}/s${st.n}/try/repo`)} && python3 ${q(t)}\``).join(', ') : ''}. Write down only readings that passed.` : null, '',
+    ...extra,
     `Write **five different readings**, each as one complete Python function named \`${f.fn}\`, imports inside it, in its own \`\`\`python block. Never branch on an example's literal input.`,
-  ], !a), `readings-${st.n}${round > 1 ? `.${round}` : ''}${a ? `-${a + 1}` : ''}`, 'Readings', t => (t.match(/```python/g) || []).length >= 2)
+  ], !a), `readings-${st.n}${round > 1 ? `.${round}` : ''}${a ? `-${a + 1}` : ''}${tag ? `-${tag}` : ''}`, 'Readings', t => (t.match(/```python/g) || []).length >= 2)
   const mds = (await parallel([0, 1].map(a => () => one(a)))).filter(Boolean)
+  // The runtime runs what the tool-using agent saved, and asks again with the failing output -
+  // up to twice. Measured (d16 he10 a9): told to run every reading, the agent made three tool
+  // calls, never ran the examples, and wrote that all five passed; none did.
+  const tryDir = `${SCRATCH}/s${st.n}/try`
+  const tried = `${tryDir}/${f.fn}.py`
+  const verify = EXAMPLES && PRISTINE ? `mkdir -p ${q(tryDir + '/repo')} && cp -R ${q(BASE)}/. ${q(tryDir + '/repo')}/
+if [ -s ${q(tried)} ]; then
+${replaceCommand(`${tryDir}/repo/${f.file}`, f.fn, tried)}
+else echo "NO READING SAVED"; fi
+python3 ${q(EXAMPLES)} ${q(`${PRISTINE}/${f.file}`)} ${q(`${tryDir}/repo/${f.file}`)} ${f.fn}${(st.specTests || []).map(t => `\n(cd ${q(tryDir + '/repo')} && PYTHONPATH=${q(tryDir + '/repo')} PYTHONDONTWRITEBYTECODE=1 perl -e 'alarm 20; exec @ARGV' python3 ${q(t)} >/dev/null 2>&1) || echo "SPEC FAIL $(tail -1 ${q(t)})"`).join('')}` : null
+  const passes = out => { const m = String(out || '').match(/(\d+)\/(\d+) docstring examples pass/); return !!m && m[1] === m[2] && !/SPEC FAIL|NO READING SAVED/.test(out) }
+  for (let again = 1; verify && again <= 2 && !hard; again++) {
+    const out = await runExactly(`readings-verify-${st.n}.${round}.${again}`, verify, 'Readings')
+    if (!out || passes(out)) break
+    const md = await one(1, [`## The reading saved in \`${tried}\` fails\n\`\`\`text\n${String(out).replace(/```[a-z]*\n?/g, '').trim().slice(-2500)}\n\`\`\`\nKeep trying readings - save each to \`${tried}\` and run the command again - until every example line reads \`ok\` and no SPEC FAIL is printed. Report only readings that passed.`, ''], `again ${again}`)
+    if (md) mds.push(md)
+  }
+  if (verify) {
+    const kept = await runExactly(`readings-kept-${st.n}.${round}`, `[ -s ${q(tried)} ] && cat ${q(tried)} || echo NONE`, 'Readings')
+    // First: the cap of nine readings keeps it whatever the agents wrote.
+    if (kept && new RegExp(`def ${f.fn}\\(`).test(kept)) mds.unshift(`\`\`\`python\n${String(kept).replace(/```[a-z]*\n?/g, '').trim()}\n\`\`\``)
+  }
   const seen = new Set()
   const blocks = mds.flatMap(md => [...md.matchAll(/```python\n([\s\S]*?)```/g)].map(x => x[1]))
     .filter(b => new RegExp(`def ${f.fn}\\(`).test(b))
