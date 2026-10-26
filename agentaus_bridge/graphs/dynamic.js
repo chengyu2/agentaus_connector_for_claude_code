@@ -1284,13 +1284,17 @@ async function pickFunction(st, f, ks, replies, audit, prefer) {
 // measurement says otherwise.
 // Measured (d16 c1913h): the solvers of count_top (\`< k\` to \`<= k\`) and mean_rank (median to
 // mean) fixed them, wrote no tests, and both originals were kept.
+// The judges are an extra, not a measurement: a change that only rewords comments or the docstring
+// is not judged, and a late graph skips them (the Check phase). Measured (d16 c1913, c1913h at
+// half the usual upstream rate): 23 judges ran beside 46 solvers, and most subtasks were never
+// decided before the graph's time ran out.
 async function judgeAudit(st, f, out) {
   const rows = [...String(out || '').matchAll(/^candidate (\d+): (\S+) - docstring example mismatches (\d+), pooled tests passed (\d+)\/(\d+), self-checks and raising probes (\d+), behaviour \w+, replied \d, changed True/gm)]
   const orig = String(out || '').match(/^candidate 0: .* docstring example mismatches (\d+), pooled tests passed (\d+)\//m)
   if (!orig) return null
   const c = rows.find(r => r[1] !== '0' && Number(r[3]) <= Number(orig[1]) && Number(r[6]) === 0 && Number(r[4]) >= Number(orig[2]))
   if (!c) return null
-  const shown = await runExactly(`audit-diff-${st.n}`, `python3 - ${q(`${BASE}/${f.file}`)} ${q(c[2])} ${f.fn} <<'PY'\nimport ast,difflib,sys\ndef src(p):\n    t=open(p).read()\n    for n in ast.parse(t).body:\n        if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name==sys.argv[3]: return ''.join(t.splitlines(True)[n.lineno-1:n.end_lineno])\n    return t\na,b=src(sys.argv[1]),src(sys.argv[2])\nprint(''.join(difflib.unified_diff(a.splitlines(True),b.splitlines(True),'original','change')) or 'NO DIFFERENCE')\nPY`, 'Pick')
+  const shown = await runExactly(`audit-diff-${st.n}`, `python3 - ${q(`${BASE}/${f.file}`)} ${q(c[2])} ${f.fn} <<'PY'\nimport ast,difflib,sys\ndef src(p):\n    t=open(p).read()\n    for n in ast.parse(t).body:\n        if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name==sys.argv[3]: return ''.join(t.splitlines(True)[n.lineno-1:n.end_lineno])\n    return t\na,b=src(sys.argv[1]),src(sys.argv[2])\ndef bare(t):\n    try: n=ast.parse(t.strip())\n    except SyntaxError: return t\n    for x in ast.walk(n):\n        if isinstance(x,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef,ast.Module)) and x.body and isinstance(x.body[0],ast.Expr) and isinstance(getattr(x.body[0],'value',None),ast.Constant) and isinstance(x.body[0].value.value,str): x.body=x.body[1:] or [ast.Pass()]\n    return ast.dump(n)\nprint('NO DIFFERENCE' if bare(a)==bare(b) else ''.join(difflib.unified_diff(a.splitlines(True),b.splitlines(True),'original','change')) or 'NO DIFFERENCE')\nPY`, 'Check')
   if (!shown || /NO DIFFERENCE/.test(shown) || !/^[-+]/m.test(shown)) return null
   const judge = j => ask(prompt('check', `Is this change to ${f.fn} a fix? (judge ${j})`, [
     specOf(st), '',
@@ -1300,7 +1304,7 @@ async function judgeAudit(st, f, out) {
     '- KEEP: the original already does what the spec says, the change is only style, or it changes behaviour the spec does not ask to change.',
     '- Most audited functions are already right, and a rewrite that looks tidier is still KEEP. When unsure, KEEP.',
     'A FIX needs evidence: under `## Input`, one concrete input; then what the original returns for it, what the change returns, and the sentence of the spec the original contradicts, quoted. With no such input, the verdict is KEEP. End with exactly one line: `**Verdict:** FIX` or `**Verdict:** KEEP`.',
-  ], true), `audit-judge-${st.n}.${j}`, 'Pick', t => /\*\*Verdict:\*\*\s*(FIX|KEEP)/i.test(t))
+  ], true), `audit-judge-${st.n}.${j}`, 'Check', t => /\*\*Verdict:\*\*\s*(FIX|KEEP)/i.test(t))
   const votes = (await parallel([1, 2, 3].map(j => () => judge(j)))).filter(Boolean)
   // Every judge who answered, and at least two, must call it a fix - each with an input that
   // shows it. Measured (d16 c1913 a7): at two of three, judges passed rewrites of top and
