@@ -1685,12 +1685,22 @@ async function runSubtask(st, deps, opts = {}) {
       card('The result to check', d.result, { top: 2, evidence: true }),
     ]), `check-${st.n}${n > 1 ? `.${n}` : ''}`, 'Check', md => !!VERDICT(md), { pri: -1 })
     const tested = md => !ready || String(md).includes(c)
-    let check = await checkOnce(1)
-    if (check && /fail/i.test(VERDICT(check)) && !tested(check)) return { st, ...d, ...counts, check: 'FAIL not tested in the copy - kept' }
+    // A feature keeps every existing behaviour: a command that does not use the new flag prints
+    // what it printed before. Measured, not judged - no checker is asked. Measured (d16 c1913h
+    // a9): the \`--json\` change also put a header row on the plain summary the request said
+    // must still print, and every check that reads the summary failed.
+    const flags = [...new Set(`${st.title}\n${st.task}`.match(/(?<![\w-])--[a-z][\w-]*/g) || [])]
+    const altered = /^\W*Feature\b/i.test(st.title) && flags.length && runs
+      ? String(runs).split(/^(?=\$ )/m).filter(b => /^\$ /.test(b) && !flags.some(fl => b.split('\n')[0].includes(fl)) && !/\(output unchanged\)/.test(b))
+      : []
+    const measured = altered.length ? `**Verdict:** FAIL\n\n## Problem\nThe request keeps existing behaviour, and this change alters the output of a command that does not use ${flags.join(', ')}:\n\`\`\`diff\n${altered.join('\n').slice(0, 2500)}\n\`\`\`\nMake that output exactly what it was before.` : null
+    if (measured) log(`subtask ${st.n}: the feature changes what ${altered.length} existing command(s) print - redone`)
+    let check = measured || await checkOnce(1)
+    if (check && /fail/i.test(VERDICT(check)) && !tested(check) && !measured) return { st, ...d, ...counts, check: 'FAIL not tested in the copy - kept' }
     // A failure is acted on only when a second checker, who has not seen the first, finds it
     // too. Measured: one checker's mistaken FAIL brought in a redo that replaced three
     // solvers' correct median.
-    const second = check && /fail/i.test(VERDICT(check)) ? await checkOnce(2) : null
+    const second = measured || (check && /fail/i.test(VERDICT(check)) ? await checkOnce(2) : null)
     if (second && /fail/i.test(VERDICT(second))) {
       const k = st.solvers + 1
       const feedback = `What the checkers found:\n${section(check, 'Problem') || check}\n${section(second, 'Problem')}\n\nReply in your solve format - \`## Answer\`, \`## Key values\`, \`## Evidence\` - never a verdict.`
