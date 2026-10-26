@@ -2303,8 +2303,14 @@ const assembled = sectionMode ? `## Written\n- \`${deliverables[0]}\` - ${sectio
 // Measured: mergers wrote `GST‑registered` and `355‑30` with non-breaking hyphens, and cited
 // sources in 【lenticular brackets】 - text that no search for the plain words finds.
 const NORMALISE = f => `python3 - ${q(f)} <<'PY'\nimport re,sys\np=sys.argv[1]; t=open(p,encoding='utf-8').read(); n=len(t)\nt=re.sub('[\\u2010\\u2011\\u2012\\u2212]','-',t)\nt=re.sub('[\\u00a0\\u2007\\u2009\\u202f]',' ',t)\nt=re.sub('\\u3010([^\\u3011\\n]{1,80})\\u3011',r'[\\1]',t)\nopen(p,'w',encoding='utf-8').write(t); print('normalised',p,n,len(t))\nPY`
+// A JSON deliverable holds numbers as numbers: a value written with thousands separators
+// ("-30,645,707", "$1,234.50") becomes the number it spells. A string of digits without them -
+// an ABN, an id - is left as it is. Measured (d17 rdti): q8 was right and written as a string
+// with commas, and the reader that compared numbers failed it.
+const NORMALISE_JSON = f => `python3 - ${q(f)} <<'PY'\nimport json,re,sys\np=sys.argv[1]\ntry: d=json.load(open(p,encoding='utf-8'))\nexcept Exception as e: print('not JSON:',e); sys.exit()\nN=re.compile(r'^\\s*(-?)\\$?(\\d{1,3}(?:,\\d{3})+)(\\.\\d+)?\\s*$')\nn=[0]\ndef fix(v):\n    if isinstance(v,dict): return {k:fix(x) for k,x in v.items()}\n    if isinstance(v,list): return [fix(x) for x in v]\n    if isinstance(v,str):\n        m=N.match(v)\n        if m:\n            n[0]+=1; t=m.group(1)+m.group(2).replace(',','')+(m.group(3) or '')\n            return float(t) if m.group(3) else int(t)\n    return v\nd=fix(d)\nif n[0]: json.dump(d,open(p,'w',encoding='utf-8'),indent=2,ensure_ascii=False)\nprint('numbers made numeric:',n[0])\nPY`
 const normalise = async () => {
   for (const d of deliverables.filter(d => SECTION_FILE.test(d))) await runExactly('normalise', NORMALISE(d), 'Assemble')
+  for (const d of deliverables.filter(d => /\.json$/i.test(d))) await runExactly('normalise-json', NORMALISE_JSON(d), 'Assemble')
 }
 await normalise()
 
