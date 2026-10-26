@@ -1321,7 +1321,7 @@ async function specTests(st, f) {
     '- **At least four of your cases must be inputs on which those readings give different results** (a sentence starting "Is ...", a negative number, a tie). A case every reading agrees on tests nothing.',
     '- Then the other traps: boundaries, empty input, rounding.',
     '- Work each expected value out by hand from the words, and check that the same rule gives every docstring example its stated result.',
-  ], true), `spec-tests-${st.n}.${j}`, 'Solve', t => /assert\s/.test(t), { pri: 1 })
+  ], true), `spec-tests-${st.n}.${j}`, 'Pick', t => /assert\s/.test(t), { pri: 1 })
   const outs = (await parallel([1, 2, 3].map(j => () => ask1(j)))).filter(Boolean)
   const norm = l => l.replace(/\s+/g, '')
   const examples = new Map([...String(inv.doc).matchAll(new RegExp(`>>>\\s*(${f.fn}\\([^\\n]*\\))\\s*\\n\\s*([^\\n]+)`, 'g'))].map(m => [norm(m[1]), norm(m[2])]))
@@ -1339,6 +1339,10 @@ async function specTests(st, f) {
       count.set(key, c)
     }
   }
+  // Writers and judges are measurement, not solving: they run in the Pick phase, which a
+  // late graph still runs. Measured (d16 he10 a6): the judges were asked once the budget was
+  // spent, the Solve phase skipped them, no tie-order case was agreed, and a reading that
+  // reversed the docstring's tie order to fit its one example was chosen.
   // Writers seldom pick the same inputs, so a lone writer's case goes to three judges who see
   // only the call: it counts when every judge works out the same result. Measured (d15 he10):
   // only the empty and docstring cases had two writers, and "Is ..." and the tie order went
@@ -1356,7 +1360,7 @@ async function specTests(st, f) {
       '- First find the one reading of the words that gives **every** docstring example its stated result - work each example through. Then apply that reading, word for word: "the word X" is not "starts with the letters X", and a stated tie order is kept.',
       `- Answer with one line per call, each exactly \`assert <call> == <result>\`, all in one \`\`\`python block - every call, in this order.`, '',
       '```python', ...calls, '```',
-    ], true), `spec-judge-${st.n}.${j}`, 'Solve', t => /assert\s/.test(t), { pri: 1 })
+    ], true), `spec-judge-${st.n}.${j}`, 'Pick', t => /assert\s/.test(t), { pri: 1 })
     const verdicts = (await parallel([1, 2, 3].map(j => () => judge(j)))).filter(Boolean)
     const said = new Map()
     for (const md of verdicts) {
