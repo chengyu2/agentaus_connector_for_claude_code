@@ -1280,7 +1280,8 @@ async function pickFunction(st, f, ks, replies, audit, prefer) {
 
 // An Audit's original wins unless a change beats it on a measurement - and solvers often write
 // no test that measures. Then three judges read the original and the change against the spec:
-// when two call it a fix, the picker prefers it, still only if no measurement says otherwise.
+// when all of them (two at least) call it a fix, the picker prefers it, still only if no
+// measurement says otherwise.
 // Measured (d16 c1913h): the solvers of count_top (\`< k\` to \`<= k\`) and mean_rank (median to
 // mean) fixed them, wrote no tests, and both originals were kept.
 async function judgeAudit(st, f, out) {
@@ -1297,12 +1298,16 @@ async function judgeAudit(st, f, out) {
     'Decide from the spec - the function\'s name, its docstring, the README and any model or standard the request names - whether the original is wrong and the change makes it right.',
     '- FIX: the original disagrees with the spec (a mean that is a median, a "top k" that leaves out the k-th, a tie broken the wrong way) and the change corrects it without breaking anything else.',
     '- KEEP: the original already does what the spec says, the change is only style, or it changes behaviour the spec does not ask to change.',
-    'Work one concrete input through both versions before you decide. End with exactly one line: `**Verdict:** FIX` or `**Verdict:** KEEP`.',
+    '- Most audited functions are already right, and a rewrite that looks tidier is still KEEP. When unsure, KEEP.',
+    'A FIX needs evidence: under `## Input`, one concrete input; then what the original returns for it, what the change returns, and the sentence of the spec the original contradicts, quoted. With no such input, the verdict is KEEP. End with exactly one line: `**Verdict:** FIX` or `**Verdict:** KEEP`.',
   ], true), `audit-judge-${st.n}.${j}`, 'Pick', t => /\*\*Verdict:\*\*\s*(FIX|KEEP)/i.test(t))
   const votes = (await parallel([1, 2, 3].map(j => () => judge(j)))).filter(Boolean)
-  const fix = votes.filter(v => /\*\*Verdict:\*\*\s*FIX/i.test(v)).length
+  // Every judge who answered, and at least two, must call it a fix - each with an input that
+  // shows it. Measured (d16 c1913 a7): at two of three, judges passed rewrites of top and
+  // mean_rank, both already right.
+  const fix = votes.filter(v => /\*\*Verdict:\*\*\s*FIX/i.test(v) && /^#+\s*Input\b/im.test(v)).length
   log(`subtask ${st.n}: no measurement decided ${f.fn}; judges call candidate ${c[1]}'s change a fix ${fix} of ${votes.length}`)
-  return fix >= 2 ? c[1] : null
+  return fix >= 2 && fix === votes.length ? c[1] : null
 }
 
 // Consensus spec tests: three agents each write test cases from the docstring alone; a case
