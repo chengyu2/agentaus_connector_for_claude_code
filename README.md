@@ -1066,6 +1066,42 @@ of the fixed graph's agents because easy work gets one solver. It loses on `he10
 on data and documents within the noise, and is still well short of Opus everywhere. Two runs
 per task is a small sample: read the bug-fix gains as solid and the rest as not yet decided.
 
+#### Rounds d16-d17: measuring instead of trusting
+
+Same tasks, the benchmark loop running unattended on the dynamic graph, every valid run
+counted (a run is void only when Agentaus itself was down or out of quota, never because it
+scored badly). Mean (lowest-highest, runs):
+
+| Task | Agentaus, own workflow | Dynamic graph, first | **Dynamic graph, d16-d17** | Typical time |
+| --- | --- | --- | --- | --- |
+| `c1913` - five bugs and a feature | 0.57 | 0.88 | **0.84** (0.25-1.00, n=8) | 79 min |
+| `c1913h` - nine bugs, five unreported | 0.14 | 0.50 | **0.37** (0.08-0.58, n=7) | 82 min |
+| `he10` - ten HumanEval+ functions | 0.80 | 0.60 | **0.90** (0.80-1.00, n=6) | 72 min |
+| `rdti` - spreadsheets | 0.61 | 0.56 | **1.00** (1.00-1.00, n=8) | 21 min |
+| `tender` - RFQ from a `.docx` | 0.71 | 0.65 | **0.99** (0.90-1.00, n=9) | 25 min |
+| **Mean** | 0.57 | 0.64 | **0.82** | |
+
+The data and document tasks now match Opus run after run; `c1913` and `he10` reach 1.00
+and usually land one check short; `c1913h` beats Agentaus's own workflow on every run but
+swings widely and is the open problem. Most of the gain came from replacing an agent's word
+with a measurement:
+
+- **Picks are measured, and fairly.** A solver's pytest-style tests are called, a test that
+  imports the module by its bare name finds it, a test that loads the solver's own file
+  tests the candidate instead, and a candidate's import of its own module or exact copy of
+  a module table is removed before it is measured.
+- **The docstring's traps are tested.** Spec-test writers aim at inputs where readings
+  disagree, judges settle lone cases even in a late graph, and the agent proposing new
+  readings has its saved reading run and is asked again with the failing output.
+- **An audited function keeps its original** unless a measurement - or, failing one, every
+  judge with an input that shows the bug - says the change is a fix.
+- **Checkers see what the program prints** on the project's own data before and after a
+  change, and a feature that changes the output of an existing command is failed without
+  asking anyone.
+- **The bridge is robust to Agentaus itself:** a spent quota (HTTP 402) is waited out like an
+  outage, the graph is launched by the bridge when a turn opts in, and a graph agent cannot
+  wander into another run's scratch folder.
+
 
 ---
 
