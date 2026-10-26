@@ -1431,6 +1431,9 @@ async function drafts(st, f, n, ph) {
 // ranks example mismatches first - chooses among solvers and readings alike. Measured (d9,
 // d10): every order_by_points candidate kept the planner's "absolute value" reading and failed
 // the docstring's own example; agents then patched the example's values in by hand.
+// The backward-reading agent has tools and runs each reading on the examples and the agreed
+// cases before writing it down. Measured (d16 he10 a8): 18 think-only readings each fitted the
+// example by breaking the tie rule, or kept the tie rule and missed the example.
 // Measured (d16 he10): told only what the best candidate returned, one agent wrote five copies
 // of that candidate's own reading (digit sums of abs(n)), and every one broke the example the
 // same way. The agents now see the failing code, must work each reading through the failing
@@ -1451,8 +1454,9 @@ async function readings(st, f, evidence, round, change) {
     '3. Find readings of the open words that give exactly those values - the main computation (how a sign, a digit, a boundary, "the word" versus "the letters", a rounding rule is meant), not only the tie order.',
     '4. For every reading, write under it, worked by hand, what it gives for each failing example. Drop a reading that does not give the expected output.',
     ANGLES[a || 0], '',
+    a && EXAMPLES && PRISTINE ? `**Run every reading before you write it down.** Save it as \`${SCRATCH}/s${st.n}/try/${f.fn}.py\` and run the examples on it:\n\`\`\`bash\nmkdir -p ${q(`${SCRATCH}/s${st.n}/try/repo`)} && cp -R ${q(BASE)}/. ${q(`${SCRATCH}/s${st.n}/try/repo`)}/ && ${replaceCommand(`${SCRATCH}/s${st.n}/try/repo/${f.file}`, f.fn, `${SCRATCH}/s${st.n}/try/${f.fn}.py`)}\npython3 ${q(EXAMPLES)} ${q(`${PRISTINE}/${f.file}`)} ${q(`${SCRATCH}/s${st.n}/try/repo/${f.file}`)} ${f.fn}\n\`\`\`\nKeep trying readings until one gives every example \`ok\`${(st.specTests || []).length ? ', and run the agreed cases too: ' + st.specTests.map(t => `\`cd ${q(`${SCRATCH}/s${st.n}/try/repo`)} && python3 ${q(t)}\``).join(', ') : ''}. Write down only readings that passed.` : null, '',
     `Write **five different readings**, each as one complete Python function named \`${f.fn}\`, imports inside it, in its own \`\`\`python block. Never branch on an example's literal input.`,
-  ], true), `readings-${st.n}${round > 1 ? `.${round}` : ''}${a ? `-${a + 1}` : ''}`, 'Readings', t => (t.match(/```python/g) || []).length >= 2)
+  ], !a), `readings-${st.n}${round > 1 ? `.${round}` : ''}${a ? `-${a + 1}` : ''}`, 'Readings', t => (t.match(/```python/g) || []).length >= 2)
   const mds = (await parallel([0, 1].map(a => () => one(a)))).filter(Boolean)
   const seen = new Set()
   const blocks = mds.flatMap(md => [...md.matchAll(/```python\n([\s\S]*?)```/g)].map(x => x[1]))
