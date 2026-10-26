@@ -1465,7 +1465,11 @@ async function readings(st, f, evidence, round, change) {
   // calls, never ran the examples, and wrote that all five passed; none did.
   const tryDir = `${SCRATCH}/s${st.n}/try`
   const tried = `${tryDir}/${f.fn}.py`
+  // An agent that saved its reading under another name in the folder still has it measured:
+  // the newest file there that defines the function stands in. Measured (d17 he10 a3): the agent
+  // wrote reading1.py ... impls/reading5.py and never the file it was given.
   const verify = EXAMPLES && PRISTINE ? `mkdir -p ${q(tryDir + '/repo')} && cp -R ${q(BASE)}/. ${q(tryDir + '/repo')}/
+[ -s ${q(tried)} ] || { alt=$(find ${q(tryDir)} -name '*.py' -not -path '*/repo/*' -not -path '*/__pycache__/*' -print0 2>/dev/null | xargs -0 grep -l ${q(`def ${f.fn}(`)} 2>/dev/null | xargs ls -t 2>/dev/null | head -1); [ -n "$alt" ] && cp "$alt" ${q(tried)} && echo "using $alt"; }
 if [ -s ${q(tried)} ]; then
 ${replaceCommand(`${tryDir}/repo/${f.file}`, f.fn, tried)}
 else echo "NO READING SAVED"; fi
