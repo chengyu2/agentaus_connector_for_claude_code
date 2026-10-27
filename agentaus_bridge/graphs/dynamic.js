@@ -105,9 +105,13 @@ later(END_MS, () => {
   for (const w of waiting.splice(0)) w.resolve()
   endNow(null)
 })
+// Resolves when the solving budget is spent: work that refines a decision races it.
+let lateNow = () => {}
+const lateStop = new Promise(r => { lateNow = r })
 function startBudget() {
   later(BUDGET_MS, () => {
     late = true
+    lateNow(null)
     for (const w of waiting.filter(w => LATE_SKIPS.has(w.ph))) w.resolve()
     waiting.splice(0, waiting.length, ...waiting.filter(w => !LATE_SKIPS.has(w.ph)))
   })
@@ -510,7 +514,10 @@ function functionOf(st) {
   // measured (d10), "top-five" bound a subtask to `top`, and "first name" to `first`. And
   // (d9) a reviewer wrote `## Subtask 1: is_bored` without backticks.
   const inv = n => !/^[A-Z][A-Z0-9_]*$/.test(n) && (!FUNCTIONS.length || FUNCTIONS.some(f => f.fn === n))
-  const tick = t => [...new Set((t.match(/`([A-Za-z_]\w*)(?:\(\))?`/g) || []).map(n => n.replace(/[`()]/g, '')))].filter(inv)
+  // A backtick a model escaped (\`name\`) is a backtick. Measured (d17 c1913h a6): titles came
+  // back as "Audit \`_clean\`", bound to no function, and the coverage pass planned five
+  // functions twice.
+  const tick = t => [...new Set((String(t).replace(/\\`/g, '`').match(/`([A-Za-z_]\w*)(?:\(\))?`/g) || []).map(n => n.replace(/[`()]/g, '')))].filter(inv)
   let names = tick(st.title)
   if (!names.length) names = tick(st.task)
   if (!names.length) {
@@ -585,7 +592,7 @@ phase('Review')
   const targets = plan.subtasks.filter(wholeFile)
   for (const st of targets) {
     const md = await ask(prompt('plan', `Split the code subtask "${st.title}"`, [
-      'This subtask covers a whole file. Split it into subtasks in the plan format: one per reported symptom, and - if the request says there may be more problems - one `Audit \\`function\\`` subtask per function in the file. Each is `Kind: code`, at least `Difficulty: medium`, `Merge: pick-change`, and its Task names the function and the file.',
+      'This subtask covers a whole file. Split it into subtasks in the plan format: one per reported symptom, and - if the request says there may be more problems - one subtask per function in the file, titled Audit and the function name in backticks (for example Audit `parse`). Each is `Kind: code`, at least `Difficulty: medium`, `Merge: pick-change`, and its Task names the function and the file.',
       'Write only the `## Subtask N: ...` sections, numbered from 1.', '',
       '## The request', '```text', TASK, '```', '', '## The subtask', st.task, '', '## The brief from the scout', brief,
     ], true), `split-${st.n}`, 'Review', md => parsePlan(md).subtasks.length > 1)
@@ -593,7 +600,7 @@ phase('Review')
       // without the brief. Measured (d13 c1913): both splitters replied "I'm sorry ... can't
       // fit", the whole file went to five solvers for up to 1042 s and a merger for 833 s.
       || await ask(prompt('plan', `Split the code subtask "${st.title}" (short)`, [
-        'Split this code subtask into subtasks in the plan format: one per symptom the request reports' + (AUDITING ? ', and one `Audit \\`function\\`` subtask per function below' : '') + '. Each is `Kind: code`, `Difficulty: medium`, `Merge: pick-change`, and its Task names the function and the file. Write only the `## Subtask N: ...` sections, numbered from 1.', '',
+        'Split this code subtask into subtasks in the plan format: one per symptom the request reports' + (AUDITING ? ', and one subtask per function below, titled Audit and the function name in backticks (for example Audit `parse`)' : '') + '. Each is `Kind: code`, `Difficulty: medium`, `Merge: pick-change`, and its Task names the function and the file. Write only the `## Subtask N: ...` sections, numbered from 1.', '',
         '## The request', '```text', TASK, '```', '',
         FUNCTIONS.length ? ['## The functions', ...FUNCTIONS.slice(0, 60).map(f => `- \`${f.fn}\` in \`${f.file}\``)].join('\n') : null,
       ], true), `split-${st.n}.short`, 'Review', md => parsePlan(md).subtasks.length > 1)
@@ -616,6 +623,34 @@ phase('Review')
     for (const o of plan.subtasks) o.deps = o.deps.flatMap(d => d === st.n ? parts.map(p => p.n) : [d])
     log(`plan: split subtask ${st.n} into ${parts.length}`)
   }
+}
+
+// An Audit subtask is about one function. When its title binds none - however the planner wrote
+// it - one Agentaus call picks the function from the code's own list, and only a name on that
+// list is taken: no reading of the title's formatting. Measured (d17 c1913h a6): titles written
+// "Audit \`_clean\`" bound to no function, and five functions were planned twice.
+{
+  // A command-line or feature audit is a whole-copy change on purpose (see functionOf): never bound.
+  const WHOLE = /(?<![\w-])--[a-z][\w-]*|__main__|command[- ]line|\bCLI\b|^\W*Feature\b/i
+  const loose = plan.subtasks.filter(st => st.kind === 'code' && /^\W*Audit\b/i.test(st.title) && !WHOLE.test(st.title) && !functionOf(st) && FUNCTIONS.length)
+  const byName = new Map()
+  for (const f of FUNCTIONS) byName.set(f.fn, [...(byName.get(f.fn) || []), f])
+  await parallel(loose.map(st => async () => {
+    const md = await ask(prompt('plan', `Which function is subtask ${st.n} about?`, [
+      '## The subtask', `**${st.title}**`, '', nest(st.task || '', 3), '',
+      '## The functions in the code', ...FUNCTIONS.slice(0, 80).map(f => `- ${f.fn} (${f.file})`), '',
+      'Reply with exactly one line: `Function: <name>`, the one function from the list this subtask audits, spelled exactly as listed - or `Function: NONE` if it audits no single function.',
+    ], true), `bind-${st.n}`, 'Review', t => /Function:/i.test(String(t).replace(/[*`_]/g, '')), { short: true })
+    // The answer only counts as a name on the list; markdown around it is not part of it.
+    const said = (String(md || '').replace(/[*`]/g, '').match(/Function:\s*([A-Za-z_]\w*)/i) || [])[1]
+    // A name two files define is bound only to the file the subtask names.
+    const fs = (said && byName.get(said)) || []
+    const f = fs.length === 1 ? fs[0] : fs.find(o => `${st.title}\n${st.task}`.includes(o.file))
+    if (f) {
+      st.title = `Audit \`${f.fn}\` in \`${f.file}\``
+      log(`plan: subtask ${st.n} bound to ${f.fn} by Agentaus`)
+    }
+  }))
 }
 
 // The plan covers the code's inventory: every stub is implemented, and - when the request
@@ -955,6 +990,9 @@ const PICK_PY = String.raw`import ast,hashlib,json,os,re,shutil,subprocess,sys,t
 T0=time.time(); LIMIT=float(os.environ.get('PICK_S') or 420)
 left=lambda: LIMIT-(time.time()-T0)
 root,rel,fn,ex=sys.argv[1:5]; rest=sys.argv[5:]; i=rest.index('--'); cands=rest[:i]; tests=[t for t in rest[i+1:] if os.path.exists(t)]
+# A solver copy's repo/tests.py that is the project's own tests.py is not that solver's test.
+import filecmp
+tests=[t for t in tests if not (t.endswith('/repo/tests.py') and os.path.exists(os.path.join(root,'tests.py')) and filecmp.cmp(t,os.path.join(root,'tests.py'),shallow=False))]
 AUDIT=os.environ.get('PICK_AUDIT')=='1'; frozen=os.environ.get('PICK_OUT')
 def node(code):
     for n in ast.parse(code).body:
@@ -1258,11 +1296,18 @@ const solverDir = (st, k) => `${SCRATCH}/s${st.n}/${k}`
 const installPick = `mkdir -p ${q(SCRATCH)} && { [ -s ${q(PICK)} ] || { cat > ${q(PICK + '.part')}.$$ <<'AGENTAUS_PICK_END' && mv ${q(PICK + '.part')}.$$ ${q(PICK)}; }; }\n${PICK_PY}AGENTAUS_PICK_END`
 // An Audit's original competes, and a change replaces it only on a measurement.
 const isAudit = st => /^\W*Audit\b/i.test(st.title)
+let pickSeq = 0
 async function pickFunction(st, f, ks, replies, audit, prefer) {
   const cands = ks.map(k => `${k}|${solverDir(st, k)}|${replies[k] ? 1 : 0}`)
-  const tests = [...ks.map(k => `${solverDir(st, k)}/tests.py`), ...(st.specTests || [])]
+  // A solver's tests, wherever in its folder it saved them. Measured (d17 c1913h a5): mean_rank's
+  // fix had its tests at repo/tests.py, none ran, and the original median was kept.
+  const tests = [...ks.flatMap(k => [`${solverDir(st, k)}/tests.py`, `${solverDir(st, k)}/repo/tests.py`]), ...(st.specTests || [])]
   // The chosen function is frozen at once: a solver still running cannot change it afterwards.
-  const frozen = `${SCRATCH}/chosen/s${st.n}/${f.fn}.py`
+  // Each pick freezes into its own file. A decision names its file, and a later pick for the same
+  // subtask must never rewrite it: the picker writes every interim best there, the original first.
+  // Measured (review of the decide-first change): a re-pick running when a checkpoint fired, or
+  // at the seal, would have installed the original over a decided fix.
+  const frozen = `${SCRATCH}/chosen/s${st.n}/${f.fn}.${++pickSeq}.py`
   const out = await runExactly(`pick-${st.n}${prefer ? '-judged' : ''}`, `${installPick}\nPICK_OUT=${q(frozen)}${audit ? ' PICK_AUDIT=1' : ''}${prefer ? ` PICK_PREFER=${prefer}` : ''} PICK_S=420 python3 ${q(PICK)} ${q(BASE)} ${q(f.file)} ${f.fn} ${EXAMPLES && PRISTINE ? q(EXAMPLES) : '-'} ${cands.map(q).join(' ')} -- ${tests.map(q).join(' ')}`, 'Pick')
   // The last CHOSEN line is the pick's best: it prints one each time the best improves.
   const all = [...String(out || '').matchAll(/^CHOSEN (\S+) mismatches (-?\d+) from (\S+) changed (\w+)(?: votes (\d+) examples (\d+) candidate (\S+))?/gm)]
@@ -1633,7 +1678,6 @@ async function runSubtask(st, deps, opts = {}) {
   const replies = {}
   solving.forEach((k, i) => { if (outs[i]) replies[k] = outs[i] })
   const dks = await drafted
-  st.specTests = await specs
   const pool = [...every, ...dks]
   let snapped = null
   if (st.kind === 'code' && !f) {
@@ -1668,7 +1712,29 @@ async function runSubtask(st, deps, opts = {}) {
     return fails.length ? { ...x, mismatches: (x.mismatches || 0) + fails.length, specFails: fails.length,
       evidence: [x.evidence, ...fails.map(l => l.replace(/^SPEC FAIL /, 'agreed spec case fails: '))].filter(Boolean).join('\n') } : x
   }
-  let d = await withSpec(await decide(pool))
+  // Spec tests refine a decision; they never hold one up. The picker decides at once on the
+  // docstring examples and the solvers' tests, the decision goes into the project, and when the
+  // agreed cases arrive - before the budget is spent - it decides again with them. Measured
+  // (d17 he10 a7, after a9298ff): every decision waited on ~37 queued writers and judges, none
+  // was made by the hard stop, the ten picks finished one second after the graph sealed, and an
+  // unmeasured assembler wrote every function by hand into a file that no longer imported - 0.0.
+  const already = await Promise.race([specs, sleep(0).then(() => null)])
+  let d
+  if (already !== null || !byScript) {
+    st.specTests = already || await specs
+    d = await withSpec(await decide(pool))
+  } else {
+    st.specTests = []
+    d = await decide(pool)
+    if (d && st.kind === 'code' && !sealed) {
+      provisional[st.n] = { st, ...d, solved: Object.keys(replies).length, drafts: dks.length, check: 'decided before its spec tests' }
+      checkpoint()
+    }
+    const arrived = await Promise.race([specs, lateStop.then(() => null), hardStop.then(() => null)])
+    st.specTests = arrived || []
+    if (arrived && arrived.length && !hard) d = (await withSpec(await decide(pool))) || d
+    else if (!arrived) log(`subtask ${st.n}: decided without its spec tests - they were not ready when the budget ran out`)
+  }
   const nReplied = () => Object.keys(replies).length
   if (!d) return { st, result: '', why: 'no solver returned a result', solved: nReplied(), drafts: dks.length }
   // Up to two rounds of readings while the best candidate breaks an example - and no checker
@@ -2140,6 +2206,14 @@ const solving = (async () => {
   }
 })()
 await Promise.race([solving, hardStop])
+// Decisions already being made land before the seal: a pick is an exact command that takes
+// seconds, and one that finished just after the hard stop used to be thrown away. Measured
+// (d17 he10 a7): ten picks finished one second after sealing; (d17 he10 a5) the decided
+// order_by_points arrived after it and a stub stayed in place.
+if (hard) {
+  const grace = Math.max(0, Math.min(60000, END_MS - CLOSE_MS / 2 - (TOTAL_MS - CLOSE_MS)))
+  await Promise.race([solving, sleep(grace)])
+}
 sealed = true
 for (const st of plan.subtasks) if (!hasResult(st) && provisional[st.n] && provisional[st.n].result) done[st.n] = provisional[st.n]
 
@@ -2288,6 +2362,13 @@ const codeOnly = changeNs.length > 0 && !failedChanges.length && restoreOk && al
 // exact command, and the ones that are not are listed for the main loop. Measured (arithmetic):
 // an assembler with the writer's 1620 s after a late hard stop ran past the 7200 s kill.
 const skipWriter = hard && allCode && changeNs.length > 0
+// The assembler writes by hand, unmeasured: the project as the runtime put it in place is kept,
+// and a Python file the assembler leaves unparseable goes back to it. Measured (d17 he10 a7): the
+// assembler replaced every stub with one function's body, indented too far, and the module
+// never imported again - every check failed on an IndentationError.
+const writerRuns = !sectionMode && !codeOnly && !skipWriter && !ended
+const preWriter = `${SCRATCH}/pre-writer`
+if (writerRuns) await runExactly('pre-writer', `rm -rf ${q(preWriter)} && mkdir -p ${q(preWriter)} && rsync -a --exclude .git --exclude __pycache__ ${q(CWD)}/ ${q(preWriter)}/ && echo saved`, 'Assemble')
 const assembled = sectionMode ? `## Written\n- \`${deliverables[0]}\` - ${sectionsWritten.filter(Boolean).length} of ${plan.subtasks.length} sections`
   : codeOnly || skipWriter ? `## Written\n${applied}${failedChanges.length ? `\n\n**Not in place - make these by hand:** ${failedChanges.map(n => `subtask ${n}`).join(', ')}` : ''}`
   : ended ? null
@@ -2302,6 +2383,15 @@ const assembled = sectionMode ? `## Written\n- \`${deliverables[0]}\` - ${sectio
   '## Checklist - every item must end up in a deliverable, exactly as written', CHECKLIST, '',
   '## Merged results', RESULTS,
 ]), 'assemble', 'Assemble', null, { wait: true, deadline: hard ? Math.round(CLOSE_MS / 3) : undefined })
+
+// Run after the assembler returns, and again at the end: an assembler cut off at its deadline
+// keeps editing, and its last edits land after the first run.
+async function writerGuard(label) {
+  const guard = await runExactly(`writer-guard${label}`, `python3 - ${q(preWriter)} ${q(CWD)} <<'PY'\nimport ast,os,shutil,sys\npre,cwd=sys.argv[1:3]\ndef ok(p):\n    try: ast.parse(open(p,encoding='utf-8').read()); return True\n    except Exception: return False\nfor dp,dn,fs in os.walk(cwd):\n    dn[:]=[d for d in dn if d not in ('.git','__pycache__','node_modules','.venv','venv')]\n    for f in fs:\n        if not f.endswith('.py'): continue\n        p=os.path.join(dp,f); rel=os.path.relpath(p,cwd); b=os.path.join(pre,rel)\n        if os.path.exists(b) and ok(b) and not ok(p): shutil.copy2(b,p); print('RESTORED',rel)\nprint('guard done')\nPY`, 'Assemble') || ''
+  const restored = String(guard).match(/^RESTORED .*$/gm) || []
+  if (restored.length) log(`assemble: the assembler left ${restored.length} Python file(s) unparseable - put back as the runtime had them: ${restored.map(l => l.slice(9)).join(', ')}`)
+}
+if (writerRuns) await writerGuard('')
 
 // Text deliverables in plain characters: hyphens, spaces and brackets as typed on a keyboard.
 // Measured: mergers wrote `GST‑registered` and `355‑30` with non-breaking hyphens, and cited
@@ -2474,6 +2564,7 @@ let settledLine = null
     if (same.length) settledLine = `**Settled - do not edit:** ${same.join(', ')}. Each was measured - its docstring examples or two agreeing candidates - passed its check, and is still the chosen version; a test you write that disagrees with one is more likely wrong than the function. Never edit a docstring.`
   }
 }
+if (writerRuns && !ended) await writerGuard('-end')
 for (const t of timers) clearTimeout(t)
 
 const missing = plan.subtasks.filter(st => !hasResult(st))
