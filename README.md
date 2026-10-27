@@ -229,6 +229,27 @@ restart the session — in VS Code, reload the window — or the row will not ap
 Then run `/model`: **Agentaus (Trellis Data)** sits below Opus, Sonnet and Haiku. Claude
 Code skips validation on that model id, so any string the bridge understands works.
 
+### Keeping the picker current as Anthropic adds and retires models
+
+Nothing here names a Claude model, so nothing goes stale. The picker's Opus, Sonnet, Haiku
+and Fable rows are aliases that always mean Anthropic's newest model of each family, and the
+bridge forwards every Claude request to Anthropic unchanged.
+
+For explicit, versioned rows as well, add `"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"`
+to the same `env` block (this repo's own `.claude/settings.json` does). At startup Claude
+Code then asks the bridge for `GET /v1/models`, and the bridge answers with **Anthropic's own
+list, fetched live with your credentials**, plus Agentaus - so the picker follows Anthropic
+with no change to the bridge. Its details:
+
+- Claude Code keeps only ids containing `claude` or `anthropic`, so Agentaus still comes from
+  `ANTHROPIC_CUSTOM_MODEL_OPTION`; keep that variable.
+- Claude Code sends credentials on that request only from `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN` or an `apiKeyHelper`. With a claude.ai subscription login and none
+  of those, the bridge has nothing to ask Anthropic with and serves only Agentaus, so the
+  picker shows its usual alias rows - nothing breaks.
+- Claude Code waits 3 s; the bridge gives Anthropic 2.5 s and otherwise serves the last list
+  it fetched, and Claude Code falls back to its own cache or built-in list on any failure.
+
 ### Why the launcher does *not* set `ANTHROPIC_AUTH_TOKEN`
 
 Setting a gateway credential replaces your claude.ai subscription login for the whole

@@ -225,24 +225,81 @@ async def healthz_upstream() -> JSONResponse:
                          "flights": flight.running(), "source_hash": _SOURCE_HASH})
 
 
-@app.get("/v1/models")
-async def list_models() -> JSONResponse:
-    """Served for completeness. Note Claude Code's gateway model discovery only keeps
-    ids containing "claude" or "anthropic", so use ANTHROPIC_CUSTOM_MODEL_OPTION to put
-    Agentaus in the /model picker instead of relying on discovery."""
-    return JSONResponse(
-        {
-            "data": [
-                {
-                    "id": "agentaus",
-                    "display_name": "Agentaus (Trellis Data)",
-                    "type": "model",
-                    "created_at": "2026-05-01T00:00:00Z",
-                }
-            ],
-            "has_more": False,
-        }
+# Claude Code's model picker, when CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1, asks the gateway
+# for GET /v1/models?limit=1000 at startup, waits 3 s, keeps ids containing "claude" or
+# "anthropic", and falls back to its cache or built-in list on any failure or redirect. The
+# bridge answers with Anthropic's own list, live, fetched with the caller's credentials - so the
+# picker follows every model Anthropic adds or retires with no change here - plus Agentaus.
+# Agentaus's id holds neither word, so the picker drops it: ANTHROPIC_CUSTOM_MODEL_OPTION is what
+# puts it in the picker, and the entry here serves any other client that lists models.
+AGENTAUS_MODEL = {
+    "id": "agentaus",
+    "type": "model",
+    "display_name": "Agentaus (Trellis Data)",
+    "description": "Sovereign Australian model via the local Agentaus bridge",
+    "created_at": "2026-05-01T00:00:00Z",
+}
+# Inside the picker's 3 s, with room for the bridge's own work.
+_MODELS_TIMEOUT_S = 2.5
+# The last list Anthropic returned, served when it cannot be reached in time.
+_MODELS_LAST: dict = {"data": None}
+
+
+async def _anthropic_models(request: Request) -> list | None:
+    """Anthropic's model list for this caller, or None when it cannot be had in time.
+
+    One attempt, no retries: the picker stops waiting at 3 s. Only a caller that sent
+    credentials is asked about - the bridge holds none of its own for Anthropic.
+    """
+    if not settings.passthrough_enabled:
+        return None
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in _STRIP_REQUEST_HEADERS}
+    if not any(k.lower() in ("x-api-key", "authorization") for k in headers):
+        return None
+    headers.setdefault("anthropic-version", "2023-06-01")
+    # The whole list, whatever page size the caller asked for: what is kept for the next caller
+    # must not be one caller's partial page.
+    url = f"{settings.anthropic_base_url}/v1/models?limit=1000"
+    client: httpx.AsyncClient = (
+        getattr(request.app.state, "anthropic_client", None) or request.app.state.client
     )
+    try:
+        # One bound on the whole call: httpx's timeout bounds each phase (connect, write, read)
+        # separately, and together they could run past the picker's 3 s.
+        response = await asyncio.wait_for(client.get(url, headers=headers, timeout=_MODELS_TIMEOUT_S),
+                                          _MODELS_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001 - the list must never fail: a bad header, a timeout, a refusal
+        rlog(logging.INFO, "model list: Anthropic not reached in time (%s)", type(exc).__name__)
+        return None
+    if response.status_code != 200:
+        rlog(logging.INFO, "model list: Anthropic answered HTTP %s", response.status_code)
+        return None
+    try:
+        data = response.json().get("data")
+    except (ValueError, AttributeError):
+        return None
+    models = [m for m in data or [] if isinstance(m, dict) and m.get("id")]
+    return models or None
+
+
+@app.get("/v1/models")
+async def list_models(request: Request) -> JSONResponse:
+    """Anthropic's current models, live where it can be reached, plus Agentaus."""
+    live = await _anthropic_models(request)
+    if live is not None:
+        _MODELS_LAST["data"] = live
+    models = list(live if live is not None else _MODELS_LAST["data"] or [])
+    if not any(m.get("id") == AGENTAUS_MODEL["id"] for m in models):
+        models.append(dict(AGENTAUS_MODEL))
+    rlog(logging.INFO, "model list: %d model(s) served (%s)", len(models),
+             "live from Anthropic" if live is not None
+             else "Anthropic's last list" if _MODELS_LAST["data"] else "Agentaus only")
+    return JSONResponse({
+        "data": models,
+        "has_more": False,
+        "first_id": models[0]["id"],
+        "last_id": models[-1]["id"],
+    })
 
 
 # --------------------------------------------------------------------------------------
