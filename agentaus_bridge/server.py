@@ -362,6 +362,17 @@ def _route(request: Request, body: dict, model: str, *, main_loop: bool) -> tupl
     return by_model, False
 
 
+def _to_gemini(request: Request, body: dict, model: str) -> bool:
+    """A gemini-* id goes to Gemini - except a subagent of a session whose main loop is on
+    Agentaus, which stays with its session there, whatever model it names."""
+    if not settings.routes_to_gemini(model):
+        return False
+    if (settings.agentaus_subagents_follow_session and sessions.is_subagent(request.headers, body)
+            and sessions.main_loop_on_agentaus(sessions.session_of(request.headers))):
+        return False
+    return True
+
+
 @app.post("/v1/messages")
 async def messages(request: Request) -> Response:
     if not _client_authorised(request):
@@ -377,7 +388,7 @@ async def messages(request: Request) -> Response:
     wants_stream = bool(body.get("stream"))
     _request_id.set(_new_request_id())
 
-    if settings.routes_to_gemini(model):
+    if _to_gemini(request, body, model):
         rlog(logging.INFO, "recv model=%s route=gemini stream=%s msgs=%d est=%d bytes=%d",
              model, wants_stream, len(body.get("messages") or []),
              estimate_request_tokens(body), len(raw))
@@ -417,7 +428,7 @@ async def count_tokens(request: Request) -> Response:
     except json.JSONDecodeError:
         body = {}
     model = body.get("model") or ""
-    if settings.routes_to_gemini(model):
+    if _to_gemini(request, body, model):
         # Gemini's countTokens takes its own request shape; the estimate only feeds Claude
         # Code's context meter, as it does for Agentaus.
         return JSONResponse({"input_tokens": estimate_request_tokens(body)})

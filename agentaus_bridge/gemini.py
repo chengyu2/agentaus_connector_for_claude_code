@@ -51,6 +51,10 @@ DUMMY_SIGNATURE = "skip_thought_signature_validator"
 # bridge only rides out a short spike.
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
 _RETRY_DELAYS_S = (2.0, 5.0)
+# A 429 is a per-minute quota (measured: Tier 1's 2M input tokens a minute, hit by ~430k-token
+# turns a few seconds apart), so it waits longer - Google's own retryDelay when it gives one.
+_QUOTA_DELAYS_S = (5.0, 15.0)
+_MAX_QUOTA_WAIT_S = 30.0
 
 # Anthropic's tool_use id pattern. Gemini's own ids ("call_5874...") already fit.
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -178,20 +182,40 @@ def _effort(body: dict) -> str | None:
     return _EFFORTS.get(wanted)
 
 
+def _reminders(notes: list[str]) -> list[str]:
+    return [f"<system-reminder>\n{note}\n</system-reminder>" for note in notes]
+
+
 def to_openai(body: dict, model: str, *, stream: bool, max_output: int) -> dict:
     """One Anthropic /v1/messages body as a Gemini chat-completions body."""
     messages: list[dict] = []
-    system = "\n\n".join(
-        t for t in [_system_to_text(body.get("system"))] + system_notes(body) if t)
+    source = body.get("messages") or []
+    # Notes Claude Code sends before the first answer join the system prompt. Later ones stay
+    # where they arrived, on the next user message: moved to the top, a new note changes the
+    # start of every request, and Gemini's implicit cache only reuses an unchanged start.
+    # Measured: the first mid-conversation note cost a full-price turn of ~430k tokens.
+    first_answer = next(
+        (i for i, m in enumerate(source) if m.get("role") == "assistant"), len(source))
+    early = system_notes({"messages": source[:first_answer]})
+    system = "\n\n".join(t for t in [_system_to_text(body.get("system"))] + early if t)
     if system:
         messages.append({"role": "system", "content": system})
 
-    for message in body.get("messages") or []:
+    pending: list[str] = []             # later notes, waiting for the next user message
+    for index, message in enumerate(source):
         role = message.get("role", "user")
         content = message.get("content")
         if role == "system":
-            continue                    # joined to the system prompt above
+            if index > first_answer:
+                pending.extend(system_notes({"messages": [message]}))
+            continue
+        if role == "assistant" and pending:
+            messages.append({"role": "user", "content": "\n".join(_reminders(pending))})
+            pending = []
         if isinstance(content, str):
+            if role == "user" and pending:
+                content = "\n".join(_reminders(pending) + [content])
+                pending = []
             if content.strip():
                 messages.append({"role": role, "content": content})
             continue
@@ -241,9 +265,14 @@ def to_openai(body: dict, model: str, *, stream: bool, max_output: int) -> dict:
                              "content": text})
         if result_images:
             texts = ["Images returned by the tool calls above:"] + texts
+        if pending:
+            texts = _reminders(pending) + texts
+            pending = []
         user = _user_content(texts, result_images + images)
         if user:
             messages.append({"role": "user", "content": user})
+    if pending:
+        messages.append({"role": "user", "content": "\n".join(_reminders(pending))})
 
     payload: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
     if stream:
@@ -270,10 +299,27 @@ def to_openai(body: dict, model: str, *, stream: bool, max_output: int) -> dict:
 # Gemini -> Claude Code
 # --------------------------------------------------------------------------------------
 
+def _cached(usage: dict | None) -> int:
+    """Input tokens Gemini's implicit cache served, at a tenth of the price. Measured: the
+    OpenAI-compatible endpoint reports them as prompt_tokens_details.cached_tokens."""
+    return int(((usage or {}).get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+
+
 def _usage(usage: dict | None) -> dict:
+    """Anthropic usage: input_tokens excludes what the cache served, as Claude's API does."""
     usage = usage or {}
-    return {"input_tokens": int(usage.get("prompt_tokens") or 0),
+    cached = _cached(usage)
+    return {"input_tokens": max(int(usage.get("prompt_tokens") or 0) - cached, 0),
+            "cache_read_input_tokens": cached,
             "output_tokens": int(usage.get("completion_tokens") or 0)}
+
+
+def usage_line(usage: dict | None) -> str:
+    """in, cached, out and thinking tokens for the log, so a run's cost can be read off it."""
+    usage = usage or {}
+    thinking = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+    return (f"in={usage.get('prompt_tokens')} cached={_cached(usage)} "
+            f"out={usage.get('completion_tokens')} thinking={thinking if thinking is not None else '-'}")
 
 
 def to_anthropic(data: dict, model: str) -> dict:
@@ -319,15 +365,37 @@ def _error_message(text: str) -> str:
     return (text or "").strip()[:800]
 
 
+def _retry_hint(text: str) -> float | None:
+    """Seconds Google asks a client to wait: a RetryInfo retryDelay ("28s") in the error's
+    details, or "retry in 28.3s" in its message. None when it names no wait."""
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        data = None
+    if isinstance(data, list) and data:
+        data = data[0]
+    error = data.get("error") if isinstance(data, dict) else None
+    for detail in (error or {}).get("details") or [] if isinstance(error, dict) else []:
+        delay = detail.get("retryDelay") if isinstance(detail, dict) else None
+        found = re.fullmatch(r"\s*([\d.]+)s\s*", str(delay or ""))
+        if found:
+            return float(found.group(1))
+    found = re.search(r"retry in ([\d.]+)\s*s", _error_message(text), re.I)
+    return float(found.group(1)) if found else None
+
+
 def error_response(status: int, text: str) -> JSONResponse:
     message = _error_message(text)
     # Claude Code compacts on "prompt is too long"; Gemini says the input "exceeds" its limit.
     if status == 400 and "token" in message.lower() and "exceed" in message.lower():
         message = f"prompt is too long: {message}"
+    hint = _retry_hint(text) if status in _RETRY_STATUSES else None
     return JSONResponse(
         {"type": "error", "error": {"type": _ERROR_TYPES.get(status, "api_error"),
                                     "message": f"Gemini error: {message}"}},
         status_code=status,
+        # Claude Code's client waits this long before its own retry.
+        headers={"retry-after": str(max(1, round(hint)))} if hint else None,
     )
 
 
@@ -399,8 +467,7 @@ async def _relay(response: httpx.Response, builder: AnthropicStreamBuilder,
         call_id = _tool_id(call["id"])
         remember_signature(call_id, call["signature"])
         yield builder.tool_use(call_id, call["name"], call["arguments"] or "{}")
-    rlog(logging.INFO, "gemini done finish=%s tools=%d in=%s out=%s", finish, len(calls),
-         usage.get("prompt_tokens"), usage.get("completion_tokens"))
+    rlog(logging.INFO, "gemini done finish=%s tools=%d %s", finish, len(calls), usage_line(usage))
     yield builder.finish("tool_calls" if calls else finish or "stop",
                          {"output_tokens": usage.get("completion_tokens")})
 
@@ -486,6 +553,7 @@ async def _send(client: httpx.AsyncClient, payload: dict, stream: bool,
     body = json.dumps(payload)
     for attempt in range(len(_RETRY_DELAYS_S) + 1):
         last = attempt == len(_RETRY_DELAYS_S)
+        delay = _RETRY_DELAYS_S[min(attempt, len(_RETRY_DELAYS_S) - 1)]
         try:
             response = await client.send(
                 client.build_request("POST", url, headers=headers, content=body), stream=stream)
@@ -497,10 +565,16 @@ async def _send(client: httpx.AsyncClient, payload: dict, stream: bool,
             if response.status_code not in _RETRY_STATUSES or last:
                 return response
             await response.aread()
+            if response.status_code == 429:
+                hint = _retry_hint(response.text)
+                if hint is not None and hint > _MAX_QUOTA_WAIT_S:
+                    # Longer than a turn should hang: hand it to Claude Code with retry-after.
+                    return response
+                delay = hint if hint is not None else _QUOTA_DELAYS_S[attempt]
             await response.aclose()
-            rlog(logging.WARNING, "gemini answered HTTP %d (%s), retrying", response.status_code,
-                 _error_message(response.text)[:200])
-        await asyncio.sleep(_RETRY_DELAYS_S[attempt])
+            rlog(logging.WARNING, "gemini answered HTTP %d (%s), retrying in %.0fs",
+                 response.status_code, _error_message(response.text)[:200], delay)
+        await asyncio.sleep(delay)
     raise RuntimeError("unreachable")
 
 
@@ -532,9 +606,10 @@ async def handle(request: Request, body: dict, model: str, wants_stream: bool,
         return error_response(response.status_code, text)
 
     if not wants_stream:
-        message = to_anthropic(response.json(), model)
-        rlog(logging.INFO, "gemini done stop=%s out=%s", message["stop_reason"],
-             message["usage"]["output_tokens"])
+        data = response.json()
+        message = to_anthropic(data, model)
+        rlog(logging.INFO, "gemini done stop=%s %s", message["stop_reason"],
+             usage_line(data.get("usage")))
         return JSONResponse(message)
 
     builder = AnthropicStreamBuilder(model, input_tokens=estimate_request_tokens(body),

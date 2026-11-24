@@ -519,8 +519,27 @@ Three things the bridge handles for it, all measured against the live API:
 - **Model lookups.** Before switching to an id it does not know, Claude Code asks
   `GET /v1/models/{id}` and refuses the model on anything but a 200. The bridge checks the
   id with Google, so a typo is still refused.
-- **Overload.** `503 high demand` is common; the bridge retries twice before passing it
-  on, and Claude Code retries after that.
+- **Overload and quota.** `503 high demand` is common; the bridge retries twice before
+  passing it on, and Claude Code retries after that. A `429` is Gemini's per-minute quota
+  (Tier 1 allows 2M input tokens a minute, which a few 400k-token turns use up), so the
+  bridge waits as long as Google asks, up to 30 s, and hands anything longer to Claude Code
+  with a `retry-after` header.
+
+**What a Gemini session costs.** Gemini bills every input token on every turn, and Claude
+Code resends the whole conversation each time, so the size of the conversation, not the
+reasoning, is the bill: a 15-turn run on a 430k-token conversation sent 6.6M input tokens
+and under 10k output. Gemini's implicit cache charges a tenth for an unchanged start of the
+request; the bridge keeps that start stable (notes Claude Code adds mid-conversation stay
+where they arrived) and logs `cached=` and `thinking=` on every `gemini done` line, so the
+split can be read off the log. In practice:
+
+- Start Gemini work in a fresh session, with a short handoff note, rather than switching a
+  long Agentaus or Claude conversation onto it. The first Gemini turn after a switch is
+  never cached, and every later turn carries the whole history.
+- Keep the effort setting where it is. Thinking is billed as output, which was a few cents
+  of that run; lowering it costs quality and saves almost nothing.
+- Gemini 3.8 Flash and 3.6 Flash cost the same, so use 3.8 Flash. Gemini 4 Hydrogen costs
+  twice as much.
 
 A subagent started from a Gemini session runs on Claude Code's default Claude model, as
 Agentaus sessions did before the bridge made them follow their session. Settings:

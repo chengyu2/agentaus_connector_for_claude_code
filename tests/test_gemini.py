@@ -89,15 +89,18 @@ class Gemini(unittest.TestCase):
         STATE.update({"seen": [], "replies": []})
         gemini._SIGNATURES.clear()
         gemini._OUTPUT_LIMITS.clear()
-        self._saved = (settings.gemini_api_key, settings.gemini_base_url, gemini._RETRY_DELAYS_S)
+        self._saved = (settings.gemini_api_key, settings.gemini_base_url, gemini._RETRY_DELAYS_S,
+                       gemini._QUOTA_DELAYS_S)
         settings.gemini_api_key = "test-key"
         settings.gemini_base_url = stub_server.url(self.server)
         gemini._RETRY_DELAYS_S = (0.0, 0.0)
+        gemini._QUOTA_DELAYS_S = (0.0, 0.0)
 
     def tearDown(self) -> None:
         from agentaus_bridge import gemini
         from agentaus_bridge.config import settings
-        settings.gemini_api_key, settings.gemini_base_url, gemini._RETRY_DELAYS_S = self._saved
+        (settings.gemini_api_key, settings.gemini_base_url, gemini._RETRY_DELAYS_S,
+         gemini._QUOTA_DELAYS_S) = self._saved
 
     def post(self, body: dict, path: str = "/v1/messages"):
         from agentaus_bridge import server
@@ -192,7 +195,71 @@ class Gemini(unittest.TestCase):
         response = self.post({"model": "gemini-3.8-flash", "max_tokens": 100,
                               "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["usage"], {"input_tokens": 5, "output_tokens": 1})
+        self.assertEqual(response.json()["usage"],
+                         {"input_tokens": 5, "cache_read_input_tokens": 0, "output_tokens": 1})
+
+    def test_a_note_that_arrives_mid_conversation_leaves_the_start_of_the_request_alone(self):
+        from agentaus_bridge import gemini
+        turn = [{"role": "system", "content": "env: cwd is /repo"},
+                {"role": "user", "content": "Fix the bug."},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_1", "name": "Read", "input": {"file_path": "a"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "x = 1"}]}]
+        later = turn + [
+            {"role": "assistant", "content": [{"type": "text", "text": "Found it."}]},
+            {"role": "system", "content": "A new MCP server connected."},
+            {"role": "user", "content": "Go on."}]
+        first = gemini.to_openai({"system": "Be brief.", "messages": turn}, "gemini-4-hydrogen",
+                                 stream=False, max_output=100)["messages"]
+        second = gemini.to_openai({"system": "Be brief.", "messages": later}, "gemini-4-hydrogen",
+                                  stream=False, max_output=100)["messages"]
+        # Gemini's implicit cache reuses an unchanged start: the earlier request is a prefix.
+        self.assertEqual(second[:len(first)], first)
+        self.assertEqual(first[0], {"role": "system", "content": "Be brief.\n\nenv: cwd is /repo"})
+        self.assertEqual(second[-1]["content"],
+                         "<system-reminder>\nA new MCP server connected.\n</system-reminder>\nGo on.")
+
+    def test_cache_hits_are_reported_the_way_claudes_api_reports_them(self):
+        from agentaus_bridge import gemini
+        usage = {"prompt_tokens": 1000, "completion_tokens": 5,
+                 "prompt_tokens_details": {"cached_tokens": 900},
+                 "completion_tokens_details": {"reasoning_tokens": 40}}
+        STATE["replies"] = [(200, {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                                   "usage": usage})]
+        response = self.post({"model": "gemini-3.8-flash", "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(response.json()["usage"], {"input_tokens": 100, "cache_read_input_tokens": 900,
+                                                    "output_tokens": 5})
+        self.assertEqual(gemini.usage_line(usage), "in=1000 cached=900 out=5 thinking=40")
+
+    def test_a_quota_429_waits_as_long_as_google_asks_and_passes_a_long_wait_on(self):
+        quota = [{"error": {"code": 429, "message": "You exceeded your current quota.", "status": "RESOURCE_EXHAUSTED",
+                            "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "0.01s"}]}}]
+        STATE["replies"] = [(429, quota), (200, {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})]
+        body = {"model": "gemini-3.8-flash", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]}
+        self.assertEqual(self.post(body).status_code, 200)
+        self.assertEqual(len(STATE["seen"]), 2)
+
+        long_wait = [{"error": {"code": 429, "message": "Quota exceeded. Please retry in 45.2s.",
+                                "status": "RESOURCE_EXHAUSTED"}}]
+        STATE.update({"seen": [], "replies": [(429, long_wait)]})
+        response = self.post(body)
+        # Not held for 45 s: handed straight to Claude Code, told how long to wait.
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.headers["retry-after"], "45")
+        self.assertEqual(response.json()["error"]["type"], "rate_limit_error")
+        self.assertEqual(len(STATE["seen"]), 1)
+
+    def test_a_subagent_of_an_agentaus_session_stays_on_agentaus(self):
+        from types import SimpleNamespace
+        from agentaus_bridge import server, sessions
+        sessions.note_main_loop("sess-1", True)
+        body = {"model": "gemini-4-hydrogen", "messages": [{"role": "user", "content": "hi"}]}
+        subagent = SimpleNamespace(headers={"x-claude-code-session-id": "sess-1",
+                                            "x-claude-code-agent-id": "agent-1"})
+        main_loop = SimpleNamespace(headers={"x-claude-code-session-id": "sess-1"})
+        self.assertFalse(server._to_gemini(subagent, body, "gemini-4-hydrogen"))
+        self.assertTrue(server._to_gemini(main_loop, body, "gemini-4-hydrogen"))
 
     def test_without_a_key_the_turn_says_how_to_fix_it(self):
         from agentaus_bridge.config import settings
