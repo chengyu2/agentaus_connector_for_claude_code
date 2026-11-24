@@ -50,6 +50,9 @@ from .augment import (
     CLASSIFY_REFUSAL_INSTRUCTION,
     GROUNDING_INSTRUCTION,
     STRIP_UNGROUNDED_INSTRUCTION,
+    MISSING_DELIVERABLES_CORRECTION,
+    announces_a_step,
+    missing_deliverables,
     could_be_a_refusal,
     awaiting_background,
     early_deliverable_writes,
@@ -1830,14 +1833,25 @@ def _original_request(body: dict) -> str:
 # kept calling a finished turn stalled kept it going until the client's turn cap.
 # Observed: 76 re-asks in one benchmark run, and a session that had finished its task
 # pushed into writing notes into the user's Claude memory folder.
-_STALL_REASKS: "OrderedDict[str, tuple[int, int]]" = OrderedDict()
+_STALL_REASKS: "OrderedDict[str, tuple[int, int, str, int]]" = OrderedDict()
 _STALL_REASK_LIMIT = 2
 # The budget refills once the model has made this many tool calls since its last re-ask.
 # A lifetime budget of two was spent in the first minutes of a long ultracode session,
 # and its last reply - "We will apply multiple Edit calls." - ended the run with the bug
 # fixes unwritten. Calls made since the re-ask are progress; a model that keeps stopping
-# without making any still runs out after two.
-_STALL_PROGRESS_CALLS = 3
+# without making any still runs out after two. Measured (influenca, devine): a model that
+# announced every step ("Let me look at what's inside the uv tools dir.") took each one
+# when re-asked - one call per re-ask - and a refill at three calls forwarded its third
+# announcement as the answer. One call is progress.
+_STALL_PROGRESS_CALLS = 1
+# However much progress, at most this many re-asks per message the user types: the bound
+# on a judge that keeps calling a finished turn stalled. Something new the user says starts
+# a fresh budget - the summary-keyed budget alone was spent for the whole session.
+_STALL_REASKS_PER_MESSAGE = 8
+# A reply that plainly announces its next step is no judgement call, so it may be sent back
+# this often per message - still only after a tool call each time, so a model that never
+# acts runs out after two.
+_STALL_ANNOUNCED_PER_MESSAGE = 40
 
 
 def _stall_key(body: dict) -> str:
@@ -1851,15 +1865,33 @@ def _tool_calls_made(body: dict) -> int:
                for b in m["content"] if isinstance(b, dict) and b.get("type") == "tool_use")
 
 
-def _may_reask_stalled(body: dict) -> bool:
+def _may_reask_stalled(body: dict, *, announced: bool = False) -> bool:
+    """Whether a reply judged stalled may be sent back, charging the budget if so.
+
+    Two counters per conversation, both reset by a new message from the user:
+
+    - `used`: re-asks since the model last made progress. Any tool call since the last
+      re-ask resets it, and at `_STALL_REASK_LIMIT` (2) no more are sent. This is what bounds
+      a misfire: a finished answer wrongly re-asked gets no tool call back, so it costs two
+      re-asks at most, whatever the per-message cap.
+    - `total`: re-asks for this user message, capped at `_STALL_REASKS_PER_MESSAGE` (judged
+      by the model) or `_STALL_ANNOUNCED_PER_MESSAGE` (`announced`: a reply that plainly
+      says what it does next, or ends without the files the request names). Only a model
+      that keeps making progress between re-asks reaches these caps - a long task can
+      announce every one of its steps.
+    """
     key = _stall_key(body)
     calls = _tool_calls_made(body)
-    used, at = _STALL_REASKS.get(key, (0, calls))
-    if calls - at >= _STALL_PROGRESS_CALLS:
+    said = _last_user_text(body)
+    used, at, before, total = _STALL_REASKS.get(key, (0, calls, said, 0))
+    if said != before:
+        used, total = 0, 0
+    elif calls - at >= _STALL_PROGRESS_CALLS:
         used = 0
-    if used >= _STALL_REASK_LIMIT:
+    cap = _STALL_ANNOUNCED_PER_MESSAGE if announced else _STALL_REASKS_PER_MESSAGE
+    if used >= _STALL_REASK_LIMIT or total >= cap:
         return False
-    _STALL_REASKS[key] = (used + 1, calls)
+    _STALL_REASKS[key] = (used + 1, calls, said, total + 1)
     _STALL_REASKS.move_to_end(key)
     while len(_STALL_REASKS) > 512:
         _STALL_REASKS.popitem(last=False)
@@ -3442,6 +3474,11 @@ async def _agentaus_event_stream(
         answer_so_far = "".join(pending)
         is_refusal = False
         turn_verdict = "answer"
+        # Files the user's request says to write that are still not on disk. A main loop
+        # only: a graph agent's prompt names files the graph writes itself.
+        missing = [] if (mine or theirs or not known or is_subagent_turn(original)
+                         or awaiting_background(original)) else missing_deliverables(
+            _last_user_text(received), working_directory_of(received))
         if (
             corrections < settings.agentaus_correction_rounds
             # Started in the background and said so: the right reply, not a stall.
@@ -3451,6 +3488,21 @@ async def _agentaus_event_stream(
                 tools_offered=bool(known),
                 called_a_tool=bool(mine or theirs),
                 answers_an_image=has_unseen((original.get("messages") or [])[-1:]),
+            )
+        ) and (missing or announces_a_step(answer_so_far)):
+            # An announcement is a step not taken, whatever is missing: asking it for the
+            # files at that point pushed a model to write them before it had read anything.
+            if announces_a_step(answer_so_far):
+                missing = []
+            # It says what it will do next: a stall on its face, so no judge call to wait on.
+            turn_verdict = "stalled"
+        elif (
+            corrections < settings.agentaus_correction_rounds
+            and not awaiting_background(original)
+            and could_be_a_refusal(
+                answer_so_far,
+                tools_offered=bool(known),
+                called_a_tool=bool(mine or theirs),
             )
         ):
             async def classify() -> str:
@@ -3475,21 +3527,30 @@ async def _agentaus_event_stream(
                 rlog(logging.WARNING, "refusal check failed (%s); forwarding the answer",
                      exc)
 
-        if turn_verdict == "stalled" and not _may_reask_stalled(original):
-            rlog(logging.WARNING, "judged stalled again, but this conversation has used "
-                 "its %d re-asks; forwarding the reply", _STALL_REASK_LIMIT)
+        if turn_verdict == "stalled" and not _may_reask_stalled(
+                original, announced=bool(missing) or announces_a_step(answer_so_far)):
+            rlog(logging.WARNING, "judged stalled again, but the re-ask budget for this "
+                 "message is spent; forwarding the reply")
             turn_verdict = "answer"
         if is_refusal or turn_verdict == "stalled":
             corrections += 1
             if is_refusal:
                 rlog(logging.WARNING,
                      "model refused to use tools it has; correcting and re-asking")
+            elif missing:
+                rlog(logging.WARNING, "turn ended without the file(s) the request names "
+                     "(%s); asking for them", ", ".join(n for n, _ in missing))
             else:
                 rlog(logging.WARNING,
                      "model announced a step and stopped; asking it to take the step")
             yield progress("re-asking: the reply " + (
-                "declined to use its tools" if is_refusal else "announced a step it did not take"))
-            correction = (REFUSAL_CORRECTION if is_refusal else STALLED_CORRECTION).format()
+                "declined to use its tools" if is_refusal
+                else "left out the file(s) the request asks for" if missing
+                else "announced a step it did not take"))
+            correction = (REFUSAL_CORRECTION.format() if is_refusal
+                          else MISSING_DELIVERABLES_CORRECTION.format(files="\n".join(
+                              f"- `{name}` (looked for `{path}`)" for name, path in missing))
+                          if missing else STALLED_CORRECTION.format())
             payload = {**payload, "messages": list(payload.get("messages") or []) + [
                 {"role": "assistant", "content": "".join(pending)[:2000]},
                 {"role": "user", "content": correction},

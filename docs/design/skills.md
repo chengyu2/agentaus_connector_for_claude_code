@@ -105,7 +105,7 @@ it is already in the conversation.
 
 ## The bridge's own skill library
 
-`agentaus_bridge/skill_library/` holds skills adapted from Anthropic's Apache-2.0
+`agentaus_bridge/skill_library/` holds skills, most adapted from Anthropic's Apache-2.0
 plugins (attribution in its `NOTICE`), rewritten for this model in annotated Markdown:
 
 | Skill | Adapted from |
@@ -117,6 +117,7 @@ plugins (attribution in its `NOTICE`), rewritten for this model in annotated Mar
 | `git-commit-and-pr` | `commit-commands` |
 | `math-reasoning` | `math-olympiad`, refocused on everyday quantitative questions |
 | `skill-authoring` | `skill-creator` and `plugin-dev`, with a spec validator script |
+| `browser-download` | Written here (macOS): fetch a file behind the user's browser login, such as a private Google Sheet, through Safari, and answer the prompts the browser or website raises |
 
 Claude Code has never heard of them, so the bridge serves them itself
 (`AGENTAUS_SKILL_LIBRARY`, on by default). It adds them to the listing, after the project's
