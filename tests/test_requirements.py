@@ -51,6 +51,7 @@ class Missing(unittest.TestCase):
             ({"ID": "rocky", "ID_LIKE": "rhel centos fedora"}, "fedora"),
             ({"ID": "ubuntu", "ID_LIKE": "debian"}, "debian"),
             ({"ID": "debian"}, "debian"),
+            ({"ID": "rhel", "ID_LIKE": "centos"}, "fedora"),
         )
         for release, family in cases:
             with mock.patch.object(requirements, "MAC", False), \
@@ -66,6 +67,10 @@ class Missing(unittest.TestCase):
                 mock.patch.object(requirements.platform, "freedesktop_os_release", side_effect=OSError), \
                 mock.patch.object(requirements.shutil, "which", return_value=None):
             self.assertEqual(requirements._family(), "debian")
+        with mock.patch.object(requirements, "MAC", False), \
+                mock.patch.object(requirements.platform, "freedesktop_os_release", return_value={"ID": "unknownos"}), \
+                mock.patch.object(requirements.shutil, "which", side_effect=lambda n: "/usr/bin/dnf" if n == "dnf" else None):
+            self.assertEqual(requirements._family(), "fedora")
 
     def test_the_bridge_refuses_to_start_without_them(self):
         from agentaus_bridge.config import settings

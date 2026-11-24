@@ -23,7 +23,10 @@ if [[ "${INSTALL_DOCUMENT_READERS:-0}" == "1" ]]; then
     sudo apt-get update
     sudo apt-get install -y libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils tesseract-ocr
   elif command -v dnf >/dev/null; then
-    sudo dnf install -y libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils tesseract tesseract-langpack-eng
+    # The readers are optional: a repo without one of them (RHEL 10 dropped LibreOffice,
+    # EL9 keeps tesseract in EPEL) must not stop the virtualenv from being made.
+    sudo dnf install -y libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils tesseract tesseract-langpack-eng \
+      || echo "Some document readers could not be installed; the bridge will name what is missing." >&2
   else
     echo "Install LibreOffice, poppler (pdftotext, pdftoppm) and tesseract with your package manager." >&2
   fi

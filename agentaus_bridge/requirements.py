@@ -24,7 +24,7 @@ def _family() -> str:
         return "mac"
     try:
         release = platform.freedesktop_os_release()
-    except OSError:
+    except (OSError, ValueError):  # absent, or not UTF-8
         release = {}
     ids = {release.get("ID", "")} | set(release.get("ID_LIKE", "").split())
     if ids & {"fedora", "rhel", "centos"}:

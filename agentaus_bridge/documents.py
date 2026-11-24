@@ -131,6 +131,7 @@ def install_hint(path: str = "") -> str:
         "configuration:\n"
         "  macOS   brew install --cask libreoffice\n"
         "  Debian  sudo apt install libreoffice-writer libreoffice-calc\n"
+        "  Fedora  sudo dnf install libreoffice-writer libreoffice-calc\n"
         "  or set AGENTAUS_SOFFICE_PATH if it is installed somewhere unusual."
     )
 
