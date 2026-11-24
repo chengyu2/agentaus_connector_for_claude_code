@@ -1194,6 +1194,25 @@ def _recover_harmony_calls(data: dict) -> tuple:
 
     cleaned, calls = harmony.extract(text)
     message["content"] = cleaned or None
+    if calls:
+        # The calls must also go back into the response, not only out of it as dicts:
+        # `_with_coerced_calls` writes name and argument corrections into
+        # `message.tool_calls`, and the translator builds the client's tool_use blocks
+        # from it. A call left only in the dicts is dropped by both - and with the
+        # markup gone the answer reads as empty, so the empty-answer fallback replaced
+        # the turn the model had already spent on a tool call.
+        message["tool_calls"] = [
+            {
+                "id": call["id"],
+                "type": "function",
+                "function": {"name": call["name"], "arguments": call["arguments"]},
+            }
+            for call in calls
+        ]
+        # The turn ends in a tool call the client is to answer, whatever the prose
+        # finish_reason said. Bridge-owned calls run their rounds and re-answer; client
+        # calls reach the client with stop_reason tool_use.
+        choice["finish_reason"] = "tool_calls"
     choice["message"] = message
     return {**data, "choices": [choice] + choices[1:]}, calls
 
