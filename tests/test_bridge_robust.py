@@ -318,13 +318,15 @@ class Flights(_WithStub):
         self.assertEqual(len(stub.calls), 1)
 
     def test_a_buffered_fallback_joins_the_stream_it_replaces(self):
-        stub = self.stub(lambda p: (200, 0.5, "42"))
+        # The buffered fallback arrives 0.4 s into a 1.5 s turn, so the stream's flight is
+        # registered by then and the turn is still running.
+        stub = self.stub(lambda p: (200, 1.5, "42"))
 
         async def go():
             async with self.asgi() as c:
                 streamed = asyncio.ensure_future(
                     c.post("/v1/messages", json={**self.BODY, "stream": True}))
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(0.4)
                 buffered = await c.post("/v1/messages", json={**self.BODY, "stream": False})
                 streamed = await streamed
                 await server.app.state.client.aclose()
@@ -338,13 +340,16 @@ class Flights(_WithStub):
         self.assertIn("42", streamed.text)
 
     def test_a_buffered_client_is_told_to_retry_at_the_deadline_and_the_retry_joins(self):
-        # The turn takes 0.4 s: the first client gives up at 0.25 s, the retry joins and gets it.
-        stub = self.stub(lambda p: (200, 0.4, "42"))
+        # The turn takes 1.5 s: the first client gives up at 0.25 s, the retry joins and gets it.
+        # The retry waits up to 30 s, so a slow runner can't make it time out as well; each
+        # request reads the deadline when it arrives.
+        stub = self.stub(lambda p: (200, 1.5, "42"))
         settings.nonstream_deadline_seconds = 0.25
 
         async def go():
             async with self.asgi() as c:
                 first = await c.post("/v1/messages", json={**self.BODY, "stream": False})
+                settings.nonstream_deadline_seconds = 30
                 second = await c.post("/v1/messages", json={**self.BODY, "stream": False})
                 await server.app.state.client.aclose()
                 return first, second
@@ -374,7 +379,7 @@ class Flights(_WithStub):
             reader.cancel()                    # the client hangs up
             await asyncio.sleep(0.05)
             self.assertIs(flight.find("k"), f, "kept for a retry during the grace")
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(1.0)
             return f
         f = run(go())
         self.assertTrue(ran["cancelled"])
@@ -399,7 +404,7 @@ class Flights(_WithStub):
             r = await server._answer_buffered(Gone(), "k2", slow, "agentaus")
             waited = time.monotonic() - started
             f = flight._flights.get("k2")
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(1.0)
             return r, waited, f
         r, waited, f = run(go())
         self.assertEqual(r.status_code, 504)

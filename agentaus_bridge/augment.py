@@ -1233,7 +1233,9 @@ doing what the request asked for with it - printing a file's contents when the r
 said to write the file, showing a command when the request said to run it.
 
 ANSWER - a genuine final answer or result, or a legitimate statement about something it
-really cannot know or do, or a question the human genuinely has to answer.
+really cannot know or do, or a question the human genuinely has to answer. Saying it
+cannot see an image, screenshot or picture is an ANSWER: it really cannot, because no
+image ever reaches it.
 </question>
 
 <output_format>
@@ -1243,13 +1245,17 @@ Exactly one word: REFUSAL, STALLED or ANSWER. Nothing else.
 
 
 
-def could_be_a_refusal(answer: str, *, tools_offered: bool, called_a_tool: bool) -> bool:
+def could_be_a_refusal(answer: str, *, tools_offered: bool, called_a_tool: bool,
+                       answers_an_image: bool = False) -> bool:
     """Whether this turn is even worth classifying - structural, no language involved.
 
     A cheap gate in front of the model call. A turn that used a tool is acting; a long
-    answer is answering; a turn offered no tools cannot be refusing to use them.
+    answer is answering; a turn offered no tools cannot be refusing to use them. A turn
+    answering input that held an image is told it cannot see it, so "I can't view the
+    image, please describe it" is the honest reply - and re-asking it with "nobody will
+    upload anything, call the tool" brings back the repeated Read or invented content.
     """
-    if called_a_tool or not tools_offered:
+    if called_a_tool or not tools_offered or answers_an_image:
         return False
     text = (answer or "").strip()
     return 0 < len(text) <= _REFUSAL_LENGTH_CEILING

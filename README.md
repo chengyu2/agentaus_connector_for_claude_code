@@ -1001,7 +1001,7 @@ and `--check` (verify the credential and exit).
 
 | Feature | Behaviour |
 | --- | --- |
-| Images and PDFs | Agentaus is text-only, so attachments become a bracketed note rather than being silently dropped. Screenshot-based workflows will not work. |
+| Images and PDFs | Agentaus is text-only: its API drops image parts. Every image or PDF - attached, inside a tool result, in a compaction summary or in the grounding check's evidence - becomes a note saying it never reached the model, and the system prompt gains a line saying it cannot see images, so it says so instead of describing one from its name. Plain-text documents pass through as text. Screenshot-based workflows will not work. |
 | Extended thinking | Agentaus exposes no reasoning channel, so `thinking` blocks from earlier Claude turns are stripped before sending. The bridge substitutes its own: it asks Agentaus to plan the turn as a separate call and shows that plan as a thinking block. |
 | Context window | Agentaus accepts **131,072 tokens** total, prompt plus reply. The bridge enforces the limit and compacts for you — see [What happens when a conversation outgrows Agentaus](#what-happens-when-a-conversation-outgrows-agentaus). |
 | Prompt caching | Not supported upstream, so `cache_control` markers do nothing. Every turn resends the whole conversation — the main cost driver in long sessions. |

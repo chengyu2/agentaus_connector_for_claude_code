@@ -21,7 +21,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -31,7 +30,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from agentaus_bridge import server as server_mod  # noqa: E402
 
-PORT = 9941
+import stub_server  # noqa: E402
+
 OVERSIZE_ERROR = {
     "error": {
         "code": 400,
@@ -70,15 +70,11 @@ _SERVER: HTTPServer | None = None
 
 def setUpModule() -> None:
     global _SERVER
-    HTTPServer.allow_reuse_address = True
-    _SERVER = HTTPServer(("127.0.0.1", PORT), _InBandErrorUpstream)
-    threading.Thread(target=_SERVER.serve_forever, daemon=True).start()
+    _SERVER = stub_server.start(_InBandErrorUpstream)
 
 
 def tearDownModule() -> None:
-    if _SERVER is not None:
-        _SERVER.shutdown()
-        _SERVER.server_close()
+    stub_server.stop(_SERVER)
 
 
 class _Base(unittest.TestCase):
@@ -90,7 +86,7 @@ class _Base(unittest.TestCase):
             settings.agentaus_api_key,
             settings.agentaus_max_input_tokens,
         )
-        settings.agentaus_base_url = f"http://127.0.0.1:{PORT}"
+        settings.agentaus_base_url = stub_server.url(_SERVER)
         settings.agentaus_api_key = "test-key"
         # The learned window is module state; without clearing it a limit picked up
         # by an earlier test silently overrides the one set here.
@@ -268,8 +264,6 @@ class TestTrimReachesUpstream(unittest.TestCase):
     Unit-testing the trim function in isolation cannot catch that - only asserting
     on what the upstream actually received can."""
 
-    PORT = 9942
-
     @classmethod
     def setUpClass(cls) -> None:
         cls.received = []
@@ -293,14 +287,11 @@ class TestTrimReachesUpstream(unittest.TestCase):
             def log_message(self, *a) -> None:
                 pass
 
-        HTTPServer.allow_reuse_address = True
-        cls.server = HTTPServer(("127.0.0.1", cls.PORT), _Recorder)
-        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.server = stub_server.start(_Recorder)
 
     @classmethod
     def tearDownClass(cls) -> None:
-        cls.server.shutdown()
-        cls.server.server_close()
+        stub_server.stop(cls.server)
 
     def test_upstream_receives_the_trimmed_conversation(self):
         from agentaus_bridge import server
@@ -309,7 +300,7 @@ class TestTrimReachesUpstream(unittest.TestCase):
         self.received.clear()
         saved = (settings.agentaus_base_url, settings.agentaus_api_key,
                  settings.agentaus_max_input_tokens, settings.agentaus_auto_trim)
-        settings.agentaus_base_url = f"http://127.0.0.1:{self.PORT}"
+        settings.agentaus_base_url = stub_server.url(self.server)
         settings.agentaus_api_key = "k"
         settings.agentaus_max_input_tokens = 2000
         settings.agentaus_auto_trim = True

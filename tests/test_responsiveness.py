@@ -23,15 +23,16 @@ import json
 import os
 import sys
 import tempfile
-import threading
 import time
 import unittest
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agentaus_bridge import documents, server, tools  # noqa: E402
 from agentaus_bridge.config import settings  # noqa: E402
+
+import stub_server  # noqa: E402
 
 
 def run(coroutine):
@@ -243,9 +244,6 @@ class TurnDeadline(unittest.TestCase):
 # Passthrough that dies mid-response
 # --------------------------------------------------------------------------------------
 
-PORT = 9947
-
-
 class _DiesMidStream(BaseHTTPRequestHandler):
     """Stands in for api.anthropic.com: one SSE event, then the socket goes away."""
 
@@ -271,20 +269,17 @@ class _DiesMidStream(BaseHTTPRequestHandler):
 class PassthroughMidStream(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        HTTPServer.allow_reuse_address = True
-        cls.stub = HTTPServer(("127.0.0.1", PORT), _DiesMidStream)
-        threading.Thread(target=cls.stub.serve_forever, daemon=True).start()
+        cls.stub = stub_server.start(_DiesMidStream)
 
     @classmethod
     def tearDownClass(cls):
-        cls.stub.shutdown()
-        cls.stub.server_close()
+        stub_server.stop(cls.stub)
 
     def test_the_client_gets_an_error_event_not_a_dropped_socket(self):
         from fastapi.testclient import TestClient
 
         saved = settings.anthropic_base_url
-        settings.anthropic_base_url = f"http://127.0.0.1:{PORT}"
+        settings.anthropic_base_url = stub_server.url(self.stub)
         try:
             with TestClient(server.app) as client:
                 response = client.post(
