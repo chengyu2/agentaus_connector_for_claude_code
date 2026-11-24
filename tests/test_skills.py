@@ -170,8 +170,8 @@ class TestTheGateDoesNotOverReach(unittest.TestCase):
         self.assertIn("multi-step-work", skills_for(body))
 
     def test_the_inline_notes_stand_down_when_the_skill_covers_them(self):
-        """Two voices giving the same instruction is the failure the README records
-        between two skills; this model handles a long list of rules badly."""
+        """Two voices giving the same instruction is the failure docs/design/skills.md
+        records between two skills; this model handles a long list of rules badly."""
         root = project("analyse-data")
         body = {"tools": [{"name": "Bash"}], "messages": [
             {"role": "user", "content": [{"type": "text", "text": f"analyse {root}/d.csv"}]},

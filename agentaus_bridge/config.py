@@ -635,7 +635,7 @@ class Settings:
     # `Workflow` call. See agentaus_bridge/graph.py. On by default for the dynamic graph,
     # on evidence: across five tasks it averaged 0.64 against 0.57 for Agentaus's own
     # workflow, with its gains on code - two bug-fix tasks from 0.57 to 0.88 and 0.14 to
-    # 0.50. The fixed graph averaged 0.45. See the README.
+    # 0.50. The fixed graph averaged 0.45. See docs/design/ultracode.md.
     agentaus_workflow_graph: bool = field(
         default_factory=lambda: _bool("AGENTAUS_WORKFLOW_GRAPH", True)
     )

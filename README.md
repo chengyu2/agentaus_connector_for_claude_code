@@ -32,6 +32,10 @@ available in the same session.
 Pick `agentaus` in `/model` and the turn goes to Canberra. Pick Sonnet or Opus and the
 turn goes to Anthropic exactly as it would without the bridge.
 
+This README covers setup and day-to-day operation. The detail lives in [`docs/`](docs/README.md):
+the full configuration reference, behaviours worth knowing about, troubleshooting, the
+design notes behind each compensation, and benchmark results.
+
 ---
 
 ## Before you start
@@ -57,8 +61,8 @@ Claude Code comes in two forms, and this matters later:
 - **The standalone `claude` CLI** — a separate install.
 
 Check which you have with `which claude`. If it prints nothing you have the extension only,
-which is fine — but `scripts/claude-agentaus.sh` (and `.ps1` on Windows) cannot work for
-you, because they `exec` `claude`. Use a settings file instead (Option 1 or 2 under
+which is fine — but `scripts/claude-agentaus.sh` cannot work for
+you, because it `exec`s `claude`. Use a settings file instead (Option 1 or 2 under
 [Pointing Claude Code at the bridge](#pointing-claude-code-at-the-bridge)).
 
 ---
@@ -71,16 +75,15 @@ Only Python and the packages in `requirements.txt` are required; the install scr
 those in a virtualenv and need nothing else on the machine. LibreOffice, poppler and
 tesseract are optional document readers: without them the bridge starts, logs a warning
 naming each missing reader, and walks past the documents it cannot read.
-`INSTALL_DOCUMENT_READERS=1` (or `$env:INSTALL_DOCUMENT_READERS = "1"` in PowerShell)
-installs them as well.
+`INSTALL_DOCUMENT_READERS=1` installs them as well.
 
-| Requirement | Reads | macOS | Debian / Ubuntu | Fedora (dnf) | Windows (winget) |
-| --- | --- | --- | --- | --- | --- |
-| Python 3.11+ | - | `brew install python` | `sudo apt install python3 python3-venv` | `sudo dnf install python3` | python.org install, or the Microsoft Store |
-| **LibreOffice** | `.docx`, `.xlsx`, `.pptx`, tables intact | `brew install --cask libreoffice` | `sudo apt install libreoffice-writer libreoffice-calc libreoffice-impress` | `sudo dnf install libreoffice` | `winget install -e --id TheDocumentFoundation.LibreOffice` |
-| **poppler** (`pdftotext`, `pdftoppm`) | PDF text with its layout; scanned pages for OCR | `brew install poppler` | `sudo apt install poppler-utils` | `sudo dnf install poppler-utils` | `winget install -e --id oschwartz10612.Poppler` |
-| **tesseract** | Scanned PDF pages | `brew install tesseract` | `sudo apt install tesseract-ocr` | `sudo dnf install tesseract` | `winget install -e --id UB-Mannheim.TesseractOCR` |
-| Python packages in `requirements.txt` | PDF fallbacks (`pdfminer.six`, `pypdf`), the code outline (`tree-sitter`), macOS Vision OCR (`pyobjc`) | `pip install -r requirements.txt` | same | same | same (via install script) |
+| Requirement | Reads | macOS | Debian / Ubuntu | Fedora (dnf) |
+| --- | --- | --- | --- | --- |
+| Python 3.11+ | - | `brew install python` | `sudo apt install python3 python3-venv` | `sudo dnf install python3` |
+| **LibreOffice** | `.docx`, `.xlsx`, `.pptx`, tables intact | `brew install --cask libreoffice` | `sudo apt install libreoffice-writer libreoffice-calc libreoffice-impress` | `sudo dnf install libreoffice` |
+| **poppler** (`pdftotext`, `pdftoppm`) | PDF text with its layout; scanned pages for OCR | `brew install poppler` | `sudo apt install poppler-utils` | `sudo dnf install poppler-utils` |
+| **tesseract** | Scanned PDF pages | `brew install tesseract` | `sudo apt install tesseract-ocr` | `sudo dnf install tesseract` |
+| Python packages in `requirements.txt` | PDF fallbacks (`pdfminer.six`, `pypdf`), the code outline (`tree-sitter`), macOS Vision OCR (`pyobjc`) | `pip install -r requirements.txt` | same | same |
 
 ### macOS, Debian / Ubuntu, Fedora (bash)
 
@@ -99,28 +102,16 @@ A successful `--check` prints `OK - Agentaus replied` with a token count. If it 
 `HTTP 401`, the key is wrong or expired — fix that before going further, because nothing
 downstream can work without it.
 
-The install script detects your package manager automatically: `brew` on macOS, `apt-get`
-on Debian/Ubuntu, and `dnf` on Fedora/RHEL/Alma/Rocky.
+With `INSTALL_DOCUMENT_READERS=1`, the install script installs the readers with `brew` on
+macOS, `apt-get` on Debian/Ubuntu and `dnf` on Fedora. Anywhere else it tells you what to
+install by hand.
 
-### Windows (PowerShell)
+### Windows
 
-Open PowerShell in the repo folder (or `cd` into it). If the script is blocked by the
-execution policy, prefix the command with `powershell -ExecutionPolicy Bypass -File`.
-
-```powershell
-git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git
-cd agentaus_connector_for_claude_code
-.\scripts\install.ps1                          # virtualenv, dependencies, .env scaffold
-# Optionally install the document readers too:
-#   $env:INSTALL_DOCUMENT_READERS = "1"; .\scripts\install.ps1
-notepad .env                                   # paste your AGENTAUS_API_KEY
-.\\.venv\\Scripts\\python.exe -m agentaus_bridge --check
-.\scripts\start-bridge.ps1                      # start the bridge (leave this window open)
-```
-
-The PowerShell install locates Python automatically (`python`, or the `py -3` launcher if
-only the Microsoft Store install is present), and installs the document readers through
-`winget` when enabled.
+There are no native Windows scripts yet. Run the bridge inside
+[WSL](https://learn.microsoft.com/windows/wsl/install) with a Debian or Ubuntu
+distribution and follow the bash steps above. Claude Code on the Windows side reaches the
+bridge at `http://127.0.0.1:8787`, because WSL forwards localhost by default.
 
 Then **tell Claude Code the bridge exists.** This is a separate step and it is where almost
 everyone gets stuck: the settings file has to go in the directory you actually *work* in,
@@ -226,11 +217,8 @@ endpoint that only resolves on your machine.
 
 ### Option 3 — the launcher script (standalone CLI only)
 
-- Linux / macOS: `./scripts/claude-agentaus.sh --model agentaus`
-- Windows: `.\scripts\claude-agentaus.ps1 --model agentaus`
-
-Each sets every variable and execs `claude`, forwarding its arguments, so
-`--model agentaus` starts directly on Agentaus.
+`./scripts/claude-agentaus.sh` sets every variable and execs `claude`, forwarding its
+arguments, so `./scripts/claude-agentaus.sh --model agentaus` starts directly on Agentaus.
 
 **This needs the standalone `claude` CLI on your PATH.** With a VS Code extension-only
 install there is no `claude` binary and the script dies with `command not found`. Check
@@ -243,14 +231,6 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
 export ANTHROPIC_CUSTOM_MODEL_OPTION="agentaus"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="Agentaus (Trellis Data)"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="Sovereign Australian model via the local bridge"
-claude
-```
-
-For the equivalent one-off in PowerShell:
-
-```powershell
-$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
-$env:ANTHROPIC_CUSTOM_MODEL_OPTION = "agentaus"
 claude
 ```
 
@@ -549,7 +529,7 @@ bridge. That symptom looks like the model is down when it is really a port misma
 
 | Where | How to change it | When it matters |
 | --- | --- | --- |
-| `scripts/claude-agentaus.sh` / `.ps1` | `export BRIDGE_URL="http://127.0.0.1:9100"` before running it | Only if you use the launcher; it reads `BRIDGE_URL` and needs no edit |
+| `scripts/claude-agentaus.sh` | `export BRIDGE_URL="http://127.0.0.1:9100"` before running it | Only if you use the launcher; it reads `BRIDGE_URL` and needs no edit |
 | `tests/smoke_test.py` | `--url http://127.0.0.1:9100` | Running the end-to-end checks |
 | Command line | `python -m agentaus_bridge --port 9100` | Overrides `.env` for one run, handy for testing |
 | launchd / systemd plist or unit | nothing — they read `.env` | No edit needed |
@@ -757,7 +737,7 @@ all of it invisible from the settings file:
 
 | What arrives | Why it hurt Agentaus | What the bridge does |
 | --- | --- | --- |
-| **26 tools, 120 KB of schemas** (~30,000 tokens a call). `Artifact` alone is 34 KB | A quarter of the window gone before the conversation starts, and 26 names to choose from - where the invented and misspelt calls come from | **Tool focus**: Claude Code's non-coding harness tools are held back unless the user names them or the conversation already used them - 13 KB. A deny-list, so custom and MCP tools are never hidden. `AGENTAUS_TOOL_FOCUS=false` sends everything |
+| **26 tools, 120 KB of schemas** (~30,000 tokens a call). `Artifact` alone is 34 KB | A quarter of the window gone before the conversation starts, and 26 names to choose from - where the invented and misspelt calls come from | **Tool focus**: Claude Code's non-coding harness tools are held back unless the user names them or the conversation already used them - 13 KB. A deny-list, so custom tools are never hidden, and MCP tools only over a 40 KB schema budget ([details](docs/operating/behaviours.md#mcp-tools-over-the-schema-budget)). `AGENTAUS_TOOL_FOCUS=false` sends everything |
 | The environment block - **including the working directory** - as a `system`-role entry *inside `messages`*, and connector instructions the same way | Forwarded as-is it became the *last* message, after the user's request, and Agentaus answered it: a finished R task replied to with "I have not read the Claude Docs workflow you shared" | Every `system`-role entry joins the system prompt, so the turn ends on what the user said. The working-directory lookup reads them too - it had silently been finding nothing |
 | `<system-reminder>` blocks beside what the user typed: account email, commit attribution, which tools loaded | Handed to the planner, reviewer and turn judge as part of "the request" | Stripped wherever the bridge reads the request |
 | The commit attribution asks an unknown model - `agentaus` included - for `Co-Authored-By: Claude Code <noreply@anthropic.com>` (2.1.293) | Every commit an Agentaus session made credited Claude on GitHub | Swapped for `AGENTAUS_COAUTHOR` on Agentaus turns. See [Commit credit](#commit-credit) |
@@ -833,8 +813,8 @@ spreadsheet exactly as it cites into source code:
 
 ### One reader, on purpose
 
-If LibreOffice is absent, the bridge refuses to start and tells you how to install it. It
-does not fall back to a lighter library. `python-docx` and `openpyxl` would handle
+LibreOffice is optional: if it is absent, the bridge logs a warning at startup and skips
+office documents. It does not fall back to a lighter library. `python-docx` and `openpyxl` would handle
 `.docx` and `.xlsx` in 496 KB against LibreOffice's 795 MB, but they are a **second
 implementation of "how does a table become text"** — different format coverage and a
 different rendering of the same document. A row that reads one way on a laptop and
@@ -844,14 +824,14 @@ another way in CI is a bug nobody finds until a number is wrong in a tender resp
 macOS   brew install --cask libreoffice
 Debian  sudo apt install libreoffice-writer libreoffice-calc
 Fedora  sudo dnf install libreoffice
-Windows winget install -e --id TheDocumentFoundation.LibreOffice
 ```
 
 Conversions are cached per file, keyed on path, mtime and size — so a search reading many
 chunks converts once, and a document edited under the bridge is re-read rather than
 served stale. Each conversion gets a private LibreOffice profile, because concurrent
 `soffice` invocations otherwise fight over the shared one and a run silently produces
-nothing.
+nothing. Why one reader, and why not just strip the XML:
+[docs/design/documents.md](docs/design/documents.md).
 
 ---
 
@@ -877,7 +857,8 @@ twenty-page report with two scanned pages costs two OCR calls, not twenty.
 
 All 48 now extract: **1,120,798 characters in 11 seconds.** Extracted text carries
 `[page N]` markers, because a page number is the only coordinate a PDF has and a quote
-from a 93-page tender cannot be checked without one.
+from a 93-page tender cannot be checked without one. The ladder's design is in
+[docs/design/documents.md](docs/design/documents.md#pdfs).
 
 ---
 
@@ -892,6 +873,13 @@ They matter more here than they would with a stronger model. Most of the disappo
 answers this bridge produced were not capability gaps — they were a competent model taking
 the wrong approach, and an approach is exactly what a skill supplies.
 
+**Agentaus does not call `Skill` on its own**, so on Agentaus turns the bridge does it: a
+skill whose description matches the request is injected into the prompt
+(`AGENTAUS_SKILL_ROUTING`). The bridge also ships its own skill library in
+`agentaus_bridge/skill_library/` (code review, commits and PRs, feature development and
+more), offered in every project (`AGENTAUS_SKILL_LIBRARY`). A project skill with the same
+name wins. How the gate and routing work: [docs/design/skills.md](docs/design/skills.md).
+
 | Skill | The pain point it encodes |
 | --- | --- |
 | `repo-survey` | Asked to review a repo, ran one `find`, answered from a 2 KB preview of a 1.6 MB listing, and **invented a policy that does not exist** |
@@ -900,6 +888,8 @@ the wrong approach, and an approach is exactly what a skill supplies.
 | `search-exhaustively` | Asked to go through hundreds of documents, answered from **one or two** — because the stopping condition was "I have something to say" rather than "there is nothing left to find" |
 | `investigate` | A single pass produces one story about the evidence, and a fluent story is indistinguishable from a correct one once written down |
 | `research` | Current facts answered from memory with no source, and web claims blended into repository claims with no way back |
+| `tender-evidence` | Four rows of 43 proposed additions asserting real certifications **with no quote behind them** |
+| `bridge-diagnose` | 63 timeouts and 1236 slot waits read as separate faults when they were one |
 
 Each names the failure it prevents, with the measurement, because a rule whose reason is
 stated is followed more reliably than one asserted. They are deliberately short — every
@@ -939,7 +929,9 @@ footer (`Generated with Claude Code`) is left alone, since the tool is still Cla
 ## Configuration reference
 
 All settings are environment variables, readable from `.env`. Shell exports win over
-`.env` values.
+`.env` values. This table has the common ones. The full list, including PDF and OCR
+tuning, search limits, retries and timeouts, and the ultracode agent graph, is in
+[docs/operating/configuration.md](docs/operating/configuration.md).
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -984,7 +976,7 @@ All settings are environment variables, readable from `.env`. Shell exports win 
 | `BRIDGE_LOG_BODIES` | `false` | Log full request bodies — **includes your source code** |
 | `AGENTAUS_PROMPT_STYLE` | `markdown` | How the bridge lays out what it writes for Agentaus: `markdown` or `xml` |
 | `AGENTAUS_LIVE_DRAFT` | `true` | Stream tokens into a thinking block while the answer is held for checks |
-| `AGENTAUS_TOOL_FOCUS` | `true` | Hold back Claude Code's non-coding harness tools unless named or used. Custom and MCP tools are never hidden |
+| `AGENTAUS_TOOL_FOCUS` | `true` | Hold back Claude Code's non-coding harness tools unless named or used. Custom tools are never hidden; MCP tools only over a 40 KB schema budget |
 
 Command-line flags override the file: `--host`, `--port`, `--env-file`, `--log-level`,
 and `--check` (verify the credential and exit).
@@ -1108,21 +1100,14 @@ EOF
 systemctl --user enable --now agentaus-bridge
 ```
 
-Enable lingering so the service starts at login without you signed in:
+By default a user service runs only while you are logged in. Enable lingering so it starts
+at boot and keeps running after you log out:
 
 ```bash
-loginctl enable-linger $(id -u)
+loginctl enable-linger "$USER"
 ```
 
-### Windows — Task Scheduler
-
-1. Open **Task Scheduler** → **Create Task**.
-2. **General**: name `agentaus-bridge`.
-3. **Triggers**: *At logon* (and optionally *At startup*).
-4. **Actions**: *Start a program* → Program/Script: the full path to
-   `<repo>\.venv\Scripts\python.exe`, Arguments: `-m agentaus_bridge`, Start in: the repo
-   folder, so it reads `.env`.
-5. Save and *Run* it once to confirm. Stop it, or use Task Manager, when you want it down.
+The log goes to the journal: `journalctl --user -u agentaus-bridge -f`.
 
 ---
 
@@ -1144,13 +1129,14 @@ loginctl enable-linger $(id -u)
 ./benchmarks/run.py --model agentaus --suite humaneval --limit 20
 ```
 
-Four suites, so the scoring authority sits outside this repository — a benchmark whose
-verdicts are its own opinion cannot tell you anything:
+Five suites. Where possible the verdict comes from outside the bridge, because a benchmark
+whose verdicts are its own opinion cannot tell you anything:
 
 | Suite | Measures | Verdict comes from |
 | --- | --- | --- |
 | `humaneval` | pass@1 over 164 problems | **the dataset's own unit tests** |
 | `retrieval` | localisation precision, recall, F1 | ground truth over this repository |
+| `injection` | resistance to instructions hidden in file content | this bridge's stated threat model |
 | `documents` | can it answer from a PDF at all — found and cited rates | six facts checked to exist **only** inside PDFs, against the 263 non-PDF files in the corpus |
 | `coverage` | does it survey the corpus or stop at the first hit | filenames counted against the real listing, so invented ones score nothing |
 
@@ -1161,12 +1147,17 @@ borrow the OAuth token Claude Code holds.
 Generated code runs in a subprocess with a wall-clock timeout. That bounds a runaway loop;
 it is **not a sandbox**. Run it somewhere that is acceptable, or in a container.
 
+Results, including the Claude Code A/B against Opus and the ultracode runs, and what each
+suite is really testing: [docs/benchmarks/](docs/benchmarks/README.md).
+
 ---
 
 ## Reading the log
 
-`/tmp/agentaus-bridge.log` (macOS/Linux). Every line for one turn carries the same short
-request id, so a single turn can be followed end to end:
+The bridge logs to stderr. Under launchd that lands in `/tmp/agentaus-bridge.log`, under
+the systemd unit in the journal (`journalctl --user -u agentaus-bridge`), and with
+`./scripts/start-bridge.sh` in its terminal. Every line for one turn carries the same
+short request id, so a single turn can be followed end to end:
 
 ```
 req f5782343 recv model=agentaus route=agentaus stream=True msgs=81 est=241482 bytes=963487
@@ -1189,12 +1180,12 @@ To follow one turn: `grep 'req f5782343' /tmp/agentaus-bridge.log`. To watch liv
 
 `BRIDGE_LOG_LEVEL=debug` adds a line per summarisation call. `BRIDGE_LOG_BODIES=true`
 logs full request bodies — **including your source code** — so leave it off routinely.
-On Windows, log output goes to the console where you started the bridge (or Task
-Scheduler's log viewer).
 
 `./scripts/diagnose.py` reads the log and reports what is actually going wrong, ranked
 by severity, each with what it means and what to do about it. It also lists what **never**
-fired, which is the half people forget.
+fired, which is the half people forget. It reads `/tmp/agentaus-bridge.log` unless you
+pass another path. How to read its report, and the rest of the log lines:
+[docs/operating/troubleshooting.md](docs/operating/troubleshooting.md).
 
 ---
 
@@ -1212,6 +1203,9 @@ fired, which is the half people forget.
 | `/compact` also fails on Agentaus | Expected past 131k: compaction sends the conversation to the model to be summarised, so it overflows too. Switch to a Claude model, compact there, then switch back. `/clear` also works but discards history. |
 | A short message on a long session takes minutes | The first compaction after a session outgrows the window reads the whole history. Later turns reuse it and are fast. `grep 'compaction done' /tmp/agentaus-bridge.log` shows the split. |
 | `Address already in use` on start | An older bridge is still bound: `lsof -ti tcp:8787 \| xargs kill`. |
+
+More symptoms, including DNS failures on macOS, stream errors and a generic-assistant tone:
+[docs/operating/troubleshooting.md](docs/operating/troubleshooting.md#symptoms).
 
 ---
 
