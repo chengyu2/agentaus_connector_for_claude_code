@@ -692,8 +692,9 @@ on Agentaus turns, to say it is for exact literal matches you can already spell.
 schema is untouched.
 
 **What it will not read.** `.env` files, `*.pem`, `*.key`, SSH keys and `.git/` are
-excluded no matter what matches. Set `AGENTAUS_SEARCH_ROOTS` to confine the bridge to
-specific trees. It is worth doing, because these reads never pass through Claude Code's
+excluded no matter what matches. With `AGENTAUS_SEARCH_ROOTS` unset the bridge stays
+inside the session's working directory; set it to colon-separated roots to pin it to
+specific trees. Both matter, because these reads never pass through Claude Code's
 permission prompts.
 
 **What it costs.** One expansion call plus one call per chunk, capped at
@@ -1061,7 +1062,7 @@ tuning, search limits, retries and timeouts, and the ultracode agent graph, is i
 | `AGENTAUS_PDF_OCR` | `true` | OCR the pages that came back blank or garbled. macOS Vision first, then tesseract |
 | `AGENTAUS_SEARCH` | `true` | Offer `agentaus_search`, the bridge-executed semantic search |
 | `AGENTAUS_WEB_SEARCH` | `true` | Offer `agentaus_web_search`, which drives Agentaus' own web search |
-| `AGENTAUS_SEARCH_ROOTS` | *(empty)* | Colon-separated directories search may read. Empty allows any absolute path |
+| `AGENTAUS_SEARCH_ROOTS` | *(empty)* | Colon-separated directories search may read. Empty confines reads to the session's working directory, not any absolute path |
 | `AGENTAUS_SEARCH_MAX_FILES` | `5000` | Ceiling on files one search or inventory walk returns |
 | `AGENTAUS_TOOL_TIMEOUT` | `480` | Wall-clock ceiling on one bridge tool call. `0` disables |
 | `AGENTAUS_TOOL_ROUNDS` | `12` | Rounds of bridge-executed tool calls one turn may run before the answer has to stand |
