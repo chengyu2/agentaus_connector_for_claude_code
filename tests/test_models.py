@@ -56,7 +56,7 @@ class ModelList(unittest.TestCase):
         from agentaus_bridge import server
         from agentaus_bridge.config import settings
         STATE.update({"status": 200, "delay": 0.0, "seen": []})
-        server._MODELS_LAST["data"] = None
+        server._MODELS_LAST.clear()  # the per-credential fallback cache
         self._saved = settings.anthropic_base_url
         settings.anthropic_base_url = stub_server.url(self.server)
 

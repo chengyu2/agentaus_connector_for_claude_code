@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import contextvars
 import hashlib
+import hmac
 import json
 import logging
 import random
@@ -107,9 +108,71 @@ app = FastAPI(title="Agentaus bridge for Claude Code", docs_url=None, redoc_url=
 _STRIP_REQUEST_HEADERS = {
     "host", "content-length", "connection", "transfer-encoding", "accept-encoding",
 }
+# The bridge's own auth header. It exists so a client can hold both a bridge secret and a
+# real Anthropic credential at once; it is for this bridge only and must never be forwarded.
+BRIDGE_TOKEN_HEADER = "x-agentaus-bridge-token"
 _STRIP_RESPONSE_HEADERS = {
     "content-length", "content-encoding", "transfer-encoding", "connection",
 }
+
+
+def _same_secret(supplied: str, expected: str) -> bool:
+    """Constant-time comparison of two tokens."""
+    return hmac.compare_digest((supplied or "").encode(), (expected or "").encode())
+
+
+def _header_carries_bridge_token(name: str, value: str) -> bool:
+    """Whether this header's value IS the bridge token (a credential must not be dropped
+    merely for living in the same header name as one)."""
+    token = settings.bridge_token
+    if not token:
+        return False
+    lowered = (name or "").lower()
+    value = value or ""
+    if lowered == "x-api-key":
+        return _same_secret(value, token)
+    if lowered == "authorization":
+        if _same_secret(value, token):
+            return True
+        if value.lower().startswith("bearer "):
+            return _same_secret(value[7:].strip(), token)
+    return False
+
+
+def _anthropic_request_headers(request: Request) -> dict:
+    """The headers a request to Anthropic should carry, sanitised of the bridge.
+
+    Everything the caller sent goes through except hop-by-hop headers and the bridge's
+    own credential, in whichever header it actually arrived in - a legacy client that
+    authenticated with `x-api-key: <bridge token>` would otherwise hand that secret to
+    Anthropic, and a client that authenticated with the dedicated header would leak it
+    the same way. A separate, different value in the other auth header - the caller's
+    real Anthropic key or OAuth token - is kept.
+    """
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in _STRIP_REQUEST_HEADERS
+    }
+    headers.pop(BRIDGE_TOKEN_HEADER, None)
+    for name, value in list(headers.items()):
+        if _header_carries_bridge_token(name, value):
+            del headers[name]
+    return headers
+
+
+def _credential_key(headers: dict) -> str:
+    """A stable identity for the Anthropic credential a request carries, for caching.
+
+    Only the auth headers count: two callers presenting the same credential share one
+    cache entry, and a caller with no credential is distinguished from every caller
+    that has one (an empty key, never a cache hit).
+    """
+    parts = sorted(f"{name.lower()}={value}" for name, value in headers.items()
+                   if name.lower() in ("x-api-key", "authorization"))
+    if not parts:
+        return ""
+    return hashlib.sha256("\x00".join(parts).encode()).hexdigest()
 
 
 @app.on_event("startup")
@@ -245,21 +308,29 @@ AGENTAUS_MODEL = {
 }
 # Inside the picker's 3 s, with room for the bridge's own work.
 _MODELS_TIMEOUT_S = 2.5
-# The last list Anthropic returned, served when it cannot be reached in time.
-_MODELS_LAST: dict = {"data": None}
+# The last list each *credential* got back from Anthropic, served when that credential
+# cannot reach Anthropic in time. Keyed by the credential because a list fetched with one
+# caller's key must never be served to another caller, nor to a caller with no credential
+# at all - a cache holding nothing for that caller serves Agentaus alone. Bounded so a
+# long-lived bridge with many keys cannot grow it without end.
+_MODELS_LAST: "OrderedDict[str, list]" = OrderedDict()
+_MODELS_CACHE_LIMIT = 8
 
 
-async def _anthropic_models(request: Request) -> list | None:
-    """Anthropic's model list for this caller, or None when it cannot be had in time.
+async def _anthropic_models(request: Request) -> tuple[list | None, str]:
+    """Anthropic's model list for this caller, plus the credential it was asked with.
 
-    One attempt, no retries: the picker stops waiting at 3 s. Only a caller that sent
-    credentials is asked about - the bridge holds none of its own for Anthropic.
+    Returns (models, credential key), with models None when the list cannot be had in
+    time or the caller sent no credential. One attempt, no retries: the picker stops
+    waiting at 3 s. Only a caller that sent a credential of its own is asked about -
+    the bridge holds none of its own for Anthropic.
     """
     if not settings.passthrough_enabled:
-        return None
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in _STRIP_REQUEST_HEADERS}
-    if not any(k.lower() in ("x-api-key", "authorization") for k in headers):
-        return None
+        return None, ""
+    headers = _anthropic_request_headers(request)
+    credential = _credential_key(headers)
+    if not credential:
+        return None, ""  # no credential of its own (a bridge-only token is stripped above)
     headers.setdefault("anthropic-version", "2023-06-01")
     # The whole list, whatever page size the caller asked for: what is kept for the next caller
     # must not be one caller's partial page.
@@ -274,30 +345,40 @@ async def _anthropic_models(request: Request) -> list | None:
                                           _MODELS_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001 - the list must never fail: a bad header, a timeout, a refusal
         rlog(logging.INFO, "model list: Anthropic not reached in time (%s)", type(exc).__name__)
-        return None
+        return None, credential
     if response.status_code != 200:
         rlog(logging.INFO, "model list: Anthropic answered HTTP %s", response.status_code)
-        return None
+        return None, credential
     try:
         data = response.json().get("data")
     except (ValueError, AttributeError):
-        return None
+        return None, credential
     models = [m for m in data or [] if isinstance(m, dict) and m.get("id")]
-    return models or None
+    return (models or None), credential
 
 
 @app.get("/v1/models")
 async def list_models(request: Request) -> JSONResponse:
     """Anthropic's current models, live where it can be reached, plus Agentaus."""
-    live = await _anthropic_models(request)
+    if not _client_authorised(request):
+        return _error_response(401, "authentication_error", "Invalid bridge token")
+    live, credential = await _anthropic_models(request)
     if live is not None:
-        _MODELS_LAST["data"] = live
-    models = list(live if live is not None else _MODELS_LAST["data"] or [])
+        _MODELS_LAST[credential] = live
+        _MODELS_LAST.move_to_end(credential)
+        while len(_MODELS_LAST) > _MODELS_CACHE_LIMIT:
+            _MODELS_LAST.popitem(last=False)
+        models, source = list(live), "live from Anthropic"
+    else:
+        # The fallback belongs to this caller's credential alone. An empty key - a caller
+        # with no Anthropic credential - is never a hit, so it is served Agentaus only.
+        cached = _MODELS_LAST.get(credential)
+        models = list(cached or [])
+        source = ("this credential's last list" if cached
+                  else "no cached list for this credential")
     if not any(m.get("id") == AGENTAUS_MODEL["id"] for m in models):
         models.append(dict(AGENTAUS_MODEL))
-    rlog(logging.INFO, "model list: %d model(s) served (%s)", len(models),
-             "live from Anthropic" if live is not None
-             else "Anthropic's last list" if _MODELS_LAST["data"] else "Agentaus only")
+    rlog(logging.INFO, "model list: %d model(s) served (%s)", len(models), source)
     return JSONResponse({
         "data": models,
         "has_more": False,
@@ -311,13 +392,22 @@ async def list_models(request: Request) -> JSONResponse:
 # --------------------------------------------------------------------------------------
 
 def _client_authorised(request: Request) -> bool:
+    """Whether this caller may use the bridge at all (BRIDGE_TOKEN, when one is set).
+
+    Preferred: the dedicated `x-agentaus-bridge-token` header, which is for the bridge
+    alone and never forwarded upstream. Legacy (kept for existing Agentaus-only clients
+    such as abbench scripts and bridges configured before the dedicated header existed):
+    `x-api-key` or `Authorization: Bearer`. Compared in constant time either way.
+    """
     if not settings.bridge_token:
         return True
-    supplied = request.headers.get("x-api-key") or ""
-    auth = request.headers.get("authorization") or ""
-    if auth.lower().startswith("bearer "):
-        supplied = supplied or auth[7:]
-    return supplied == settings.bridge_token
+    supplied = request.headers.get(BRIDGE_TOKEN_HEADER) or ""
+    if not supplied:
+        supplied = request.headers.get("x-api-key") or ""
+        auth = request.headers.get("authorization") or ""
+        if auth.lower().startswith("bearer "):
+            supplied = supplied or auth[7:]
+    return _same_secret(supplied, settings.bridge_token)
 
 
 # --------------------------------------------------------------------------------------
@@ -386,6 +476,9 @@ async def messages(request: Request) -> Response:
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request) -> Response:
+    if not _client_authorised(request):
+        return _error_response(401, "authentication_error", "Invalid bridge token")
+
     raw = await request.body()
     try:
         body = json.loads(raw or b"{}")
@@ -3749,7 +3842,10 @@ async def _passthrough(request: Request, raw: bytes) -> Response:
 
     Headers go through verbatim: `anthropic-beta` carries the OAuth capability that a
     claude.ai subscription login needs, and error bodies must stay unmodified or
-    Claude Code's capability-rejection retry logic stops matching on them.
+    Claude Code's capability-rejection retry logic stops matching on them. "Verbatim"
+    except the bridge's own credential - `_anthropic_request_headers` strips the
+    dedicated bridge header and any auth header whose value IS the bridge token, so the
+    secret never reaches Anthropic while the caller's real key or OAuth token survives.
     """
     if not settings.passthrough_enabled:
         return _error_response(
@@ -3765,11 +3861,7 @@ async def _passthrough(request: Request, raw: bytes) -> Response:
     if request.url.query:
         url = f"{url}?{request.url.query}"
 
-    headers = {
-        key: value
-        for key, value in request.headers.items()
-        if key.lower() not in _STRIP_REQUEST_HEADERS
-    }
+    headers = _anthropic_request_headers(request)
 
     # Retry the connect only. Nothing has been written to the client yet, so replaying
     # the identical body is invisible; once we start streaming the response back a
