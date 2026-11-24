@@ -558,6 +558,8 @@ class ConversationCompactor:
         keep_fraction: float = 0.5,
         threshold: float = 1.0,
         chunk_tokens: int | None = None,
+        skip_summarisation: bool = False,
+        summarisation_timeout: float = 0.0,
     ) -> dict:
         """Return a plan describing how to fit `body` into `limit`.
 
@@ -591,12 +593,24 @@ class ConversationCompactor:
             return {"messages": tail, "summary": None, "summarised": 0, "method": "none"}
 
         summary = ""
-        try:
-            summary = await self.summarise_head(
-                head, chunk_budget=chunk_tokens or max(budget // 4, 1000)
-            )
-        except Exception as exc:  # fall back rather than fail the turn
-            log.warning("summarisation failed (%s); falling back to trimming", exc)
+        if skip_summarisation:
+            log.info("skipping summarisation (AGENTAUS_SKIP_SUMMARISATION); will trim instead")
+        else:
+            try:
+                _coro = self.summarise_head(
+                    head, chunk_budget=chunk_tokens or max(budget // 4, 1000)
+                )
+                if summarisation_timeout > 0:
+                    summary = await asyncio.wait_for(_coro, timeout=summarisation_timeout)
+                else:
+                    summary = await _coro
+            except asyncio.TimeoutError:
+                log.warning(
+                    "summarisation timed out after %.0fs; falling back to trimming",
+                    summarisation_timeout,
+                )
+            except Exception as exc:  # fall back rather than fail the turn
+                log.warning("summarisation failed (%s); falling back to trimming", exc)
 
         # The opening request and any background-task report, word for word, when they fit.
         # Measured (d12 c1913h): one compaction summarised the "ultracode:" request, the
