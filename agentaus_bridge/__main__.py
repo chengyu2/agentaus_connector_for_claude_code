@@ -82,14 +82,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    # Every document reader is required: a bridge that cannot open a .docx or a scanned
-    # page would still answer, just without the evidence those files hold.
+    # The Python packages are required. The system readers are not, but a bridge that
+    # cannot open a .docx or a scanned page still answers, just without the evidence
+    # those files hold - so say so.
     from . import requirements
 
     lacking = requirements.missing()
     if lacking:
         log.error("%s", requirements.report(lacking))
         return 3
+    degraded = requirements.optional_missing()
+    if degraded:
+        log.warning("%s", requirements.optional_report(degraded))
 
     if args.check:
         return _check(settings)

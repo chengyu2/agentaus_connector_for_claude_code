@@ -1,10 +1,10 @@
 """What the bridge needs installed before it serves a single request.
 
-Every document reader is required, not optional. Without them the bridge used to run
-regardless: a .docx or .xlsx was walked past as binary, a scanned PDF page came back
-blank, and the run went on answering from what it could see - a tender response written
+The Python packages are required: install.sh puts them in the virtualenv, so they need
+nothing from the machine. The system readers (LibreOffice, poppler, tesseract) are
+optional. Without them a .docx or .xlsx is walked past and a scanned PDF page comes
+back blank, so the bridge names each missing one at startup - a tender response written
 without the document that held its evidence looks like a weak answer, not a missing tool.
-A machine that cannot read a document now refuses to start and says what to install.
 """
 
 from __future__ import annotations
@@ -49,20 +49,32 @@ def _module(name: str) -> bool:
 
 
 def missing() -> list[str]:
-    """One line per missing requirement, each with the command that installs it."""
-    from . import documents, pdf
+    """One line per missing required package, each with the command that installs it."""
     out = []
-    for what, binary, why, mac, debian in SYSTEM:
-        found = documents.soffice() if binary == "soffice" else pdf._tool(binary)
-        if not found:
-            out.append(f"{what} (`{binary}`) - {why}. Install: `{mac if MAC else debian}`")
     for module, package, why in PYTHON:
         if not _module(module):
             out.append(f"{package} - {why}. Install: `.venv/bin/pip install -r requirements.txt`")
     return out
 
 
+def optional_missing() -> list[str]:
+    """One line per missing system reader, each with the command that installs it."""
+    from . import documents, pdf
+    out = []
+    for what, binary, why, mac, debian in SYSTEM:
+        found = documents.soffice() if binary == "soffice" else pdf._tool(binary)
+        if not found:
+            out.append(f"{what} (`{binary}`) - {why}. Install: `{mac if MAC else debian}`")
+    return out
+
+
 def report(lines: list[str]) -> str:
-    return ("The bridge needs every document reader installed and these are missing:\n"
+    return ("The bridge needs these Python packages and they are missing:\n"
             + "\n".join(f"  - {l}" for l in lines)
             + "\n\nOr run ./scripts/install.sh, which installs all of them.")
+
+
+def optional_report(lines: list[str]) -> str:
+    return ("Document reading is degraded; these readers are not installed:\n"
+            + "\n".join(f"  - {l}" for l in lines)
+            + "\n\nOr run INSTALL_DOCUMENT_READERS=1 ./scripts/install.sh.")
