@@ -60,7 +60,7 @@ jobs:
           fi
 
       # uv installs Python and the packages from its cache in seconds.
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.4.0  # setup-uv publishes no floating major tag
         with:
           python-version: "3.12"
           activate-environment: true
