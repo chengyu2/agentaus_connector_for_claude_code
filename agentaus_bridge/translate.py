@@ -855,7 +855,11 @@ class AnthropicStreamBuilder:
 
     def finish(self, finish_reason: str | None, usage: dict | None) -> bytes:
         out = self._close_open_block()
-        if finish_reason:
+        if finish_reason and self.stop_reason != "tool_use":
+            # Once a tool block is on the wire this is a tool turn, even when a
+            # recovered call arrived in a stream Agentaus finished with generic
+            # "stop". A later finish reason must not contradict the tool_use blocks
+            # the client has already seen.
             self.stop_reason = _STOP_REASON.get(finish_reason, self.stop_reason)
         usage = usage or {}
         output_tokens = int(
