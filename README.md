@@ -77,13 +77,21 @@ tesseract are optional document readers. Without them the bridge starts, logs a 
 naming each missing reader, and skips the documents it cannot read.
 `INSTALL_DOCUMENT_READERS=1` installs them as well.
 
-| Requirement | Reads | macOS | Debian / Ubuntu | Fedora (dnf) |
-| --- | --- | --- | --- | --- |
-| Python 3.11+ | - | `brew install python` | `sudo apt install python3 python3-venv` | `sudo dnf install python3` |
-| LibreOffice | `.docx`, `.xlsx`, `.pptx`, tables intact | `brew install --cask libreoffice` | `sudo apt install libreoffice-writer libreoffice-calc libreoffice-impress` | `sudo dnf install libreoffice` |
-| poppler (`pdftotext`, `pdftoppm`) | PDF text with its layout; scanned pages for OCR | `brew install poppler` | `sudo apt install poppler-utils` | `sudo dnf install poppler-utils` |
-| tesseract | Scanned PDF pages | `brew install tesseract` | `sudo apt install tesseract-ocr` | `sudo dnf install tesseract` |
-| Python packages in `requirements.txt` | PDF fallbacks (`pdfminer.six`, `pypdf`), the code outline (`tree-sitter`), macOS Vision OCR (`pyobjc`) | `pip install -r requirements.txt` | same | same |
+| Requirement | Reads | macOS | Debian / Ubuntu | Fedora (dnf) | Windows (winget) |
+| --- | --- | --- | --- | --- | --- |
+| Python 3.11+ | - | `brew install python` | `sudo apt install python3 python3-venv` | `sudo dnf install python3` | `winget install --id Python.Python.3.12` (or [python.org](https://www.python.org/downloads/windows/)) |
+| LibreOffice | `.docx`, `.xlsx`, `.pptx`, tables intact | `brew install --cask libreoffice` | `sudo apt install libreoffice-writer libreoffice-calc libreoffice-impress` | `sudo dnf install libreoffice` | `winget install --id TheDocumentFoundation.LibreOffice` |
+| poppler (`pdftotext`, `pdftoppm`) | PDF text with its layout; scanned pages for OCR | `brew install poppler` | `sudo apt install poppler-utils` | `sudo dnf install poppler-utils` | `winget install --id oschwartz10612.Poppler` |
+| tesseract | Scanned PDF pages | `brew install tesseract` | `sudo apt install tesseract-ocr` | `sudo dnf install tesseract` | `winget install --id UB-Mannheim.TesseractOCR` |
+| Python packages in `requirements.txt` | PDF fallbacks (`pdfminer.six`, `pypdf`), the code outline (`tree-sitter`), macOS Vision OCR (`pyobjc`) | `pip install -r requirements.txt` | same | same | `.venv\Scripts\python.exe -m pip install -r requirements.txt` |
+
+> **Windows note on the document readers:** winget installs LibreOffice, poppler and
+> tesseract to folders that are **not** on `PATH`, and the current terminal does not see
+> PATH changes anyway. `install.ps1` installs them automatically when you set
+> `INSTALL_DOCUMENT_READERS=1` (see below). Open a **new** terminal afterwards, and if the
+> bridge still reports LibreOffice missing, set `AGENTAUS_SOFFICE_PATH` in `.env`. The
+> bridge also checks the winget install folders directly, so it usually needs no extra
+> configuration.
 
 ### macOS, Debian / Ubuntu, Fedora (bash)
 
@@ -140,12 +148,54 @@ With `INSTALL_DOCUMENT_READERS=1`, the install script installs the readers with 
 macOS, `apt-get` on Debian/Ubuntu and `dnf` on Fedora. Anywhere else it tells you what to
 install by hand.
 
-### Windows
+### Windows (PowerShell)
 
-There are no native Windows scripts yet. Run the bridge inside
-[WSL](https://learn.microsoft.com/windows/wsl/install) with a Debian or Ubuntu
-distribution and follow the bash steps above. Claude Code on the Windows side reaches the
-bridge at `http://127.0.0.1:8787`, because WSL forwards localhost by default.
+Windows is supported by three first-class PowerShell scripts that mirror the bash ones.
+
+**One-line install** — clone, enter the repo and run the installer:
+
+```powershell
+git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git; cd agentaus_connector_for_claude_code; powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+```
+
+Windows blocks `.ps1` scripts by default, so the `-ExecutionPolicy Bypass` flag is
+required the first time (or set your policy with `Set-ExecutionPolicy -Scope CurrentUser
+RemoteSigned`). To also install the optional document readers (LibreOffice, poppler,
+tesseract) via winget, set the flag on the same line:
+
+```powershell
+git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git; cd agentaus_connector_for_claude_code; $env:INSTALL_DOCUMENT_READERS="1"; powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+```
+
+Prefer its step-by-step form to see what each piece does:
+
+```powershell
+git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git
+cd agentaus_connector_for_claude_code
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1   # virtualenv, dependencies, .env scaffold
+$EDITOR .env                                                    # paste your AGENTAUS_API_KEY
+.\.venv\Scripts\python.exe -m agentaus_bridge --check              # verify the key with a live call
+.\scripts\start-bridge.ps1                                       # start the bridge (leave this terminal open)
+```
+
+A successful `--check` prints `OK - Agentaus replied` with a token count. If it prints
+`HTTP 401`, the key is wrong or expired. Fix that before going further, because nothing
+downstream can work without it.
+
+`install.ps1` needs Python 3.11+ and detects it automatically, preferring the `py -3`
+launcher so a Microsoft Store placeholder `python` is never picked. With
+`INSTALL_DOCUMENT_READERS=1` it installs the readers with winget; open a **new** terminal
+afterwards so PATH changes are seen, and set `AGENTAUS_SOFFICE_PATH` in `.env` if the
+bridge still cannot find LibreOffice.
+
+For the launcher options (vs a settings file) see [Option 3: the launcher script](#option-3-the-launcher-script-standalone-cli-only),
+which covers `claude-agentaus.ps1`.
+
+If you prefer to run the bridge inside
+[WSL](https://learn.microsoft.com/windows/wsl/install) instead, follow the
+[macOS, Debian / Ubuntu, Fedora (bash)](#macos-debian--ubuntu-fedora-bash) steps above —
+WSL forwards localhost, so Claude Code on the Windows side still reaches the bridge at
+`http://127.0.0.1:8787`.
 
 Then tell Claude Code the bridge exists. This is a separate step and it is where almost
 everyone gets stuck. The settings file has to go in the directory you actually work in,
@@ -252,12 +302,17 @@ committing a `localhost` endpoint that only resolves on your machine.
 
 ### Option 3: the launcher script (standalone CLI only)
 
-`./scripts/claude-agentaus.sh` sets every variable and execs `claude`, forwarding its
-arguments, so `./scripts/claude-agentaus.sh --model agentaus` starts directly on Agentaus.
+`./scripts/claude-agentaus.sh` (or `.\scripts\claude-agentaus.ps1` on Windows) sets every
+variable and execs `claude`, forwarding its arguments, so
+`./scripts/claude-agentaus.sh --model agentaus` (or
+`.\scripts\claude-agentaus.ps1 --model agentaus`) starts directly on Agentaus. The
+PowerShell launcher runs inside the current shell, so it saves and restores the
+`ANTHROPIC_*` variables afterwards and never changes the working directory — your shell
+is left exactly as it was found.
 
 This needs the standalone `claude` CLI on your PATH. With a VS Code extension-only
 install there is no `claude` binary and the script dies with `command not found`. Check
-with `which claude` first.
+with `which claude` first (or `Get-Command claude` on Windows).
 
 ### Option 4: export by hand, for one shell
 
@@ -567,6 +622,7 @@ bridge. That symptom looks like the model is down when it is really a port misma
 | Where | How to change it | When it matters |
 | --- | --- | --- |
 | `scripts/claude-agentaus.sh` | `export BRIDGE_URL="http://127.0.0.1:9100"` before running it | Only if you use the launcher; it reads `BRIDGE_URL` and needs no edit |
+| `scripts/claude-agentaus.ps1` | `$env:BRIDGE_URL="http://127.0.0.1:9100"` before running it | Windows; same as the `.sh` row |
 | `tests/smoke_test.py` | `--url http://127.0.0.1:9100` | Running the end-to-end checks |
 | Command line | `python -m agentaus_bridge --port 9100` | Overrides `.env` for one run, handy for testing |
 | launchd / systemd plist or unit | nothing. They read `.env` | No edit needed |
@@ -1237,7 +1293,7 @@ pass another path. How to read its report, and the rest of the log lines:
 | `HTTP 406` from Agentaus | Something sent `Accept: text/event-stream`. The bridge sends `Accept: */*`; check any proxy in front of it. |
 | Agentaus missing from `/model` | `ANTHROPIC_CUSTOM_MODEL_OPTION` was not set before Claude Code started. Variables are read once at startup, so restart the session (reload the VS Code window). |
 | Agentaus missing, but the bridge is healthy | **Settings scope.** Your `.claude/settings.json` is in the bridge repo, not the project you have open. Move the `env` block to `~/.claude/settings.json` (all projects) or that project's own `.claude/settings.json`, then restart. |
-| `./scripts/claude-agentaus.sh: claude: command not found` | You have the VS Code extension but not the standalone `claude` CLI, so the launcher cannot work. Use a settings file instead (Option 1 or 2). |
+| `./scripts/claude-agentaus.sh: claude: command not found` (or `.ps1: The standalone 'claude' CLI was not found`) | You have the VS Code extension but not the standalone `claude` CLI, so the launcher cannot work. Use a settings file instead (Option 1 or 2). |
 | Both Agentaus and Claude fail at once | Almost always DNS or the bridge being down, not either provider. Everything flows through the bridge, so one broken resolver takes out both. `curl -sf localhost:8787/healthz` tells you in one second. |
 | `This conversation is too long for Agentaus` | Working as intended. Agentaus' window is much smaller than Claude's, and there is no prompt caching, so long sessions hit it quickly. `/compact` usually recovers the session. |
 | `/compact` also fails on Agentaus | This is expected past 131k. Compaction sends the conversation to the model to be summarised, so it overflows too. Switch to a Claude model, compact there, then switch back. `/clear` also works but discards history. |

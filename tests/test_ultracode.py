@@ -98,6 +98,11 @@ class WorkflowIsOfferedWhenTheUserOptsIn(unittest.TestCase):
         # Stripping the "off" mention leaves a real opt-in standing.
         self.assertTrue(augment.workflow_opted_in(self.body(
             "ultracode is off but let's enable ultracode for this task")))
+        for said in ["ultracode off for now, just fix it", "ultracode: off",
+                     "ultracode isn't on, so do it yourself", "Ultracode is not enabled."]:
+            self.assertFalse(augment.workflow_opted_in(self.body(said)), said)
+        self.assertTrue(augment.workflow_opted_in(self.body("ultracode: map the repo")))
+        self.assertTrue(augment.workflow_opted_in(self.body("ultracode off-by-one fix")))
 
     def test_the_ultracode_reminder_is_an_opt_in(self):
         body = self.body('<system-reminder>The user included the keyword "ultracode"</system-reminder>do it')
@@ -448,7 +453,6 @@ class AnAnnouncedStepIsAStall(unittest.TestCase):
         for text in ["Both greps are empty. Let me look at what's actually inside the uv tools dir.",
                      "We will apply multiple Edit calls.", "Next, I'll run the tests:",
                      "Let me look at the folder...", "Next, I'll run the tests \u2014",
-                     "Let me think about that.",
                      "Fixed it.\n\n**Now let me verify the services load.**"]:
             self.assertTrue(augment.announces_a_step(text), text)
 
@@ -460,6 +464,79 @@ class AnAnnouncedStepIsAStall(unittest.TestCase):
                      "That's everything. I'll leave the rest to you.",
                      "All fixed. We'll see how it goes in CI."]:
             self.assertFalse(augment.announces_a_step(text), text)
+
+    def test_a_line_that_names_no_tool_step_is_left_to_the_judge(self):
+        # These start like an announcement but are a finished answer, a refusal to do
+        # something harmful, or a request for something only the user has. Re-asked with
+        # "call the tool now" they were replaced or pushed into a step nobody asked for.
+        for text in ["We need to run the migration on production before this works.",
+                     "I'll need your API key to continue.",
+                     "I will not delete those files.",
+                     "Let me explain why it works.",
+                     "All tests pass. Let's ship it!",
+                     "I'll stop here.", "Let's call it done.",
+                     "We'll want to add a regression test later.",
+                     "Let me think about that.", "Let me see.", "I'll get back to you.",
+                     "I'll use British spelling from now on."]:
+            self.assertFalse(augment.announces_a_step(text), text)
+
+    def test_a_tool_step_after_a_lead_in_word_is_still_a_stall(self):
+        for text in ["Now let me just check the logs.", "I'm going to open the config.",
+                     "Okay, I'll go ahead and run the build.", "Time to search the repo.",
+                     "Let me take a look at the logs.", "I'll double-check the config.",
+                     "Let me begin by exploring the repo.", "I need to read the file first.",
+                     "I'll set up the venv."]:
+            self.assertTrue(augment.announces_a_step(text), text)
+
+
+class OneGateForBothStallChecks(unittest.TestCase):
+    """The follow-up to the structural stall check called the gate a second time for the
+    judge and dropped `answers_an_image`, so "I can't see that screenshot" was sent to the
+    judge again. One gate, with the exemption, serves both."""
+
+    def body(self, last):
+        return {"messages": [user("what does this show?"), last]}
+
+    def test_an_image_turn_is_not_checked_at_all(self):
+        image = {"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "x"}},
+            {"type": "text", "text": "what is this?"}]}
+        self.assertFalse(server._worth_checking(
+            self.body(image), "I can't view images. Could you describe it?",
+            tools_offered=True, called_a_tool=False))
+
+    def test_a_short_toolless_reply_otherwise_is(self):
+        self.assertTrue(server._worth_checking(
+            self.body(user("look in the folder")), "Let me look at the folder.",
+            tools_offered=True, called_a_tool=False))
+
+
+class TheStructuralStallCheck(unittest.TestCase):
+    MISSING = [("report.md", "/w/report.md")]
+
+    def test_a_question_back_is_not_sent_back_for_files(self):
+        self.assertEqual(server._structural_stall("Which folder should it go in?", self.MISSING),
+                         (False, [], False))
+
+    def test_a_question_that_announces_a_step_goes_to_the_judge(self):
+        # Neither structural signal fires; the shared gate still lets the judge decide.
+        self.assertEqual(server._structural_stall("Shall I look at the folder next?", []),
+                         (False, [], False))
+
+    def test_missing_files_alone_are_a_stall_on_the_smaller_budget(self):
+        stalled, missing, announced = server._structural_stall("Here is the summary.", self.MISSING)
+        self.assertTrue(stalled)
+        self.assertEqual(missing, self.MISSING)
+        # `announced` is what earns the 40-per-message cap; missing files get the judge's 8.
+        self.assertFalse(announced)
+
+    def test_an_announcement_is_asked_for_its_step_not_the_files(self):
+        self.assertEqual(server._structural_stall("Let me look at the folder.", self.MISSING),
+                         (True, [], True))
+
+    def test_a_finished_answer_is_no_stall(self):
+        self.assertEqual(server._structural_stall("Done. The file is written.", []),
+                         (False, [], False))
 
 
 class FilesTheRequestNamesMustExist(unittest.TestCase):
@@ -479,6 +556,8 @@ class FilesTheRequestNamesMustExist(unittest.TestCase):
             "Write a.md, b.md and c.md": ["a.md", "b.md", "c.md"],
             "Save the results to out/report.csv and out/summary.md": ["out/report.csv", "out/summary.md"],
             "Write notes.txt, then read main.py and config.py": ["notes.txt"],
+            "write the results, e.g. output.md and notes.md": ["output.md", "notes.md"],
+            "Save it as a report, such as report.md": ["report.md"],
         }
         for task, want in cases.items():
             self.assertEqual([n for n, _ in augment.missing_deliverables(task, "/nowhere")], want, task)
@@ -490,6 +569,40 @@ class FilesTheRequestNamesMustExist(unittest.TestCase):
         for task in ["Read README.md and tell me what it does", "Fix the bug in tools/bank.py",
                      "look in config.py and write me a summary", "Create the summary, e.g. a table"]:
             self.assertEqual(augment.missing_deliverables(task, "/nowhere"), [], task)
+
+    def test_names_that_are_not_files_to_write(self):
+        for task in ["Write a Node.js script", "create a Next.js app",
+                     "create an ASP.NET controller",
+                     "draft an email to john.smith@example.com",
+                     "write to example.com about the outage", "produce the P.S. section",
+                     "Don't write config.yaml yet, just plan", "do not create notes.md",
+                     "Can you explain how to write to output.csv safely?",
+                     "Why did the build generate dist/app.js twice?",
+                     "The tool should create out.json when run"]:
+            self.assertEqual(augment.missing_deliverables(task, "/nowhere"), [], task)
+
+    def test_a_request_in_other_words_still_counts(self):
+        cases = {
+            "Summarise the emails and save it to summary.md": ["summary.md"],
+            "Can you write the results to results.csv?": ["results.csv"],
+            "Please create `report.final` for me": ["report.final"],
+            "- Write CHANGELOG.md": ["CHANGELOG.md"],
+            "Read the RFQ. Then write answers.md": ["answers.md"],
+            "I'd like you to create report.docx": ["report.docx"],
+            "You should write notes.md": ["notes.md"],
+            "Make sure to write report.md": ["report.md"],
+            "Your job is to produce brief.md": ["brief.md"],
+            "We need you to write b.md": ["b.md"],
+            "Step 2 - write drafts.md": ["drafts.md"],
+            "a) write a.md": ["a.md"],
+            "Write main.tf": ["main.tf"],
+            "Create App.vue": ["App.vue"],
+            # Tripwire: a quoted name is taken as written, whatever its extension.
+            "Write `notes.weird` and `data.v2`": ["notes.weird", "data.v2"],
+        }
+        for task, want in cases.items():
+            self.assertEqual([n for n, _ in augment.missing_deliverables(task, "/nowhere")],
+                             want, task)
 
     def test_a_file_that_exists_is_not_missing(self):
         import tempfile, os
