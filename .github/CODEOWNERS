@@ -1,0 +1,10 @@
+# Changes to these paths need the repository owner's approval once branch protection on
+# `main` requires review from code owners (Settings > Branches).
+#
+# The identity line: who Agentaus says it is. tests/test_identity.py fails if it is removed
+# or stops reaching the model; the CI workflow runs that test, and this file says who owns
+# all three.
+/agentaus_bridge/identity.py   @chengyu2
+/tests/test_identity.py        @chengyu2
+/.github/workflows/            @chengyu2
+/.github/CODEOWNERS            @chengyu2

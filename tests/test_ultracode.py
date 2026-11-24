@@ -556,6 +556,8 @@ class FilesTheRequestNamesMustExist(unittest.TestCase):
             "Write a.md, b.md and c.md": ["a.md", "b.md", "c.md"],
             "Save the results to out/report.csv and out/summary.md": ["out/report.csv", "out/summary.md"],
             "Write notes.txt, then read main.py and config.py": ["notes.txt"],
+            "write the results, e.g. output.md and notes.md": ["output.md", "notes.md"],
+            "Save it as a report, such as report.md": ["report.md"],
         }
         for task, want in cases.items():
             self.assertEqual([n for n, _ in augment.missing_deliverables(task, "/nowhere")], want, task)

@@ -15,6 +15,7 @@ import json
 import os
 import re
 
+from .identity import with_identity
 from .text import normalise_for_display
 from .tokens import calibrator, count_tokens
 import uuid
@@ -262,9 +263,9 @@ def anthropic_request_to_agentaus(
     # finished task replied to with "I have not read the Claude Docs workflow you
     # shared". They are context, so they join the system prompt, and the turn always
     # ends on what the user actually said.
-    system_text = _with_no_vision_line(
+    system_text = with_identity(_with_no_vision_line(
         "\n\n".join(t for t in [_system_to_text(body.get("system"))] + system_notes(body) if t),
-        body.get("messages"))
+        body.get("messages")))
     if system_text:
         messages.append({"role": "system", "content": system_text})
 

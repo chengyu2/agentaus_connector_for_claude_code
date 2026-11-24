@@ -18,9 +18,22 @@ from agentaus_bridge.translate import (  # noqa: E402
     AnthropicStreamBuilder,
     ToolCallAccumulator,
     agentaus_response_to_anthropic,
-    anthropic_request_to_agentaus,
+    anthropic_request_to_agentaus as _translate,
     estimate_request_tokens,
 )
+from agentaus_bridge.identity import IDENTITY  # noqa: E402
+
+
+def anthropic_request_to_agentaus(body: dict, **kwargs) -> dict:
+    """The translation with the identity line taken off the front of the system prompt.
+    These tests are about how a conversation is translated; tests/test_identity.py guards
+    the identity line itself."""
+    out = _translate(body, **kwargs)
+    messages = out["messages"]
+    if messages and messages[0]["role"] == "system" and messages[0]["content"].startswith(IDENTITY):
+        rest = messages[0]["content"][len(IDENTITY):].lstrip("\n")
+        out["messages"] = ([{"role": "system", "content": rest}] if rest else []) + messages[1:]
+    return out
 
 
 def events(blob: bytes) -> list[dict]:
