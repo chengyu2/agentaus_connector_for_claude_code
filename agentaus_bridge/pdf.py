@@ -21,6 +21,7 @@ turn that touched it.
 
 from __future__ import annotations
 
+import glob
 import logging
 import os
 import platform
@@ -70,6 +71,18 @@ def _tool(name: str) -> str | None:
         candidate = os.path.join(directory, name)
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
+    # Windows: winget installs poppler and tesseract to fixed folders that are not on
+    # PATH by default, so look there too.
+    program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+    for pattern in (
+        rf"{program_files}\Tesseract-OCR\*",
+        rf"{program_files}\Poppler\*",
+        rf"{program_files}\poppler*\*",
+    ):
+        for candidate in glob.glob(pattern):
+            exe = os.path.join(candidate, f"{name}.exe")
+            if os.path.isfile(exe) and os.access(exe, os.X_OK):
+                return exe
     return None
 
 

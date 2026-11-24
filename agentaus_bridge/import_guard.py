@@ -146,7 +146,11 @@ def _copy_project(root: str, dest: str) -> bool:
 
 
 def _python() -> str:
-    return shutil.which("python3") or sys.executable
+    # On Windows `python3` is usually absent, and a Store-placeholder `python` can exist
+    # that opens the Microsoft Store instead of running. The interpreter already running
+    # this bridge is always real, so prefer it; `python3` is only a fallback for cases
+    # where sys.executable points somewhere unusable.
+    return sys.executable or shutil.which("python3")
 
 
 def probe(root: str, path: str, text: str, copy: str) -> tuple[bool, str]:

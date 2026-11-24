@@ -13,3 +13,4 @@ if (-not (Test-Path ".env")) {
 }
 
 & $VENV_PY -m agentaus_bridge $args
+exit $LASTEXITCODE

@@ -75,3 +75,40 @@ jobs:
       - name: Run tests
         timeout-minutes: 10
         run: python -m pytest tests -n auto --dist loadfile -o python_files='test_*.py' -p no:cacheprovider -q -ra --durations=10
+
+  # Windows has no bash, so the scripts/install.sh path never runs there. This job at least
+  # proves the three .ps1 scripts parse and that install.ps1 completes the offline part the
+  # reviewer asked for: virtualenv creation, dependency install and the requirements check.
+  # A live `-m agentaus_bridge --check` needs the AGENTAUS_API_KEY secret, so it is not part
+  # of CI; the requirements check inside install.ps1 covers the same failure modes that used
+  # to slip through (a missing package reported as success).
+  windows:
+    name: Windows / PowerShell install
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Parse the three PowerShell scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($f in @("scripts/install.ps1", "scripts/start-bridge.ps1", "scripts/claude-agentaus.ps1")) {
+            $tokens = $null; $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $f), [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) { throw "Parse errors in $f" }
+            Write-Host "parsed OK: $f"
+          }
+
+      - name: Run install.ps1 (virtualenv, dependencies, requirements check)
+        shell: pwsh
+        run: |
+          $env:INSTALL_DOCUMENT_READERS = "0"
+          & .\scripts\install.ps1
+
+      - name: Verify the bridge imports on Windows
+        shell: pwsh
+        run: |
+          & .\.venv\Scripts\python.exe -c "from agentaus_bridge import requirements, documents, pdf; print('bridge import OK')"

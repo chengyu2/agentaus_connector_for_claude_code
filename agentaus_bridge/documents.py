@@ -45,13 +45,17 @@ OFFICE_SUFFIXES = {
     ".pptx", ".ppt", ".odp",
 }
 
-# Where soffice usually lives. Checked in order; the configured path wins.
+# Where soffice usually lives. Checked in order; the configured path wins. Windows is
+# included because winget installs LibreOffice to a fixed folder that is not on PATH.
+_WINDOWS = os.environ.get("PROGRAMFILES", r"C:\Program Files")
 _CANDIDATES = (
     "/Applications/LibreOffice.app/Contents/MacOS/soffice",
     "/usr/bin/soffice",
     "/usr/local/bin/soffice",
     "/opt/homebrew/bin/soffice",
     "/snap/bin/libreoffice",
+    f"{_WINDOWS}\\LibreOffice\\program\\soffice.exe",
+    f"{_WINDOWS}\\LibreOffice\\program\\libreoffice.exe",
 )
 
 _binary: str | None = None
