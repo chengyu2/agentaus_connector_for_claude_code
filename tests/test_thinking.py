@@ -769,6 +769,21 @@ class TestRefusalClassification(unittest.TestCase):
         self.assertFalse(self.gate("Here are the headings. " * 1000,
                                    tools_offered=True, called_a_tool=False))
 
+    def test_saying_it_cannot_see_an_image_it_was_given_is_not_judged(self):
+        """The bridge tells the model it cannot see images. Its honest reply - short, no
+        tool, tools on offer - must not reach the judge, whose correction ("nobody will
+        upload anything, call the tool") brings back the repeated Read or invented content."""
+        reply = "I can't view images, so I can't read that screenshot. Could you describe it?"
+        self.assertTrue(self.gate(reply, tools_offered=True, called_a_tool=False))
+        self.assertFalse(self.gate(reply, tools_offered=True, called_a_tool=False,
+                                   answers_an_image=True))
+
+    def test_the_judge_is_told_a_cannot_see_reply_is_an_answer(self):
+        """For a later turn, where the image is no longer in the newest input."""
+        from agentaus_bridge.augment import CLASSIFY_REFUSAL_INSTRUCTION
+        prompt = CLASSIFY_REFUSAL_INSTRUCTION.format(request="r", ran="", answer="a")
+        self.assertIn("cannot see an image, screenshot or picture is an ANSWER", prompt)
+
     def test_a_script_printed_instead_of_written_is_judged(self):
         printed = "**pareto.R**\n\n```r\nlibrary(readxl)\n" + "x <- 1\n" * 400 + "```"
         self.assertTrue(self.gate(printed, tools_offered=True, called_a_tool=False))

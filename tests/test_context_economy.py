@@ -97,6 +97,13 @@ class TestEvidenceForTheGroundingCheck(unittest.TestCase):
         self.assertIn("coef=0.8492778865371", text)
         self.assertIn("se=0.9584713297165", text)
 
+    def test_an_image_result_is_evidence_as_its_note(self):
+        """The grounding check cannot read base64; it must see that the image never arrived."""
+        image = {"type": "image", "source": {"type": "base64", "data": "iVBORw0KGgo" + "A" * 4000}}
+        text = ledger.render_evidence([call("a", "Read", file_path="/a.png"), result("a", [image])])
+        self.assertIn("Image omitted", text)
+        self.assertNotIn("iVBORw0KGgo", text)
+
     def test_the_plain_ledger_still_carries_no_output(self):
         """The two callers want opposite things, and the cheap one must stay cheap."""
         messages = [call("a", "Bash", command="python fit.py"), result("a", "coef=0.849")]

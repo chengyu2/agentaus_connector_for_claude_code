@@ -58,6 +58,16 @@ class _Counter:
 
 
 class TestSplit(unittest.TestCase):
+    def test_an_image_is_costed_as_its_note(self):
+        """One recent screenshot at its base64 size used to overflow keep_tokens and push
+        nearly the whole conversation into the head; Agentaus only ever receives its note."""
+        image = {"type": "image", "source": {"type": "base64", "data": "iVBORw0KGgo" + "A" * 800000}}
+        messages = convo(12)
+        messages[-3] = {"role": "user", "content": [image, {"type": "text", "text": "see this"}]}
+        _, tail = split_head_tail(messages, 20000)
+
+        self.assertGreater(len(tail), 3, "the image message overflowed the tail on its own")
+
     def test_newest_message_is_always_kept(self):
         messages = convo(20)
         _, tail = split_head_tail(messages, 500)

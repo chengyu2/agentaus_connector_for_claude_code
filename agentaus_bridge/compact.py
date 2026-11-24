@@ -33,8 +33,8 @@ from collections import OrderedDict
 from typing import Awaitable, Callable
 
 from .gate import hold
-from .translate import (content_text, estimate_request_tokens, estimate_tokens, has_unseen,
-                        unseen_note)
+from .translate import (as_sent, content_text, estimate_request_tokens, estimate_tokens,
+                        has_unseen, unseen_note)
 # Re-exported: these lived here first and several modules import them from here.
 from .text import normalise_for_display, normalise_identifiers  # noqa: F401
 from . import prompt_style
@@ -182,7 +182,10 @@ def split_head_tail(
     tail: list = []
     used = 0
     for message in reversed(messages):
-        cost = estimate_tokens(json.dumps(message, default=str))
+        # Costed as Agentaus receives it: an image is its note, not its base64, or one
+        # recent screenshot overflows keep_tokens and pushes nearly everything into the head.
+        sized = as_sent(message) if has_unseen(message) else message
+        cost = estimate_tokens(json.dumps(sized, default=str))
         if tail and used + cost > keep_tokens:
             break
         tail.insert(0, message)

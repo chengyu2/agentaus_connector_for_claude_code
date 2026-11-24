@@ -158,7 +158,9 @@ class TestRequestTranslation(unittest.TestCase):
         self.assertIn("Image omitted: you cannot see images", body)
         self.assertIn("what is this?", body)
         # Even with no system prompt of its own, the request says the model has no vision.
+        # That creates a system message, so Agentaus's own persona is replaced too.
         self.assertEqual(result["messages"][0], {"role": "system", "content": NO_VISION_SYSTEM})
+        self.assertTrue(result["system_prompt_overwrite"])
 
     def test_thinking_blocks_are_dropped(self):
         result = anthropic_request_to_agentaus(
@@ -218,6 +220,27 @@ class TestNoVision(unittest.TestCase):
         self.assertIn("Screenshot captured.", tool["content"])
         self.assertIn("Image omitted", tool["content"])
         self.assertNotIn("never ask for it", tool["content"])
+
+    def test_an_image_nested_in_another_container_gets_its_note(self):
+        """has_unseen finds an image at any depth, so the note must appear at any depth
+        too - otherwise the empty text falls back to sending the base64."""
+        nested = [{"type": "search_result", "source": "https://x", "title": "x",
+                   "content": [{"type": "text", "text": "a caption"}, IMAGE]}]
+        tool = _read_result(nested)["messages"][-1]
+        self.assertIn("a caption", tool["content"])
+        self.assertIn("Image omitted", tool["content"])
+        self.assertNotIn("iVBORw0KGgo", tool["content"])
+
+    def test_a_plain_text_document_is_passed_through(self):
+        """A text-source document is readable, so it is neither omitted nor 'unseen'."""
+        doc = {"type": "document", "title": "notes.txt",
+               "source": {"type": "text", "media_type": "text/plain", "data": "the launch is on 3 May"}}
+        result = anthropic_request_to_agentaus({"messages": [{"role": "user", "content": [
+            doc, {"type": "text", "text": "when is the launch?"}]}]})
+        body = result["messages"][-1]["content"]
+        self.assertIn("the launch is on 3 May", body)
+        self.assertNotIn("Document omitted", body)
+        self.assertFalse(any(m["role"] == "system" for m in result["messages"]))
 
     def test_a_text_tool_result_keeps_its_usual_framing(self):
         tool = _read_result([{"type": "text", "text": "def main(): pass"}])["messages"][-1]

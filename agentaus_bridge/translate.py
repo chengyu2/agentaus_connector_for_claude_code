@@ -69,17 +69,44 @@ def unseen_note(kind: str) -> str:
             "description or the text it contains.]")
 
 
+def _readable_document(block: dict) -> bool:
+    """A document whose source is plain text: Agentaus can read that, so it is not unseen."""
+    source = block.get("source")
+    return (block.get("type") == "document" and isinstance(source, dict)
+            and source.get("type") == "text" and isinstance(source.get("data"), str))
+
+
+def _is_unseen(block: dict) -> bool:
+    return block.get("type") == "image" or (
+        block.get("type") == "document" and not _readable_document(block))
+
+
+def attachment_text(block: dict) -> str:
+    """An image or document block as Agentaus receives it: a plain-text document's own
+    text, and anything else as the note saying it never arrived."""
+    if _readable_document(block):
+        title = block.get("title")
+        return (f"[Document: {title}]\n" if title else "") + block["source"]["data"]
+    return unseen_note(block.get("type", "image"))
+
+
 def has_unseen(content: Any) -> bool:
-    """Whether messages, content or a block hold an image or document block, at any depth."""
+    """Whether messages, content or a block hold an image or unreadable document, at any
+    depth - inside a tool_result, a search_result or any other container."""
     if isinstance(content, list):
         return any(has_unseen(block) for block in content)
     if isinstance(content, dict):
-        return content.get("type") in ("image", "document") or has_unseen(content.get("content"))
+        return _is_unseen(content) or has_unseen(content.get("content"))
     return False
 
 
 def _flatten_text(content: Any) -> str:
-    """Anthropic content may be a plain string or a list of typed blocks."""
+    """Anthropic content may be a plain string or a list of typed blocks.
+
+    Descends into any block that holds content of its own - a tool_result, a
+    search_result - so an image anywhere is replaced by its note, the same blocks
+    has_unseen finds.
+    """
     if content is None:
         return ""
     if isinstance(content, str):
@@ -92,10 +119,10 @@ def _flatten_text(content: Any) -> str:
             elif isinstance(block, dict):
                 if block.get("type") == "text":
                     parts.append(block.get("text", ""))
-                elif block.get("type") == "tool_result":
-                    parts.append(_flatten_text(block.get("content")))
                 elif block.get("type") in ("image", "document"):
-                    parts.append(unseen_note(block["type"]))
+                    parts.append(attachment_text(block))
+                elif isinstance(block.get("content"), (list, str)):
+                    parts.append(_flatten_text(block["content"]))
         return "\n".join(p for p in parts if p)
     if isinstance(content, dict):
         return _flatten_text([content])
@@ -205,6 +232,20 @@ def system_notes(body: dict) -> list:
     return notes
 
 
+def _with_no_vision_line(system_text: str, messages: Any) -> str:
+    """The system prompt with NO_VISION_SYSTEM appended.
+
+    Appended whenever there is a system prompt, so the model knows before it meets an
+    image it only hears about (a URL, a path). Also when there is none but the request
+    holds an image - which creates a system message, and so sets
+    system_prompt_overwrite and replaces Agentaus's own persona for that request. Claude
+    Code always sends a system prompt, so in practice that second case is other clients.
+    """
+    if system_text or has_unseen(messages):
+        return f"{system_text}\n\n{NO_VISION_SYSTEM}".strip()
+    return system_text
+
+
 def anthropic_request_to_agentaus(
     body: dict,
     *,
@@ -221,10 +262,9 @@ def anthropic_request_to_agentaus(
     # finished task replied to with "I have not read the Claude Docs workflow you
     # shared". They are context, so they join the system prompt, and the turn always
     # ends on what the user actually said.
-    system_text = "\n\n".join(t for t in [_system_to_text(body.get("system"))]
-                               + system_notes(body) if t)
-    if system_text or has_unseen(body.get("messages")):
-        system_text = f"{system_text}\n\n{NO_VISION_SYSTEM}".strip()
+    system_text = _with_no_vision_line(
+        "\n\n".join(t for t in [_system_to_text(body.get("system"))] + system_notes(body) if t),
+        body.get("messages"))
     if system_text:
         messages.append({"role": "system", "content": system_text})
 
@@ -275,7 +315,7 @@ def anthropic_request_to_agentaus(
                 pending_tool_results.append(block)
             elif btype in ("image", "document"):
                 # Agentaus accepts text only; say so where the attachment was.
-                text_parts.append(unseen_note(btype))
+                text_parts.append(attachment_text(block))
             elif btype == "thinking":
                 # Reasoning blocks from a previous Claude turn: not replayable upstream.
                 continue
@@ -431,14 +471,14 @@ def raw_token_count(text: str) -> int:
     return count_tokens(text)
 
 
-def _as_sent(value: Any) -> Any:
+def as_sent(value: Any) -> Any:
     """`value` with each image or document block as the note that replaces it upstream."""
     if isinstance(value, list):
-        return [_as_sent(item) for item in value]
+        return [as_sent(item) for item in value]
     if isinstance(value, dict):
         if value.get("type") in ("image", "document"):
-            return {"type": "text", "text": unseen_note(value["type"])}
-        return {k: _as_sent(v) for k, v in value.items()}
+            return {"type": "text", "text": attachment_text(value)}
+        return {k: as_sent(v) for k, v in value.items()}
     return value
 
 
@@ -448,7 +488,7 @@ def estimate_request_tokens(body: dict) -> int:
     messages = body.get("messages")
     blob = json.dumps(
         {"s": body.get("system"),
-         "m": _as_sent(messages) if has_unseen(messages) else messages,
+         "m": as_sent(messages) if has_unseen(messages) else messages,
          "t": body.get("tools")},
         default=str,
     )
