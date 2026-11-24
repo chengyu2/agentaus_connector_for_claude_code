@@ -415,8 +415,8 @@ def _apply_quality_mode(mode: str) -> None:
     _QUALITY_MODE = mode
     for attr, value in _QUALITY_PRESETS[mode].items():
         setattr(settings, attr, value)
-    log.info("quality mode set to %s (thinking=%s review=%s)",
-             mode, settings.agentaus_thinking, settings.agentaus_self_review)
+    rlog(logging.INFO, "quality mode set to %s (thinking=%s review=%s)",
+         mode, settings.agentaus_thinking, settings.agentaus_self_review)
 
 
 _UI_PAGE = """\
