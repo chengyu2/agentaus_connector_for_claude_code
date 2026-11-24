@@ -71,129 +71,128 @@ you, because it `exec`s `claude`. Use a settings file instead (Option 1 or 2 und
 
 ### Requirements
 
-Only Python and the packages in `requirements.txt` are required; the install scripts put
-those in a virtualenv and need nothing else on the machine. LibreOffice, poppler and
-tesseract are optional document readers. Without them the bridge starts, logs a warning
-naming each missing reader, and skips the documents it cannot read.
-`INSTALL_DOCUMENT_READERS=1` installs them as well.
+Only Python 3.11+ and the core packages are required. Everything else is a **component**
+you can choose at install: the document readers (LibreOffice, poppler, tesseract), the
+pure-Python PDF fallbacks, the code outline, macOS Vision OCR, and the setup pieces
+(Claude Code settings, background service, `agentaus-bridge` command). Without a
+component the bridge still starts; one you chose but that is missing is logged as a
+warning with its install command, and one you skipped is a single info line.
 
-| Requirement | Reads | macOS | Debian / Ubuntu | Fedora (dnf) | Windows (winget) |
-| --- | --- | --- | --- | --- | --- |
-| Python 3.11+ | - | `brew install python` | `sudo apt install python3 python3-venv` | `sudo dnf install python3` | `winget install --id Python.Python.3.12` (or [python.org](https://www.python.org/downloads/windows/)) |
-| LibreOffice | `.docx`, `.xlsx`, `.pptx`, tables intact | `brew install --cask libreoffice` | `sudo apt install libreoffice-writer libreoffice-calc libreoffice-impress` | `sudo dnf install libreoffice` | `winget install --id TheDocumentFoundation.LibreOffice` |
-| poppler (`pdftotext`, `pdftoppm`) | PDF text with its layout; scanned pages for OCR | `brew install poppler` | `sudo apt install poppler-utils` | `sudo dnf install poppler-utils` | `winget install --id oschwartz10612.Poppler` |
-| tesseract | Scanned PDF pages | `brew install tesseract` | `sudo apt install tesseract-ocr` | `sudo dnf install tesseract` | `winget install --id UB-Mannheim.TesseractOCR` |
-| Python packages in `requirements.txt` | PDF fallbacks (`pdfminer.six`, `pypdf`), the code outline (`tree-sitter`), macOS Vision OCR (`pyobjc`) | `pip install -r requirements.txt` | same | same | `.venv\Scripts\python.exe -m pip install -r requirements.txt` |
+The installer runs these for you; they are here for installing by hand.
 
-> **Windows note on the document readers:** winget installs LibreOffice, poppler and
-> tesseract to folders that are **not** on `PATH`, and the current terminal does not see
-> PATH changes anyway. `install.ps1` installs them automatically when you set
-> `INSTALL_DOCUMENT_READERS=1` (see below). Open a **new** terminal afterwards, and if the
-> bridge still reports LibreOffice missing, set `AGENTAUS_SOFFICE_PATH` in `.env`. The
-> bridge also checks the winget install folders directly, so it usually needs no extra
-> configuration.
+| Requirement | Reads | macOS | Debian / Ubuntu | Fedora (dnf) | Arch (pacman) | Windows (winget) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Python 3.11+ | - | `brew install python` | `sudo apt install python3 python3-venv` | `sudo dnf install python3` | `sudo pacman -S python` | `winget install --id Python.Python.3.12` (or [python.org](https://www.python.org/downloads/windows/)) |
+| LibreOffice | `.docx`, `.xlsx`, `.pptx`, tables intact | `brew install --cask libreoffice` | `sudo apt install libreoffice-writer libreoffice-calc libreoffice-impress` | `sudo dnf install libreoffice-writer libreoffice-calc libreoffice-impress` | `sudo pacman -S libreoffice-fresh` | `winget install --id TheDocumentFoundation.LibreOffice` |
+| poppler (`pdftotext`, `pdftoppm`) | PDF text with its layout; scanned pages for OCR | `brew install poppler` | `sudo apt install poppler-utils` | `sudo dnf install poppler-utils` | `sudo pacman -S poppler` | `winget install --id oschwartz10612.Poppler` |
+| tesseract | Scanned PDF pages | `brew install tesseract` | `sudo apt install tesseract-ocr` | `sudo dnf install tesseract` | `sudo pacman -S tesseract tesseract-data-eng` | `winget install --id UB-Mannheim.TesseractOCR` |
+| Python packages | PDF fallbacks (`pdfminer.six`, `pypdf`), the code outline (`tree-sitter`), macOS Vision OCR (`pyobjc`) | `pip install -r requirements.txt` | same | same | same | `.venv\Scripts\python.exe -m pip install -r requirements.txt` |
 
-### macOS, Debian / Ubuntu, Fedora (bash)
+### macOS, Debian / Ubuntu, Fedora, Arch (bash)
 
-**One-line install** — clone, enter the repo and run the installer in a single command:
+**Guided install.** One command fetches the bridge into `~/.agentaus-bridge` and walks you
+through it, confirming each step before it runs:
 
 ```bash
-git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git && cd agentaus_connector_for_claude_code && ./scripts/install.sh
+curl -fsSL https://raw.githubusercontent.com/chengyu2/agentaus_connector_for_claude_code/main/scripts/install.sh | bash
 ```
 
-To also install the optional document readers (LibreOffice, poppler, tesseract) on macOS,
-Debian/Ubuntu or Fedora, set the flag on the same line:
+From a clone, `./scripts/install.sh` runs the same installer in place. Either way it:
+
+1. checks for Python 3.11+ (and says how to get it if not), then creates a virtualenv;
+2. lets you choose components - **Recommended**, **Minimal**, **Full**, or **Custom** to tick
+   each one - and shows the plan, sizes and what skipping each component costs;
+3. shows any `brew` / `apt` / `dnf` / `pacman` command before running it, and asks;
+4. asks for your Agentaus API key (hidden), writes it to `.env` (mode 600) and tests it
+   with a live call;
+5. merges the `env` block into `~/.claude/settings.json` (or one project's
+   `.claude/settings.local.json`), showing the diff and keeping a backup;
+6. optionally installs a background service (a launchd agent on macOS, a systemd user
+   service on Linux, a Task Scheduler task on Windows) and the `agentaus-bridge` command.
+
+| Component | What it adds | Without it |
+| --- | --- | --- |
+| `core` | the bridge (always installed) | - |
+| `pdf` | pdfminer, pypdf | PDFs unreadable unless poppler is installed |
+| `poppler` | `pdftotext`, `pdftoppm` | PDF text loses its column and table layout |
+| `ocr` | tesseract (pulls in `poppler`) | scanned PDF pages come back blank |
+| `vision` | macOS Vision OCR (macOS only) | OCR falls back to tesseract |
+| `office` | LibreOffice, ~500 MB | `.docx`, `.xlsx`, `.pptx` are not read |
+| `outline` | tree-sitter | the search outline is less precise |
+| `settings` | the `env` block in a Claude Code settings file | you add it by hand |
+| `service` | launchd agent / systemd user service | you start the bridge yourself |
+| `command` | `~/.local/bin/agentaus-bridge` | you use the scripts in `scripts/` |
+
+Options pass through, so the same install runs unattended:
 
 ```bash
-git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git && cd agentaus_connector_for_claude_code && INSTALL_DOCUMENT_READERS=1 ./scripts/install.sh
+# Everything, no questions; the key comes from the environment
+curl -fsSL .../scripts/install.sh | AGENTAUS_API_KEY=sk-... bash -s -- --yes --preset full
+
+# Recommended plus LibreOffice, without the service, settings for one project only
+./scripts/install.sh --with office --without service --settings ~/code/my_project
+
+# See what would happen, change nothing
+./scripts/install.sh --dry-run
 ```
 
-**System dependencies in one line** — Python plus the document readers, per platform
-(`brew` software includes Python itself; `apt`/`dnf` need `python3-venv` too):
+`--preset minimal|recommended|full`, `--with` / `--without` (comma-separated component
+names), `--settings user|none|<project dir>`, `--port`, `--no-check`, `--yes`, `--dry-run`.
+Run `./scripts/install.sh --help` for the list. `AGENTAUS_BRIDGE_HOME` changes where a piped
+install goes, and `AGENTAUS_BRIDGE_REF` installs a branch or tag other than `main`.
 
-macOS:
+Afterwards, `agentaus-bridge` manages it: `status`, `doctor` (adds a live key check),
+`components` (add or remove components), `run`, `start` / `stop` / `restart`, `logs`,
+`update` and `uninstall` (removes the settings keys, service and command it added). The
+installer never removes system packages, because other software may use them.
 
-```bash
-brew install python poppler tesseract && brew install --cask libreoffice
-```
-
-Debian / Ubuntu:
-
-```bash
-sudo apt-get update && sudo apt-get install -y python3 python3-venv libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils tesseract-ocr
-```
-
-Fedora (dnf):
-
-```bash
-sudo dnf install -y python3 libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils tesseract
-```
-
-Prefer its step-by-step form to see what each piece does:
+**By hand**, if you would rather see each piece:
 
 ```bash
 git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git
 cd agentaus_connector_for_claude_code
-./scripts/install.sh                           # virtualenv, dependencies, .env scaffold
-$EDITOR .env                                   # paste your AGENTAUS_API_KEY
+python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+cp .env.example .env && $EDITOR .env           # paste your AGENTAUS_API_KEY
 ./.venv/bin/python -m agentaus_bridge --check   # verify the key with a live call
 ./scripts/start-bridge.sh                      # start the bridge (leave this terminal open)
 ```
 
-A successful `--check` prints `OK - Agentaus replied` with a token count. If it prints
-`HTTP 401`, the key is wrong or expired. Fix that before going further, because nothing
-downstream can work without it.
-
-With `INSTALL_DOCUMENT_READERS=1`, the install script installs the readers with `brew` on
-macOS, `apt-get` on Debian/Ubuntu and `dnf` on Fedora. Anywhere else it tells you what to
-install by hand.
+`requirements.txt` installs every Python component; `requirements/*.txt` has them one
+group per file. A successful `--check` prints `OK - Agentaus replied` with a token count.
+If it prints `HTTP 401`, the key is wrong or expired. Fix that before going further,
+because nothing downstream can work without it.
 
 ### Windows (PowerShell)
 
-Windows is supported by three first-class PowerShell scripts that mirror the bash ones.
-
-**One-line install** — clone, enter the repo and run the installer:
+The same guided installer, with the readers coming from winget. In PowerShell:
 
 ```powershell
-git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git; cd agentaus_connector_for_claude_code; powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+irm https://raw.githubusercontent.com/chengyu2/agentaus_connector_for_claude_code/main/scripts/install.ps1 | iex
 ```
 
-Windows blocks `.ps1` scripts by default, so the `-ExecutionPolicy Bypass` flag is
-required the first time (or set your policy with `Set-ExecutionPolicy -Scope CurrentUser
-RemoteSigned`). To also install the optional document readers (LibreOffice, poppler,
-tesseract) via winget, set the flag on the same line:
+From a clone, `powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1` runs it in
+place (Windows blocks `.ps1` files by default, hence the flag). It takes the same options;
+to pass them to the piped form, run it as a script block:
 
 ```powershell
-git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git; cd agentaus_connector_for_claude_code; $env:INSTALL_DOCUMENT_READERS="1"; powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/chengyu2/agentaus_connector_for_claude_code/main/scripts/install.ps1))) --preset full
 ```
 
-Prefer its step-by-step form to see what each piece does:
-
-```powershell
-git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git
-cd agentaus_connector_for_claude_code
-powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1   # virtualenv, dependencies, .env scaffold
-$EDITOR .env                                                    # paste your AGENTAUS_API_KEY
-.\.venv\Scripts\python.exe -m agentaus_bridge --check              # verify the key with a live call
-.\scripts\start-bridge.ps1                                       # start the bridge (leave this terminal open)
-```
-
-A successful `--check` prints `OK - Agentaus replied` with a token count. If it prints
-`HTTP 401`, the key is wrong or expired. Fix that before going further, because nothing
-downstream can work without it.
-
-`install.ps1` needs Python 3.11+ and detects it automatically, preferring the `py -3`
-launcher so a Microsoft Store placeholder `python` is never picked. With
-`INSTALL_DOCUMENT_READERS=1` it installs the readers with winget; open a **new** terminal
-afterwards so PATH changes are seen, and set `AGENTAUS_SOFFICE_PATH` in `.env` if the
-bridge still cannot find LibreOffice.
+`install.ps1` finds a real Python 3.11+ (preferring the `py -3` launcher, so the Microsoft
+Store placeholder `python` is never picked) and says how to install one if there is none.
+The `service` component registers a Task Scheduler task, `AgentausBridge`, that starts the
+bridge without a console window when you log in and logs to `%TEMP%\agentaus-bridge.log`.
+The `command` component adds `%USERPROFILE%\.local\bin\agentaus-bridge.cmd` and offers to put
+that folder on your user PATH. winget installs LibreOffice, poppler and tesseract into
+folders that are not on PATH; the bridge looks in them directly, and `AGENTAUS_SOFFICE_PATH`
+in `.env` covers a LibreOffice it still cannot find.
 
 For the launcher options (vs a settings file) see [Option 3: the launcher script](#option-3-the-launcher-script-standalone-cli-only),
 which covers `claude-agentaus.ps1`.
 
 If you prefer to run the bridge inside
 [WSL](https://learn.microsoft.com/windows/wsl/install) instead, follow the
-[macOS, Debian / Ubuntu, Fedora (bash)](#macos-debian--ubuntu-fedora-bash) steps above —
+[macOS, Debian / Ubuntu, Fedora, Arch (bash)](#macos-debian--ubuntu-fedora-arch-bash) steps above —
 WSL forwards localhost, so Claude Code on the Windows side still reaches the bridge at
 `http://127.0.0.1:8787`.
 
@@ -1118,7 +1117,9 @@ that blocks Anthropic entirely those will report errors while inference keeps wo
 
 ## Running it in the background
 
-To avoid keeping a terminal open, install a background agent. The bridge reads its own
+To avoid keeping a terminal open, install a background agent. The installer does this for
+you when you keep the `service` component (`agentaus-bridge components` adds it later);
+the steps below are the same thing by hand. The bridge reads its own
 `.env` from its working directory, so the API key stays out of the service definition.
 
 ### macOS: launchd (starts at login, restarts if it dies)

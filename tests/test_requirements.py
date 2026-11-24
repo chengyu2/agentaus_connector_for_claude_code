@@ -1,5 +1,5 @@
-"""The Python packages are required and the bridge will not start without them; the system
-readers are optional and the bridge names each missing one."""
+"""Only the core packages are required. A component chosen at install that is missing is a
+warning naming its install command; one the user skipped is a single info line."""
 
 from __future__ import annotations
 
@@ -11,64 +11,86 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agentaus_bridge import __main__ as entry  # noqa: E402
-from agentaus_bridge import documents, pdf, requirements  # noqa: E402
+from agentaus_bridge import components, documents, pdf, requirements  # noqa: E402
 
 
 class Missing(unittest.TestCase):
     def test_nothing_missing_when_every_reader_is_there(self):
-        with mock.patch.object(documents, "soffice", return_value="/x/soffice"), \
-                mock.patch.object(pdf, "_tool", return_value="/x/tool"), \
-                mock.patch.object(requirements, "_module", return_value=True):
+        with mock.patch.object(components, "_binary", return_value="/x/tool"), \
+                mock.patch.object(components, "_module", return_value=True):
             self.assertEqual(requirements.missing(), [])
             self.assertEqual(requirements.optional_missing(), [])
+            self.assertEqual(requirements.degraded(), [])
 
-    def test_each_missing_reader_is_named_with_its_install_command(self):
-        with mock.patch.object(requirements, "WIN", False), \
-                mock.patch.object(documents, "soffice", return_value=None), \
-                mock.patch.object(pdf, "_tool", side_effect=lambda n: None if n == "tesseract" else "/x/" + n), \
-                mock.patch.object(requirements, "_module", side_effect=lambda m: m != "pdfminer.high_level"):
+    def test_only_core_packages_are_required(self):
+        with mock.patch.object(components, "_module", side_effect=lambda m: m not in ("httpx", "pypdf")):
             lines = requirements.missing()
-            optional = requirements.optional_missing()
         self.assertEqual(len(lines), 1)
-        self.assertTrue(any(l.startswith("pdfminer.six") and "requirements.txt" in l for l in lines))
+        self.assertTrue(lines[0].startswith("httpx") and "requirements/core.txt" in lines[0])
         self.assertIn("install.sh", requirements.report(lines))
-        self.assertEqual(len(optional), 2)
-        self.assertTrue(any(l.startswith("LibreOffice") and "libreoffice" in l for l in optional))
-        self.assertTrue(any(l.startswith("tesseract") and "install tesseract" in l.replace("tesseract-ocr", "tesseract") for l in optional))
-        self.assertIn("INSTALL_DOCUMENT_READERS=1", requirements.optional_report(optional))
+
+    def test_a_chosen_component_that_is_missing_is_named_with_its_install_command(self):
+        with mock.patch.object(requirements, "WIN", False), mock.patch.object(requirements, "MAC", False), \
+                mock.patch.object(components, "package_manager", return_value="apt"), \
+                mock.patch.object(components, "_binary", side_effect=lambda n: None if n in ("soffice", "tesseract") else "/x/" + n), \
+                mock.patch.object(components, "_module", side_effect=lambda m: m != "pdfminer.high_level"):
+            lines = requirements.degraded(["core", "pdf", "poppler", "ocr", "office", "outline"])
+            report = requirements.degraded_report(lines)
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(any(l.startswith("PDF text fallbacks") and "requirements/pdf.txt" in l for l in lines))
+        self.assertTrue(any(l.startswith("Office documents") and "sudo apt install libreoffice-writer" in l for l in lines))
+        self.assertTrue(any(l.startswith("OCR") and "tesseract-ocr" in l for l in lines))
+        self.assertIn("agentaus-bridge components", report)
+
+    def test_a_skipped_component_is_not_degraded_only_skipped(self):
+        with mock.patch.object(requirements, "MAC", False), mock.patch.object(requirements, "WIN", False), \
+                mock.patch.object(components, "_binary", return_value=None), \
+                mock.patch.object(components, "_module", return_value=True):
+            chosen = ["core", "pdf", "outline"]
+            self.assertEqual(requirements.degraded(chosen), [])
+            skipped = requirements.skipped(chosen)
+        self.assertIn("Office documents (LibreOffice)", skipped)
+        self.assertIn("OCR for scanned PDFs (tesseract)", skipped)
+        self.assertNotIn("Claude Code settings", skipped)
+
+    def test_an_install_without_components_counts_as_choosing_everything(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(components.ENV_KEY, None)
+            self.assertEqual(components.selected(), [c.key for c in components.available()])
 
     def test_windows_hints_are_winget_and_powershell(self):
         with mock.patch.object(requirements, "WIN", True), \
-                mock.patch.object(documents, "soffice", return_value=None), \
-                mock.patch.object(pdf, "_tool", return_value=None):
+                mock.patch.object(components, "package_manager", return_value="winget"), \
+                mock.patch.object(components, "_binary", return_value=None):
             optional = requirements.optional_missing()
-            report = requirements.optional_report(optional)
             missing = requirements.report(["x"])
         self.assertTrue(all("winget install --id" in l for l in optional))
-        self.assertIn("$env:INSTALL_DOCUMENT_READERS=1; .\\scripts\\install.ps1", report)
         self.assertIn(".\\scripts\\install.ps1", missing)
 
-    def test_the_bridge_refuses_to_start_without_them(self):
+    def test_the_bridge_refuses_to_start_without_core(self):
         from agentaus_bridge.config import settings
         with mock.patch.object(settings, "agentaus_api_key", "k"), \
-                mock.patch.object(requirements, "missing", return_value=["LibreOffice (`soffice`)"]), \
+                mock.patch.object(requirements, "missing", return_value=["httpx - the bridge itself"]), \
                 mock.patch("uvicorn.run") as run, \
                 self.assertLogs("agentaus-bridge", level="ERROR") as caught:
             code = entry.main(["--env-file", "/nonexistent/.env"])
         self.assertEqual(code, 3)
         run.assert_not_called()
-        self.assertTrue(any("LibreOffice" in line for line in caught.output))
+        self.assertTrue(any("httpx" in line for line in caught.output))
 
-    def test_the_bridge_starts_without_the_system_readers(self):
+    def test_the_bridge_starts_with_chosen_components_missing_and_says_so(self):
         from agentaus_bridge.config import settings
         with mock.patch.object(settings, "agentaus_api_key", "k"), \
                 mock.patch.object(requirements, "missing", return_value=[]), \
-                mock.patch.object(requirements, "optional_missing", return_value=["tesseract (`tesseract`)"]), \
+                mock.patch.object(requirements, "degraded", return_value=["OCR for scanned PDFs (tesseract)"]), \
+                mock.patch.object(requirements, "skipped", return_value=["Office documents (LibreOffice)"]), \
                 mock.patch("uvicorn.run") as run, \
-                self.assertLogs("agentaus-bridge", level="WARNING") as caught:
+                self.assertLogs("agentaus-bridge", level="INFO") as caught:
             entry.main(["--env-file", "/nonexistent/.env"])
         run.assert_called_once()
-        self.assertTrue(any("tesseract" in line for line in caught.output))
+        self.assertTrue(any("WARNING" in line and "tesseract" in line for line in caught.output))
+        self.assertTrue(any("INFO" in line and "skipped at install" in line and "LibreOffice" in line
+                            for line in caught.output))
 
 
 @unittest.skipIf(requirements.optional_missing(), "system document readers not installed")
@@ -98,7 +120,7 @@ class RealReaders(unittest.TestCase):
     def test_every_requirement_is_installed(self):
         self.assertEqual(requirements.missing(), [], "run ./scripts/install.sh")
         self.assertEqual(requirements.optional_missing(), [],
-                         "run INSTALL_DOCUMENT_READERS=1 ./scripts/install.sh")
+                         "run ./scripts/install.sh --preset full")
 
     def test_libreoffice_made_a_pdf_and_each_ocr_tier_reads_it(self):
         self.assertTrue(os.path.exists(self.pdf), "LibreOffice did not convert")

@@ -1,0 +1,3 @@
+# Component "outline": exact declaration indexing for the search outline.
+tree-sitter>=0.21
+tree-sitter-language-pack>=0.4

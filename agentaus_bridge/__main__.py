@@ -36,6 +36,13 @@ def load_env_file(path: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    args_in = sys.argv[1:] if argv is None else argv
+    if args_in and not args_in[0].startswith("-"):
+        # `setup`, `status`, `components`, ...: the installer and the agentaus-bridge
+        # command. Imported lazily so the server never loads the installer's packages.
+        from .installer import cli
+        return cli.main(args_in)
+
     parser = argparse.ArgumentParser(
         prog="agentaus_bridge",
         description="Anthropic Messages API bridge for the Agentaus API.",
@@ -82,18 +89,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    # The Python packages are required. The system readers are not, but a bridge that
-    # cannot open a .docx or a scanned page still answers, just without the evidence
-    # those files hold - so say so.
+    # Only the core packages are required. A chosen component that is missing still lets
+    # the bridge answer, just without the evidence those files hold - so say so; one the
+    # user skipped at install is a choice, so it gets a single info line.
     from . import requirements
 
     lacking = requirements.missing()
     if lacking:
         log.error("%s", requirements.report(lacking))
         return 3
-    degraded = requirements.optional_missing()
+    degraded = requirements.degraded()
     if degraded:
-        log.warning("%s", requirements.optional_report(degraded))
+        log.warning("%s", requirements.degraded_report(degraded))
+    skipped = requirements.skipped()
+    if skipped:
+        log.info("not installed (skipped at install): %s", ", ".join(skipped))
 
     if args.check:
         return _check(settings)
