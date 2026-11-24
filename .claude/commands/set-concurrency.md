@@ -6,8 +6,8 @@ The user should have provided a number as an argument (e.g. `/set-concurrency 4`
 
 **Step 2 — Check the current value**
 
-```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:8787/healthz" -Method GET
+```sh
+curl -s http://127.0.0.1:8787/healthz
 ```
 
 Report the current concurrency limit from the response (field: `max_concurrency`), or note if it isn't shown.
@@ -24,16 +24,26 @@ Stop and wait for the user to confirm ("yes", "go ahead", etc.) before proceedin
 
 **Step 4 — Apply the change**
 
-Update the value in the .env file (run from the repo root):
+Update the value in the .env file using Python (works on all platforms):
 
-```powershell
-(Get-Content .env) -replace '^AGENTAUS_MAX_CONCURRENCY=\d+', "AGENTAUS_MAX_CONCURRENCY=$VALUE" | Set-Content .env
+```sh
+python -c "
+import re, pathlib
+p = pathlib.Path('.env')
+p.write_text(re.sub(r'^AGENTAUS_MAX_CONCURRENCY=\d+', 'AGENTAUS_MAX_CONCURRENCY=VALUE', p.read_text(), flags=re.M))
+"
 ```
+
+Replace `VALUE` with the actual number before running.
 
 Then verify it was written:
 
-```powershell
-Select-String -Path .env -Pattern "AGENTAUS_MAX_CONCURRENCY"
+```sh
+python -c "
+import pathlib
+lines = [l for l in pathlib.Path('.env').read_text().splitlines() if 'MAX_CONCURRENCY' in l]
+print(lines)
+"
 ```
 
 **Step 5 — Remind the user**
