@@ -375,6 +375,10 @@ _SECRET_PATH_TAILS = (
     (".aws", "config"),
 )
 
+# Directories whose every file is a credential however deep it sits: `.ssh/keys/deploy`
+# and `.ssh/config.d/work` are as much a key, or a config naming one, as `.ssh/id_rsa`.
+_SECRET_DIRS = (".ssh",)
+
 
 def _is_secret_name(name: str) -> bool:
     """Basename-only test: whether `name` alone marks a file as a secret."""
@@ -394,16 +398,16 @@ def _is_secret_path(path: str) -> bool:
 
     Separate from the basename test because these files are only secret in context:
     `config` under `.kube` is cluster credentials, `config` anywhere else is ordinary.
-    Anything directly inside a `.ssh/` directory is a key, a `known_hosts`, or a config
-    that names one, whatever it is called.
+    Anything inside a `.ssh/` directory, at any depth, is a key, a `known_hosts`, or a
+    config that names one, whatever it is called. Checking only the immediate parent let
+    `.ssh/keys/deploy` through.
     """
-    parts = os.path.normpath(path).split(os.sep)
+    parts = [part.lower() for part in os.path.normpath(path).split(os.sep)]
     if len(parts) < 2:
         return False
-    parent, base = parts[-2].lower(), parts[-1].lower()
-    if parent == ".ssh":
+    if any(part in _SECRET_DIRS for part in parts[:-1]):
         return True
-    return any(parent == d and base == f for d, f in _SECRET_PATH_TAILS)
+    return (parts[-2], parts[-1]) in _SECRET_PATH_TAILS
 
 
 def _is_secret(name: str, path: str | None = None) -> bool:
