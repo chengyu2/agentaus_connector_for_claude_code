@@ -112,25 +112,86 @@ on run argv
 	set body to item 3 of argv
 	set fromId to item 4 of argv -- exactly "<Name> <address>" of one of Mail's accounts
 	tell application "Mail"
-		set m to make new outgoing message with properties {subject:subj, content:body & return & return, visible:false, sender:fromId}
+		set m to make new outgoing message with properties {subject:subj, content:body & return & return, visible:true, sender:fromId}
 		tell m
 			make new to recipient at end of to recipients with properties {address:toAddr}
 			if (count of argv) > 4 then
 				tell content to make new attachment with properties {file name:(POSIX file (item 5 of argv))} at after last paragraph
 			end if
 		end tell
-		delay 1
+		delay 3 -- let the attachment load
 		save m
-		close m saving yes
+		delay 2
+		close (first window whose name is subj) saving no
 	end tell
 end run
 ```
 
 Run: `osascript draft.applescript "<to>" "<subject>" "<body>" "<Name> <address>" /path/invite.ics`.
 
+- **Make the draft visible, save it once, and close its window.** Measured:
+  - `visible:false` drafts never close: `close m` and `delete m` leave them open, they pile up
+    (`tell application "Mail" to count outgoing messages` keeps growing), and at about 20 Mail
+    stopped answering AppleScript at all until it was quit and reopened.
+  - `save m` followed by `close m saving yes`, run for 17 people back to back, left 29 drafts:
+    extra copies, some with no attachment and three with no recipient.
+  - The recipe above left exactly one complete draft per run and no open window. Its window
+    shows on screen for a few seconds.
+- Check `count outgoing messages` before and after: it must not grow.
+- Run one script against Mail at a time. Mail answers one AppleScript request at a time: a
+  second script waits behind a long one and fails after two minutes with "AppleEvent timed out".
+- If Mail stops answering even `count outgoing messages`, scripts cannot fix it. Ask the user
+  before quitting Mail: open drafts they have not saved would be lost.
 - The draft lands in the `Drafts` mailbox of the account that `sender` belongs to. A
   `sender` that matches no account puts it in the default account.
-- Check: `count (messages of (item 1 of (mailboxes of account "<account>" whose name is "Drafts")) whose subject is "<subject>")`.
+
+### Check: exactly one complete draft per person
+
+Count the drafts with that subject: it should equal the number of people. If it is more,
+or some are incomplete, keep each person's newest complete draft - one recipient, the
+attachment - and delete the rest. List first, then delete:
+
+```applescript
+on run argv
+	-- argv: account, exact subject, then "list" or "delete"
+	set acct to item 1 of argv
+	set subj to item 2 of argv
+	set doDelete to (item 3 of argv) is "delete"
+	set out to ""
+	set kept to {}
+	set doomed to {}
+	with timeout of 600 seconds
+		tell application "Mail"
+			set mb to item 1 of (mailboxes of account acct whose name is "Drafts")
+			set ds to (messages of mb whose subject is subj)
+			set ds to reverse of ds -- newest first
+			repeat with d in ds
+				set rs to to recipients of d
+				set addr to ""
+				if (count rs) is 1 then set addr to address of item 1 of rs
+				if (count rs) is 1 and (count mail attachments of d) > 0 and kept does not contain addr then
+					set end of kept to addr
+					set out to out & "KEEP   " & addr & linefeed
+				else
+					set end of doomed to contents of d
+					set out to out & "DELETE " & addr & " (recipients " & (count rs) & ", attachments " & (count mail attachments of d) & ")" & linefeed
+				end if
+			end repeat
+			if doDelete then
+				repeat with d in doomed
+					delete d
+				end repeat
+			end if
+		end tell
+	end timeout
+	if doDelete then return out & "kept " & (count kept) & ", deleted " & (count doomed)
+	return out & "kept " & (count kept) & ", would delete " & (count doomed) & " (run again with delete)"
+end run
+```
+
+Run `osascript dedupe.applescript "<account>" "<subject>" list`, read it, then run it again
+with `delete`. Drafts that had no attachment by design are deleted too: drop the attachment
+test (`(count mail attachments of d) > 0`) when the drafts carry none.
 
 ## 5. Create the event, and invite people
 
