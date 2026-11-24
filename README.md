@@ -87,12 +87,46 @@ naming each missing reader, and skips the documents it cannot read.
 
 ### macOS, Debian / Ubuntu, Fedora (bash)
 
+**One-line install** — clone, enter the repo and run the installer in a single command:
+
+```bash
+git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git && cd agentaus_connector_for_claude_code && ./scripts/install.sh
+```
+
+To also install the optional document readers (LibreOffice, poppler, tesseract) on macOS,
+Debian/Ubuntu or Fedora, set the flag on the same line:
+
+```bash
+git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git && cd agentaus_connector_for_claude_code && INSTALL_DOCUMENT_READERS=1 ./scripts/install.sh
+```
+
+**System dependencies in one line** — Python plus the document readers, per platform
+(`brew` software includes Python itself; `apt`/`dnf` need `python3-venv` too):
+
+macOS:
+
+```bash
+brew install python poppler tesseract && brew install --cask libreoffice
+```
+
+Debian / Ubuntu:
+
+```bash
+sudo apt-get update && sudo apt-get install -y python3 python3-venv libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils tesseract-ocr
+```
+
+Fedora (dnf):
+
+```bash
+sudo dnf install -y python3 libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils tesseract
+```
+
+Prefer its step-by-step form to see what each piece does:
+
 ```bash
 git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git
 cd agentaus_connector_for_claude_code
 ./scripts/install.sh                           # virtualenv, dependencies, .env scaffold
-# Optionally install the document readers too:
-#   INSTALL_DOCUMENT_READERS=1 ./scripts/install.sh
 $EDITOR .env                                   # paste your AGENTAUS_API_KEY
 ./.venv/bin/python -m agentaus_bridge --check   # verify the key with a live call
 ./scripts/start-bridge.sh                      # start the bridge (leave this terminal open)
