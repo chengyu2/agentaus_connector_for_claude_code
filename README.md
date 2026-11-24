@@ -67,9 +67,11 @@ which is fine — but `scripts/claude-agentaus.sh` cannot work for you, because 
 
 ### Requirements
 
-All of these are required. The bridge checks for every one at startup and refuses to
-start, naming what is missing and the command that installs it, rather than run without
-the documents they read. `./scripts/install.sh` installs them all.
+Only Python and the packages in `requirements.txt` are required; `./scripts/install.sh`
+puts those in a virtualenv and needs nothing else on the machine. LibreOffice, poppler and
+tesseract are optional: without them the bridge starts, logs a warning naming each missing
+reader, and walks past the documents it cannot read. `INSTALL_DOCUMENT_READERS=1
+./scripts/install.sh` installs them as well.
 
 | Requirement | Reads | macOS | Debian / Ubuntu |
 | --- | --- | --- | --- |
@@ -82,7 +84,7 @@ the documents they read. `./scripts/install.sh` installs them all.
 ```bash
 git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git
 cd agentaus_connector_for_claude_code
-./scripts/install.sh                           # document readers, virtualenv, dependencies, .env scaffold
+./scripts/install.sh                           # virtualenv, dependencies, .env scaffold
 $EDITOR .env                                   # paste your AGENTAUS_API_KEY
 ./.venv/bin/python -m agentaus_bridge --check   # verify the key with a live call
 ./scripts/start-bridge.sh                      # start the bridge (leave this terminal open)

@@ -1,4 +1,5 @@
-"""Every document reader is required: the bridge names what is missing and will not start."""
+"""The Python packages are required and the bridge will not start without them; the system
+readers are optional and the bridge names each missing one."""
 
 from __future__ import annotations
 
@@ -19,17 +20,21 @@ class Missing(unittest.TestCase):
                 mock.patch.object(pdf, "_tool", return_value="/x/tool"), \
                 mock.patch.object(requirements, "_module", return_value=True):
             self.assertEqual(requirements.missing(), [])
+            self.assertEqual(requirements.optional_missing(), [])
 
     def test_each_missing_reader_is_named_with_its_install_command(self):
         with mock.patch.object(documents, "soffice", return_value=None), \
                 mock.patch.object(pdf, "_tool", side_effect=lambda n: None if n == "tesseract" else "/x/" + n), \
                 mock.patch.object(requirements, "_module", side_effect=lambda m: m != "pdfminer.high_level"):
             lines = requirements.missing()
-        self.assertEqual(len(lines), 3)
-        self.assertTrue(any(l.startswith("LibreOffice") and "libreoffice" in l for l in lines))
-        self.assertTrue(any(l.startswith("tesseract") and "install tesseract" in l.replace("tesseract-ocr", "tesseract") for l in lines))
+            optional = requirements.optional_missing()
+        self.assertEqual(len(lines), 1)
         self.assertTrue(any(l.startswith("pdfminer.six") and "requirements.txt" in l for l in lines))
         self.assertIn("install.sh", requirements.report(lines))
+        self.assertEqual(len(optional), 2)
+        self.assertTrue(any(l.startswith("LibreOffice") and "libreoffice" in l for l in optional))
+        self.assertTrue(any(l.startswith("tesseract") and "install tesseract" in l.replace("tesseract-ocr", "tesseract") for l in optional))
+        self.assertIn("INSTALL_DOCUMENT_READERS=1", requirements.optional_report(optional))
 
     def test_the_bridge_refuses_to_start_without_them(self):
         from agentaus_bridge.config import settings
@@ -42,9 +47,21 @@ class Missing(unittest.TestCase):
         run.assert_not_called()
         self.assertTrue(any("LibreOffice" in line for line in caught.output))
 
+    def test_the_bridge_starts_without_the_system_readers(self):
+        from agentaus_bridge.config import settings
+        with mock.patch.object(settings, "agentaus_api_key", "k"), \
+                mock.patch.object(requirements, "missing", return_value=[]), \
+                mock.patch.object(requirements, "optional_missing", return_value=["tesseract (`tesseract`)"]), \
+                mock.patch("uvicorn.run") as run, \
+                self.assertLogs("agentaus-bridge", level="WARNING") as caught:
+            entry.main(["--env-file", "/nonexistent/.env"])
+        run.assert_called_once()
+        self.assertTrue(any("tesseract" in line for line in caught.output))
 
+
+@unittest.skipIf(requirements.optional_missing(), "system document readers not installed")
 class RealReaders(unittest.TestCase):
-    """The installed tools themselves, not stubs: they are required, so they are tested.
+    """The installed tools themselves, not stubs: tested wherever they are installed.
     Measured: on poppler 26.10 `pdftoppm ... -` wrote a file named "-.png" instead of
     stdout, and the tesseract tier returned nothing for every page while its stub test
     passed."""
@@ -68,6 +85,8 @@ class RealReaders(unittest.TestCase):
 
     def test_every_requirement_is_installed(self):
         self.assertEqual(requirements.missing(), [], "run ./scripts/install.sh")
+        self.assertEqual(requirements.optional_missing(), [],
+                         "run INSTALL_DOCUMENT_READERS=1 ./scripts/install.sh")
 
     def test_libreoffice_made_a_pdf_and_each_ocr_tier_reads_it(self):
         self.assertTrue(os.path.exists(self.pdf), "LibreOffice did not convert")
