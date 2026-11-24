@@ -20,7 +20,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agentaus_bridge import server  # noqa: E402
 from agentaus_bridge.config import settings  # noqa: E402
 
-PORT = 9961
 CALLS: list = []
 STALL = "Let me read the settings file next."
 DONE = "The limit is 10 requests per second."
@@ -60,7 +59,9 @@ class StallCheckWithoutBuffering(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         HTTPServer.allow_reuse_address = True
-        cls.stub = HTTPServer(("127.0.0.1", PORT), _Upstream)
+        # Port 0: test_helper_latency.py runs its own stub, and pytest-xdist may run both files at once.
+        cls.stub = HTTPServer(("127.0.0.1", 0), _Upstream)
+        cls.port = cls.stub.server_address[1]
         threading.Thread(target=cls.stub.serve_forever, daemon=True).start()
 
     @classmethod
@@ -74,7 +75,7 @@ class StallCheckWithoutBuffering(unittest.TestCase):
         names = ("agentaus_base_url", "agentaus_api_key", "agentaus_self_review",
                  "agentaus_thinking", "agentaus_grounding_check")
         self._saved = {n: getattr(settings, n) for n in names}
-        settings.agentaus_base_url = f"http://127.0.0.1:{PORT}"
+        settings.agentaus_base_url = f"http://127.0.0.1:{self.port}"
         settings.agentaus_api_key = "test-key"
         settings.agentaus_self_review = False
         settings.agentaus_thinking = False
