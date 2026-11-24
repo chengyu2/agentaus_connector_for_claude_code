@@ -24,6 +24,14 @@ Suites:
 
 No lookups: coding and knowledge suites run with web tools off in every arm, and every
 transcript is scanned for network commands afterwards.
+
+No machine-specific paths are baked in. Locations outside this repository come from the
+environment (full list in abbench/README.md):
+    AB_RUNS         run artefacts live here, outside every git repository
+                    (default ~/agentaus_ab_runs)
+    AB_PEER_DATA    read-only agentaus-bench data directory; required for the econ_r suite
+    AB_CLAUDE_CODE  Claude Code binary to drive (default: newest under ~/.vscode/extensions)
+    AB_PY           interpreter the driver shell scripts run this harness with
 """
 from __future__ import annotations
 
@@ -43,34 +51,66 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "data"
-# Outside every git repository. Inside one, Claude Code treats each run as that repo's
-# project: it loads the repo's .claude/ skills and settings, and hands the session the
-# project's memory folder - where one benchmark run wrote notes into the user's real
-# Claude memory for the connector repo.
-RUNS = Path("/Users/cheng/agentaus_ab_runs")
-PEER_DATA = Path("/Users/cheng/agentaus-bench/data")      # read-only; files are copied
-def _newest_claude_code() -> str:
-    """The binary the installed VS Code extension ships - the newest one, since VS Code
-    updates the extension in place and leaves older versions behind."""
+
+
+def runs_root():
+    """Where run artefacts live: AB_RUNS, else ~/agentaus_ab_runs.
+
+    Run artefacts must stay outside every git repository: inside one, Claude Code treats
+    each run directory as that repo's project - it loads the repo's .claude/ skills and
+    settings, and hands the session the project's memory folder - where one benchmark run
+    wrote notes into the user's real Claude memory for the connector repo. The default is
+    a plain directory in the home directory, which satisfies that on any machine.
+    """
+    return Path(os.environ.get("AB_RUNS") or Path.home() / "agentaus_ab_runs")
+
+
+RUNS = runs_root()
+
+
+def peer_data():
+    """Read-only agentaus-bench data the econ_r suite copies from: AB_PEER_DATA.
+
+    Files are copied into each run directory; the original is never written. There is no
+    safe default - the directory does not exist on a machine that has not fetched it - so
+    a missing value is an error, not somebody else's absolute path.
+    """
+    value = os.environ.get("AB_PEER_DATA")
+    if not value:
+        raise SystemExit("The econ_r suite needs AB_PEER_DATA set to the agentaus-bench "
+                         "data directory (read-only; files are copied into each run).")
+    return Path(value).expanduser()
+
+
+def claude_binary():
+    """The Claude Code binary to drive: AB_CLAUDE_CODE if set, else the newest copy the
+    installed VS Code extension ships - the newest one, since VS Code updates the
+    extension in place and leaves older versions behind."""
+    override = os.environ.get("AB_CLAUDE_CODE")
+    if override:
+        return Path(os.path.expanduser(override))
     import glob
     found = sorted(glob.glob(os.path.expanduser(
         "~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude")),
         key=lambda p: [int(x) for x in re.findall(r"claude-code-(\d+)\.(\d+)\.(\d+)", p)[0]])
     if not found:
-        raise SystemExit("No Claude Code VS Code extension found under ~/.vscode/extensions")
-    return found[-1]
+        raise SystemExit("No Claude Code binary: set AB_CLAUDE_CODE, or install the Claude "
+                         "Code VS Code extension under ~/.vscode/extensions")
+    return Path(found[-1])
 
 
-CC = _newest_claude_code()
-PY = "/Users/cheng/agentaus_connector_for_claude_code/.venv/bin/python"
+# Interpreter the driver shell scripts (bridges.sh, cdev.sh, ...) run this harness with:
+# AB_PY, else whichever interpreter is running right now. The graders always run under
+# sys.executable, so a benchmark's verdicts do not depend on AB_PY.
+PY = os.environ.get("AB_PY", sys.executable)
 
 ARMS = {
     "opus": ("claude-opus-5", 8795),
     "agentaus_base": ("agentaus", 8795),
     "agentaus_tuned": ("agentaus", 8796),
-    "agentaus_next": ("agentaus", 8797),    # frozen snapshot in /Users/cheng/agentaus_ab_snap
-    # Skills A/B: main as committed (a detached checkout in /Users/cheng/agentaus_ab_head)
-    # against the working tree with the skill listing restored.
+    "agentaus_next": ("agentaus", 8797),    # frozen snapshot, served from $AB_SNAP by bridges.sh
+    # Skills A/B: main as committed (a detached checkout in $AB_STOCK) against the
+    # working tree with the skill listing restored.
     "agentaus_head": ("agentaus", 8796),
     "agentaus_skills": ("agentaus", 8797),
 }
@@ -324,12 +364,13 @@ def _rerun_r(wd, script, timeout=300):
 
 
 def econ_tasks():
-    ols = json.load(open(PEER_DATA / "ground_truth_ols.json"))
+    peer = peer_data()
+    ols = json.load(open(peer / "ground_truth_ols.json"))
     pareto = {"n_positive": 13131, "alpha": 1.49722067017857, "se_alpha": 0.09469254955296041,
               "r_squared": 0.9848867679700225, "xmin": 5445594}
 
     def r1_setup(wd):
-        shutil.copy(PEER_DATA / "australia_macro.csv", wd)
+        shutil.copy(peer / "australia_macro.csv", wd)
 
     def r1_grade(wd, transcript):
         checks = {}
@@ -400,7 +441,10 @@ def clean_env(port):
     """
     keep = ("HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "TERM")
     env = {k: os.environ[k] for k in keep if k in os.environ}
-    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    # The VS Code extension's default PATH on macOS. AB_PATH overrides it, for a
+    # contributor on another platform or with tools elsewhere.
+    env["PATH"] = os.environ.get(
+        "AB_PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
     env["CLAUDE_CODE_ENTRYPOINT"] = "claude-vscode"
     env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
     env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = "agentaus"
@@ -440,7 +484,7 @@ def _run_once(arm, task, label):
     settings = json.dumps({"env": {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
                                    "ANTHROPIC_CUSTOM_MODEL_OPTION": "agentaus"},
                            "autoMemoryEnabled": False})
-    cmd = [CC, "-p", "--model", model, "--settings", settings,
+    cmd = [str(claude_binary()), "-p", "--model", model, "--settings", settings,
            "--output-format", "stream-json", "--verbose",
            "--permission-mode", "bypassPermissions", "--max-turns", str(task.max_turns)]
     if not task.web:
@@ -475,8 +519,14 @@ def _run_once(arm, task, label):
     network = [c for c in tool_cmds if NETWORK.search(c)]
     # Anything a run touched outside its own directory. Expected to be empty; a
     # benchmark that writes to the user's real files is broken however well it scores.
-    escaped = sorted({m for c in tool_inputs for m in re.findall(r"(/Users/[^\s\"'\\]+)", c)
-                      if not m.startswith(str(wd)) and not m.startswith(str(PEER_DATA))
+    # Exempted: the run directory itself, the AB_PEER_DATA copies came from, and the
+    # R library under ~/Library/R/ on macOS.
+    allowed = [str(wd)]
+    if os.environ.get("AB_PEER_DATA"):
+        allowed.append(str(Path(os.environ["AB_PEER_DATA"]).expanduser()))
+    escaped = sorted({m for c in tool_inputs
+                      for m in re.findall(r"(/(?:Users|home)/[^\s\"'\\]+)", c)
+                      if not any(m.startswith(p) for p in allowed)
                       and "/Library/R/" not in m})
     grade = task.grade(wd, lines)
     rec = {"arm": arm, "suite": task.suite, "task": task.id, "label": label,

@@ -11,11 +11,18 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import statistics
 import sys
 from pathlib import Path
 
-RUNS = Path("/Users/cheng/agentaus_ab_runs")
+
+def runs_root():
+    """Where run artefacts live: AB_RUNS, else ~/agentaus_ab_runs (matches ab.py)."""
+    return Path(os.environ.get("AB_RUNS") or Path.home() / "agentaus_ab_runs")
+
+
+RUNS = runs_root()
 
 
 def wilson(k: float, n: int, z: float = 1.96):
@@ -29,8 +36,9 @@ def wilson(k: float, n: int, z: float = 1.96):
 
 def load(labels):
     recs = []
+    runs = runs_root()
     for label in labels:
-        for p in (RUNS / label).glob("*/*.json"):
+        for p in (runs / label).glob("*/*.json"):
             try:
                 r = json.loads(p.read_text())
             except ValueError:
