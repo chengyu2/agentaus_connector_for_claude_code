@@ -13,7 +13,6 @@ import gzip
 import json
 import os
 import sys
-import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -21,7 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-PORT = 9921
+import stub_server  # noqa: E402
+
 PAYLOAD = {
     "id": "msg_stub",
     "type": "message",
@@ -54,19 +54,18 @@ class TestGzippedPassthrough(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.server = HTTPServer(("127.0.0.1", PORT), _GzipUpstream)
-        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.server = stub_server.start(_GzipUpstream)
 
     @classmethod
     def tearDownClass(cls) -> None:
-        cls.server.shutdown()
+        stub_server.stop(cls.server)
 
     def test_gzipped_upstream_response_reaches_the_client_as_json(self):
         from agentaus_bridge import server
         from agentaus_bridge.config import settings
 
         original = settings.anthropic_base_url
-        settings.anthropic_base_url = f"http://127.0.0.1:{PORT}"
+        settings.anthropic_base_url = stub_server.url(self.server)
         try:
             with TestClient(server.app) as client:
                 response = client.post(
@@ -94,7 +93,7 @@ class TestGzippedPassthrough(unittest.TestCase):
         from agentaus_bridge.config import settings
 
         original = settings.anthropic_base_url
-        settings.anthropic_base_url = f"http://127.0.0.1:{PORT}"
+        settings.anthropic_base_url = stub_server.url(self.server)
         try:
             with TestClient(server.app) as client:
                 response = client.post(
