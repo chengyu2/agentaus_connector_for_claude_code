@@ -569,9 +569,10 @@ class Settings:
     agentaus_search_max_document_bytes: int = field(
         default_factory=lambda: _int("AGENTAUS_SEARCH_MAX_DOCUMENT_BYTES", 25 * 1024 * 1024)
     )
-    # Colon-separated directories the search may read. Empty means any absolute path the
-    # model names, which matches what Claude Code's own Read tool would allow. Set it to
-    # confine the bridge to specific trees.
+    # Colon-separated directories the search may read. Empty confines the bridge to the
+    # working directory the request named (falling back to the bridge process's own cwd
+    # when none was named) plus the bridge's skill library - NOT to any absolute path.
+    # Set it to specific roots to widen or pin that.
     agentaus_search_roots: str = field(
         default_factory=lambda: os.environ.get("AGENTAUS_SEARCH_ROOTS", "").strip()
     )
