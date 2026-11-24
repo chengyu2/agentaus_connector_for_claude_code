@@ -71,6 +71,7 @@ from .augment import (
     with_guidance,
     with_plan,
     with_parent_request,
+    workflow_offered,
     workflow_opted_in,
     worth_reviewing,
     worth_reviewing_turn,
@@ -333,6 +334,11 @@ def _route(request: Request, body: dict, model: str, *, main_loop: bool) -> tupl
     records the session's model: a title or summary call must not flip it.
     """
     by_model = settings.routes_to_agentaus(model) or not settings.passthrough_enabled
+    if (settings.agentaus_subagents_only and not by_model
+            and sessions.is_subagent(request.headers, body)):
+        # Every subagent on Agentaus, whatever its session or model - including after a bridge
+        # restart, when the in-memory session record is gone.
+        return True, True
     if not settings.agentaus_subagents_follow_session:
         return by_model, False
     session = sessions.session_of(request.headers)
@@ -1344,9 +1350,12 @@ def _tool_schemas(payload: dict) -> dict:
 
 
 def _graph_main_loop(body: dict) -> bool:
-    """A main loop whose `Workflow` call the bridge runs its graph in place of."""
+    """A main loop whose `Workflow` call the bridge runs its graph in place of. Opted in is not
+    enough: with `Workflow` still deferred there is no call to run the graph for, and treating
+    the session as one skipped the planning pass and held every write for a Workflow call
+    the model could not make."""
     return bool(settings.agentaus_workflow_graph and not is_subagent_turn(body)
-                and workflow_opted_in(body))
+                and workflow_opted_in(body) and workflow_offered(body))
 
 
 def _writes_plain_text(body: dict) -> bool:

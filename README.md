@@ -490,6 +490,18 @@ main-loop turn (tools offered, no agent id) records the session's model, so a ti
 summary call cannot flip it. The log says `route=agentaus (subagent of an Agentaus session)` when
 it applies. Turn it off with `AGENTAUS_SUBAGENTS_FOLLOW_SESSION=false`.
 
+`AGENTAUS_SUBAGENTS_ONLY=true` goes further: every subagent runs on Agentaus, whatever
+session started it or model it names. That includes a Claude session's subagents, and the
+first subagents after a bridge restart, before the bridge has seen their session's main
+loop. Use it when subagents should never spend Claude usage.
+
+An "ultracode" session (or one at max effort, which opts in) is orchestrated through the
+`Workflow` tool, but Claude Code keeps `Workflow` deferred until something loads it. Until it
+is on the wire the bridge treats the session as an ordinary one: `Agent` stays available,
+the planning pass runs, and Agentaus is told to delegate with `Agent` or load `Workflow`
+first. Measured before this: with the opt-in on and `Workflow` deferred, Agentaus worked
+alone for 32 turns.
+
 ---
 
 ## What happens when a conversation outgrows Agentaus

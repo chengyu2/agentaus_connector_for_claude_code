@@ -423,6 +423,28 @@ def skills_for(body: dict) -> list[str]:
     return wanted
 
 
+# Ultracode with `Workflow` still deferred: Claude Code's reminder says "use the Workflow
+# tool", and it is not on the wire. Measured (24 Nov 2026): told that and offered nothing
+# else, an opted-in Agentaus main loop worked alone for 32 turns, one tool call at a time.
+WORKFLOW_NOT_LOADED = """\
+
+--- Multi-agent work ---
+
+**The user opted into multi-agent orchestration, but the `Workflow` tool is not loaded.**
+
+- **Delegate with `Agent`**: one call per independent part, **all in the same turn** - a survey of one area, the tests for one module, a review of one file, a change to files no other part touches.
+- **Keep for yourself** only the edits to files several parts share.
+- To orchestrate with `Workflow` instead, load it first: `ToolSearch` with `select:Workflow`.
+"""
+
+
+def workflow_offered(body: dict) -> bool:
+    """Whether `Workflow` is on the wire. Claude Code defers it until it is loaded, so an
+    opted-in session can hold the opt-in without the tool."""
+    return any(isinstance(t, dict) and t.get("name") == "Workflow"
+               for t in body.get("tools") or [])
+
+
 WORKFLOW_GUIDANCE = """\
 
 --- Multi-agent workflows ---
@@ -889,8 +911,10 @@ def guidance_for(body: dict, *, covered_by_skill: tuple = (), routing: bool = Tr
         notes += SUBAGENT_GUIDANCE.format(how=how)
         return prompt_style.headings(notes) + tool_selection(body)
     opted = workflow_opt_in if workflow_opt_in is not None else workflow_opted_in(body)
-    if opted and any(isinstance(t, dict) and t.get("name") == "Workflow"
-                     for t in body.get("tools") or []):
+    if opted and not workflow_offered(body) and any(
+            isinstance(t, dict) and t.get("name") == "Agent" for t in body.get("tools") or []):
+        notes += WORKFLOW_NOT_LOADED
+    if opted and workflow_offered(body):
         from .config import settings
         from . import graph
         texts = [t for t in _user_text_blocks(body) if "<task-notification>" not in t]
@@ -1815,7 +1839,17 @@ def working_directory(system) -> str | None:
             path = found.group(1).strip().strip("`'\".,")
             if path.startswith("/") or path.startswith("~"):
                 return path
+            if _WINDOWS_PATH.match(path):
+                # A Windows path often holds spaces ("C:\Users\me\GitHub Repo\x"), so it runs to
+                # the end of its line, not to the first space as the patterns read it.
+                end = text.find("\n", found.start(1))
+                whole = text[found.start(1): end if end != -1 else len(text)]
+                return whole.strip().strip("`'\".,")
     return None
+
+
+# A drive-letter path (C:\ or C:/) or a UNC share (\\server\share).
+_WINDOWS_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\])")
 
 
 _TOOL_BLURB_CHARS = 240
@@ -2074,9 +2108,11 @@ def focus_tools(body: dict, *, workflow_opt_in: bool | None = None) -> tuple[dic
         used = used | {"Workflow"}
     # With the bridge's graph on, an opted-in main loop orchestrates through Workflow. Offered
     # `Agent` as well, Agentaus handed ten functions to one subagent instead, twice running.
+    # Only while Workflow is on the wire, though: hidden with Workflow still deferred, the
+    # main loop is left with no way to delegate at all.
     from .config import settings
     hide_agent = (opted and settings.agentaus_workflow_graph and not is_subagent_turn(body)
-                  and "Agent" not in _tools_used(body))
+                  and workflow_offered(body) and "Agent" not in _tools_used(body))
     kept, dropped = [], []
     for tool in tools:
         name = (tool or {}).get("name") or ""
