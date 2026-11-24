@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -15,7 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-PORT = 9923
+import stub_server  # noqa: E402
+
 STATE = {"status": 200, "delay": 0.0, "seen": []}
 LIVE = [
     {"id": "claude-opus-9-9", "type": "model", "display_name": "Claude Opus 9.9", "created_at": "2027-01-01T00:00:00Z"},
@@ -46,12 +46,11 @@ class ModelList(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.server = HTTPServer(("127.0.0.1", PORT), _Anthropic)
-        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.server = stub_server.start(_Anthropic)
 
     @classmethod
     def tearDownClass(cls) -> None:
-        cls.server.shutdown()
+        stub_server.stop(cls.server)
 
     def setUp(self) -> None:
         from agentaus_bridge import server
@@ -59,7 +58,7 @@ class ModelList(unittest.TestCase):
         STATE.update({"status": 200, "delay": 0.0, "seen": []})
         server._MODELS_LAST["data"] = None
         self._saved = settings.anthropic_base_url
-        settings.anthropic_base_url = f"http://127.0.0.1:{PORT}"
+        settings.anthropic_base_url = stub_server.url(self.server)
 
     def tearDown(self) -> None:
         from agentaus_bridge.config import settings

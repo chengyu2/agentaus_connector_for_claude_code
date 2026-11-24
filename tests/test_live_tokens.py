@@ -13,10 +13,9 @@ import asyncio
 import json
 import os
 import sys
-import threading
 import time
 import unittest
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -25,6 +24,8 @@ import httpx  # noqa: E402
 from agentaus_bridge import server  # noqa: E402
 from agentaus_bridge.config import settings  # noqa: E402
 from agentaus_bridge.translate import AnthropicStreamBuilder  # noqa: E402
+
+import stub_server  # noqa: E402
 
 
 def run(coro):
@@ -67,7 +68,6 @@ class TheLiveBlock(unittest.TestCase):
 
 
 # A slow upstream: five pieces, 0.25s apart, like Agentaus' real cadence but slower.
-PORT = 9953
 PIECES = ["The ", "answer ", "is ", "forty ", "two."]
 GAP = 0.25
 
@@ -95,20 +95,17 @@ class _SlowStream(BaseHTTPRequestHandler):
 class TokensArriveWhileAgentausIsStillWriting(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        HTTPServer.allow_reuse_address = True
-        cls.stub = HTTPServer(("127.0.0.1", PORT), _SlowStream)
-        threading.Thread(target=cls.stub.serve_forever, daemon=True).start()
+        cls.stub = stub_server.start(_SlowStream)
 
     @classmethod
     def tearDownClass(cls):
-        cls.stub.shutdown()
-        cls.stub.server_close()
+        stub_server.stop(cls.stub)
 
     def setUp(self):
         self._saved = (settings.agentaus_base_url, settings.agentaus_self_review,
                        settings.agentaus_live_draft, settings.agentaus_grounding_check,
                        settings.agentaus_syntax_check, settings.agentaus_api_key)
-        settings.agentaus_base_url = f"http://127.0.0.1:{PORT}"
+        settings.agentaus_base_url = stub_server.url(self.stub)
         settings.agentaus_api_key = "test-key"
         settings.agentaus_self_review = True          # the answer is held back
         settings.agentaus_grounding_check = False
@@ -189,7 +186,6 @@ if __name__ == "__main__":
 # Claude Code's own utility calls are answered, never rewritten
 # --------------------------------------------------------------------------------------
 
-UTILITY_PORT = 9954
 UTILITY_CALLS: list = []
 VERDICT = '{"state": "done", "reason": "' + "the agent delivered the explanation " * 8 + '"}'
 
@@ -218,21 +214,18 @@ class _Upstream(BaseHTTPRequestHandler):
 class UtilityCallsAreNotRewritten(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        HTTPServer.allow_reuse_address = True
-        cls.stub = HTTPServer(("127.0.0.1", UTILITY_PORT), _Upstream)
-        threading.Thread(target=cls.stub.serve_forever, daemon=True).start()
+        cls.stub = stub_server.start(_Upstream)
 
     @classmethod
     def tearDownClass(cls):
-        cls.stub.shutdown()
-        cls.stub.server_close()
+        stub_server.stop(cls.stub)
 
     def setUp(self):
         UTILITY_CALLS.clear()
         self._saved = (settings.agentaus_base_url, settings.agentaus_api_key,
                        settings.agentaus_self_review, settings.agentaus_thinking,
                        settings.agentaus_grounding_check)
-        settings.agentaus_base_url = f"http://127.0.0.1:{UTILITY_PORT}"
+        settings.agentaus_base_url = stub_server.url(self.stub)
         settings.agentaus_api_key = "test-key"
         settings.agentaus_self_review = True
         settings.agentaus_thinking = False
@@ -268,7 +261,6 @@ class UtilityCallsAreNotRewritten(unittest.TestCase):
 # The plan streams too, and the response starts before planning does
 # --------------------------------------------------------------------------------------
 
-PLAN_PORT = 9955
 PLAN_PIECES = ["1. Read ", "the file. ", "2. Fix ", "the bug."]
 
 
@@ -304,14 +296,11 @@ class _PlanThenAnswer(BaseHTTPRequestHandler):
 class ThePlanStreamsLive(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        HTTPServer.allow_reuse_address = True
-        cls.stub = HTTPServer(("127.0.0.1", PLAN_PORT), _PlanThenAnswer)
-        threading.Thread(target=cls.stub.serve_forever, daemon=True).start()
+        cls.stub = stub_server.start(_PlanThenAnswer)
 
     @classmethod
     def tearDownClass(cls):
-        cls.stub.shutdown()
-        cls.stub.server_close()
+        stub_server.stop(cls.stub)
 
     def setUp(self):
         names = ("agentaus_base_url", "agentaus_api_key", "agentaus_self_review",
@@ -320,7 +309,7 @@ class ThePlanStreamsLive(unittest.TestCase):
                  "agentaus_web_search", "agentaus_inventory", "agentaus_zoom",
                  "agentaus_investigate")
         self._saved = {n: getattr(settings, n) for n in names}
-        settings.agentaus_base_url = f"http://127.0.0.1:{PLAN_PORT}"
+        settings.agentaus_base_url = stub_server.url(self.stub)
         settings.agentaus_api_key = "test-key"
         settings.agentaus_self_review = False
         settings.agentaus_thinking = settings.agentaus_thinking_visible = True
