@@ -1874,9 +1874,10 @@ def _may_reask_stalled(body: dict, *, announced: bool = False) -> bool:
       re-ask resets it, and at `_STALL_REASK_LIMIT` (2) no more are sent. This is what bounds
       a misfire: a finished answer wrongly re-asked gets no tool call back, so it costs two
       re-asks at most, whatever the per-message cap.
-    - `total`: re-asks for this user message, capped at `_STALL_REASKS_PER_MESSAGE` (judged
-      by the model) or `_STALL_ANNOUNCED_PER_MESSAGE` (`announced`: a reply that plainly
-      says what it does next, or ends without the files the request names). Only a model
+    - `total`: re-asks for this user message, capped at `_STALL_ANNOUNCED_PER_MESSAGE`
+      when `announced` (a reply that plainly says which tool step it takes next) and at
+      `_STALL_REASKS_PER_MESSAGE` otherwise (judged by the model, or ended without the
+      files the request names - both less certain than an announcement). Only a model
       that keeps making progress between re-asks reaches these caps - a long task can
       announce every one of its steps.
     """
@@ -3479,7 +3480,12 @@ async def _agentaus_event_stream(
         missing = [] if (mine or theirs or not known or is_subagent_turn(original)
                          or awaiting_background(original)) else missing_deliverables(
             _last_user_text(received), working_directory_of(received))
-        if (
+        # A question back to the user is a fair place to stop, files or not.
+        if answer_so_far.rstrip().endswith("?"):
+            missing = []
+        announced = announces_a_step(answer_so_far)
+        # One gate for both checks below, so the image exemption covers the judge too.
+        worth_checking = (
             corrections < settings.agentaus_correction_rounds
             # Started in the background and said so: the right reply, not a stall.
             and not awaiting_background(original)
@@ -3489,22 +3495,15 @@ async def _agentaus_event_stream(
                 called_a_tool=bool(mine or theirs),
                 answers_an_image=has_unseen((original.get("messages") or [])[-1:]),
             )
-        ) and (missing or announces_a_step(answer_so_far)):
+        )
+        if worth_checking and (missing or announced):
             # An announcement is a step not taken, whatever is missing: asking it for the
             # files at that point pushed a model to write them before it had read anything.
-            if announces_a_step(answer_so_far):
+            if announced:
                 missing = []
             # It says what it will do next: a stall on its face, so no judge call to wait on.
             turn_verdict = "stalled"
-        elif (
-            corrections < settings.agentaus_correction_rounds
-            and not awaiting_background(original)
-            and could_be_a_refusal(
-                answer_so_far,
-                tools_offered=bool(known),
-                called_a_tool=bool(mine or theirs),
-            )
-        ):
+        elif worth_checking:
             async def classify() -> str:
                 async with hold("refusal check", "urgent"):
                     return await _agentaus_summarise(
@@ -3527,8 +3526,10 @@ async def _agentaus_event_stream(
                 rlog(logging.WARNING, "refusal check failed (%s); forwarding the answer",
                      exc)
 
+        # Only a plain announcement gets the larger budget. Missing files are the less
+        # certain signal (the request may not mean them), so they share the judge's.
         if turn_verdict == "stalled" and not _may_reask_stalled(
-                original, announced=bool(missing) or announces_a_step(answer_so_far)):
+                original, announced=announced):
             rlog(logging.WARNING, "judged stalled again, but the re-ask budget for this "
                  "message is spent; forwarding the reply")
             turn_verdict = "answer"
