@@ -31,21 +31,33 @@ def build_parser() -> argparse.ArgumentParser:
                         "settings for every project, the key from $AGENTAUS_API_KEY)")
     p.add_argument("--dry-run", action="store_true", help="show what would happen and change nothing")
     p.add_argument("--preset", choices=list(C.PRESETS), help="start from this set of components")
-    p.add_argument("--with", dest="with_", default="", metavar="A,B",
-                   help="add components (" + ", ".join(C.BY_KEY) + ")")
-    p.add_argument("--without", default="", metavar="A,B", help="leave components out")
+    p.add_argument("--with", dest="with_", action="append", default=[], metavar="A,B",
+                   help="add components (" + ", ".join(C.BY_KEY) + "); may be repeated")
+    p.add_argument("--without", action="append", default=[], metavar="A,B",
+                   help="leave components out; may be repeated")
     p.add_argument("--settings", metavar="SCOPE",
                    help="where Claude Code learns about the bridge: user (every project), none, "
                         "or a project directory")
     p.add_argument("--port", type=int, help="port for the bridge (default 8787, or what .env has)")
     p.add_argument("--no-check", action="store_true", help="skip the live check of the API key")
     p.add_argument("--plain", action="store_true", help="plain numbered prompts instead of menus")
+    p.add_argument("--no-system", action="store_true",
+                   help="never run the system package manager; list what is missing instead")
     p.add_argument("--components-only", action="store_true", help=argparse.SUPPRESS)
     return p
 
 
-def _split(value: str) -> list[str]:
-    return [v.strip() for v in value.split(",") if v.strip()]
+def _split(values) -> list[str]:
+    if isinstance(values, str):
+        values = [values]
+    return [v.strip() for value in values for v in value.split(",") if v.strip()]
+
+
+def _env_port(env: dict[str, str]) -> int:
+    try:
+        return int(env.get("BRIDGE_PORT") or A.DEFAULT_PORT)
+    except ValueError:
+        return A.DEFAULT_PORT
 
 
 def system_commands(needed: list[C.Component], manager: str, as_root: bool) -> list[list[str]]:
@@ -98,8 +110,9 @@ class Setup:
         ui.ok(f"Installing into {self.root}")
 
         self.keys = self.choose_components()
-        if not self.args.components_only:
-            self.port = self.choose_port()
+        # components/update only change packages: the port, settings, service and command
+        # stay as setup left them (settings.json already points at that port).
+        self.port = _env_port(self.env) if self.args.components_only else self.choose_port()
         self.show_plan()
         if not ui.confirm("Continue?", True):
             raise Aborted()
@@ -107,24 +120,28 @@ class Setup:
         self.install_system()
         self.install_python()
         updates = {C.ENV_KEY: ",".join(self.keys)}
-        if self.port != A.DEFAULT_PORT or "BRIDGE_PORT" in self.env:
+        if not self.args.components_only and (self.port != A.DEFAULT_PORT or "BRIDGE_PORT" in self.env):
             updates["BRIDGE_PORT"] = str(self.port)
         A.write_env(self.runner, self.root, updates)
         self.state["components"] = self.keys
+        self.save()
 
+        # Each step records itself as soon as it is done, so an abort or failure later
+        # still leaves uninstall knowing about it.
         if not self.args.components_only:
             self.api_key()
-            if "settings" in self.keys:
-                self.settings()
-            if "service" in self.keys:
-                self.service()
-            if "command" in self.keys:
-                self.command()
+            for key, step in (("settings", self.settings), ("service", self.service),
+                              ("command", self.command)):
+                if key in self.keys:
+                    step()
+                    self.save()
         elif "service" in self.state:
             self.restart_service()
-        A.save_state(self.runner, self.state, self.root)
         self.finish()
         return 0
+
+    def save(self) -> None:
+        A.save_state(self.runner, self.state, self.root)
 
     # --- components --------------------------------------------------------------------
 
@@ -137,6 +154,15 @@ class Setup:
         previous = C.parse(self.env.get(C.ENV_KEY))
         present = self._present()
         with_, without = _split(args.with_), _split(args.without)
+        if args.components_only:
+            # Only the packages are chosen here; setup pieces keep what setup decided.
+            setup_keys = [k for k in (previous or []) if C.BY_KEY[k].kind == "setup"]
+            bad = [k for k in with_ + without if k in C.BY_KEY and C.BY_KEY[k].kind == "setup"]
+            if bad:
+                ui.warn(f"{', '.join(bad)}: run `agentaus-bridge setup` to change settings, "
+                        "service or command; `components` only installs packages")
+            with_ = [k for k in with_ if k not in bad]
+            without = [k for k in without if k not in bad]
         try:
             if args.preset or with_ or without or ui.assume_yes:
                 base = C.preset(args.preset, self.platform) if args.preset else \
@@ -146,6 +172,8 @@ class Setup:
                     ui.warn("core cannot be left out; keeping it")
             else:
                 picked = self._ask_components(previous, present)
+            if args.components_only:
+                picked = [k for k in picked if C.BY_KEY[k].kind != "setup"] + setup_keys
             keys = C.resolve(picked, self.platform)
         except ValueError as exc:
             ui.error(str(exc))
@@ -179,6 +207,8 @@ class Setup:
         start = set(previous or C.preset(RECOMMENDED, self.platform)) | present
         boxes = []
         for c in C.available(self.platform):
+            if self.args.components_only and c.kind == "setup":
+                continue
             notes = [c.size] if c.size else []
             if c.key in present:
                 notes.append("already installed")
@@ -198,6 +228,8 @@ class Setup:
         present = self._present()
         rows = []
         for c in C.available(self.platform):
+            if self.args.components_only and c.kind == "setup":
+                continue
             if c.key in self.keys:
                 if c.kind == "setup":
                     status = "[cyan]will set up[/cyan]"
@@ -223,9 +255,12 @@ class Setup:
 
     def choose_port(self) -> int:
         ui = self.ui
-        try:
-            port = int(self.args.port or self.env.get("BRIDGE_PORT") or A.DEFAULT_PORT)
-        except ValueError:
+        port = self.args.port if self.args.port is not None else _env_port(self.env)
+        if not A.valid_port(port):
+            if self.args.port is not None:
+                ui.error(f"--port {port} is not a port (1-65535)")
+                raise SystemExit(2)
+            ui.warn(f"BRIDGE_PORT={port} in .env is not a port; using {A.DEFAULT_PORT}")
             port = A.DEFAULT_PORT
         if A.port_free(port):
             return port
@@ -249,6 +284,11 @@ class Setup:
             return
         ui.step("System packages")
         manager = C.package_manager(self.platform)
+        if self.args.no_system:
+            ui.warn("Not installed (system packages were not to be touched). Install them with:")
+            for c in needed:
+                ui.info(f"- {c.title}: {C.install_hint(c, self.platform)}")
+            return
         if manager is None:
             ui.warn("No supported package manager found (brew, apt, dnf, pacman, winget). "
                     "Install these yourself:")
@@ -384,8 +424,8 @@ class Setup:
         if scope == "none":
             ui.info("Skipped. See \"Pointing Claude Code at the bridge\" in the README.")
             return
-        if scope != "user" and not Path(scope).expanduser().is_dir():
-            ui.error(f"{scope} is not a directory; skipping the settings step")
+        if scope != "user" and not A.project_dir(scope).is_dir():
+            ui.error(f"{A.project_dir(scope)} is not a directory; skipping the settings step")
             return
         path = A.settings_path(scope)
         wanted = A.bridge_env(self.port)
@@ -396,6 +436,7 @@ class Setup:
             return
         if not changes:
             ui.ok(f"{path} already points Claude Code at the bridge")
+            self.settings_done = True
         else:
             ui.info(f"Adds to the \"env\" block of {path}:")
             for key, old, new in changes:
@@ -409,12 +450,27 @@ class Setup:
                 return
             backup = A.merge_settings(self.runner, path, wanted)
             ui.ok(f"Updated {path}" + (f" (backup: {backup.name})" if backup else ""))
-        self.settings_done = True
-        entries = [e for e in self.state.get("settings", []) if e.get("path") != str(path)]
-        self.state["settings"] = entries + [{"path": str(path), "env": wanted}]
+            self.settings_done = True
+            self._record_settings(path, changes)
         if scope == "user" and "service" not in self.keys:
             ui.warn("Every Claude Code session now goes through the bridge, so while it is not "
                     "running Claude models fail too. The background service keeps it running.")
+
+    def _record_settings(self, path: Path, changes: list[tuple[str, str | None, str]]) -> None:
+        """Remember which keys the installer added or changed, and what they held before,
+        so uninstall can remove or restore exactly those. Keys that already held the
+        bridge's values are the user's own and are never recorded. On a re-run the
+        value from before the first install is kept."""
+        entries = self.state.get("settings", [])
+        entry = next((e for e in entries if e.get("path") == str(path)), None)
+        written = dict(entry.get("env", {})) if entry else {}
+        previous = dict(entry.get("previous", {})) if entry else {}
+        for key, old, new in changes:
+            if key not in written:
+                previous[key] = old
+            written[key] = new
+        others = [e for e in entries if e.get("path") != str(path)]
+        self.state["settings"] = others + [{"path": str(path), "env": written, "previous": previous}]
 
     # --- service -----------------------------------------------------------------------
 
@@ -449,12 +505,19 @@ class Setup:
         self._wait_for_health(kind)
 
     def restart_service(self) -> None:
+        """After components/update: restart a running service so it loads the new packages.
+        A service the user stopped stays stopped."""
         service = self.state.get("service") or {}
         kind = service.get("kind")
-        if kind and (kind == "schtasks" or Path(service.get("path", "")).exists()):
-            self.ui.step("Background service")
-            if self._service_do(kind, "restart"):
-                self._wait_for_health(kind)
+        if not kind or (kind != "schtasks" and not Path(service.get("path", "")).exists()):
+            return
+        self.ui.step("Background service")
+        if not A.health(self.port):
+            self.ui.info("The bridge is not running, so it was left stopped. "
+                         "Start it with: agentaus-bridge start")
+            return
+        if self._service_do(kind, "restart"):
+            self._wait_for_health(kind)
 
     def _service_do(self, kind: str, action: str) -> bool:
         for cmd in A.service_commands(kind, action, self.root):
@@ -567,6 +630,6 @@ def main(argv: list[str]) -> int:
         return Setup(args, ui, runner).run()
     except Aborted as exc:
         ui.print("")
-        ui.warn(f"Stopped{': ' + str(exc) if str(exc) else ''}. Nothing after this point was changed; "
-                "run setup again to pick up where you left off.")
+        ui.warn(f"Stopped{': ' + str(exc) if str(exc) else ''}. The steps before this one were "
+                "kept (uninstall knows about them); run setup again to finish.")
         return 130

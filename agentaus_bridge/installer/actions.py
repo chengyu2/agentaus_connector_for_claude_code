@@ -55,14 +55,24 @@ class Runner:
             return 127
 
     def write(self, path: Path, text: str, mode: int | None = None) -> None:
+        """Atomic write. A symlink is written through (a dotfiles repo keeps its file), an
+        existing file keeps its permissions unless `mode` is given, and the temporary file
+        is created with the final mode, so a key is never readable by others even briefly."""
         self.log.append(f"write: {path}")
         if self.dry_run:
             return
+        if path.is_symlink():
+            path = path.resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
+        if mode is None:
+            mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(text, encoding="utf-8")
-        if mode is not None:
-            os.chmod(tmp, mode)
+        if tmp.exists():
+            tmp.unlink()
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, mode)  # os.open's mode is filtered by the umask
         os.replace(tmp, path)
 
     def remove(self, path: Path) -> None:
@@ -155,11 +165,20 @@ def bridge_env(port: int) -> dict[str, str]:
     }
 
 
+def project_dir(scope: str) -> Path:
+    """A project directory as the user typed it: relative to where they ran the command
+    (the bootstrap and the shim both cd into the install folder before running setup)."""
+    path = Path(scope).expanduser()
+    if not path.is_absolute():
+        path = Path(os.environ.get("AGENTAUS_INSTALL_CWD") or os.getcwd()) / path
+    return path.resolve()
+
+
 def settings_path(scope: str) -> Path:
     """`user` for every project, otherwise a project directory."""
     if scope == "user":
         return Path.home() / ".claude" / "settings.json"
-    return Path(scope).expanduser().resolve() / ".claude" / "settings.local.json"
+    return project_dir(scope) / ".claude" / "settings.local.json"
 
 
 class SettingsError(Exception):
@@ -188,7 +207,8 @@ def settings_changes(data: dict, wanted: dict[str, str]) -> list[tuple[str, str 
 
 
 def merge_settings(runner: Runner, path: Path, wanted: dict[str, str]) -> Path | None:
-    """Merge the env block into the file, keeping everything else. Returns the backup."""
+    """Merge the env block into the file, keeping everything else. Returns the backup.
+    Callers record settings_changes() first, so uninstall can put old values back."""
     data = load_settings(path)
     backup = None
     if path.exists():
@@ -200,32 +220,45 @@ def merge_settings(runner: Runner, path: Path, wanted: dict[str, str]) -> Path |
     return backup
 
 
-def unmerge_settings(runner: Runner, path: Path, written: dict[str, str]) -> list[str]:
-    """Remove the keys the installer wrote, where they still hold what it wrote."""
-    try:
-        data = load_settings(path)
-    except SettingsError:
+def unmerge_settings(runner: Runner, path: Path, written: dict[str, str],
+                     previous: dict[str, str | None] | None = None) -> list[str]:
+    """Undo the installer's keys, where they still hold what it wrote: a key it added is
+    removed, a key it changed gets its old value back. Keys the user has since edited, and
+    keys that already held these values before install, are left alone.
+    Raises SettingsError if the file can no longer be parsed."""
+    if not path.exists():
         return []
+    data = load_settings(path)
+    previous = previous or {}
     env = data.get("env", {})
-    removed = [k for k, v in written.items() if env.get(k) == v]
-    if not removed:
+    undone = [k for k, v in written.items() if env.get(k) == v]
+    if not undone:
         return []
-    for k in removed:
-        del env[k]
+    for k in undone:
+        if previous.get(k) is None:
+            del env[k]
+        else:
+            env[k] = previous[k]
     if not env:
         data.pop("env", None)
     runner.write(path, json.dumps(data, indent=2) + "\n")
-    return removed
+    return undone
 
 
 # --- port ------------------------------------------------------------------------------
 
+def valid_port(port: int) -> bool:
+    return 1 <= port <= 65535
+
+
 def port_free(port: int, host: str = "127.0.0.1") -> bool:
+    if not valid_port(port):
+        return False
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((host, port))
             return True
-        except OSError:
+        except (OSError, OverflowError):
             return False
 
 
@@ -240,7 +273,7 @@ def health(port: int, timeout: float = 2.0) -> dict | None:
 
 
 def next_free_port(start: int) -> int:
-    for port in range(start + 1, start + 200):
+    for port in range(start + 1, min(start + 200, 65536)):
         if port_free(port):
             return port
     raise RuntimeError("no free port found")
@@ -271,10 +304,17 @@ def service_file(kind: str) -> Path | None:
     return Path.home() / ".config" / "systemd" / "user" / SYSTEMD_UNIT
 
 
+def _systemd_quote(value: str) -> str:
+    """One systemd command-line word: quoted for spaces, % doubled for specifiers."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
+
+
 def service_text(kind: str, root: Path | None = None) -> str:
+    from xml.sax.saxutils import escape
     root = root or ROOT
     python = venv_python(root)
     if kind == "launchd":
+        python, root_text, log = escape(str(python)), escape(str(root)), escape(LOG_FILE)
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -288,11 +328,11 @@ def service_text(kind: str, root: Path | None = None) -> str:
     <string>agentaus_bridge</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>{root}</string>
+  <string>{root_text}</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>{LOG_FILE}</string>
-  <key>StandardErrorPath</key><string>{LOG_FILE}</string>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
 </dict>
 </plist>
 """
@@ -301,8 +341,8 @@ Description=Agentaus bridge for Claude Code
 After=network-online.target
 
 [Service]
-WorkingDirectory={root}
-ExecStart={python} -m agentaus_bridge
+WorkingDirectory={str(root).replace("%", "%%")}
+ExecStart={_systemd_quote(str(python))} -m agentaus_bridge
 Restart=on-failure
 
 [Install]
@@ -341,7 +381,10 @@ def service_commands(kind: str, action: str, root: Path | None = None) -> list[l
     """action: start (install and start), restart, stop, remove (stop for good), status."""
     if kind == "schtasks":
         return {
-            "start": [_ps(task_register_script(root) + f"; Start-ScheduledTask -TaskName {TASK_NAME}")],
+            # Stop first: with IgnoreNew a re-run's Start would leave the old bridge running.
+            "start": [_ps(task_register_script(root)
+                          + f"; Stop-ScheduledTask -TaskName {TASK_NAME} -ErrorAction SilentlyContinue"
+                          + f"; Start-ScheduledTask -TaskName {TASK_NAME}")],
             "restart": [_ps(f"Stop-ScheduledTask -TaskName {TASK_NAME}; "
                             f"Enable-ScheduledTask -TaskName {TASK_NAME} | Out-Null; "
                             f"Start-ScheduledTask -TaskName {TASK_NAME}")],
@@ -405,6 +448,7 @@ def command_text(root: Path | None = None, windows: bool = WINDOWS) -> str:
 rem The Agentaus bridge's command, written by its installer.
 rem Remove it (with the service and settings) using: agentaus-bridge uninstall
 setlocal
+set "AGENTAUS_INSTALL_CWD=%CD%"
 cd /d "{root}" || exit /b 1
 if "%~1"=="" (
   "{python}" -m agentaus_bridge status
@@ -415,6 +459,7 @@ if "%~1"=="" (
     return f"""#!/bin/sh
 # The Agentaus bridge's command, written by its installer.
 # Remove it (with the service and settings) using: agentaus-bridge uninstall
+AGENTAUS_INSTALL_CWD="$PWD"; export AGENTAUS_INSTALL_CWD
 cd {shlex.quote(str(root))} || exit 1
 [ $# -eq 0 ] && set -- status
 exec {shlex.quote(str(python))} -m agentaus_bridge "$@"

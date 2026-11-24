@@ -65,7 +65,9 @@ jobs:
           python-version: "3.12"
           activate-environment: true
           enable-cache: true
-          cache-dependency-glob: requirements.txt
+          cache-dependency-glob: |
+            requirements.txt
+            requirements/*.txt
 
       - name: Install Python dependencies
         run: uv pip install -r requirements.txt pytest pytest-xdist

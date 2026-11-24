@@ -263,7 +263,7 @@ class RecordingRunner(A.Runner):
         return 0
 
 
-class WholeRun(unittest.TestCase):
+class _Fixture(unittest.TestCase):
     """setup --yes into a temporary install folder, with HOME pointed at a temporary home."""
 
     def setUp(self):
@@ -292,6 +292,9 @@ class WholeRun(unittest.TestCase):
         code = flow.Setup(args, ui, runner, root=self.root).run()
         return code, runner, ui.out.getvalue()
 
+
+
+class WholeRun(_Fixture):
     def test_minimal_with_command(self):
         code, runner, out = self.setup("--preset", "minimal", "--with", "command", "--settings", "user")
         self.assertEqual(code, 0)
@@ -343,6 +346,102 @@ class WholeRun(unittest.TestCase):
         self.assertNotIn("env", settings)
         self.assertFalse((self.home / ".local" / "bin" / "agentaus-bridge").exists())
         self.assertNotIn("command", A.load_state(self.root))
+
+
+class ReviewFixes(_Fixture):
+    """Bugs found in review, each pinned by the run that showed it."""
+
+    def test_with_adds_up_across_repeats(self):
+        code, _, _ = self.setup("--preset", "minimal", "--with", "pdf", "--with", "outline", "--settings", "none")
+        self.assertEqual(A.read_env(self.root / ".env")[C.ENV_KEY], "core,pdf,outline,settings")
+
+    def test_components_keeps_the_port_and_the_setup_choices(self):
+        self.setup("--preset", "minimal", "--with", "command", "--settings", "none")
+        args = flow.build_parser().parse_args(["--yes", "--components-only", "--with", "outline,service"])
+        ui = UI(assume_yes=True, interactive=False, out=io.StringIO())
+        flow.Setup(args, ui, RecordingRunner(), root=self.root).run()
+        env = A.read_env(self.root / ".env")
+        self.assertEqual(env["BRIDGE_PORT"], str(self.port))
+        self.assertEqual(env[C.ENV_KEY], "core,outline,settings,command")
+        self.assertIn("run `agentaus-bridge setup`", ui.out.getvalue())
+
+    def test_uninstall_restores_overwritten_values_and_leaves_matching_ones(self):
+        path = self.home / ".claude" / "settings.json"
+        path.parent.mkdir(parents=True)
+        mine = A.bridge_env(self.port)
+        path.write_text(json.dumps({"env": {
+            "ANTHROPIC_BASE_URL": "https://corp-gateway.example",          # will be overwritten
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": mine["ANTHROPIC_CUSTOM_MODEL_OPTION"],  # already ours
+        }}))
+        self.setup("--preset", "minimal", "--settings", "user")
+        self.assertEqual(json.loads(path.read_text())["env"]["ANTHROPIC_BASE_URL"], mine["ANTHROPIC_BASE_URL"])
+        with mock.patch.object(A, "ROOT", self.root):
+            cli.main(["uninstall", "--yes"])
+        env = json.loads(path.read_text())["env"]
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://corp-gateway.example")
+        self.assertEqual(env["ANTHROPIC_CUSTOM_MODEL_OPTION"], mine["ANTHROPIC_CUSTOM_MODEL_OPTION"])
+        self.assertNotIn("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME", env)
+
+    def test_settings_already_pointing_at_the_bridge_are_not_claimed(self):
+        path = self.home / ".claude" / "settings.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"env": A.bridge_env(self.port)}))
+        self.setup("--preset", "minimal", "--settings", "user")
+        self.assertFalse(A.load_state(self.root).get("settings"))
+
+    def test_relative_project_path_is_relative_to_the_caller(self):
+        project = self.home / "proj"
+        project.mkdir()
+        with mock.patch.dict(os.environ, {"AGENTAUS_INSTALL_CWD": str(self.home)}):
+            self.setup("--preset", "minimal", "--settings", "proj")
+        self.assertTrue((project / ".claude" / "settings.local.json").exists())
+        self.assertFalse((self.root / ".claude").exists())
+
+    def test_out_of_range_port_is_an_error_not_a_traceback(self):
+        args = flow.build_parser().parse_args(["--yes", "--port", "99999"])
+        with self.assertRaises(SystemExit):
+            flow.Setup(args, UI(assume_yes=True, interactive=False, out=io.StringIO()),
+                       RecordingRunner(), root=self.root).run()
+
+    def test_dry_run_writes_nothing_anywhere(self):
+        args = flow.build_parser().parse_args(["--yes", "--dry-run", "--no-check", "--port", str(self.port),
+                                               "--preset", "full", "--settings", "user"])
+        before = sorted(p for p in list(self.root.rglob("*")) + list(self.home.rglob("*")))
+        flow.Setup(args, UI(assume_yes=True, interactive=False, out=io.StringIO()),
+                   A.Runner(dry_run=True), root=self.root).run()
+        after = sorted(p for p in list(self.root.rglob("*")) + list(self.home.rglob("*")))
+        self.assertEqual(before, after)
+
+    def test_state_is_saved_before_a_later_step_aborts(self):
+        with mock.patch.object(flow.Setup, "command", side_effect=Aborted()):
+            with self.assertRaises(Aborted):
+                self.setup("--preset", "minimal", "--with", "command", "--settings", "user")
+        self.assertTrue(A.load_state(self.root).get("settings"))
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX file modes and symlinks")
+class Writes(unittest.TestCase):
+    def test_symlink_is_written_through_and_mode_kept(self):
+        with tempfile.TemporaryDirectory() as d:
+            real = Path(d) / "dotfiles" / "settings.json"
+            real.parent.mkdir()
+            real.write_text("{}")
+            os.chmod(real, 0o600)
+            link = Path(d) / "settings.json"
+            link.symlink_to(real)
+            A.merge_settings(A.Runner(), link, {"K": "v"})
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(json.loads(real.read_text())["env"], {"K": "v"})
+            self.assertEqual(stat.S_IMODE(real.stat().st_mode), 0o600)
+
+    def test_systemd_unit_quotes_paths(self):
+        unit = A.service_text("systemd", Path("/home/a b/100%"))
+        self.assertIn("WorkingDirectory=/home/a b/100%%", unit)
+        self.assertRegex(unit, r'ExecStart="[^"]+" -m agentaus_bridge')
+
+    def test_shims_keep_the_callers_directory(self):
+        self.assertIn('AGENTAUS_INSTALL_CWD="$PWD"', A.command_text(Path("/x"), windows=False))
+        self.assertIn('set "AGENTAUS_INSTALL_CWD=%CD%"', A.command_text(Path("C:/x"), windows=True))
 
 
 class Cli(unittest.TestCase):

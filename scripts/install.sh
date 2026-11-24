@@ -55,24 +55,41 @@ main() {
     fi
   fi
 
+  # Without git: download the archive into a temporary folder first, so a download that
+  # dies halfway leaves nothing behind, then copy it over the install (which keeps .venv,
+  # .env and .install-state.json - they are not in the archive).
+  download_archive() {
+    command -v curl >/dev/null 2>&1 || die "Neither git nor curl is installed."
+    local tarball="${repo%.git}/archive/${ref}.tar.gz" tmp
+    say "Downloading $tarball (git is not installed, so 'agentaus-bridge update' cannot pull)"
+    tmp="$(mktemp -d)"
+    if ! curl -fsSL "$tarball" | tar -xz -C "$tmp" --strip-components=1; then
+      rm -rf "$tmp"; die "download failed"
+    fi
+    mkdir -p "$root"
+    cp -R "$tmp"/. "$root"/
+    rm -rf "$tmp"
+  }
+
   if [[ -z "$root" ]]; then
     root="$home"
     if [[ -d "$root/.git" ]]; then
       say "Updating the existing install in $root"
       git -C "$root" fetch --quiet origin "$ref" || die "git fetch failed"
       git -C "$root" checkout --quiet "$ref" 2>/dev/null || git -C "$root" checkout --quiet -B "$ref" "origin/$ref"
-      git -C "$root" merge --quiet --ff-only "origin/$ref" 2>/dev/null || true
+      if ! git -C "$root" merge --quiet --ff-only "origin/$ref" 2>/dev/null; then
+        printf '%s\n' "  ${red}!${reset} Could not fast-forward $root to origin/$ref (local changes?); installing the version already there." >&2
+      fi
+    elif [[ -f "$root/agentaus_bridge/__main__.py" ]]; then
+      say "Updating the existing install in $root"
+      download_archive
     elif [[ -e "$root" && -n "$(ls -A "$root" 2>/dev/null)" ]]; then
       die "$root exists and is not a bridge install. Move it, or set AGENTAUS_BRIDGE_HOME."
     elif command -v git >/dev/null 2>&1; then
       say "Downloading the bridge into $root"
       git clone --quiet --branch "$ref" "$repo" "$root" || die "git clone of $repo failed"
     else
-      command -v curl >/dev/null 2>&1 || die "Neither git nor curl is installed."
-      local tarball="${repo%.git}/archive/${ref}.tar.gz"
-      say "Downloading $tarball into $root (git is not installed, so 'update' will not work)"
-      mkdir -p "$root"
-      curl -fsSL "$tarball" | tar -xz -C "$root" --strip-components=1 || die "download failed"
+      download_archive
     fi
     ok "Bridge source in $root"
   fi
@@ -107,24 +124,33 @@ main() {
   ok "Python $("$python" -c 'import platform; print(platform.python_version())') ($python)"
 
   # --- virtualenv and the installer's packages ---------------------------------------
-  if [[ ! -x .venv/bin/python ]] || ! .venv/bin/python -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+  # A venv is reused only if it runs, is 3.11+ and has pip: a failed `python -m venv`
+  # (no ensurepip) leaves a python behind with no pip in it.
+  if [[ ! -x .venv/bin/python ]] \
+      || ! .venv/bin/python -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null \
+      || ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
     say "Creating a virtualenv in $root/.venv"
     rm -rf .venv
     local err
     err="$(mktemp)"
-    if ! "$python" -m venv .venv 2>"$err"; then
+    # Python prints the "ensurepip is not available" advice on stdout, not stderr.
+    if ! "$python" -m venv .venv >"$err" 2>&1; then
+      rm -rf .venv
       if grep -q ensurepip "$err" 2>/dev/null; then
+        rm -f "$err"
         local minor
         minor="$("$python" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')"
         die "Python's venv module is missing. Install it with: sudo apt-get install python${minor}-venv"
       fi
       cat "$err" >&2
+      rm -f "$err"
       die "Could not create the virtualenv."
     fi
     rm -f "$err"
   fi
   say "Installing the installer's packages ${dim}(core bridge, questionary, rich)${reset}"
-  .venv/bin/python -m pip install --quiet --disable-pip-version-check --upgrade pip
+  .venv/bin/python -m pip install --quiet --disable-pip-version-check --upgrade pip \
+    || die "pip could not upgrade itself (see above)."
   .venv/bin/python -m pip install --quiet --disable-pip-version-check \
     -r requirements/core.txt -r requirements/setup.txt || die "pip install failed (see above)."
   ok "Ready"
@@ -134,7 +160,7 @@ main() {
   local args=()
   args=(${@+"$@"})
   if [[ "${INSTALL_DOCUMENT_READERS:-0}" == "1" ]]; then
-    args+=(--with office,ocr)
+    args+=(--with office,ocr)   # --with adds up, so the user's own --with is kept
   fi
   export AGENTAUS_INSTALL_CWD="$caller_cwd"
 

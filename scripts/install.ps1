@@ -54,6 +54,26 @@ function Find-Python {
     return $null
 }
 
+# Without git: download the zip into a temporary folder first, so a download that dies
+# halfway leaves nothing behind, then copy it over the install (keeping .venv, .env and
+# .install-state.json, which are not in the archive).
+function Get-BridgeArchive {
+    param([string]$Repo, [string]$Ref, [string]$Root)
+    $zip = ($Repo -replace '\.git$', '') + "/archive/$Ref.zip"
+    Write-Host "  Downloading $zip (git is not installed, so 'agentaus-bridge update' cannot pull)"
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("agentaus-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Path $tmp | Out-Null
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri $zip -OutFile (Join-Path $tmp "src.zip")
+        Expand-Archive -Path (Join-Path $tmp "src.zip") -DestinationPath (Join-Path $tmp "x")
+        $inner = Get-ChildItem (Join-Path $tmp "x") -Directory | Select-Object -First 1
+        New-Item -ItemType Directory -Force -Path $Root | Out-Null
+        Copy-Item -Path (Join-Path $inner.FullName "*") -Destination $Root -Recurse -Force
+    } finally {
+        Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    }
+}
+
 function Install-AgentausBridge {
     param([string[]]$SetupArgs)
     $ErrorActionPreference = "Stop"
@@ -81,6 +101,12 @@ function Install-AgentausBridge {
             if ($LASTEXITCODE -ne 0) { Write-Host "  git fetch failed." -ForegroundColor Red; $script:InstallCode = 1; return }
             & git -C $root checkout --quiet $ref
             & git -C $root merge --quiet --ff-only "origin/$ref"
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "  Could not fast-forward $root to origin/$ref (local changes?); installing the version already there." -ForegroundColor Yellow
+            }
+        } elseif (Test-Path (Join-Path $root "agentaus_bridge\__main__.py")) {
+            Write-Host "  Updating the existing install in $root"
+            Get-BridgeArchive -Repo $repo -Ref $ref -Root $root
         } elseif ((Test-Path $root) -and (Get-ChildItem $root -Force | Select-Object -First 1)) {
             Write-Host "  $root exists and is not a bridge install. Move it, or set AGENTAUS_BRIDGE_HOME." -ForegroundColor Red
             $script:InstallCode = 1; return
@@ -89,16 +115,7 @@ function Install-AgentausBridge {
             & git clone --quiet --branch $ref $repo $root
             if ($LASTEXITCODE -ne 0) { Write-Host "  git clone of $repo failed." -ForegroundColor Red; $script:InstallCode = 1; return }
         } else {
-            $zip = ($repo -replace '\.git$', '') + "/archive/$ref.zip"
-            Write-Host "  Downloading $zip (git is not installed, so 'update' will not work)"
-            $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("agentaus-" + [guid]::NewGuid())
-            New-Item -ItemType Directory -Path $tmp | Out-Null
-            Invoke-WebRequest -UseBasicParsing -Uri $zip -OutFile (Join-Path $tmp "src.zip")
-            Expand-Archive -Path (Join-Path $tmp "src.zip") -DestinationPath $tmp
-            $inner = Get-ChildItem $tmp -Directory | Select-Object -First 1
-            New-Item -ItemType Directory -Force -Path $root | Out-Null
-            Get-ChildItem $inner.FullName -Force | Move-Item -Destination $root
-            Remove-Item -Recurse -Force $tmp
+            Get-BridgeArchive -Repo $repo -Ref $ref -Root $root
         }
         Write-Host "  [ok] Bridge source in $root" -ForegroundColor Green
     }
@@ -114,7 +131,16 @@ function Install-AgentausBridge {
         }
 
         $VENV_PY = Join-Path $root ".venv\Scripts\python.exe"
-        if (-not (Test-Path $VENV_PY)) {
+        # Reuse the venv only if its python runs and has pip: a half-made venv, or one whose
+        # base Python was uninstalled, is rebuilt.
+        $venvOk = $false
+        if (Test-Path $VENV_PY) {
+            $ErrorActionPreference = "Continue"
+            try { & $VENV_PY -m pip --version *> $null; $venvOk = ($LASTEXITCODE -eq 0) } catch { $venvOk = $false }
+            $ErrorActionPreference = "Stop"
+        }
+        if (-not $venvOk) {
+            if (Test-Path ".venv") { Remove-Item -Recurse -Force ".venv" }
             Write-Host "==> Creating a virtualenv in $root\.venv"
             & $PY.exe @($PY.args) -m venv .venv
             if ($LASTEXITCODE -ne 0) {

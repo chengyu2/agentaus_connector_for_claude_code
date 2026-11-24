@@ -198,7 +198,10 @@ def present(component: Component) -> bool:
 def package_manager(platform: str | None = None) -> str | None:
     platform = platform or platform_name()
     if platform == "darwin":
-        return "brew" if shutil.which("brew") else None
+        # launchd starts the bridge with PATH=/usr/bin:/bin:..., which has no Homebrew.
+        found = shutil.which("brew") or any(
+            os.access(p, os.X_OK) for p in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"))
+        return "brew" if found else None
     if platform == "windows":
         return "winget" if shutil.which("winget") else None
     for manager, exe in (("apt", "apt-get"), ("dnf", "dnf"), ("pacman", "pacman")):
@@ -213,7 +216,8 @@ def install_hint(component: Component, platform: str | None = None) -> str:
     if component.kind == "python":
         pip = r".venv\Scripts\pip" if platform == "windows" else ".venv/bin/pip"
         return f"{pip} install -r requirements/{component.pip}.txt"
-    manager = package_manager(platform)
+    # Every macOS hint is a brew command, whether or not this process can see brew.
+    manager = "brew" if platform == "darwin" else package_manager(platform)
     if manager == "brew":
         if "brew-cask" in component.packages:
             return "brew install --cask " + " ".join(component.packages["brew-cask"])
