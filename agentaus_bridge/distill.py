@@ -38,7 +38,7 @@ from typing import Awaitable, Callable
 
 from .compact import _chunk, normalise_identifiers
 from .gate import hold
-from .translate import estimate_tokens
+from .translate import content_text, estimate_tokens, has_unseen
 from .prompt_style import Template
 
 log = logging.getLogger("agentaus-bridge")
@@ -110,6 +110,9 @@ The joined record only. No tags.
 def _text_of(content) -> str:
     if isinstance(content, str):
         return content
+    if has_unseen(content):
+        # Never distil an image's base64; keep its note so the model knows it never saw it.
+        return content_text(content)
     if isinstance(content, list):
         parts = []
         for block in content:

@@ -1,0 +1,77 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python 3.12
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      # The system document readers (LibreOffice, poppler, tesseract) are optional: the tests
+      # that run them for real skip unless every one is installed. Ubuntu always installs them,
+      # restored from a cache after the first run. macOS installs them only on pushes to main,
+      # because the LibreOffice cask alone takes minutes.
+      - name: Install document readers (Ubuntu, cached)
+        if: runner.os == 'Linux'
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils tesseract-ocr
+          version: "1"  # bump to rebuild the cache
+
+      - name: Install document readers (macOS, pushes to main only)
+        if: runner.os == 'macOS' && github.event_name == 'push'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+        run: |
+          brew install poppler tesseract
+          brew install --cask libreoffice
+
+      - name: Check the readers are on hand
+        if: runner.os == 'Linux' || github.event_name == 'push'
+        run: |
+          pdftotext -v
+          pdftoppm -v
+          tesseract --version
+          if [ "$RUNNER_OS" = macOS ]; then
+            /Applications/LibreOffice.app/Contents/MacOS/soffice --version
+          else
+            soffice --version
+          fi
+
+      # uv installs Python and the packages from its cache in seconds.
+      - uses: astral-sh/setup-uv@v10.4.0  # setup-uv publishes no floating major tag
+        with:
+          python-version: "3.12"
+          activate-environment: true
+          enable-cache: true
+          cache-dependency-glob: requirements.txt
+
+      - name: Install Python dependencies
+        run: uv pip install -r requirements.txt pytest pytest-xdist
+
+      # One worker per core. loadfile keeps each test file on one worker, because some
+      # classes share setUpClass state. Same files as `unittest discover -s tests`.
+      - name: Run tests
+        timeout-minutes: 10
+        run: python -m pytest tests -n auto --dist loadfile -o python_files='test_*.py' -p no:cacheprovider -q -ra --durations=10

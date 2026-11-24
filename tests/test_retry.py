@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -25,7 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-PORT = 9931
+import stub_server  # noqa: E402
+
 
 # Mutated per-test to drive the stub's behaviour.
 STATE = {"fail_times": 0, "calls": 0, "mode": "ok", "fail_status": 502}
@@ -104,21 +104,13 @@ _SERVER: HTTPServer | None = None
 
 
 def setUpModule() -> None:
-    """One stub server for every class here.
-
-    Binding per-class leaves the previous socket in TIME_WAIT and the second class
-    fails with EADDRINUSE.
-    """
+    """One stub server, on an OS-chosen port, for every class here."""
     global _SERVER
-    HTTPServer.allow_reuse_address = True
-    _SERVER = HTTPServer(("127.0.0.1", PORT), _FlakyUpstream)
-    threading.Thread(target=_SERVER.serve_forever, daemon=True).start()
+    _SERVER = stub_server.start(_FlakyUpstream)
 
 
 def tearDownModule() -> None:
-    if _SERVER is not None:
-        _SERVER.shutdown()
-        _SERVER.server_close()
+    stub_server.stop(_SERVER)
 
 
 class _RetryTestBase(unittest.TestCase):
@@ -132,7 +124,7 @@ class _RetryTestBase(unittest.TestCase):
             settings.retry_backoff_seconds,
             settings.max_retries,
         )
-        settings.agentaus_base_url = f"http://127.0.0.1:{PORT}"
+        settings.agentaus_base_url = stub_server.url(_SERVER)
         settings.agentaus_api_key = "test-key"
         settings.retry_backoff_seconds = 0.01  # keep the suite fast
         from agentaus_bridge import server as _srv
