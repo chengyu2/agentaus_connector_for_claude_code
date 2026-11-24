@@ -29,8 +29,10 @@ the specific failure mode a survey question invites.
 from __future__ import annotations
 
 import os
+import re
 
-CORPUS = "/Users/cheng/trellis_data_tender"
+# See documents.py: the same folder, and the same refusal to fall back to anything else.
+CORPUS = os.environ.get("BENCH_CORPUS", "/Users/cheng/trellis_data_tender")
 
 QUESTIONS = [
     "What kinds of documents are in this folder, and what does each kind cover? "
@@ -83,7 +85,9 @@ def cited(answer: str, known: set) -> set:
 
     Matched against the real listing rather than by pattern, so an invented but
     plausible-looking document name scores nothing. Stems are checked too because an
-    answer reasonably writes "Echo PowerPoint WIP2" without the extension.
+    answer reasonably writes "Echo PowerPoint WIP2" without the extension - but only a
+    stem that could not be an ordinary word. "requirements" or "background" in prose
+    used to count as citing requirements.txt or background.docx.
     """
     text = (answer or "").lower()
     found = set()
@@ -91,48 +95,65 @@ def cited(answer: str, known: set) -> set:
         stem = os.path.splitext(name)[0]
         if len(stem) < 8:
             continue
-        if name in text or stem in text:
+        if _named(name, text) or (not stem.isalpha() and _named(stem, text)):
             found.add(name)
     return found
 
 
-def run(model: str, limit: int | None, ask, totals, log=print, root: str = ".") -> dict:
-    corpus = CORPUS if os.path.isdir(CORPUS) else os.path.abspath(root)
+def _named(token: str, text: str) -> bool:
+    return re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", text) is not None
+
+
+def run(model: str, limit: int | None, ask, totals, log=print,
+        corpus: str | None = None) -> dict:
+    import harness
+
+    corpus = corpus or CORPUS
+    if not os.path.isdir(corpus):
+        reason = (f"corpus not found: {corpus}. Pass --corpus or set BENCH_CORPUS; "
+                  f"counting citations of some other folder measures nothing.")
+        log(f"  SKIPPED: {reason}")
+        return {"suite": "coverage", "skipped": reason}
     known = corpus_files(corpus)
-    tools = [{
-        "name": "Read",
-        "description": "Read a file from the filesystem.",
-        "input_schema": {"type": "object",
-                         "properties": {"file_path": {"type": "string"}},
-                         "required": ["file_path"]},
-    }]
     rows = QUESTIONS[:limit] if limit else QUESTIONS
     log(f"  corpus: {len(known)} files under {corpus}")
 
     arms = {"bare": "", "skill": PROCEDURE}
-    counts = {"bare": [], "skill": []}
+    cases = []
 
     for index, question in enumerate(rows, 1):
-        for arm, procedure in arms.items():
+        # Alternate which arm goes first. The bridge caches summaries and document
+        # conversions, so a fixed order handed the second arm a warm cache every time.
+        order = list(arms) if index % 2 else list(arms)[::-1]
+        for arm in order:
             reply = ask(model, PROMPT.format(question=question, root=corpus,
-                                             procedure=procedure),
-                        system=SYSTEM, tools=tools, max_tokens=1600)
+                                             procedure=arms[arm]),
+                        system=SYSTEM, tools=harness.FILE_TOOLS, max_tokens=1600,
+                        root=corpus)
             totals.add(reply)
             if not reply.ok:
-                counts[arm].append(0)
+                cases.append(harness.record(reply, q=question, arm=arm))
                 log(f"  [{index}/{len(rows)}] {arm:5} CALL FAILED  {reply.error[:60]}")
                 continue
             names = cited(reply.text, known)
-            counts[arm].append(len(names))
+            cases.append(harness.record(reply, q=question, arm=arm, cited=sorted(names)))
             log(f"  [{index}/{len(rows)}] {arm:5} cited {len(names):>2} file(s) "
                 f"{reply.seconds:5.1f}s  {question[:40]}")
 
+    # Only questions both arms answered: a failed call in one arm would otherwise read as
+    # that arm citing nothing.
+    by_question: dict = {}
+    for case in harness.answered(cases):
+        by_question.setdefault(case["q"], {})[case["arm"]] = len(case["cited"])
+    paired = [v for v in by_question.values() if len(v) == 2]
+
     def mean(arm):
-        return sum(counts[arm]) / max(1, len(counts[arm]))
+        return sum(v[arm] for v in paired) / max(1, len(paired))
 
     bare, skill = mean("bare"), mean("skill")
     log(f"  mean files cited: bare {bare:.1f}  with procedure {skill:.1f}  "
         f"({skill - bare:+.1f})")
-    return {"suite": "coverage", "n": len(rows), "bare_cited": bare,
-            "skill_cited": skill, "delta": skill - bare,
-            "one_file_answers": sum(1 for c in counts["bare"] + counts["skill"] if c <= 1)}
+    return {"suite": "coverage", "n": len(rows), "answered": len(paired),
+            "bare_cited": bare, "skill_cited": skill, "delta": skill - bare,
+            "one_file_answers": sum(1 for v in paired for c in v.values() if c <= 1),
+            "cases": cases}

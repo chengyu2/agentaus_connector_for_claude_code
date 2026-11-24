@@ -21,7 +21,8 @@ from __future__ import annotations
 # (label, approximate pass@1, note). Rounded on purpose: a figure quoted to two decimals
 # would imply a precision that cross-harness comparison does not have.
 HUMANEVAL = [
-    ("canonical solutions", 1.00, "the dataset's own answers - a ceiling, measured here"),
+    ("canonical solutions", 1.00, "the dataset's own answers - a ceiling; all 164 pass "
+                                  "this harness (tests/test_benchmark_tasks.py)"),
     ("frontier tier (2024-2025 flagships)", 0.90, "vendor-reported, clusters near the ceiling"),
     ("strong mid-tier / small frontier", 0.80, "vendor-reported"),
     ("competent open-weight ~7-14B", 0.60, "commonly reported range"),
@@ -46,15 +47,21 @@ _IMPLAUSIBLE = 0.93
 
 
 def bracket(score: float) -> str:
-    """Where a measured pass@1 sits, and a warning when it sits too high to believe."""
+    """Where a measured pass@1 sits, and a warning when it sits too high to believe.
+
+    A score is placed in the highest tier it reaches, not the highest it comes within
+    five points of: the old margin called 0.86 "frontier" and 0.76 "strong mid-tier",
+    which rounded every result up a tier.
+    """
     if score >= _IMPLAUSIBLE:
-        return (f"{score:.3f} - ABOVE the frontier reference. Read this as a CONTAMINATION "
-                f"SIGNAL, not as capability: HumanEval is from 2021 and is in every "
-                f"training corpus. Do not quote it as a capability result. The suites that "
-                f"still discriminate here are retrieval and injection, whose cases were "
-                f"written after the fact and cannot have been trained on.")
+        return (f"{score:.3f} - ABOVE the frontier reference. Unless the model is itself "
+                f"a frontier one, read this as a CONTAMINATION SIGNAL, not as capability: "
+                f"HumanEval is from 2021 and is in every training corpus. Do not quote it "
+                f"as a capability result. The suites that still discriminate here are "
+                f"retrieval and injection, whose cases were written after the fact and "
+                f"cannot have been trained on.")
     for label, value, _note in HUMANEVAL:
-        if score >= value - 0.05:
+        if score >= value:
             return label
     return "below the referenced range"
 

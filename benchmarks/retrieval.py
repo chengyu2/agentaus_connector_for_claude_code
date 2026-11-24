@@ -21,8 +21,18 @@ happens when one piece of a lookup takes too long" is handled in `tools.py` by s
 the chunk AND in `server.py` by refusing to replay a gateway timeout. It stays as it is.
 Read the reported F1 as a floor, and read that limitation as inherent to ground truth
 written by whoever wrote the code.
+
+The search runs over a copy of the repository without this file, the other suites, the
+tests, the docs or the README. They hold the answers - the README quotes the first one -
+and a search that finds the key scores on the key.
 """
 from __future__ import annotations
+
+import fnmatch
+import os
+import re
+import shutil
+import tempfile
 
 QUESTIONS = [
     {
@@ -86,7 +96,8 @@ PROMPT = """<question>
 </repository>
 
 <task>
-Find where this is handled. Use `agentaus_search` on the repository path - do not guess.
+Find where this is handled. Use the tools you are given on the repository path - do not
+guess.
 </task>
 
 <output_format>
@@ -95,52 +106,106 @@ At most 4 lines. Nothing else.
 </output_format>"""
 
 
-def score(reply: str, expected_files: set, expected_symbols: set) -> dict:
-    """Precision and recall over the files named, plus whether a right symbol appeared."""
-    named = set()
-    for line in (reply or "").splitlines():
-        for part in line.replace("`", " ").split():
-            if part.endswith(".py") or ".py:" in part:
-                named.add(part.split(":")[0].lstrip("./").strip(","))
+# A location as a model writes it: a .py path, optionally followed by :symbol or :line.
+_LOCATION = re.compile(r"([\w./\\-]+\.py)(?::(\w[\w.]*))?")
+
+
+def _relative(path: str, root: str) -> str:
+    """A named path as ground truth spells it, relative to the repository.
+
+    The prompt shows the repository's absolute path, so an answer that repeats it is
+    right, not wrong. `lstrip("./")` used to do this and also ate the leading dot of any
+    hidden directory.
+    """
+    path = path.replace("\\", "/")
+    if root:
+        # Both spellings of the root: Glob and Grep print resolved paths, and on macOS a
+        # temporary folder resolves from /var/folders to /private/var/folders.
+        for base in {root.rstrip("/") + "/", os.path.realpath(root).rstrip("/") + "/"}:
+            if path.startswith(base):
+                path = path[len(base):]
+                break
+    while path.startswith("./"):
+        path = path[2:]
+    return path.lstrip("/")
+
+
+def score(reply: str, expected_files: set, expected_symbols: set, root: str = "") -> dict:
+    """Precision and recall over the files named, plus whether a right symbol was named.
+
+    A symbol counts only where the answer gives it as a location (`path.py:symbol`).
+    Matching it anywhere in the reply credited generic words - "hold", "extract",
+    "_cache" - that turn up in any explanation.
+    """
+    named, symbols = set(), set()
+    for path, symbol in _LOCATION.findall(reply or ""):
+        named.add(_relative(path, root))
+        if symbol:
+            symbols.update(part.lower() for part in symbol.split("."))
     hit = named & expected_files
     precision = len(hit) / len(named) if named else 0.0
     recall = len(hit) / len(expected_files) if expected_files else 0.0
     f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
-    symbol_hit = any(s.lower() in (reply or "").lower() for s in expected_symbols)
+    symbol_hit = any(s.lower() in symbols for s in expected_symbols)
     return {"named": sorted(named), "precision": precision, "recall": recall,
             "f1": f1, "symbol": symbol_hit}
 
 
-def run(model: str, limit: int | None, ask, totals, log=print, root: str = ".") -> dict:
-    import os
-    root = os.path.abspath(root)
-    tools = [{
-        "name": "Read",
-        "description": "Read a file from the filesystem.",
-        "input_schema": {"type": "object",
-                         "properties": {"file_path": {"type": "string"}},
-                         "required": ["file_path"]},
-    }]
-    rows = QUESTIONS[:limit] if limit else QUESTIONS
-    scores = []
-    for index, case in enumerate(rows, 1):
-        reply = ask(model, PROMPT.format(question=case["q"], root=root),
-                    system=SYSTEM, tools=tools, max_tokens=512)
-        totals.add(reply)
-        if not reply.ok:
-            scores.append({"precision": 0.0, "recall": 0.0, "f1": 0.0, "symbol": False,
-                           "named": []})
-            log(f"  [{index}/{len(rows)}] CALL FAILED  {reply.error[:70]}")
+# Left out of the searched copy: everything that states an answer, what no question is
+# about, and anything holding a secret. Top-level Markdown goes too - the README quotes
+# answers, and the API document holds a key. So does .env, which a model could otherwise
+# Read and quote into a reply that is saved to the run file.
+_HELD_BACK = {"benchmarks", "tests", "abbench", "docs", ".git", ".venv", "venv",
+              "node_modules", "__pycache__", ".pytest_cache", ".env", ".env.*"}
+
+
+def searchable_copy(root: str) -> str:
+    """A temporary copy of `root` without the answer key. The caller removes it."""
+    target = tempfile.mkdtemp(prefix="bench-retrieval-")
+    for name in os.listdir(root):
+        source = os.path.join(root, name)
+        if (any(fnmatch.fnmatch(name, held) for held in _HELD_BACK)
+                or (os.path.isfile(source) and name.endswith(".md"))):
             continue
-        result = score(reply.text, case["files"], case["symbols"])
-        scores.append(result)
-        log(f"  [{index}/{len(rows)}] P={result['precision']:.2f} R={result['recall']:.2f} "
-            f"F1={result['f1']:.2f} sym={'y' if result['symbol'] else 'n'} "
-            f"{reply.seconds:5.1f}s  {','.join(result['named'])[:52]}")
+        if os.path.isdir(source):
+            shutil.copytree(source, os.path.join(target, name), symlinks=True,
+                            ignore=shutil.ignore_patterns(*_HELD_BACK))
+        else:
+            shutil.copy2(source, target)
+    return target
+
+
+def run(model: str, limit: int | None, ask, totals, log=print, root: str | None = None) -> dict:
+    import harness
+
+    repo = os.path.abspath(root or os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    # Resolved, so the root in the prompt matches the paths Glob and Grep print.
+    copy = os.path.realpath(searchable_copy(repo))
+    rows = QUESTIONS[:limit] if limit else QUESTIONS
+    cases = []
+    try:
+        for index, case in enumerate(rows, 1):
+            reply = ask(model, PROMPT.format(question=case["q"], root=copy),
+                        system=SYSTEM, tools=harness.FILE_TOOLS, max_tokens=512, root=copy)
+            totals.add(reply)
+            if not reply.ok:
+                cases.append(harness.record(reply, q=case["q"]))
+                log(f"  [{index}/{len(rows)}] CALL FAILED  {reply.error[:70]}")
+                continue
+            result = score(reply.text, case["files"], case["symbols"], copy)
+            cases.append(harness.record(reply, q=case["q"], **result))
+            log(f"  [{index}/{len(rows)}] P={result['precision']:.2f} "
+                f"R={result['recall']:.2f} F1={result['f1']:.2f} "
+                f"sym={'y' if result['symbol'] else 'n'} {reply.seconds:5.1f}s  "
+                f"{','.join(result['named'])[:52]}")
+    finally:
+        shutil.rmtree(copy, ignore_errors=True)
+
+    scored = harness.answered(cases)
 
     def mean(key):
-        return sum(s[key] for s in scores) / max(1, len(scores))
+        return sum(c[key] for c in scored) / max(1, len(scored))
 
-    return {"suite": "retrieval", "n": len(rows),
+    return {"suite": "retrieval", "n": len(rows), "answered": len(scored),
             "precision": mean("precision"), "recall": mean("recall"), "f1": mean("f1"),
-            "symbol_rate": sum(s["symbol"] for s in scores) / max(1, len(scores))}
+            "symbol_rate": mean("symbol"), "cases": cases}

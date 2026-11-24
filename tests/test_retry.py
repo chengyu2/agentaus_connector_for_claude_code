@@ -472,6 +472,18 @@ class TestSmallRequestTimeoutsAreNotBlamedOnSize(unittest.TestCase):
     request was too big.
     """
 
+    def setUp(self):
+        # The token calibrator is process-wide, and earlier tests in the same worker feed
+        # it stub usage of a few tokens, which drags its slope to the 0.5 floor. A
+        # 200k-token request then estimates under the window and the size checks below
+        # fail depending only on which files share a worker.
+        from unittest import mock
+        from agentaus_bridge import translate
+        from agentaus_bridge.tokens import TokenCalibrator
+        patcher = mock.patch.object(translate, "calibrator", TokenCalibrator())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_a_tiny_request_is_not_worth_refitting(self):
         from agentaus_bridge.server import _worth_refitting
         body = {"messages": [{"role": "user", "content": "short question"}]}

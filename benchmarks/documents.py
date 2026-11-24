@@ -23,7 +23,13 @@ matching rather than retrieval.
 """
 from __future__ import annotations
 
-CORPUS = "/Users/cheng/trellis_data_tender"
+import os
+import re
+
+# Where the tender folder lives on the machine that wrote this suite. Anywhere else, pass
+# --corpus or set BENCH_CORPUS: falling back to the current directory used to ask tender
+# questions of the bridge's own source and report the zero as a result.
+CORPUS = os.environ.get("BENCH_CORPUS", "/Users/cheng/trellis_data_tender")
 
 QUESTIONS = [
     {
@@ -35,13 +41,13 @@ QUESTIONS = [
     {
         "q": "What does requirement PM-NFR-03 ask for regarding the versions that "
              "hardware and software run on?",
-        "any": [["manufacturer"], ["supported version"], ["patch"]],
+        "any": [["manufacturer*"], ["supported version*"], ["patch*"]],
         "source": "P21-407",
     },
     {
         "q": "What does requirement BR-NFR-01 cover, and how many deployment options "
              "were offered against it?",
-        "any": [["back"], ["restor"]],
+        "any": [["backup*"], ["back up"], ["back-up*"], ["backing up"], ["restor*"]],
         "source": "P21-407",
     },
     {
@@ -58,7 +64,7 @@ QUESTIONS = [
     {
         "q": "Which award category did Trellis Data enter in the 2026 ACT Chief "
              "Minister's Export Awards?",
-        "any": [["digital and smart"], ["smart technolog"]],
+        "any": [["digital and smart"], ["smart technolog*"]],
         "source": "export_award",
     },
 ]
@@ -76,6 +82,19 @@ PROMPT = (
 )
 
 
+def _term(term: str) -> re.Pattern:
+    """A whole word or phrase, or a stem when it ends in `*`.
+
+    Plain substrings were far too generous: "ism" matched "mechanism" and "back" matched
+    "background", so a reply saying the search mechanism found nothing scored as having
+    found the fact. Every change here narrows a match; none widens one, so the ground
+    truth is no easier to meet than it was.
+    """
+    stem = term.endswith("*")
+    body = re.escape(term.rstrip("*"))
+    return re.compile(rf"(?<![a-z0-9]){body}" + ("" if stem else r"(?![a-z0-9])"))
+
+
 def score(answer: str, case: dict) -> dict:
     """Did it find the substance, and did it say where from?
 
@@ -83,42 +102,48 @@ def score(answer: str, case: dict) -> dict:
     present. That shape lets a fact be recognised however it is phrased - "SSL" or "TLS"
     for the same requirement - without the ground truth being widened later to fit an
     answer it did not like.
+
+    Cited means the answer names the source document. Any ".pdf" in the reply used to
+    count, so naming the wrong PDF scored as a citation.
     """
     text = (answer or "").lower()
-    found = any(all(term in text for term in alternative) for alternative in case["any"])
-    cited = case["source"].lower() in text or ".pdf" in text
+    found = any(all(_term(term).search(text) for term in alternative)
+                for alternative in case["any"])
+    cited = case["source"].lower() in text
     return {"found": found, "cited": cited, "both": found and cited}
 
 
-def run(model: str, limit: int | None, ask, totals, log=print, root: str = ".") -> dict:
-    import os
+def run(model: str, limit: int | None, ask, totals, log=print,
+        corpus: str | None = None) -> dict:
+    import harness
 
-    corpus = CORPUS if os.path.isdir(CORPUS) else os.path.abspath(root)
-    tools = [{
-        "name": "Read",
-        "description": "Read a file from the filesystem.",
-        "input_schema": {"type": "object",
-                         "properties": {"file_path": {"type": "string"}},
-                         "required": ["file_path"]},
-    }]
+    corpus = corpus or CORPUS
+    if not os.path.isdir(corpus):
+        reason = (f"corpus not found: {corpus}. Pass --corpus or set BENCH_CORPUS to the "
+                  f"tender folder; the questions mean nothing against anything else.")
+        log(f"  SKIPPED: {reason}")
+        return {"suite": "documents", "skipped": reason}
     rows = QUESTIONS[:limit] if limit else QUESTIONS
-    scores = []
+    cases = []
     for index, case in enumerate(rows, 1):
         reply = ask(model, PROMPT.format(question=case["q"], root=corpus),
-                    system=SYSTEM, tools=tools, max_tokens=900)
+                    system=SYSTEM, tools=harness.FILE_TOOLS, max_tokens=900, root=corpus)
         totals.add(reply)
         if not reply.ok:
-            scores.append({"found": False, "cited": False, "both": False})
+            cases.append(harness.record(reply, q=case["q"]))
             log(f"  [{index}/{len(rows)}] CALL FAILED  {reply.error[:70]}")
             continue
         result = score(reply.text, case)
-        scores.append(result)
+        cases.append(harness.record(reply, q=case["q"], **result))
         log(f"  [{index}/{len(rows)}] found={'y' if result['found'] else 'n'} "
             f"cited={'y' if result['cited'] else 'n'} {reply.seconds:5.1f}s  "
             f"{case['q'][:46]}")
 
-    def rate(key):
-        return sum(s[key] for s in scores) / max(1, len(scores))
+    scored = harness.answered(cases)
 
-    return {"suite": "documents", "n": len(rows), "found_rate": rate("found"),
-            "cited_rate": rate("cited"), "grounded_rate": rate("both")}
+    def rate(key):
+        return sum(c[key] for c in scored) / max(1, len(scored))
+
+    return {"suite": "documents", "n": len(rows), "answered": len(scored),
+            "found_rate": rate("found"), "cited_rate": rate("cited"),
+            "grounded_rate": rate("both"), "cases": cases}
