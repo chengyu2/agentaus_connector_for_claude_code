@@ -14,17 +14,22 @@ import platform
 import sys
 
 MAC = platform.system() == "Darwin"
+WIN = platform.system() == "Windows"
 
-# (what, how it is found, why the bridge needs it, macOS install, Debian install)
+# (what, how it is found, why the bridge needs it, macOS install, Debian install, Windows install)
 SYSTEM = (
     ("LibreOffice", "soffice", "reads .docx, .xlsx, .pptx with their tables intact",
-     "brew install --cask libreoffice", "sudo apt install libreoffice-writer libreoffice-calc libreoffice-impress"),
+     "brew install --cask libreoffice", "sudo apt install libreoffice-writer libreoffice-calc libreoffice-impress",
+     "winget install --id TheDocumentFoundation.LibreOffice"),
     ("poppler", "pdftotext", "the best PDF text tier, with column and table layout",
-     "brew install poppler", "sudo apt install poppler-utils"),
+     "brew install poppler", "sudo apt install poppler-utils",
+     "winget install --id oschwartz10612.Poppler"),
     ("poppler", "pdftoppm", "renders scanned PDF pages for tesseract",
-     "brew install poppler", "sudo apt install poppler-utils"),
+     "brew install poppler", "sudo apt install poppler-utils",
+     "winget install --id oschwartz10612.Poppler"),
     ("tesseract", "tesseract", "OCR for scanned PDF pages",
-     "brew install tesseract", "sudo apt install tesseract-ocr"),
+     "brew install tesseract", "sudo apt install tesseract-ocr",
+     "winget install --id UB-Mannheim.TesseractOCR"),
 )
 # (module, pip package, why)
 PYTHON = (
@@ -61,20 +66,24 @@ def optional_missing() -> list[str]:
     """One line per missing system reader, each with the command that installs it."""
     from . import documents, pdf
     out = []
-    for what, binary, why, mac, debian in SYSTEM:
+    for what, binary, why, mac, debian, windows in SYSTEM:
         found = documents.soffice() if binary == "soffice" else pdf._tool(binary)
         if not found:
-            out.append(f"{what} (`{binary}`) - {why}. Install: `{mac if MAC else debian}`")
+            cmd = windows if WIN else (mac if MAC else debian)
+            out.append(f"{what} (`{binary}`) - {why}. Install: `{cmd}`")
     return out
 
 
 def report(lines: list[str]) -> str:
+    script = ".\\scripts\\install.ps1" if WIN else "./scripts/install.sh"
     return ("The bridge needs these Python packages and they are missing:\n"
             + "\n".join(f"  - {l}" for l in lines)
-            + "\n\nOr run ./scripts/install.sh, which installs all of them.")
+            + f"\n\nOr run {script}, which installs all of them.")
 
 
 def optional_report(lines: list[str]) -> str:
+    run = ("$env:INSTALL_DOCUMENT_READERS=1; .\\scripts\\install.ps1" if WIN
+           else "INSTALL_DOCUMENT_READERS=1 ./scripts/install.sh")
     return ("Document reading is degraded; these readers are not installed:\n"
             + "\n".join(f"  - {l}" for l in lines)
-            + "\n\nOr run INSTALL_DOCUMENT_READERS=1 ./scripts/install.sh.")
+            + f"\n\nOr run {run}.")
