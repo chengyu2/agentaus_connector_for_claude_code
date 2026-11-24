@@ -33,7 +33,8 @@ from collections import OrderedDict
 from typing import Awaitable, Callable
 
 from .gate import hold
-from .translate import estimate_request_tokens, estimate_tokens
+from .translate import (content_text, estimate_request_tokens, estimate_tokens, has_unseen,
+                        unseen_note)
 # Re-exported: these lived here first and several modules import them from here.
 from .text import normalise_for_display, normalise_identifiers  # noqa: F401
 from . import prompt_style
@@ -239,8 +240,13 @@ def render_for_summary(messages: list) -> str:
                 lines.append(f"[{role} calls {block.get('name')}] {args}")
             elif kind == "tool_result":
                 body = block.get("content")
-                text = body if isinstance(body, str) else json.dumps(body, default=str)
+                # An image becomes its note: the summary must not carry base64, or lose
+                # that the model never saw it.
+                text = (body if isinstance(body, str) else content_text(body)
+                        if has_unseen(body) else json.dumps(body, default=str))
                 lines.append(f"[tool result] {str(text)[:1500]}")
+            elif kind in ("image", "document"):
+                lines.append(f"[{role}] {unseen_note(kind)}")
     return "\n".join(lines)
 
 

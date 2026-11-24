@@ -150,6 +150,16 @@ class TestDistillation(unittest.TestCase):
         summarise.seen = seen  # type: ignore[attr-defined]
         return summarise
 
+    def test_an_image_result_is_never_distilled(self):
+        """A screenshot's base64 is not text to condense; it reaches the model as its note."""
+        stub = self.stub()
+        d = ResultDistiller(stub, threshold_tokens=500, chunk_tokens=4000)
+        image = {"type": "image", "source": {"type": "base64", "data": "iVBORw0KGgo" + "A" * 40000}}
+        body = {"messages": [call("a", "Read", file_path="shot.png"), result("a", [image])]}
+
+        run(d.distill(body))
+        self.assertEqual(stub.seen, [], "the image's base64 was sent to be summarised")
+
     def test_a_large_result_is_condensed(self):
         stub = self.stub()
         d = ResultDistiller(stub, threshold_tokens=500, chunk_tokens=4000)

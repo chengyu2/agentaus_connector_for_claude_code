@@ -137,6 +137,20 @@ class TestRendering(unittest.TestCase):
         self.assertIn("/src/server.py", text, "file paths must survive into the summary input")
         self.assertIn("patched", text)
 
+    def test_images_reach_the_summary_as_their_note_not_base64(self):
+        """The summary must still say the model never saw the image, and carry no base64."""
+        image = {"type": "image", "source": {"type": "base64", "data": "iVBORw0KGgo" + "A" * 4000}}
+        text = render_for_summary([
+            {"role": "user", "content": [image, {"type": "text", "text": "what is this?"}]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/a.png"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [image]}]},
+        ])
+
+        self.assertEqual(text.count("Image omitted"), 2)
+        self.assertNotIn("iVBORw0KGgo", text)
+
 
 class TestCompaction(unittest.TestCase):
     def test_summary_replaces_the_head(self):
