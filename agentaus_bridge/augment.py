@@ -1349,13 +1349,14 @@ _MORE_FILES = re.compile(
 _ABBREVIATION = re.compile(r"(?:e\.g|i\.e|etc|vs|cf|a\.k\.a|n\.b)\.?", re.I)
 # A bare word.word counts as a file only with an extension files actually have: otherwise
 # "Node.js", "ASP.NET", "john.smith@...", "example.com" and "P.S" read as files to write.
-# A name in quotes or backticks, or with a directory in it, is taken as written.
+# A name in quotes or backticks, or with a directory in it, is taken as written. A name
+# with no dot at all ("Makefile") is never found, quoted or not, as before.
 _FILE_EXTENSIONS = frozenset("""
     md markdown txt text csv tsv json jsonl ndjson yaml yml toml xml html htm css scss js
     mjs cjs ts tsx jsx py ipynb rb go rs java kt swift c h cc cpp hpp cs php pl lua r sh
     bash zsh fish ps1 bat cmd sql log ini cfg conf env lock pdf docx doc xlsx xls pptx ppt
     odt ods odp rtf tex bib rst adoc png jpg jpeg gif svg webp ico mp3 mp4 wav mov zip tar
-    gz tgz bz2 xz 7z patch diff ics vcf eml srt vtt dockerfile vue svelte astro mdx zig tf
+    gz tgz bz2 xz 7z patch diff ics vcf eml srt vtt vue svelte astro mdx zig tf
     tfvars hcl scala dart sol ex exs erl hs ml clj elm nim jl proto graphql gql gradle less
     sass styl parquet org m db sqlite epub
 """.split())

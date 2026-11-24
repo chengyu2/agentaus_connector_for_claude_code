@@ -490,15 +490,53 @@ class AnAnnouncedStepIsAStall(unittest.TestCase):
 
 
 class OneGateForBothStallChecks(unittest.TestCase):
-    def test_the_image_exemption_reaches_the_judge_too(self):
-        # The follow-up to the structural stall check called the gate a second time for
-        # the judge and dropped `answers_an_image`, so "I can't see that screenshot" was
-        # sent to the judge again. One gate, with the exemption, serves both.
-        import inspect
-        source = inspect.getsource(server._agentaus_event_stream)
-        self.assertEqual(source.count("could_be_a_refusal("), 1)
-        call = source[source.index("could_be_a_refusal("):]
-        self.assertIn("answers_an_image=", call[:call.index(")\n")])
+    """The follow-up to the structural stall check called the gate a second time for the
+    judge and dropped `answers_an_image`, so "I can't see that screenshot" was sent to the
+    judge again. One gate, with the exemption, serves both."""
+
+    def body(self, last):
+        return {"messages": [user("what does this show?"), last]}
+
+    def test_an_image_turn_is_not_checked_at_all(self):
+        image = {"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "x"}},
+            {"type": "text", "text": "what is this?"}]}
+        self.assertFalse(server._worth_checking(
+            self.body(image), "I can't view images. Could you describe it?",
+            tools_offered=True, called_a_tool=False))
+
+    def test_a_short_toolless_reply_otherwise_is(self):
+        self.assertTrue(server._worth_checking(
+            self.body(user("look in the folder")), "Let me look at the folder.",
+            tools_offered=True, called_a_tool=False))
+
+
+class TheStructuralStallCheck(unittest.TestCase):
+    MISSING = [("report.md", "/w/report.md")]
+
+    def test_a_question_back_is_not_sent_back_for_files(self):
+        self.assertEqual(server._structural_stall("Which folder should it go in?", self.MISSING),
+                         (False, [], False))
+
+    def test_a_question_that_announces_a_step_goes_to_the_judge(self):
+        # Neither structural signal fires; the shared gate still lets the judge decide.
+        self.assertEqual(server._structural_stall("Shall I look at the folder next?", []),
+                         (False, [], False))
+
+    def test_missing_files_alone_are_a_stall_on_the_smaller_budget(self):
+        stalled, missing, announced = server._structural_stall("Here is the summary.", self.MISSING)
+        self.assertTrue(stalled)
+        self.assertEqual(missing, self.MISSING)
+        # `announced` is what earns the 40-per-message cap; missing files get the judge's 8.
+        self.assertFalse(announced)
+
+    def test_an_announcement_is_asked_for_its_step_not_the_files(self):
+        self.assertEqual(server._structural_stall("Let me look at the folder.", self.MISSING),
+                         (True, [], True))
+
+    def test_a_finished_answer_is_no_stall(self):
+        self.assertEqual(server._structural_stall("Done. The file is written.", []),
+                         (False, [], False))
 
 
 class FilesTheRequestNamesMustExist(unittest.TestCase):
@@ -557,6 +595,8 @@ class FilesTheRequestNamesMustExist(unittest.TestCase):
             "a) write a.md": ["a.md"],
             "Write main.tf": ["main.tf"],
             "Create App.vue": ["App.vue"],
+            # Tripwire: a quoted name is taken as written, whatever its extension.
+            "Write `notes.weird` and `data.v2`": ["notes.weird", "data.v2"],
         }
         for task, want in cases.items():
             self.assertEqual([n for n, _ in augment.missing_deliverables(task, "/nowhere")],

@@ -1865,6 +1865,36 @@ def _tool_calls_made(body: dict) -> int:
                for b in m["content"] if isinstance(b, dict) and b.get("type") == "tool_use")
 
 
+def _worth_checking(original: dict, answer: str, *, tools_offered: bool,
+                    called_a_tool: bool) -> bool:
+    """Whether a reply may be a refusal or a stall at all - the one gate in front of both
+    the structural stall check and the judge, so the image exemption covers both."""
+    # Started in the background and said so: the right reply, not a stall.
+    return not awaiting_background(original) and could_be_a_refusal(
+        answer, tools_offered=tools_offered, called_a_tool=called_a_tool,
+        answers_an_image=has_unseen((original.get("messages") or [])[-1:]))
+
+
+def _structural_stall(answer: str, missing: list) -> tuple[bool, list, bool]:
+    """(stalled on its face, files still to ask for, announced) for a reply with no tool
+    call - decided without a judge call.
+
+    - A reply ending in a question is a fair place to stop, files or not, and
+      `announces_a_step` never reads one as an announcement either: it goes to the judge.
+    - An announcement is a step not taken, whatever is missing: asking it for the files at
+      that point pushed a model to write them before it had read anything.
+    - Only an announcement is `announced`, which earns the larger re-ask budget. Missing
+      files are the less certain signal (the request may not mean them), so they share
+      the judge's.
+    """
+    if (answer or "").rstrip().endswith("?"):
+        missing = []
+    announced = announces_a_step(answer)
+    if announced:
+        missing = []
+    return announced or bool(missing), missing, announced
+
+
 def _may_reask_stalled(body: dict, *, announced: bool = False) -> bool:
     """Whether a reply judged stalled may be sent back, charging the budget if so.
 
@@ -3480,28 +3510,13 @@ async def _agentaus_event_stream(
         missing = [] if (mine or theirs or not known or is_subagent_turn(original)
                          or awaiting_background(original)) else missing_deliverables(
             _last_user_text(received), working_directory_of(received))
-        # A question back to the user is a fair place to stop, files or not.
-        if answer_so_far.rstrip().endswith("?"):
-            missing = []
-        announced = announces_a_step(answer_so_far)
+        stalled_on_its_face, missing, announced = _structural_stall(answer_so_far, missing)
         # One gate for both checks below, so the image exemption covers the judge too.
-        worth_checking = (
-            corrections < settings.agentaus_correction_rounds
-            # Started in the background and said so: the right reply, not a stall.
-            and not awaiting_background(original)
-            and could_be_a_refusal(
-                answer_so_far,
-                tools_offered=bool(known),
-                called_a_tool=bool(mine or theirs),
-                answers_an_image=has_unseen((original.get("messages") or [])[-1:]),
-            )
-        )
-        if worth_checking and (missing or announced):
-            # An announcement is a step not taken, whatever is missing: asking it for the
-            # files at that point pushed a model to write them before it had read anything.
-            if announced:
-                missing = []
-            # It says what it will do next: a stall on its face, so no judge call to wait on.
+        worth_checking = (corrections < settings.agentaus_correction_rounds
+                          and _worth_checking(original, answer_so_far, tools_offered=bool(known),
+                                              called_a_tool=bool(mine or theirs)))
+        if worth_checking and stalled_on_its_face:
+            # It says what it will do next, or left out the files: no judge call to wait on.
             turn_verdict = "stalled"
         elif worth_checking:
             async def classify() -> str:
@@ -3526,8 +3541,6 @@ async def _agentaus_event_stream(
                 rlog(logging.WARNING, "refusal check failed (%s); forwarding the answer",
                      exc)
 
-        # Only a plain announcement gets the larger budget. Missing files are the less
-        # certain signal (the request may not mean them), so they share the judge's.
         if turn_verdict == "stalled" and not _may_reask_stalled(
                 original, announced=announced):
             rlog(logging.WARNING, "judged stalled again, but the re-ask budget for this "
