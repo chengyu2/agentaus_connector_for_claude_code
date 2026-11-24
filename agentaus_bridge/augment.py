@@ -316,7 +316,7 @@ _ANALYSIS_FIELDS = ("command", "file_path", "notebook_path", "content", "new_str
 def ran_an_analysis(body: dict) -> bool:
     """Whether this turn has executed code over data.
 
-    A structural gate, in the sense the README means: it reads what the turn *did*, costs
+    A structural gate, in the sense docs/design/skills.md means: it reads what the turn *did*, costs
     nothing, and never guesses intent from the user's wording. Keyword matching on the
     request would read "model the retry budget" as an analysis and a bare "how many rows
     are in this?" as not one.
@@ -402,7 +402,7 @@ _REMINDERS = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 def skills_for(body: dict) -> list[str]:
     """Which documented procedures apply to this turn.
 
-    Structural gates, costing nothing, in the sense the README means - and they have to
+    Structural gates, costing nothing, in the sense docs/design/skills.md means - and they have to
     be, because the model will not make this choice itself. Measured: `Skill` offered
     among 28 tools and named first in the guidance, and Agentaus never called it once
     in five runs, while Opus called it on the same prompt in the same directory.
@@ -896,7 +896,7 @@ def guidance_for(body: dict, *, covered_by_skill: tuple = (), routing: bool = Tr
                       "is about before you write the script:\n\n"
                       + "\n".join(f"- [ ] {f}" for f in files) + "\n")
     # The reporting contract and the `analyse-data` skill say largely the same things.
-    # Sending both is the failure the README records between two skills - "one was
+    # Sending both is the failure docs/design/skills.md records between two skills - "one was
     # quietly arguing with another" - and this model handles a long list of rules badly.
     # The skill is the more specific of the two, so the inline notes stand down for it.
     if ran_an_analysis(body) and "analyse-data" not in covered_by_skill:

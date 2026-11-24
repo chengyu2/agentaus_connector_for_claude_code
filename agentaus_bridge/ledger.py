@@ -245,8 +245,8 @@ def render_evidence(
     that a script ran, the checker replied *"would need the actual output from fit.py
     showing these values"* and the rewrite turned every correct coefficient into "may be
     0.849; I have not read the source" - the answer contradicting itself while the right
-    numbers sat in the file it had just written. The README states the principle this
-    broke: a helper pass must never judge what it cannot see.
+    numbers sat in the file it had just written. docs/design/grounding.md states the
+    principle this broke: a helper pass must never judge what it cannot see.
 
     Newest calls get the budget first: an answer is usually written from what the turn
     found last, and an older call that no longer fits is still named and counted.
