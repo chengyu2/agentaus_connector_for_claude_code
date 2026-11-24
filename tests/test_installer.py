@@ -412,6 +412,14 @@ class ReviewFixes(_Fixture):
         after = sorted(p for p in list(self.root.rglob("*")) + list(self.home.rglob("*")))
         self.assertEqual(before, after)
 
+    def test_yes_without_a_key_finishes_says_so_and_writes_no_key(self):
+        os.environ.pop("AGENTAUS_API_KEY")
+        code, _, out = self.setup("--preset", "minimal", "--settings", "none")
+        self.assertEqual(code, 0)
+        self.assertIn("No API key", out)
+        self.assertIn("Add your API key", out)
+        self.assertEqual(A.read_env(self.root / ".env").get("AGENTAUS_API_KEY", ""), "")
+
     def test_state_is_saved_before_a_later_step_aborts(self):
         with mock.patch.object(flow.Setup, "command", side_effect=Aborted()):
             with self.assertRaises(Aborted):

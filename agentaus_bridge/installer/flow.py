@@ -349,7 +349,11 @@ class Setup:
         if ui.assume_yes:
             key = os.environ.get("AGENTAUS_API_KEY", "") or existing
             if not key:
-                ui.warn("No key given. Put AGENTAUS_API_KEY in .env, or re-run with it exported.")
+                # Carry on rather than fail: everything else can be installed now, and the
+                # closing summary leads with the missing key. Nothing empty is written.
+                ui.warn("No API key: $AGENTAUS_API_KEY is not set and .env has none. "
+                        "The bridge will not start until AGENTAUS_API_KEY is in "
+                        f"{self.root / '.env'}.")
                 return
         elif existing and ui.confirm(f"Keep the key already in .env ({A.mask(existing)})?", True):
             key = existing
@@ -582,6 +586,9 @@ class Setup:
             ui.info(f"Components: {', '.join(self.keys)}")
             return
         steps = []
+        if not A.read_env(self.root / ".env").get("AGENTAUS_API_KEY") and not self.args.dry_run:
+            steps.append(f"[bold]Add your API key[/bold] to {self.root / '.env'} "
+                         "(AGENTAUS_API_KEY=...), or run setup again")
         if not self.service_running:
             script = "start-bridge.ps1" if A.WINDOWS else "start-bridge.sh"
             start = "agentaus-bridge run" if has_command else str(self.root / "scripts" / script)

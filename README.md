@@ -97,6 +97,22 @@ through it, confirming each step before it runs:
 curl -fsSL https://raw.githubusercontent.com/chengyu2/agentaus_connector_for_claude_code/main/scripts/install.sh | bash
 ```
 
+Piping a script from the internet into a shell runs it before you have seen it. To read it
+first, download it, look, then run it. Add `--dry-run` to walk through every question with
+nothing changed:
+
+```bash
+curl -fsSLo install.sh https://raw.githubusercontent.com/chengyu2/agentaus_connector_for_claude_code/main/scripts/install.sh
+less install.sh
+bash install.sh --dry-run    # then: bash install.sh
+```
+
+The script only fetches the repository and hands over to `python -m agentaus_bridge setup`
+(`agentaus_bridge/installer/`), so that code is worth a look too; it never runs `sudo` or
+changes a file outside its own folder without showing the command or diff and asking.
+`AGENTAUS_BRIDGE_REF=<tag>` installs a tagged release rather than whatever is on `main`;
+take the script from the same tag (`.../<tag>/scripts/install.sh`) so the two match.
+
 From a clone, `./scripts/install.sh` runs the same installer in place. Either way it:
 
 1. checks for Python 3.11+ (and says how to get it if not), then creates a virtualenv;
@@ -177,6 +193,9 @@ to pass them to the piped form, run it as a script block:
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/chengyu2/agentaus_connector_for_claude_code/main/scripts/install.ps1))) --preset full
 ```
+
+To read it first: `irm <url> -OutFile install.ps1`, look at it, then
+`powershell -ExecutionPolicy Bypass -File .\install.ps1 --dry-run`.
 
 `install.ps1` finds a real Python 3.11+ (preferring the `py -3` launcher, so the Microsoft
 Store placeholder `python` is never picked) and says how to install one if there is none.
