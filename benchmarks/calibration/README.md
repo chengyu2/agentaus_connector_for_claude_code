@@ -336,9 +336,12 @@ These come from the pilot, and the expansion confirmed the first two.
      knowing one design rule, which no amount of derivation supplies. A knowledge gap
      looks the same to it as a long derivation.
    - The API bills the hidden reasoning but does not stream it, so a loop can't be seen.
-3. Tool use that does not stop. The unanswerable live tasks used all 30 tool calls in 30 of
-   40 runs, as the model kept trying to decode the image or load the page. Those runs cost
-   up to AUD 1.10 each, against AUD 0.01-0.07 for most answerable tasks.
+3. Tool use that does not stop. 30 of the 40 trap runs hit the step or time limit. In 23
+   of them the model used all 30 tool calls trying to read the image or load the page:
+   every `tools-image` and `web-hours` run and 7 `web-wharf` runs. The other 7 were
+   `code-licence` runs that made 16 to 24 tool calls and ran out of the 15 minutes of
+   working time. Runs that hit a limit cost up to AUD 1.39 each. The median run of an
+   answerable task cost AUD 0.03.
 4. Made-up values were rare. Across 40 trap-task runs, the model invented a value once
    ("210" for the image, at 35% confidence). Every other run on an unanswerable task said
    the value could not be determined, under every prompt including the baseline.

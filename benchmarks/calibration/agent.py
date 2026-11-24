@@ -71,6 +71,8 @@ def _execute(call: dict, sandbox: Sandbox | None, browser: Browser | None) -> st
             return browser.follow(int(args["number"]))
     except (KeyError, TypeError, ValueError) as exc:
         return f"[bad arguments for {name}: {exc}]"
+    except OSError as exc:              # e.g. write_file onto a path the agent made unwritable
+        return f"[{name} failed: {exc}]"
     return f"[unknown tool {name!r}]"
 
 

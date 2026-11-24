@@ -3,7 +3,9 @@
 Each case here is a wrong score the pilot actually produced or a review found by reading
 the code: "Confidence: 0.85" read as 0.85%, ten tied answers split into right and wrong
 bins, "Q3 2025 revenue: $5,266.06" graded on the year, "600 (the 900 is disabled)" failed
-for naming the value it rejects, and a hedged guess passed as an honest "cannot tell".
+for naming the value it rejects, "3 or more orders: 17" graded on the 3, a hedged guess
+passed as an honest "cannot tell", and a write_file into a directory the container made
+ending the whole run.
 """
 
 from __future__ import annotations
@@ -83,8 +85,15 @@ class NumberGraders(unittest.TestCase):
         self.assertTrue(tasks._says_number(5266.06, tol=0.011)("Q3 2025 APAC revenue: $5,266.06"))
         self.assertTrue(grade("web-count", "In October 2026, 2 disruptions affected route F2."))
 
+    def test_repeating_the_question_before_the_figure(self):
+        self.assertTrue(grade("tools-join", "Gold-tier customers with 3 or more orders: 17"))
+        self.assertTrue(grade("web-fare", "2 adults + 1 concession on Saturday: $21.50"))
+        self.assertTrue(grade("tools-logcount", "Billing ERROR lines on 3 November 2026: 5"))
+
     def test_a_wrong_first_figure_still_fails(self):
         self.assertFalse(grade("web-count", "3 disruptions (2 of them on route F2)"))
+        self.assertFalse(grade("tools-join", "3 customers"))
+        self.assertFalse(grade("web-fare", "2 adults + 1 concession: $19.50"))
 
     def test_naming_the_rejected_value_to_dismiss_it(self):
         self.assertTrue(grade("tools-config", "600 (the 900 in .env.production is disabled)"))
@@ -194,6 +203,16 @@ class CodingConfidenceHasOneMeaning(unittest.TestCase):
         self.assertNotIn("Answer line is correct", coding)
         self.assertIn("Answer line is correct", other)
         self.assertNotIn("hidden tests", other)
+
+
+class ToolErrorsReachTheModel(unittest.TestCase):
+    def test_a_file_error_is_returned_not_raised(self):
+        from benchmarks.calibration import agent
+        box = mock.Mock()
+        box.write_file.side_effect = PermissionError(13, "Permission denied")
+        call = {"function": {"name": "write_file",
+                             "arguments": json.dumps({"path": "pkg/mod.py", "content": "x"})}}
+        self.assertIn("Permission denied", agent._execute(call, box, None))
 
 
 if __name__ == "__main__":

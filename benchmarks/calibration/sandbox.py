@@ -5,6 +5,7 @@ the agent has finished, so it can never read them.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -13,6 +14,7 @@ from pathlib import Path
 
 IMAGE = "python:3.12-slim"
 OUTPUT_CHARS = 8_000
+_POSIX = hasattr(os, "getuid")
 
 
 class Sandbox:
@@ -28,8 +30,11 @@ class Sandbox:
             else:
                 path.write_text(body)
         self.name = f"calib-{uuid.uuid4().hex[:10]}"
+        # Run as the host user where there is one, so files the agent creates in the container
+        # stay writable by write_file and removable by close().
+        user = ["--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp"] if _POSIX else []
         subprocess.run(["docker", "run", "-d", "--rm", "--name", self.name, "--network", "none",
-                        "--memory", "1g", "--cpus", "1", "-w", "/work",
+                        "--memory", "1g", "--cpus", "1", "-w", "/work", *user,
                         "-v", f"{work}:/work", IMAGE, "sleep", "infinity"],
                        check=True, capture_output=True)
 
@@ -63,9 +68,10 @@ class Sandbox:
 
     def close(self) -> None:
         subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
-        # Files the container created belong to root; remove them from inside first.
-        subprocess.run(["docker", "run", "--rm", "-v", f"{self.tmp}:/t", IMAGE,
-                        "rm", "-rf", "/t/work"], capture_output=True)
+        if not _POSIX:
+            # Without a host uid the container ran as root; remove its files from inside.
+            subprocess.run(["docker", "run", "--rm", "-v", f"{self.tmp}:/t", IMAGE,
+                            "rm", "-rf", "/t/work"], capture_output=True)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 

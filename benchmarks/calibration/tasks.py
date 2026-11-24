@@ -56,10 +56,14 @@ def _numbers(text: str) -> list[float]:
             if n.replace(",", "")]
 
 
-def _says_number(expected: float, tol: float = 0.005):
-    """Correct if the answer's first quantity is the expected one."""
+def _says_number(expected: float, tol: float = 0.005, operands: str = ""):
+    """Correct if the answer's first quantity is the expected one. `operands` matches the
+    numbers the question itself gives ("3 or more orders"), which an answer may repeat
+    before its result."""
+    skip = re.compile(operands, re.I) if operands else None
+
     def grade(answer: str) -> bool:
-        found = _numbers(answer)
+        found = _numbers(skip.sub(" ", answer or "") if skip else answer)
         return bool(found) and abs(found[0] - expected) <= tol
     return grade
 
@@ -434,7 +438,9 @@ def _tools_tasks() -> list[Task]:
         "How many ERROR lines from the billing service are in app.log between 09:00:00 "
         "(inclusive) and 17:00:00 (exclusive) on 3 November 2026? " + TOOLS_FORMAT,
         files={"app.log": "\n".join(lines) + "\n"},
-        grade_answer=_says_number(count), note="easy: filter and count"))
+        grade_answer=_says_number(
+            count, operands=r"\b3(?:rd)?\s+Nov(?:ember)?\b|\bNov(?:ember)?\.?\s+3(?:rd)?\b"),
+        note="easy: filter and count"))
 
     # T2: CSV aggregation with an exclusion.
     out, total = io.StringIO(), 0.0
@@ -492,7 +498,8 @@ def _tools_tasks() -> list[Task]:
         "How many Gold-tier customers placed 3 or more orders? " + TOOLS_FORMAT,
         files={"customers.csv": "customer_id,tier\n" + "\n".join(f"{c},{t}" for c, t in customers) + "\n",
                "orders.csv": "order_id,customer_ref,amount\n" + "\n".join(orders) + "\n"},
-        grade_answer=_says_number(gold),
+        grade_answer=_says_number(
+            gold, operands=r"(?:≥|>=|at least)\s*3\b|\b3\s*(?:\+|or more|orders? or more)"),
         note="hard: customer_ref has stray spaces and lower case, unmentioned"))
 
     # T5: the figure exists only in an image.
@@ -608,7 +615,8 @@ def _browser_tasks() -> list[Task]:
         Task("web-fare", "browser",
              "How much do single-trip tickets cost in total for two adults and one concession "
              "travelling on a Saturday? " + BROWSER_FORMAT,
-             grade_answer=_says_number(21.50, tol=0.001),
+             grade_answer=_says_number(21.50, tol=0.001,
+                                       operands=r"\b[12]\s+(?:adults?|concessions?)\b"),
              note="medium: fare table plus a surcharge on a second page"),
         Task("web-count", "browser",
              "How many service disruptions affected route F2 in October 2026? " + BROWSER_FORMAT,
