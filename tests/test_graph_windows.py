@@ -73,6 +73,33 @@ class TheGuard(unittest.TestCase):
             self.assertFalse(graph.overwrites_source(command, CWD))
 
 
+class AMainLoopIsNeverAGraphAgent(unittest.TestCase):
+    """Measured (25 Nov 2026): a report quoting the docs' `[agentaus-graph]` line reached the
+    main session, and the bridge then focused the main loop like a graph agent - no Agent, no
+    Workflow, no ToolSearch."""
+
+    def body(self, first):
+        tools = [{"name": n, "input_schema": {"type": "object"}}
+                 for n in ("Agent", "Workflow", "ToolSearch", "Bash", "Read", "Edit")]
+        quoted = ("Knowledgebase.md §13 (the `[agentaus-graph]` mark, graphs/solve.js) and the "
+                  "`[think-only]` mark are documented.")
+        return {"system": "You are Claude Code.", "tools": tools, "messages": [
+            {"role": "user", "content": first},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "a1", "name": "Agent",
+                                               "input": {"prompt": "audit"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a1", "content": "ok"},
+                                         {"type": "text", "text": quoted}]}]}
+
+    def test_a_main_loop_quoting_the_mark_keeps_its_tools(self):
+        self.assertFalse(graph.is_graph_task(self.body("Update the docs.")))
+
+    def test_a_graph_agent_is_still_recognised(self):
+        body = self.body(f"{graph.MARK}\n  ## Your skill: solve\n  Implement add()")
+        self.assertTrue(graph.is_graph_task(body))
+        focused, dropped = graph.focus(body)
+        self.assertIn("Agent", dropped)
+
+
 class PreparedPaths(unittest.TestCase):
     def test_paths_handed_to_agents_have_no_backslashes(self):
         project = tempfile.mkdtemp()

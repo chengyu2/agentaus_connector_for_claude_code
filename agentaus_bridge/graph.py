@@ -766,15 +766,21 @@ def run_state(entry: dict | None) -> str:
 
 
 def is_graph_task(body: dict) -> bool:
-    """Whether a subagent request was started by the graph - its prompt carries MARK."""
+    """Whether a subagent request was started by the graph - its prompt carries MARK.
+
+    Read from the first user message only: that is the graph's prompt for its own agents, and
+    the user's own request in a main loop. Measured (25 Nov 2026): an audit report later in a
+    main session quoted the Knowledgebase's line about the `[agentaus-graph]` mark, and from
+    then on the main loop was focused like a graph agent - Agent, Workflow, ToolSearch and
+    PowerShell held back - so for an hour it announced "launching the reviewers" and could not.
+    """
     for message in body.get("messages") or []:
         if message.get("role") != "user":
             continue
         content = message.get("content")
         texts = [content] if isinstance(content, str) else [
             b.get("text", "") for b in content or [] if isinstance(b, dict)]
-        if any(MARK in (t or "") for t in texts):
-            return True
+        return any(MARK in (t or "") for t in texts)
     return False
 
 
