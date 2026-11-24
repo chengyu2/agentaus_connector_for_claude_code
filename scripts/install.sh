@@ -19,7 +19,15 @@ if [[ "${INSTALL_DOCUMENT_READERS:-0}" == "1" ]]; then
     if ! command -v soffice >/dev/null && [[ ! -x /Applications/LibreOffice.app/Contents/MacOS/soffice ]]; then
       brew install --cask libreoffice
     fi
+  elif [[ "$(uname)" == MINGW* ]] || [[ -n "${WINDIR:-}" ]]; then
+    echo "Windows detected: this bash script cannot run document-reader setup here." >&2
+    echo "Use PowerShell instead:  powershell -ExecutionPolicy Bypass -File scripts/install.ps1" >&2
+    exit 1
+  elif command -v dnf >/dev/null; then
+    # Fedora / RHEL / Alma / Rocky and other dnf-based distributions.
+    sudo dnf install -y libreoffice poppler-utils tesseract
   elif command -v apt-get >/dev/null; then
+    # Debian / Ubuntu.
     sudo apt-get update
     sudo apt-get install -y libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils tesseract-ocr
   else
