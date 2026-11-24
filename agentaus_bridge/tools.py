@@ -336,6 +336,13 @@ def _skipped_suffixes() -> set:
 _NEVER_READ = (
     ".env", ".env.local", ".env.production", ".netrc", ".htpasswd",
     "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "credentials",
+    # Each of these is a bare credential under an unambiguous name, and none was caught
+    # before. `.git-credentials` stores https git passwords in the clear, `.npmrc` and
+    # `.pypirc` hold registry auth tokens, `.dockercfg` is the legacy registry login, and
+    # `.pgpass` is Postgres passwords. Measured: exploration runs read `.git-credentials`
+    # and `.npmrc` on 40/40 turns with no permission prompt, because `_is_secret` only
+    # ever blocked `.env`-style names.
+    ".git-credentials", ".npmrc", ".pypirc", ".dockercfg", ".pgpass",
 )
 _NEVER_READ_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".keystore", ".jks")
 
@@ -353,17 +360,24 @@ _SECRET_STEMS_IN_CONFIG = ("credentials", "credential", "secrets", "secret",
                            "service-account", "service_account", "apikey", "api_key")
 
 
-def _is_secret(name: str) -> bool:
-    """Whether a file must never be read, however the search happened to match it.
+# Credentials known by where they sit, not by a name worth blocking on its own. The
+# basenames here - `hosts.yml`, `config`, `config.json`, `credentials` - are far too
+# common to refuse everywhere, so each is matched only under the directory that makes it
+# a secret. `gh/hosts.yml` is a GitHub OAuth token, `.kube/config` carries cluster certs
+# and tokens, `.docker/config.json` holds registry logins, and `.aws/credentials` and
+# `.aws/config` hold cloud keys. Measured: exploration runs read `.config/gh/hosts.yml`
+# on 40/40 turns with no permission prompt, because nothing looked past the basename.
+_SECRET_PATH_TAILS = (
+    ("gh", "hosts.yml"),
+    (".kube", "config"),
+    (".docker", "config.json"),
+    (".aws", "credentials"),
+    (".aws", "config"),
+)
 
-    These reads never reach Claude Code's permission prompts, so this is the only thing
-    standing between a search term that happens to appear in a key file and that key
-    ending up in a transcript.
 
-    Matching the whole filename was not enough: it let through `credentials.json`, which
-    is a Google service account, and `id_rsa.bak`, which is a private key with four
-    characters after it.
-    """
+def _is_secret_name(name: str) -> bool:
+    """Basename-only test: whether `name` alone marks a file as a secret."""
     lowered = name.lower()
     if lowered.startswith(".env"):
         return True
@@ -373,6 +387,51 @@ def _is_secret(name: str) -> bool:
     if stem in _NEVER_READ_STEMS:
         return True
     return stem in _SECRET_STEMS_IN_CONFIG and lowered.endswith(_SECRET_CONFIG_SUFFIXES)
+
+
+def _is_secret_path(path: str) -> bool:
+    """Path-aware test: a credential identified by the directory it lives in.
+
+    Separate from the basename test because these files are only secret in context:
+    `config` under `.kube` is cluster credentials, `config` anywhere else is ordinary.
+    Anything directly inside a `.ssh/` directory is a key, a `known_hosts`, or a config
+    that names one, whatever it is called.
+    """
+    parts = os.path.normpath(path).split(os.sep)
+    if len(parts) < 2:
+        return False
+    parent, base = parts[-2].lower(), parts[-1].lower()
+    if parent == ".ssh":
+        return True
+    return any(parent == d and base == f for d, f in _SECRET_PATH_TAILS)
+
+
+def _is_secret(name: str, path: str | None = None) -> bool:
+    """Whether a file must never be read, however the search happened to match it.
+
+    These reads never reach Claude Code's permission prompts, so this is the only thing
+    standing between a search term that happens to appear in a key file and that key
+    ending up in a transcript.
+
+    Matching the whole filename was not enough: it let through `credentials.json`, which
+    is a Google service account, and `id_rsa.bak`, which is a private key with four
+    characters after it. The basename alone also could not see two further classes, so
+    when `path` is supplied it is judged as well: credentials known by their directory
+    (`.kube/config`, `.aws/credentials`), and a symlink whose innocuous name - `notes.txt`
+    pointing at `id_rsa` - hides what it actually opens, which only the resolved target
+    reveals.
+    """
+    if _is_secret_name(name):
+        return True
+    if path is not None:
+        if _is_secret_path(path):
+            return True
+        # Resolve the link and judge what it really opens: `notes.txt -> id_rsa` is the
+        # key, and matching only the link's own name saw nothing but `notes.txt`.
+        resolved = os.path.realpath(path)
+        if _is_secret_name(os.path.basename(resolved)) or _is_secret_path(resolved):
+            return True
+    return False
 
 
 def _allowed_root(path: str) -> bool:
@@ -470,7 +529,7 @@ def enumerate_files_bounded(path: str, glob: str | None = None) -> tuple[list[st
         name = os.path.basename(path).lower()
         # Naming a binary explicitly does not make it readable as text, so the same
         # exclusions apply to a direct path as to a walked one.
-        if _is_secret(name) or any(name.endswith(s) for s in _skipped_suffixes()):
+        if _is_secret(name, path) or any(name.endswith(s) for s in _skipped_suffixes()):
             return [], False
         return [path], False
 
@@ -486,7 +545,9 @@ def enumerate_files_bounded(path: str, glob: str | None = None) -> tuple[list[st
                 log.warning("walk of %s stopped at %d files (AGENTAUS_SEARCH_MAX_FILES)",
                             path, cap)
                 return found, True
-            if _is_secret(name):
+            # Pass the full path so the directory-aware and symlink rules apply, not just
+            # the basename: a .ssh/config or a notes.txt -> id_rsa link is invisible by name.
+            if _is_secret(name, os.path.join(directory, name)):
                 continue
             lowered = name.lower()
             if any(lowered.endswith(suffix) for suffix in skipped):
@@ -542,7 +603,7 @@ def read_text(path: str) -> str:
     and each read may be a multi-second document conversion.
     """
     _check_deadline()
-    if _is_secret(os.path.basename(path)):
+    if _is_secret(os.path.basename(path), path):
         log.warning("refused to read %s: excluded as a secret", os.path.basename(path))
         return ""
     if documents.is_office_document(path) and documents.available(path):
