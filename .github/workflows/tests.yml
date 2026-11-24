@@ -118,6 +118,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "$HOME\.local\bin\agentaus-bridge.cmd" uninstall --yes
           if (Get-ScheduledTask -TaskName AgentausBridge -ErrorAction SilentlyContinue) { throw "task still registered" }
+          Start-Sleep -Seconds 6
+          if (Test-Path "$HOME\.local\bin\agentaus-bridge.cmd") { throw "agentaus-bridge.cmd was not removed" }
 
       # `powershell -ExecutionPolicy Bypass -File ...` runs Windows PowerShell 5.1, not pwsh 7,
       # and the two treat native stderr differently, so run the installer under 5.1 too.

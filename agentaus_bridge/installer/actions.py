@@ -80,6 +80,20 @@ class Runner:
         if not self.dry_run and path.exists():
             path.unlink()
 
+    def remove_later(self, path: Path) -> None:
+        """Windows: delete a file a few seconds from now, from a detached cmd. For the
+        agentaus-bridge.cmd that is running this very uninstall - cmd reads a batch file as
+        it goes, and fails with "The batch file cannot be found." if it has been deleted."""
+        self.log.append(f"remove (deferred): {path}")
+        if self.dry_run or not path.exists():
+            return
+        flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        # One string, not a list: list2cmdline would escape the quotes cmd needs.
+        subprocess.Popen(f'cmd /c ping -n 3 127.0.0.1 >nul & del /f /q "{path}"',
+                         creationflags=flags, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+
     def copy(self, src: Path, dst: Path) -> None:
         self.log.append(f"copy: {src} -> {dst}")
         if not self.dry_run:

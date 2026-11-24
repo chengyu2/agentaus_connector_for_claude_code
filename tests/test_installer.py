@@ -204,6 +204,23 @@ class Platforms(unittest.TestCase):
         self.assertIn("Unregister-ScheduledTask", A.service_commands("schtasks", "remove")[0][-1])
         self.assertIsNone(A.service_file("schtasks"))
 
+    def test_windows_uninstall_deletes_the_running_cmd_later(self):
+        with tempfile.TemporaryDirectory() as d:
+            shim = Path(d) / "agentaus-bridge.cmd"
+            shim.write_text("@echo off")
+            root = Path(d) / "root"
+            root.mkdir()
+            A.save_state(A.Runner(), {"command": str(shim)}, root)
+            with mock.patch.object(A, "ROOT", root), mock.patch.object(A, "WINDOWS", True), \
+                    mock.patch("subprocess.Popen") as popen, \
+                    mock.patch("sys.stdout", new=io.StringIO()):
+                self.assertEqual(cli.main(["uninstall", "--yes"]), 0)
+            self.assertTrue(shim.exists())          # not deleted under the running cmd
+            line = popen.call_args[0][0]
+            self.assertIsInstance(line, str)
+            self.assertIn(f'del /f /q "{shim}"', line)
+            self.assertNotIn("command", A.load_state(root))
+
     def test_add_to_user_path_has_no_double_quotes(self):
         self.assertNotIn('"', A.add_to_user_path_command(Path(r"C:\Users\me\.local\bin"))[-1])
 

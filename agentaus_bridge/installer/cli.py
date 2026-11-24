@@ -228,9 +228,13 @@ def _uninstall(rest: list[str]) -> int:
     if command:
         ui.info(f"Remove the command {command}")
         if ui.confirm("Remove it?", True):
-            runner.remove(Path(command))
+            if A.WINDOWS:
+                runner.remove_later(Path(command))
+                ui.ok("Command removed (in a few seconds, once it has exited)")
+            else:
+                runner.remove(Path(command))
+                ui.ok("Command removed")
             state.pop("command")
-            ui.ok("Command removed")
     A.save_state(runner, state)
     ui.print("")
     ui.info("The bridge itself, its virtualenv and your .env (with the key) are still in:")
