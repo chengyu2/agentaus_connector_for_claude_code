@@ -517,3 +517,29 @@ class TestSmallRequestTimeoutsAreNotBlamedOnSize(unittest.TestCase):
         self.assertIn("131,072", text)
         self.assertIn("Nothing here needs compacting", text)
         self.assertIn("/model", text, "it should offer the escape that actually works")
+
+
+class RateLimitBackoffIsShort(unittest.TestCase):
+    """A 429 is a rate window that reopens in seconds, not an outage: the wait after one
+    is capped well below the outage backoff, which grew to ~256 s per attempt."""
+
+    def test_429_wait_is_capped_but_outage_wait_is_not(self):
+        import asyncio
+        from unittest import mock
+
+        from agentaus_bridge import server
+        from agentaus_bridge.config import settings
+
+        waits = []
+
+        async def fake_sleep(s):
+            waits.append(s)
+
+        with mock.patch.object(settings, "retry_backoff_seconds", 1.0), \
+             mock.patch.object(settings, "retry_max_delay_seconds", 300.0), \
+             mock.patch.object(settings, "rate_limit_max_delay_seconds", 20.0), \
+             mock.patch.object(server.asyncio, "sleep", fake_sleep):
+            asyncio.run(server._sleep_before_retry(8, "HTTP 429"))
+            asyncio.run(server._sleep_before_retry(8, "HTTP 503"))
+        self.assertLessEqual(waits[0], 30.0)
+        self.assertGreaterEqual(waits[1], 256.0)

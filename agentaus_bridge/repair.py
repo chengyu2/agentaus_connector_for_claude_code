@@ -151,6 +151,37 @@ def _into_working_directory(path: str, cwd: str, *, must_exist: bool) -> str | N
     return None
 
 
+# `python3 -I` leaves the current directory off sys.path, so `from solutions import *` in a
+# heredoc fails with ModuleNotFoundError (base algorithms-r1: a turn spent, then re-run
+# without it). Claude Code's own prompt suggests -I for scripts that read untrusted
+# downloads; a script that imports a module of the working directory wants that directory.
+# `-E -s` keeps the rest of the isolation (no PYTHON* variables, no user site-packages).
+_ISOLATED = re.compile(r"(\bpython(?:3(?:\.\d+)?)?\s+)-I(?=\s)")
+_IMPORTS = re.compile(r"^\s*(?:from|import)\s+([A-Za-z_]\w*)", re.M)
+
+
+def _without_isolation(command: str, cwd: str) -> str:
+    if not _ISOLATED.search(command):
+        return command
+    # The imports are in the heredoc or -c text, or in a script the command runs.
+    text = command
+    for script in re.findall(r"(?<![\w/.-])([\w./-]+\.py)\b", command)[:5]:
+        path = script if os.path.isabs(script) else os.path.join(cwd, script)
+        try:
+            if os.path.getsize(path) <= 500_000:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    text += "\n" + fh.read()
+        except OSError:
+            continue
+    own = False
+    for module in set(_IMPORTS.findall(text)):
+        if (os.path.isfile(os.path.join(cwd, module + ".py"))
+                or os.path.isfile(os.path.join(cwd, module, "__init__.py"))):
+            own = True
+            break
+    return _ISOLATED.sub(r"\1-E -s", command) if own else command
+
+
 def _as_dict(arguments):
     if isinstance(arguments, dict):
         return dict(arguments)
@@ -502,6 +533,12 @@ def repair(call: dict, asked_as: str, schema: dict | None, cwd: str | None,
         if moved:
             args["file_path"] = moved
             changed.append("mangled working-directory path -> working directory")
+
+    if name == "Bash" and cwd and isinstance(args.get("command"), str):
+        unisolated = _without_isolation(args["command"], cwd)
+        if unisolated != args["command"]:
+            args["command"] = unisolated
+            changed.append("python -I importing the project's own module -> -E -s")
 
     correction = None
     if name in ("Edit", "MultiEdit") and settings.agentaus_edit_repair:

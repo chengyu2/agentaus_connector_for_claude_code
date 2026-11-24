@@ -360,7 +360,33 @@ def anthropic_request_to_agentaus(
         choice = _map_tool_choice(body.get("tool_choice")) or "auto"
         payload["tool_choice"] = choice
 
+    payload.update(decoding_params(body))
     return payload
+
+
+def _number(raw: str) -> float | None:
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def decoding_params(body: dict) -> dict:
+    """`temperature` / `top_p` for a main-loop request, from AGENTAUS_TEMPERATURE/TOP_P.
+
+    Unset sends nothing (Agentaus' default). `client` forwards Claude Code's own value.
+    """
+    from .config import settings
+    out: dict[str, Any] = {}
+    for key, raw in (("temperature", settings.agentaus_temperature),
+                     ("top_p", settings.agentaus_top_p)):
+        raw = (raw or "").strip().lower()
+        if not raw:
+            continue
+        value = body.get(key) if raw == "client" else _number(raw)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            out[key] = value
+    return out
 
 
 def _map_tools(tools: Any) -> list[dict]:

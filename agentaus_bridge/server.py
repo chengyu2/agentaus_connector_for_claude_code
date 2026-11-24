@@ -28,12 +28,18 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import attribution
+from . import diet
 from . import documents
+from . import finish
 from . import flight
 from . import graph
 from . import import_guard
+from . import batching
 from . import harmony
+from . import name_check
 from . import persisted
+from . import read_first
+from . import plans
 from . import sessions
 from . import prompt_style
 from . import repair
@@ -49,6 +55,8 @@ from .augment import (
     plan_prompt,
     CLASSIFY_REFUSAL_INSTRUCTION,
     GROUNDING_INSTRUCTION,
+    GROUNDING_ONE_PASS_INSTRUCTION,
+    grounding_revision,
     STRIP_UNGROUNDED_INSTRUCTION,
     MISSING_DELIVERABLES_CORRECTION,
     announces_a_step,
@@ -66,6 +74,7 @@ from .augment import (
     read_refusal_verdict,
     read_turn_verdict,
     should_think,
+    mid_tool_loop,
     working_directory,
     working_directory_of,
     with_guidance,
@@ -503,8 +512,15 @@ def _retry_delay(attempt: int) -> float:
 _FAILED_ATTEMPT_S = 125.0
 
 
+def _is_rate_limited(why: str) -> bool:
+    return why.startswith("HTTP 429")
+
+
 async def _sleep_before_retry(attempt: int, why: str) -> None:
     delay = _retry_delay(attempt)
+    if _is_rate_limited(why):
+        cap = settings.rate_limit_max_delay_seconds
+        delay = min(delay, cap + random.uniform(0, cap / 2))
     rlog(logging.WARNING, "upstream attempt %d failed (%s); retrying in %.2fs", attempt + 1, why, delay)
     # Neither the failed attempt nor this wait counts against the turn's timeout: retrying
     # through a slump is waiting, not being wedged (see flight.Flight.served).
@@ -950,13 +966,13 @@ def _too_long_to_rewrite(answer: str, what: str) -> bool:
     return True
 
 
-async def _fix_syntax(client: httpx.AsyncClient, answer: str) -> str:
+async def _fix_syntax(client: httpx.AsyncClient, answer: str, *, strict: bool = False) -> str:
     """If the answer's Python does not parse, ask once for the typo to be fixed.
 
     Deterministic detection, so this costs nothing on an answer that is fine. Any failure
     returns the original: a broken repair must not lose a mostly-correct answer.
     """
-    error = syntax.first_error(answer)
+    error = syntax.first_error(answer, strict=strict)
     if not error or _too_long_to_rewrite(answer, "syntax fix"):
         return answer
     rlog(logging.WARNING, "answer does not parse (%s); asking for a fix", error)
@@ -1061,6 +1077,22 @@ async def _check_grounding(
     ) if part)
     if not ran or _too_long_to_rewrite(answer, "grounding check"):
         return answer
+    if settings.agentaus_grounding_one_pass:
+        try:
+            async with hold("grounding check", "background"):
+                reply = await _agentaus_summarise(
+                    client,
+                    GROUNDING_ONE_PASS_INSTRUCTION.format(ledger=ran, answer=answer[:12000]),
+                )
+            revised = grounding_revision(reply)
+            if revised:
+                rlog(logging.WARNING, "grounding check found unsupported claims (one pass)")
+                rlog(logging.INFO, "stripped ungrounded claims (%d -> %d chars)",
+                     len(answer), len(revised))
+                return revised
+        except Exception as exc:
+            rlog(logging.WARNING, "grounding check failed (%s); keeping the answer", exc)
+        return answer
     try:
         async with hold("grounding check", "background"):
             reply = await _agentaus_summarise(
@@ -1085,6 +1117,20 @@ async def _check_grounding(
     except Exception as exc:
         rlog(logging.WARNING, "grounding check failed (%s); keeping the answer", exc)
     return answer
+
+
+def _answer_check(client: httpx.AsyncClient, original: dict, answer: str, ran: dict):
+    """The rewriting pass a final streamed answer gets, as a coroutine, or None: self-review
+    for a turn that used no tools, else the grounding check when there is evidence to check
+    it against."""
+    if (settings.agentaus_self_review and not ran and worth_reviewing_turn(original)
+            and worth_reviewing(answer, min_chars=settings.agentaus_review_min_chars)):
+        return _self_review(client, _last_user_text(original), answer)
+    if settings.agentaus_grounding_check and _grounding_applies(original, answer, ran):
+        # The turns review has to sit out are the turns where a claim can outrun the
+        # evidence. This checks against the tools actually run instead of guessing.
+        return _check_grounding(client, original, answer, ran)
+    return None
 
 
 async def _self_review(client: httpx.AsyncClient, request_text: str, answer: str) -> str:
@@ -1161,6 +1207,31 @@ async def _plan_turn(client: httpx.AsyncClient, body: dict, on_piece=None) -> st
     if plan:
         rlog(logging.INFO, "planned the turn in %d chars", len(plan))
     return plan
+
+
+def _on_the_wire(payload: dict) -> dict:
+    """The body actually POSTed for an agent turn: with AGENTAUS_BATCH_TOOLS, `run_tools`
+    added beside its tools (see batching.py). The payload the bridge
+    keeps stays in the native shape, so everything that reads it is unaffected."""
+    if not settings.agentaus_batch_tools:
+        return payload
+    return batching.wrap_payload(payload)
+
+
+def _with_unrun_calls(payload: dict, calls: list) -> dict:
+    """Answer client calls that were batched with a bridge tool and so never ran.
+
+    The bridge-tool loop asks Agentaus again once its own tools have run, and the client's
+    calls from the same reply are dropped. With one call per reply that never happened;
+    with batching (batching.py) a search and a Read can arrive together, and the model must
+    be told the Read did not run rather than left to assume it did."""
+    if not calls:
+        return payload
+    rlog(logging.INFO, "%d client call(s) batched with a bridge tool were not run; "
+         "asking again", len(calls))
+    note = ("(not run: it was batched with a bridge tool, whose results are above. Call "
+            "it again if you still need it.)")
+    return _with_tool_results(payload, calls, [note] * len(calls))
 
 
 def _openai_calls(data: dict) -> list:
@@ -1555,6 +1626,47 @@ def _with_coerced_calls(data: dict, calls: list) -> dict:
             function["name"] = repaired[call["id"]].get("name") or function.get("name")
             call = {**call, "function": function}
         rebuilt.append(call)
+    message["tool_calls"] = rebuilt
+    choice["message"] = message
+    return {**data, "choices": [choice] + choices[1:]}
+
+
+def _reads_first(calls: list, received: dict) -> list:
+    """`calls` with a Read ahead of each Edit/Write the client would refuse as unread or
+    changed since read. See read_first.py."""
+    if not settings.agentaus_read_first or not calls:
+        return calls
+    if "Read" not in {t.get("name") for t in received.get("tools") or [] if isinstance(t, dict)}:
+        return calls
+    try:
+        out, added = read_first.prepend_reads(calls, received.get("messages") or [])
+    except Exception as exc:  # a convenience; never the reason a turn fails
+        rlog(logging.WARNING, "read-first check failed (%s); forwarding as is", exc)
+        return calls
+    for path, why in added:
+        rlog(logging.INFO, "read first: added a Read of %s (%s)", path, why)
+    return out
+
+
+def _with_reads_first(data: dict, calls: list, received: dict) -> dict:
+    """The non-streaming form of _reads_first: the added Reads put into `data`."""
+    out = _reads_first(calls, received)
+    if len(out) == len(calls):
+        return data
+    choices = list(data.get("choices") or [])
+    if not choices:
+        return data
+    choice = dict(choices[0] or {})
+    message = dict(choice.get("message") or {})
+    by_id = {c.get("id"): c for c in message.get("tool_calls") or []}
+    rebuilt = []
+    for call in out:
+        if call.get("added_by_bridge"):
+            rebuilt.append({"id": call["id"], "type": "function",
+                            "function": {"name": call["name"], "arguments": call["arguments"]}})
+        elif call.get("id") in by_id:
+            rebuilt.append(by_id.pop(call["id"]))
+    rebuilt += list(by_id.values())
     message["tool_calls"] = rebuilt
     choice["message"] = message
     return {**data, "choices": [choice] + choices[1:]}
@@ -2355,6 +2467,10 @@ async def _waiting(aw, builder: AnthropicStreamBuilder | None, box: dict,
     finally:
         if not task.done():
             task.cancel()
+        name = getattr(aw, "__name__", None) or getattr(
+            aw.get_coro() if hasattr(aw, "get_coro") else None, "__name__", "call")
+        if name not in ("following", "__aenter__"):
+            rlog(logging.INFO, "waited on %s for %.1fs", name, time.monotonic() - started)
 
 
 async def _lines_beating(upstream: httpx.Response, builder: AnthropicStreamBuilder | None,
@@ -2469,6 +2585,9 @@ async def _handle_agentaus(
     # The body as the client sent it. `body` is rebound to the fitted one below, and a
     # compacted body has lost the turns the guards and the graph's task are read from.
     received = body
+    # When the client finished reading or writing each file, for read_first. Before anything
+    # below can touch the files.
+    read_first.observe(body.get("messages") or [])
 
     # An agent that runs one exact command is played by the bridge. See graph.exact_command.
     exact = graph.exact_command(body) if is_subagent_turn(body) else None
@@ -2530,6 +2649,8 @@ async def _handle_agentaus(
     # Written once and reused across refits: a refit recompacts the same turn, and
     # re-planning it would pay for the same call again to get the same plan.
     plan_holder: dict = {"text": None}
+    # Which turn this request belongs to, for a plan written in the background (plans.py).
+    turn_key = plans.turn_key(sessions.session_of(request.headers), _user_texts(received))
     # The library skills prepare() offered - the calls the bridge must answer itself.
     library_holder: dict = {"names": frozenset()}
 
@@ -2566,6 +2687,12 @@ async def _handle_agentaus(
             if hinted:
                 rlog(logging.INFO, "edit repair: showed the closest lines for %d refused "
                      "Edit(s)", hinted)
+        # A .py edit that left a name undefined in a function it touched is said so in its
+        # result. See name_check.py.
+        if settings.agentaus_name_check:
+            current, flagged = await asyncio.to_thread(name_check.annotate, current)
+            if flagged:
+                rlog(logging.INFO, "name check: %d edit(s) left a name undefined", flagged)
         # A graph main loop's .py edit that broke importing the module is said so in its
         # result. See import_guard.py.
         if settings.agentaus_import_guard and _graph_main_loop(current):
@@ -2668,11 +2795,37 @@ async def _handle_agentaus(
         if offered and not graph.is_graph_task(fitted):
             fitted = inject_bridge_tools(fitted, offered)
 
+        if settings.agentaus_prompt_diet:
+            fitted = diet.slim(fitted)
+
         if settings.agentaus_tool_ledger:
             fitted = {**fitted, "system": with_ledger(
                 fitted.get("system"), ledger_source,
                 limit=settings.agentaus_tool_ledger_limit,
             )}
+
+        # Many calls in, and the file the request asked for still does not exist: say so
+        # where the model reads it on every step. Measured: a Q&A turn read files one at a
+        # time for ten minutes and timed out without ever writing its answers file.
+        if ((settings.agentaus_deliverable_nudge_calls > 0 or settings.agentaus_rewrite_nudge)
+                and fitted.get("tools")
+                and not is_subagent_turn(fitted) and not graph.is_graph_task(fitted)):
+            with contextlib.suppress(Exception):
+                nudge = finish.deliverable_nudge(
+                    _original_request(received), working_directory_of(received),
+                    list(received.get("messages") or []),
+                    after_calls=settings.agentaus_deliverable_nudge_calls)
+                if settings.agentaus_rewrite_nudge:
+                    nudge += finish.rewrite_nudge(list(received.get("messages") or []),
+                                                  working_directory_of(received))
+                if nudge:
+                    system = fitted.get("system")
+                    if isinstance(system, list):
+                        system = list(system) + [{"type": "text", "text": nudge.strip()}]
+                    else:
+                        system = (system or "") + "\n" + nudge
+                    fitted = {**fitted, "system": system}
+                    rlog(logging.INFO, "finish nudge: %d chars", len(nudge))
 
         # Supplement the system prompt for Agentaus only. Claude turns never reach
         # here - they are forwarded untouched by _passthrough.
@@ -2692,7 +2845,31 @@ async def _handle_agentaus(
 
         # Measured (d12 c1913): the planning pass took 254 s and failed with 524 before a
         # graph main loop's first turn reached the model - a turn whose job is to call Workflow.
-        if settings.agentaus_thinking and should_think(fitted) and not _graph_not_started(received):
+        thinking_on = settings.agentaus_thinking and not _graph_not_started(received)
+        if thinking_on and settings.agentaus_plan_async and turn_key is not None:
+            # Planned beside the first call rather than before it; every later request of
+            # the turn carries the plan once it is written. See plans.py.
+            if should_think(fitted):
+                planned_body = fitted
+                if plans.start(turn_key, lambda: _plan_turn(client, planned_body)):
+                    rlog(logging.INFO, "planning in the background; first call goes unplanned")
+            elif mid_tool_loop(fitted) and not is_subagent_turn(fitted):
+                waited = await plans.wait_once(turn_key, settings.agentaus_plan_wait_seconds)
+                if waited:
+                    rlog(logging.INFO, "waited %.1fs for the plan before the turn's second call",
+                         waited)
+                found = plans.ready(turn_key)
+                if found is not None:
+                    text, first = found
+                    fitted = {**fitted, "system": with_plan(fitted.get("system"), text,
+                                                            mid_turn=True)}
+                    if first:
+                        # Shown to the user once, the first time a call follows it.
+                        plan_holder["text"] = text
+                        rlog(logging.INFO, "plan joined the turn (%d chars)", len(text))
+                elif plans.pending(turn_key):
+                    rlog(logging.INFO, "plan not written yet; this call goes without it")
+        elif thinking_on and should_think(fitted):
             if plan_holder["text"] is None:
                 with _Phase("planning"):
                     plan_holder["text"] = await _plan_turn(client, fitted, on_plan_piece)
@@ -2734,7 +2911,7 @@ async def _handle_agentaus(
                     upstream = await _post_with_retry(
                         client,
                         settings.agentaus_url,
-                        json_body=payload,
+                        json_body=_on_the_wire(payload),
                         headers=_agentaus_headers(),
                         stream_upstream=bool(payload.get("stream")),
                         kind=request_kind,
@@ -2792,6 +2969,8 @@ async def _handle_agentaus(
 
             _calibrate_from_usage(body, data.get("usage"))
 
+            if settings.agentaus_batch_tools:
+                data = batching.expand_response(data)
             known = _known_tool_names(payload)
             calls = _openai_calls(data)
             if not calls:
@@ -2835,6 +3014,7 @@ async def _handle_agentaus(
             _guard_imports(_theirs, received, cwd)
             data = _with_coerced_calls(data, mine + _theirs)
             if not mine:
+                data = _with_reads_first(data, _theirs, received)
                 if invented:
                     rlog(logging.WARNING, "dropping %d invented tool call(s) - out of "
                          "rounds to correct them", len(invented))
@@ -2845,6 +3025,7 @@ async def _handle_agentaus(
                      len(mine), ", ".join(c["name"] for c in mine))
                 payload = await _run_bridge_tools(
                     client, payload, mine, working_directory_of(body), ran)
+                payload = _with_unrun_calls(payload, _theirs)
                 continue
             # Out of rounds with a bridge tool still pending. It must not reach Claude
             # Code, which has never heard of it and would fail the tool_use outright.
@@ -2873,7 +3054,7 @@ async def _handle_agentaus(
         if (settings.agentaus_syntax_check and not msg0.get("tool_calls")
                 and not is_subagent_turn(body)
                 and (msg0.get("content") or "").strip()):
-            parsed = await _fix_syntax(client, msg0["content"])
+            parsed = await _fix_syntax(client, msg0["content"], strict=mid_tool_loop(body))
             if parsed != msg0.get("content"):
                 msg0 = {**msg0, "content": parsed}
                 data = {**data, "choices": [{**choice0, "message": msg0}]
@@ -3156,7 +3337,11 @@ async def _agentaus_event_stream(
     # Buffer the answer when it may need revising. Tool turns are never buffered:
     # they carry no prose to review and the client is waiting on the tool_use.
     # Held back only when a check may rewrite it; anything else streams as it arrives.
-    buffering = settings.agentaus_self_review and _checks_apply(original)
+    # Any of the passes that may rewrite it: tied to self-review alone, turning review off
+    # silently turned off the grounding check and the syntax fix as well - the buffered path
+    # never did that.
+    buffering = (settings.agentaus_self_review or settings.agentaus_grounding_check
+                 or settings.agentaus_syntax_check) and _checks_apply(original)
     pending: list[str] = []
 
     # While the answer is held back, its tokens still go to the client as they arrive,
@@ -3191,6 +3376,8 @@ async def _agentaus_event_stream(
     ran: dict = {}
     # The tool_choice to put back after a stall re-ask that forced one. See below.
     forced_from = None
+    # (answer, task): the answer's check, started beside the stall check. See below.
+    speculative: tuple | None = None
 
     def giving_up() -> bool:
         return stop_retrying is not None and stop_retrying()
@@ -3207,6 +3394,11 @@ async def _agentaus_event_stream(
         while True:
             emitted = False
             pending = []
+            # Everything this response said, streamed or held. The stall and refusal
+            # check reads it: with nothing buffered (AGENTAUS_SELF_REVIEW=false) `pending`
+            # stays empty, and an empty reply is never judged - so "Let me look at the
+            # settings next." ended a turn unchallenged (measured: codebase_qa, 0.00).
+            said = []
             finish_reason = None
             usage = None
             accumulator = ToolCallAccumulator()
@@ -3217,7 +3409,8 @@ async def _agentaus_event_stream(
             try:
                 if payload.get("stream"):
                     async with _watching_for_stall("upstream stream"):
-                        opening = client.stream("POST", settings.agentaus_url, json=payload,
+                        opening = client.stream("POST", settings.agentaus_url,
+                                                json=_on_the_wire(payload),
                                                 headers=_agentaus_headers())
                         box: dict = {}
                         # Waiting for the first byte - the throttle's queue, then up to 125 s
@@ -3325,6 +3518,7 @@ async def _agentaus_event_stream(
                                         delta = choice.get("delta") or {}
                                         text = delta.get("content")
                                         if text:
+                                            said.append(text)
                                             if buffering:
                                                 # Held back rather than streamed: an answer
                                                 # already on screen cannot be revised. Its
@@ -3350,7 +3544,7 @@ async def _agentaus_event_stream(
                     async for beat in _waiting(_post_with_retry(
                         client,
                         settings.agentaus_url,
-                        json_body={**payload, "stream": False},
+                        json_body=_on_the_wire({**payload, "stream": False}),
                         headers=_agentaus_headers(),
                         kind=request_kind,
                         give_up=stop_retrying,
@@ -3380,6 +3574,7 @@ async def _agentaus_event_stream(
                     choice = (data.get("choices") or [{}])[0]
                     message = choice.get("message") or {}
                     if message.get("content"):
+                        said.append(message["content"])
                         if buffering:
                             pending.append(message["content"])
                             live_bytes = draft(message["content"])
@@ -3423,6 +3618,8 @@ async def _agentaus_event_stream(
             if recovered:
                 pending = [cleaned] if cleaned.strip() else []
                 calls = recovered
+        if settings.agentaus_batch_tools:
+            calls = batching.expand_calls(calls)
         if forced_from is not None:
             payload = {k: v for k, v in payload.items() if k != "tool_choice"}
             if forced_from != "(none)":
@@ -3480,6 +3677,8 @@ async def _agentaus_event_stream(
             rlog(logging.WARNING, "forwarding %d malformed tool call(s) - out of rounds",
                  len(broken))
         _guard_imports(theirs, received, cwd)
+        if not mine:
+            theirs = _reads_first(theirs, received)
         if mine and tool_round < settings.agentaus_tool_rounds:
             tool_round += 1
             rlog(logging.INFO, "running %d bridge tool call(s): %s",
@@ -3490,6 +3689,7 @@ async def _agentaus_event_stream(
                     client, payload, mine, working_directory_of(original), ran), builder, box):
                 yield beat
             payload = box["value"]
+            payload = _with_unrun_calls(payload, theirs)
             # Whatever the model said on its way to calling the tool is superseded by
             # the answer it is about to give with the result in hand, so it is dropped
             # rather than shown - otherwise the user reads "let me search..." followed
@@ -3502,7 +3702,7 @@ async def _agentaus_event_stream(
         # A turn that used no tools and claims it has none is not an answer. Whether it
         # IS that is a judgement about language, so Agentaus makes it - behind a
         # structural gate, so the call only happens when there is something to judge.
-        answer_so_far = "".join(pending)
+        answer_so_far = "".join(pending) or "".join(said)
         is_refusal = False
         turn_verdict = "answer"
         # Files the user's request says to write that are still not on disk. A main loop
@@ -3529,6 +3729,20 @@ async def _agentaus_event_stream(
                             answer=_head_and_tail(answer_so_far, 2500, 1500))
                     )
 
+            # The answer's own check does not depend on the verdict, so it starts now rather
+            # than after it: if the verdict is "answer" (most of the time), the check is
+            # already under way; if not, it is cancelled. Not when the syntax fix may still
+            # change the answer.
+            if speculative is not None:
+                speculative[1].cancel()
+                speculative = None
+            guess = normalise_for_display("".join(pending))
+            if (settings.agentaus_overlap_checks and buffering and guess and not theirs
+                    and not (settings.agentaus_syntax_check and syntax.first_error(
+                        guess, strict=mid_tool_loop(original)))):
+                early = _answer_check(client, original, guess, ran)
+                if early is not None:
+                    speculative = (guess, asyncio.ensure_future(early))
             try:
                 box = {}
                 async for beat in _waiting(classify(), builder, box):
@@ -3547,6 +3761,9 @@ async def _agentaus_event_stream(
                  "message is spent; forwarding the reply")
             turn_verdict = "answer"
         if is_refusal or turn_verdict == "stalled":
+            if speculative is not None:
+                speculative[1].cancel()
+                speculative = None
             corrections += 1
             if is_refusal:
                 rlog(logging.WARNING,
@@ -3566,7 +3783,7 @@ async def _agentaus_event_stream(
                               f"- `{name}` (looked for `{path}`)" for name, path in missing))
                           if missing else STALLED_CORRECTION.format())
             payload = {**payload, "messages": list(payload.get("messages") or []) + [
-                {"role": "assistant", "content": "".join(pending)[:2000]},
+                {"role": "assistant", "content": answer_so_far[:2000]},
                 {"role": "user", "content": correction},
             ]}
             if not is_refusal and payload.get("tools"):
@@ -3578,6 +3795,42 @@ async def _agentaus_event_stream(
                 payload = {**payload, "tool_choice": "required"}
             pending = []
             continue
+
+        # The turn is about to end on prose. Structural checks, no model call to decide:
+        # a requested file that does not exist, code changed and never run since, a test
+        # run that still fails, or (once) the request's own checklist. See finish.py.
+        if (settings.agentaus_finish_gate and buffering and not mine and not theirs
+                and corrections < settings.agentaus_correction_rounds
+                and payload.get("tools") and not is_subagent_turn(original)
+                and not graph.is_graph_task(original)
+                and not awaiting_background(original)):
+            try:
+                gate_kind, gate_text, gate_force = finish.finish_gate(
+                    _stall_key(received), _original_request(received),
+                    list(received.get("messages") or []), working_directory_of(received),
+                    can_run="Bash" in known, checklist_on=settings.agentaus_finish_checklist)
+            except Exception as exc:  # noqa: BLE001 - a check must never break a turn
+                rlog(logging.WARNING, "finish gate failed (%s); forwarding the answer", exc)
+                gate_kind = ""
+            if gate_kind:
+                corrections += 1
+                rlog(logging.WARNING, "finish gate: %s; re-asking before the turn ends",
+                     gate_kind)
+                yield progress("re-asking: " + {
+                    "deliverable": "the requested file has not been written",
+                    "unverified": "the changed code has not been run",
+                    "failed": "the last test run still fails",
+                    "checklist": "checking the work against the request",
+                }.get(gate_kind, gate_kind))
+                payload = {**payload, "messages": list(payload.get("messages") or []) + [
+                    {"role": "assistant", "content": "".join(pending)[:2000] or "Done."},
+                    {"role": "user", "content": gate_text},
+                ]}
+                if gate_force:
+                    forced_from = payload.get("tool_choice", "(none)")
+                    payload = {**payload, "tool_choice": "required"}
+                pending = []
+                continue
 
         if mine:
             # Out of rounds. These must not be emitted: Claude Code has never heard of
@@ -3621,27 +3874,24 @@ async def _agentaus_event_stream(
     if (buffering and answer and settings.agentaus_syntax_check and not theirs
             and not is_subagent_turn(original)):
         box = {}
-        async for beat in _waiting(_fix_syntax(client, answer), builder, box):
+        fixing = _fix_syntax(client, answer, strict=mid_tool_loop(original))
+        async for beat in _waiting(fixing, builder, box):
             yield beat
         answer = box["value"]
         pending = [answer]
 
+    if speculative is not None and (speculative[0] != answer or theirs or not buffering):
+        speculative[1].cancel()
+        speculative = None
     if buffering and answer:
         if live_started and not theirs:
             yield progress("checking the answer")
         check = None
-        if not theirs and not ran and worth_reviewing_turn(original) and worth_reviewing(
-            answer, min_chars=settings.agentaus_review_min_chars
-        ):
-            check = _self_review(client, _last_user_text(original), answer)
-        elif (
-            not theirs
-            and settings.agentaus_grounding_check
-            and _grounding_applies(original, answer, ran)
-        ):
-            # The turns review has to sit out are the turns where a claim can outrun the
-            # evidence. This checks against the tools actually run instead of guessing.
-            check = _check_grounding(client, original, answer, ran)
+        if speculative is not None and speculative[0] == answer and not theirs:
+            # Already running since the stall check started, on this very answer.
+            check, speculative = speculative[1], None
+        elif not theirs:
+            check = _answer_check(client, original, answer, ran)
         if check is not None:
             box = {}
             async for beat in _waiting(check, builder, box):
