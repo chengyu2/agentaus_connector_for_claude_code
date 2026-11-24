@@ -329,18 +329,51 @@ class TestBackoffCurve(unittest.TestCase):
         from agentaus_bridge.server import _retry_delay
 
         # Jitter is bounded by retry_backoff_seconds, so compare worst-case to
-        # best-case: attempt N's floor must exceed attempt N-1's ceiling.
+        # best-case: attempt N's floor must exceed attempt N-1's ceiling. Attempt 3
+        # is saturated - its base fills the interval reserved under the ceiling -
+        # so its floor is ceiling - backoff; holding 2**3 there would require
+        # pinning every retry to exactly the ceiling, i.e. no jitter at all.
+        floors = (1.0, 2.0, 4.0, 8.0 - 1.0)
         for attempt in range(4):
             lo = min(_retry_delay(attempt) for _ in range(200))
             hi = max(_retry_delay(attempt) for _ in range(200))
-            self.assertGreaterEqual(lo, 2**attempt, f"attempt {attempt} floor too low")
+            self.assertGreaterEqual(lo, floors[attempt], f"attempt {attempt} floor too low")
             self.assertLessEqual(hi, min(2**attempt, 8.0) + 1.0, f"attempt {attempt} ceiling")
 
     def test_delay_is_capped(self):
         from agentaus_bridge.server import _retry_delay
 
         # Without a cap, attempt 20 would be 2**20 seconds - a 12-day wait.
-        self.assertLessEqual(_retry_delay(20), 8.0 + 1.0)
+        # The cap bounds the total, so jitter may not push the pause past it either.
+        for _ in range(200):
+            self.assertLessEqual(_retry_delay(20), 8.0)
+
+    def test_saturated_delay_keeps_jitter(self):
+        from agentaus_bridge.server import _retry_delay
+
+        # Capping after the jitter would flatten every saturated retry to exactly
+        # the ceiling - lockstep retries, the thing the jitter exists to prevent.
+        # Instead the pause spreads over the interval reserved under the ceiling.
+        draws = [_retry_delay(20) for _ in range(200)]
+        self.assertGreater(max(draws) - min(draws), 0.5, "jitter dies at the cap")
+        self.assertGreaterEqual(min(draws), 8.0 - 1.0)
+        self.assertLessEqual(max(draws), 8.0)
+
+    def test_ceiling_tighter_than_backoff_stays_bounded(self):
+        from agentaus_bridge.config import settings
+        from agentaus_bridge.server import _retry_delay
+
+        # A deadline tighter than one backoff interval leaves nothing to reserve;
+        # the pause must still land inside [0, ceiling].
+        saved = (settings.retry_backoff_seconds, settings.retry_max_delay_seconds)
+        try:
+            settings.retry_backoff_seconds, settings.retry_max_delay_seconds = 2.0, 1.0
+            for _ in range(200):
+                delay = _retry_delay(20)
+                self.assertGreaterEqual(delay, 0.0)
+                self.assertLessEqual(delay, 1.0)
+        finally:
+            settings.retry_backoff_seconds, settings.retry_max_delay_seconds = saved
 
 
 class TestTimeoutIsTreatedAsTooBig(unittest.TestCase):
