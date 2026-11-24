@@ -20,6 +20,8 @@ import json
 import logging
 import os
 import re
+import shlex
+import sys
 
 from . import workflow_script
 from .config import settings
@@ -149,6 +151,144 @@ def _into_working_directory(path: str, cwd: str, *, must_exist: bool) -> str | N
                 return None
             return candidate
     return None
+
+
+# `python3 -I` leaves the current directory off sys.path, so `from solutions import *` in a
+# heredoc fails with ModuleNotFoundError (base algorithms-r1: a turn spent, then re-run
+# without it). Claude Code's own prompt suggests -I for scripts that read untrusted
+# downloads; a script that imports a module of the working directory wants that directory.
+# `-E -s` keeps the rest of the isolation (no PYTHON* variables, no user site-packages).
+_ISOLATED = re.compile(r"(\bpython(?:3(?:\.\d+)?)?\s+)-I(?=\s)")
+_IMPORTS = re.compile(r"^\s*(?:from|import)\s+([A-Za-z_]\w*)", re.M)
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([\w.-]+)\1")
+# A `random.py` in the working directory shadowing the stdlib's is exactly what -I is
+# there to prevent, so a stdlib name never counts as the project's own module.
+_STDLIB = set(getattr(sys, "stdlib_module_names", ())) | set(sys.builtin_module_names)
+
+
+def _heredoc_end(command: str, start: int, delim: str) -> int:
+    """Where the heredoc text starting at `start` ends: its delimiter line's end."""
+    at = start
+    while at < len(command):
+        nl = command.find("\n", at)
+        stop = nl if nl >= 0 else len(command)
+        if command[at:stop].strip() == delim:
+            return stop
+        at = stop + 1
+    return len(command)
+
+
+def _heredoc_text(command: str, start: int, delim: str) -> str:
+    """The text of the heredoc whose `<<` is at or after `start`."""
+    op = _HEREDOC.search(command, start)
+    nl = command.find("\n", op.end() if op else start)
+    if nl < 0:
+        return ""
+    return command[nl + 1:_heredoc_end(command, nl + 1, delim)].rpartition("\n")[0]
+
+
+def _is_shell_code(command: str, pos: int) -> bool:
+    """Whether `pos` is in the command itself, not in quoted text or a heredoc's text:
+    `echo 'python -I is safer'` runs no python."""
+    quote, pending, i = None, [], 0
+    while i < pos:
+        c = command[i]
+        if quote == "'":
+            quote = None if c == "'" else quote
+        elif c == "\\":
+            i += 1
+        elif quote == '"':
+            quote = None if c == '"' else quote
+        elif c in "'\"":
+            quote = c
+        elif c == "<" and not command.startswith("<<<", i) and _HEREDOC.match(command, i):
+            m = _HEREDOC.match(command, i)
+            pending.append(m.group(2))
+            i = m.end()
+            continue
+        elif c == "\n" and pending:
+            for delim in pending:  # the heredocs' text follows this line, in order
+                stop = _heredoc_end(command, i + 1, delim)
+                if pos < stop:
+                    return False
+                i = stop
+            pending = []
+        i += 1
+    return quote is None
+
+
+def _invocation_code(command: str, end: int, cwd: str) -> str:
+    """The code the python invocation whose `-I` ends at `end` runs: its -c text, its -m
+    module, its heredoc or stdin file, or its script - not the rest of the line."""
+    lexer = shlex.shlex(command[end:], posix=True, punctuation_chars=";&|()<>\n")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    words, heredoc, stdin = [], None, None
+    try:
+        tokens = iter(lexer)
+        for token in tokens:
+            if set(token) <= set(";&|()\n"):
+                break
+            if set(token) <= set("<>&"):
+                target = next(tokens, "")
+                if token in ("<<", "<<-"):
+                    heredoc = target.lstrip("-")
+                elif token == "<<<":
+                    stdin = ("text", target)
+                elif token == "<":
+                    stdin = ("file", target)
+                continue
+            words.append(token)
+    except ValueError:  # unbalanced quotes: say nothing rather than guess
+        return ""
+    script, k = None, 0
+    while k < len(words):
+        word = words[k]
+        if word in ("-c", "-m"):
+            arg = words[k + 1] if k + 1 < len(words) else ""
+            return arg if word == "-c" else f"import {arg.split('.')[0]}"
+        if word == "-":
+            break
+        if word.startswith("-"):
+            k += 2 if word in ("-W", "-X") else 1  # the two options that take a value
+            continue
+        script = word
+        break
+    if script is None and stdin and stdin[0] == "text":
+        return stdin[1]
+    if script is None and stdin:
+        script = stdin[1]
+    if script is None:
+        return _heredoc_text(command, end, heredoc) if heredoc else ""
+    path = script if os.path.isabs(script) else os.path.join(cwd, script)
+    try:
+        if os.path.getsize(path) <= 500_000:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+    except OSError:
+        pass
+    return ""
+
+
+def _without_isolation(command: str, cwd: str) -> str:
+    """`command` with -I dropped from each python invocation whose own code imports a
+    module of the working directory."""
+    out = command
+    for m in reversed(list(_ISOLATED.finditer(command))):
+        if not _is_shell_code(command, m.start()):
+            continue
+        own = False
+        for module in set(_IMPORTS.findall(_invocation_code(command, m.end(), cwd))):
+            if module in _STDLIB:
+                continue
+            if (os.path.isfile(os.path.join(cwd, module + ".py"))
+                    or os.path.isfile(os.path.join(cwd, module, "__init__.py"))):
+                own = True
+                break
+        if own:
+            out = out[:m.start()] + m.group(1) + "-E -s" + out[m.end():]
+    return out
 
 
 def _as_dict(arguments):
@@ -502,6 +642,12 @@ def repair(call: dict, asked_as: str, schema: dict | None, cwd: str | None,
         if moved:
             args["file_path"] = moved
             changed.append("mangled working-directory path -> working directory")
+
+    if name == "Bash" and cwd and isinstance(args.get("command"), str):
+        unisolated = _without_isolation(args["command"], cwd)
+        if unisolated != args["command"]:
+            args["command"] = unisolated
+            changed.append("python -I importing the project's own module -> -E -s")
 
     correction = None
     if name in ("Edit", "MultiEdit") and settings.agentaus_edit_repair:

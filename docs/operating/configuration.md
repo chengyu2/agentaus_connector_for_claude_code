@@ -43,7 +43,7 @@ lists only the common settings. A few internal tuning knobs are documented only 
 | `AGENTAUS_SEARCH_OUTLINE_FIRST` | `true` | Build a free structural outline and spend one call choosing sections, instead of a call per chunk |
 | `AGENTAUS_SEARCH_MAX_SECTIONS` | `8` | Sections one aimed search reads before it is cheaper to read everything |
 | `AGENTAUS_SEARCH_MAX_CANDIDATES` | `12` | Ceiling on files one search reads. The shortlist is ranked, so this keeps the best matches |
-| `AGENTAUS_INVESTIGATE` | `true` | Offer `agentaus_investigate`: three independent searches, and a fact must appear in two before it is reported as established |
+| `AGENTAUS_INVESTIGATE` | `true` (`false` under `AGENTAUS_PROMPT_DIET`) | Offer `agentaus_investigate`: three independent searches, and a fact must appear in two before it is reported as established |
 | `AGENTAUS_ZOOM` | `true` | Offer `agentaus_zoom`: open a citation from a search result and read it in its section. Without it the model cites evidence it cannot quote from |
 | `AGENTAUS_ZOOM_RADIUS_LINES` | `120` | How far either side of the cited lines to look for a section boundary |
 | `AGENTAUS_ZOOM_MAX_LINES` | `400` | Hard stop, so a heading-less file cannot return itself whole |
@@ -58,8 +58,22 @@ lists only the common settings. A few internal tuning knobs are documented only 
 | `AGENTAUS_RESTORE_MAX_BYTES` | `400000` | Ceiling on what is read back |
 | `AGENTAUS_THINKING` | `true` | Plan the turn in a separate call before answering it |
 | `AGENTAUS_THINKING_VISIBLE` | `true` | Show that plan as a thinking block. `false` still uses it, but does not display it |
-| `AGENTAUS_SKILL_ROUTING` | `true` | Restore project skill descriptions, add the "if this, use that" section for skills and agent types, and have the planner name its choice. See [Routing](../design/skills.md#routing-if-this-use-that) |
-| `AGENTAUS_SKILL_LIBRARY` | `true` | Offer the bridge's own skill library to Agentaus in every project and answer `Skill` calls for it |
+| `AGENTAUS_PLAN_ASYNC` | `true` | Run the planner beside the turn's first call instead of before it; the plan joins every later request of the turn |
+| `AGENTAUS_PLAN_WAIT_SECONDS` | `30` | How long the first request after a tool result waits for a plan still being written. Later requests never wait |
+| `AGENTAUS_GROUNDING_ONE_PASS` | `true` | The grounding check returns `GROUNDED` or the corrected answer in one call, instead of a verdict call and a rewrite call |
+| `AGENTAUS_OVERLAP_CHECKS` | `true` | Start the grounding check beside the stall check; it is cancelled if the turn is re-asked |
+| `AGENTAUS_BATCH_TOOLS` | `true` | Offer `run_tools`, whose argument is a list of tool calls, beside the real tools. Agentaus' API returns one tool call per reply and drops the rest; this lets one reply carry several. See `agentaus_bridge/batching.py` |
+| `AGENTAUS_PROMPT_DIET` | `true` | A shorter, sharper prompt: a short operating block in place of the long notes, capped descriptions for non-core tools (core tools such as Bash, Edit and Read keep their full manuals), and no tool-selection or routing sections. Sets the defaults of `AGENTAUS_SKILL_LIBRARY`, `AGENTAUS_SKILL_ROUTING` and `AGENTAUS_INVESTIGATE` to `false`; each still wins when set. See `agentaus_bridge/diet.py` |
+| `AGENTAUS_TEMPERATURE` | `0.2` | Sampling temperature for main-loop calls (helper calls are not affected). Empty sends none, so Agentaus uses its default; `client` forwards Claude Code's value, which it omits while adaptive thinking is on. Must be a finite number from 0 to 2; anything else sends none and logs a warning |
+| `AGENTAUS_TOP_P` | *(empty)* | Nucleus sampling for main-loop calls. Empty sends none; a value outside above 0 up to 1 (or not a finite number) sends none and logs a warning |
+| `AGENTAUS_FINISH_GATE` | `true` | Before a turn ends on prose, re-ask once when a file the request named does not exist, code was edited and nothing ran since, or the last test run still failed |
+| `AGENTAUS_FINISH_CHECKLIST` | `false` | Also re-ask once to check the work against the request's numbered items and named spec. Off: on solved tasks it cost 1.6-3.7 min and changed no score |
+| `AGENTAUS_DELIVERABLE_NUDGE_CALLS` | `0` | After this many tool calls without the requested file written, say so in the system prompt. Off by default, because the write-now note already does |
+| `AGENTAUS_REWRITE_NUDGE` | `true` | Once a turn has written a large file, ask for `Edit`s to it rather than whole-file rewrites |
+| `AGENTAUS_NAME_CHECK` | `true` | After an edit to a `.py` file, say in its result which names it left undefined in the functions it touched, until they are defined |
+| `AGENTAUS_READ_FIRST` | `true` | Put a `Read` in front of an `Edit`/`Write` that Claude Code would refuse because the file was not read, or changed since |
+| `AGENTAUS_SKILL_ROUTING` | `true` (`false` under `AGENTAUS_PROMPT_DIET`) | Restore project skill descriptions, add the "if this, use that" section for skills and agent types, and have the planner name its choice. See [Routing](../design/skills.md#routing-if-this-use-that) |
+| `AGENTAUS_SKILL_LIBRARY` | `true` (`false` under `AGENTAUS_PROMPT_DIET`) | Offer the bridge's own skill library to Agentaus in every project and answer `Skill` calls for it |
 | `AGENTAUS_SUBAGENTS_FOLLOW_SESSION` | `true` | A subagent runs on the model its session's main loop is on. Off, an Agentaus session's subagents go to Claude |
 | `AGENTAUS_WORKFLOW_GRAPH` | `true` | Run a bridge agent graph in place of the workflow scripts Agentaus writes. See [the dynamic graph](../design/ultracode.md#the-dynamic-graph-planners-decide-the-shape-in-markdown) |
 | `AGENTAUS_GRAPH_KIND` | `dynamic` | `dynamic` (planners decide the shape, in Markdown, from skill files) or `fixed` (the ten-stage graph) |
@@ -79,9 +93,10 @@ lists only the common settings. A few internal tuning knobs are documented only 
 | `AGENTAUS_TOOL_FOCUS` | `true` | Hold back Claude Code's non-coding harness tools (Artifact, Cron, DesignSync...) unless named or used. Custom tools are never hidden; MCP tools are held back only over the schema budget - see [Behaviours](behaviours.md#mcp-tools-over-the-schema-budget) |
 | `AGENTAUS_REVIEW_TOOLLESS` | `false` | Also review tool-less requests - Claude Code's own utility calls. For bare-prompt harnesses only |
 | `BRIDGE_TURN_TIMEOUT` | `900` | Wall-clock ceiling on one streamed Agentaus turn. Pings defeat Claude Code's idle timeout, so without this a wedged turn spins forever. `0` disables |
-| `BRIDGE_MAX_RETRIES` | `2` | Extra attempts after a transient upstream failure |
-| `BRIDGE_RETRY_BACKOFF` | `0.5` | Base backoff in seconds; doubles per attempt, plus jitter |
-| `BRIDGE_RETRY_MAX_DELAY` | `8` | Ceiling on a single backoff wait |
+| `BRIDGE_MAX_RETRIES` | `1000000` | Extra attempts after a transient upstream failure: in effect, keep retrying through an outage |
+| `BRIDGE_RETRY_BACKOFF` | `1` | Base backoff in seconds; doubles per attempt, plus jitter |
+| `BRIDGE_RETRY_MAX_DELAY` | `300` | Ceiling on a single backoff wait |
+| `BRIDGE_RATE_LIMIT_MAX_DELAY` | `20` | Ceiling on the wait after an HTTP 429, from Agentaus or the Anthropic passthrough: each wait is jittered between half the ceiling and the ceiling, and never exceeds it (values under 1 count as 1). A 429 is Agentaus' per-tenant rate window, which reopens in seconds; the outage backoff above is for outages |
 | `BRIDGE_TOKEN` | *(empty)* | Require this token from clients; empty means no client auth |
 | `BRIDGE_LOG_LEVEL` | `info` | `debug` for per-request detail |
 | `BRIDGE_LOG_BODIES` | `false` | Log full request bodies — **includes your source code** |
