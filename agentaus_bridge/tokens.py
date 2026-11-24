@@ -84,6 +84,19 @@ class TokenCalibrator:
         self._samples: list[tuple[int, int]] = []
         self.samples = 0
 
+    def reset(self) -> None:
+        """Forget every observation and return to the uncalibrated starting point.
+
+        The module-level `calibrator` is shared by the whole process, so the test suite
+        resets it before each test; otherwise one test's stand-in upstream skews the
+        estimates another test asserts on.
+        """
+        with self._lock:
+            self._slope = 1.0
+            self._overhead = 0.0
+            self._samples = []
+            self.samples = 0
+
     @property
     def slope(self) -> float:
         return self._slope
