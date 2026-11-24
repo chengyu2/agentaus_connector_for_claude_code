@@ -75,8 +75,8 @@ SURVIVED_FAIL_RATIO = 0.05   # valid, but reported as "survived degraded"
 FIRST_RESPONSE_S = 900       # no assistant line by then: void:no-response
 EXTEND_MAX_S = 3600          # the run's timeout grows by the time Agentaus was down, up to this
 
-# The old status bars (secondary). Per the README, rdti 0.61 and he10 0.80 are own-workflow
-# means and the other three match neither Opus nor the README; the primary target is the
+# The old status bars (secondary). Per docs/design/ultracode.md, rdti 0.61 and he10 0.80 are own-workflow
+# means and the other three match neither Opus nor that page; the primary target is the
 # rolling Opus mean.
 OLD_BARS = {"rdti": 0.61, "tender": 0.775, "c1913": 0.875, "he10": 0.8, "c1913h": 0.5}
 # Ended for a reason that is not the model's. Not "Request timed out": where health was bad
