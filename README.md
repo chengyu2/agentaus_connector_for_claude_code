@@ -216,8 +216,9 @@ WSL forwards localhost, so Claude Code on the Windows side still reaches the bri
 `http://127.0.0.1:8787`.
 
 Then tell Claude Code the bridge exists. This is a separate step and it is where almost
-everyone gets stuck. The settings file has to go in the directory you actually work in,
-which is usually not this repo. Read
+everyone gets stuck. Copy [`.claude/settings.example.json`](.claude/settings.example.json)
+into the settings file for the directory you actually work in, which is usually not this
+repo. Read
 [Pointing Claude Code at the bridge](#pointing-claude-code-at-the-bridge) before editing
 anything, then restart Claude Code and run `/model`. Agentaus (Trellis Data) appears
 below Opus, Sonnet and Haiku.
@@ -271,21 +272,24 @@ sessions can see Agentaus.
 
 > ### The single most common mistake
 >
-> This repo ships its own `.claude/settings.json`. That file is project-scoped: it
-> applies only while the folder open in your editor is this repo.
+> This repo does **not** ship active Claude Code settings. It ships
+> `.claude/settings.example.json`, a starting point you copy into your **user-level**
+> settings or the **project you actually work in** - never into a shared repo, where a
+> tracked `localhost` endpoint and commit attribution would apply to everyone who
+> clones it.
 >
 > So if you clone the bridge to `~/agentaus_connector_for_claude_code` but do your real
-> work in `~/my_project`, that file never loads, and Agentaus never appears in `/model`.
-> The bridge is running perfectly; Claude Code was simply never told about it. Nothing in
-> the log will look wrong, because no request ever arrives.
->
-> The fix is to put the variables at user level (Option 1), or in the project you
-> actually work in (Option 2).
+> work in `~/my_project`, nothing is configured until you copy that example into your
+> own settings (Option 1 or 2 below). The bridge can be running perfectly; Claude Code
+> was simply never told about it. Nothing in the log will look wrong, because no
+> request ever arrives.
 
 ### Option 1: every project on this machine (recommended)
 
 Put the `env` block in your user-level settings at `~/.claude/settings.json`. It
-applies in every directory you open, so this is the "set it once" answer.
+applies in every directory you open, so this is the "set it once" answer. The block
+below is exactly what [`.claude/settings.example.json`](.claude/settings.example.json)
+in this repo holds; the file exists so you can copy from it rather than retype.
 
 Merge it into whatever that file already contains. Do not overwrite the file. It
 probably holds your model and permission preferences:
@@ -361,7 +365,7 @@ and Fable rows are aliases that always mean Anthropic's newest model of each fam
 the bridge forwards every Claude request to Anthropic unchanged.
 
 For explicit, versioned rows as well, add `"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"`
-to the same `env` block (this repo's own `.claude/settings.json` does). At startup Claude
+to the same `env` block (the example file `.claude/settings.example.json` includes it). At startup Claude
 Code then asks the bridge for `GET /v1/models`, and the bridge answers with Anthropic's own
 list, fetched live with your credentials, plus Agentaus, so the picker follows Anthropic
 with no change to the bridge. The details:
@@ -600,7 +604,8 @@ that must agree, and they are read by different processes:
 BRIDGE_PORT=9100
 ```
 
-**2. Tell Claude Code where to find it** (`.claude/settings.json`):
+**2. Tell Claude Code where to find it** (your settings file — `~/.claude/settings.json`
+or the project you work in, from [`.claude/settings.example.json`](.claude/settings.example.json)):
 
 ```json
 {
@@ -1032,8 +1037,10 @@ change that:
 | The bridge (`AGENTAUS_COAUTHOR`, on by default) | Agentaus turns, in every project | Yes. Claude turns pass through untouched |
 | `"attribution": {"commit": "Co-Authored-By: Agentaus <theteam@trellisdata.com>"}` in `.claude/settings.json` | Every turn in that project | No. Claude Code asks every model for that line |
 
-This repository sets both, so every commit made here credits Agentaus. The pull request
-footer (`Generated with Claude Code`) is left alone, since the tool is still Claude Code.
+`AGENTAUS_COAUTHOR` is on by default wherever the bridge runs. The repo does not ship an
+`attribution` block: it would change what every commit from every clone claims, so add
+one to your own settings if you want it. The pull request footer
+(`Generated with Claude Code`) is left alone, since the tool is still Claude Code.
 
 ---
 
@@ -1312,7 +1319,7 @@ pass another path. How to read its report, and the rest of the log lines:
 | `Agentaus error: Unauthorized` | Bad or expired `AGENTAUS_API_KEY`. Confirm with `--check`. |
 | `HTTP 406` from Agentaus | Something sent `Accept: text/event-stream`. The bridge sends `Accept: */*`; check any proxy in front of it. |
 | Agentaus missing from `/model` | `ANTHROPIC_CUSTOM_MODEL_OPTION` was not set before Claude Code started. Variables are read once at startup, so restart the session (reload the VS Code window). |
-| Agentaus missing, but the bridge is healthy | **Settings scope.** Your `.claude/settings.json` is in the bridge repo, not the project you have open. Move the `env` block to `~/.claude/settings.json` (all projects) or that project's own `.claude/settings.json`, then restart. |
+| Agentaus missing, but the bridge is healthy | **Settings scope.** The `env` block was never added to a settings file that covers the project you have open. Copy [`.claude/settings.example.json`](.claude/settings.example.json) into `~/.claude/settings.json` (all projects) or that project's own `.claude/settings.json`, then restart. |
 | `./scripts/claude-agentaus.sh: claude: command not found` (or `.ps1: The standalone 'claude' CLI was not found`) | You have the VS Code extension but not the standalone `claude` CLI, so the launcher cannot work. Use a settings file instead (Option 1 or 2). |
 | Both Agentaus and Claude fail at once | Almost always DNS or the bridge being down, not either provider. Everything flows through the bridge, so one broken resolver takes out both. `curl -sf localhost:8787/healthz` tells you in one second. |
 | `This conversation is too long for Agentaus` | Working as intended. Agentaus' window is much smaller than Claude's, and there is no prompt caching, so long sessions hit it quickly. `/compact` usually recovers the session. |

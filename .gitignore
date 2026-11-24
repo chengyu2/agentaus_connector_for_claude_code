@@ -3,9 +3,14 @@
 __pycache__/
 *.pyc
 
-# Local settings backups
-.claude/settings_old.json
+# Personal Claude Code settings. This repo ships no active settings: copy
+# .claude/settings.example.json into ~/.claude/settings.json (user level) or your
+# working project's .claude/settings.json (project level) instead. Never commit
+# your own here - a tracked settings.json reroutes every clone to a localhost
+# endpoint that only resolves on your machine.
+.claude/settings.json
 .claude/settings.local.json
+.claude/settings_*.json
 
 # Benchmark run files hold every raw reply, and documents/coverage replies quote the
 # private tender folder. The runs already committed stay tracked.
