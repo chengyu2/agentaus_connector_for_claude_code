@@ -87,6 +87,15 @@ class WorkflowIsOfferedWhenTheUserOptsIn(unittest.TestCase):
         invoked = self.body("<command-name>workflow-authoring</command-name>\nmap the repo")
         self.assertIn("Workflow", self.offered(invoked))
 
+    def test_saying_ultracode_is_off_is_no_opt_in(self):
+        # Measured (influenca): Claude Code's compaction summary said so, and the next
+        # "yep look at it and continue" launched the agent graph.
+        summary = self.body("This session is being continued from a previous conversation. "
+                            "(Ultracode is currently **off**; do not launch new Workflows "
+                            "without explicit opt-in.)")
+        self.assertNotIn("Workflow", self.offered(summary))
+        self.assertFalse(augment.workflow_opted_in(self.body("do it without ultracode")))
+
     def test_the_ultracode_reminder_is_an_opt_in(self):
         body = self.body('<system-reminder>The user included the keyword "ultracode"</system-reminder>do it')
         self.assertIn("Workflow", self.offered(body))
@@ -402,11 +411,47 @@ class TheStallBudgetRefillsWithProgress(unittest.TestCase):
         self.assertEqual([server._may_reask_stalled(self.body(1)) for _ in range(3)],
                          [True, True, False])
 
-    def test_three_tool_calls_since_the_last_reask_earn_a_fresh_budget(self):
+    def test_a_tool_call_since_the_last_reask_earns_a_fresh_budget(self):
+        # Measured (influenca): each re-ask got one call, and the third announcement -
+        # "Let me look at what's inside the uv tools dir." - was forwarded as the answer.
         server._may_reask_stalled(self.body(1))
         server._may_reask_stalled(self.body(1))
-        self.assertFalse(server._may_reask_stalled(self.body(2)))
-        self.assertTrue(server._may_reask_stalled(self.body(4)))
+        self.assertFalse(server._may_reask_stalled(self.body(1)))
+        self.assertTrue(server._may_reask_stalled(self.body(2)))
+
+    def test_progress_still_runs_out_within_one_message(self):
+        got = [server._may_reask_stalled(self.body(n)) for n in range(1, 12)]
+        self.assertEqual(got.count(True), server._STALL_REASKS_PER_MESSAGE)
+        self.assertFalse(got[-1])
+
+    def test_a_plainly_announced_step_gets_the_larger_budget(self):
+        got = [server._may_reask_stalled(self.body(n), announced=True) for n in range(1, 50)]
+        self.assertEqual(got.count(True), server._STALL_ANNOUNCED_PER_MESSAGE)
+
+    def test_an_announcement_without_progress_still_runs_out_after_two(self):
+        self.assertEqual([server._may_reask_stalled(self.body(1), announced=True) for _ in range(3)],
+                         [True, True, False])
+
+    def test_a_new_message_from_the_user_starts_a_fresh_budget(self):
+        server._may_reask_stalled(self.body(1))
+        server._may_reask_stalled(self.body(1))
+        later = self.body(1)
+        later["messages"].append(user("yep look at it and continue"))
+        self.assertTrue(server._may_reask_stalled(later))
+
+
+class AnAnnouncedStepIsAStall(unittest.TestCase):
+    def test_announcements_are_stalls(self):
+        for text in ["Both greps are empty. Let me look at what's actually inside the uv tools dir.",
+                     "We will apply multiple Edit calls.", "Next, I'll run the tests:",
+                     "Fixed it.\n\n**Now let me verify the services load.**"]:
+            self.assertTrue(augment.announces_a_step(text), text)
+
+    def test_results_and_questions_are_not(self):
+        for text in ["Done. The file is written.", "Let me know if you want more.",
+                     "I'll summarise:\n\nThe config is at ~/.config/devine.", "Shall I move them?",
+                     "Let me run:\n```bash\nls\n```\nIt printed three files."]:
+            self.assertFalse(augment.announces_a_step(text), text)
 
 
 class NothingToGroundAfterALaunch(unittest.TestCase):

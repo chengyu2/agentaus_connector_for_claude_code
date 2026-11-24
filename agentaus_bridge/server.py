@@ -50,6 +50,7 @@ from .augment import (
     CLASSIFY_REFUSAL_INSTRUCTION,
     GROUNDING_INSTRUCTION,
     STRIP_UNGROUNDED_INSTRUCTION,
+    announces_a_step,
     could_be_a_refusal,
     awaiting_background,
     early_deliverable_writes,
@@ -1829,14 +1830,25 @@ def _original_request(body: dict) -> str:
 # kept calling a finished turn stalled kept it going until the client's turn cap.
 # Observed: 76 re-asks in one benchmark run, and a session that had finished its task
 # pushed into writing notes into the user's Claude memory folder.
-_STALL_REASKS: "OrderedDict[str, tuple[int, int]]" = OrderedDict()
+_STALL_REASKS: "OrderedDict[str, tuple[int, int, str, int]]" = OrderedDict()
 _STALL_REASK_LIMIT = 2
 # The budget refills once the model has made this many tool calls since its last re-ask.
 # A lifetime budget of two was spent in the first minutes of a long ultracode session,
 # and its last reply - "We will apply multiple Edit calls." - ended the run with the bug
 # fixes unwritten. Calls made since the re-ask are progress; a model that keeps stopping
-# without making any still runs out after two.
-_STALL_PROGRESS_CALLS = 3
+# without making any still runs out after two. Measured (influenca, devine): a model that
+# announced every step ("Let me look at what's inside the uv tools dir.") took each one
+# when re-asked - one call per re-ask - and a refill at three calls forwarded its third
+# announcement as the answer. One call is progress.
+_STALL_PROGRESS_CALLS = 1
+# However much progress, at most this many re-asks per message the user types: the bound
+# on a judge that keeps calling a finished turn stalled. Something new the user says starts
+# a fresh budget - the summary-keyed budget alone was spent for the whole session.
+_STALL_REASKS_PER_MESSAGE = 8
+# A reply that plainly announces its next step is no judgement call, so it may be sent back
+# this often per message - still only after a tool call each time, so a model that never
+# acts runs out after two.
+_STALL_ANNOUNCED_PER_MESSAGE = 40
 
 
 def _stall_key(body: dict) -> str:
@@ -1850,15 +1862,22 @@ def _tool_calls_made(body: dict) -> int:
                for b in m["content"] if isinstance(b, dict) and b.get("type") == "tool_use")
 
 
-def _may_reask_stalled(body: dict) -> bool:
+def _may_reask_stalled(body: dict, *, announced: bool = False) -> bool:
+    """Whether a reply judged stalled may be sent back. `announced`: it plainly says what it
+    does next ("Let me look at..."), so it is a stall whatever the judge would say, and gets
+    the larger per-message budget - a long task can announce every one of its steps."""
     key = _stall_key(body)
     calls = _tool_calls_made(body)
-    used, at = _STALL_REASKS.get(key, (0, calls))
-    if calls - at >= _STALL_PROGRESS_CALLS:
+    said = _last_user_text(body)
+    used, at, before, total = _STALL_REASKS.get(key, (0, calls, said, 0))
+    if said != before:
+        used, total = 0, 0
+    elif calls - at >= _STALL_PROGRESS_CALLS:
         used = 0
-    if used >= _STALL_REASK_LIMIT:
+    cap = _STALL_ANNOUNCED_PER_MESSAGE if announced else _STALL_REASKS_PER_MESSAGE
+    if used >= _STALL_REASK_LIMIT or total >= cap:
         return False
-    _STALL_REASKS[key] = (used + 1, calls)
+    _STALL_REASKS[key] = (used + 1, calls, said, total + 1)
     _STALL_REASKS.move_to_end(key)
     while len(_STALL_REASKS) > 512:
         _STALL_REASKS.popitem(last=False)
@@ -3450,6 +3469,17 @@ async def _agentaus_event_stream(
                 tools_offered=bool(known),
                 called_a_tool=bool(mine or theirs),
             )
+        ) and announces_a_step(answer_so_far):
+            # It says what it will do next: a stall on its face, so no judge call to wait on.
+            turn_verdict = "stalled"
+        elif (
+            corrections < settings.agentaus_correction_rounds
+            and not awaiting_background(original)
+            and could_be_a_refusal(
+                answer_so_far,
+                tools_offered=bool(known),
+                called_a_tool=bool(mine or theirs),
+            )
         ):
             async def classify() -> str:
                 async with hold("refusal check", "urgent"):
@@ -3473,9 +3503,10 @@ async def _agentaus_event_stream(
                 rlog(logging.WARNING, "refusal check failed (%s); forwarding the answer",
                      exc)
 
-        if turn_verdict == "stalled" and not _may_reask_stalled(original):
-            rlog(logging.WARNING, "judged stalled again, but this conversation has used "
-                 "its %d re-asks; forwarding the reply", _STALL_REASK_LIMIT)
+        if turn_verdict == "stalled" and not _may_reask_stalled(
+                original, announced=announces_a_step(answer_so_far)):
+            rlog(logging.WARNING, "judged stalled again, but the re-ask budget for this "
+                 "message is spent; forwarding the reply")
             turn_verdict = "answer"
         if is_refusal or turn_verdict == "stalled":
             corrections += 1

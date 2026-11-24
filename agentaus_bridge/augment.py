@@ -95,8 +95,15 @@ user to paste a file you can read yourself.
 conversation unless the inputs genuinely changed; re-read the earlier result instead.
 Repeating a call you have already made wastes the turn and loses context.
 
-9. For anything beyond a one-line change, state the plan in two or three lines, then
-carry it out. Finish each part before starting the next.
+9. For anything beyond a one-line change, work through it one part at a time, finishing
+each part before starting the next. A short plan is fine, but only alongside the tool call
+that starts it, in the same reply.
+
+10. Keep going until the task is done. A reply with no tool call ends your turn, and
+nothing happens until the user writes again. So never end a reply on what you are about
+to do - "Let me look at the folder.", "I'll run the tests:", "Next, we will edit the
+file." Make that call now, in this reply. End your turn only with the finished result, or
+with a question only the user can answer.
 """
 
 ANALYSIS_GUIDANCE = """\
@@ -1266,6 +1273,30 @@ def read_turn_verdict(verdict: str) -> str:
     return "answer"
 
 
+# The last sentence of a reply that says what the agent does next. Measured (influenca,
+# devine): "Let me look at what's actually inside the uv tools dir." ended the turn with no
+# call, and the user had to type "yep look at it and continue".
+_ANNOUNCED_STEP = re.compile(
+    r"^(?:(?:ok(?:ay)?|now|next|first|so|then|alright|right)[,:]?\s+)*"
+    r"(?!let\s+me\s+know\b)(?:let\s+me|let's|i'll|i\s+will|i'm\s+going\s+to|i\s+am\s+going\s+to|i\s+need\s+to|"
+    r"we'll|we\s+will|we\s+need\s+to|we're\s+going\s+to|time\s+to)\b",
+    re.I,
+)
+
+
+def announces_a_step(answer: str) -> bool:
+    """Whether a reply ends by announcing a step - "Let me look at...", "I'll run the
+    tests:" - rather than with a result or a question. Structural, so the plain case needs
+    no judge call. Only the last sentence counts: "I'll summarise:" followed by the summary
+    is an answer."""
+    text = re.sub(r"```.*?```", " ", answer or "", flags=re.S).strip()
+    if not text or text.endswith("?"):
+        return False
+    text = text.replace("\u2019", "'")
+    last = re.split(r"(?<=[.!:])\s+|\n+", text)[-1].strip(" *_`>-#")
+    return len(last) <= 300 and bool(_ANNOUNCED_STEP.match(last))
+
+
 def read_refusal_verdict(verdict: str) -> bool:
     """Read the one-word answer. Anything unrecognised is treated as a real answer.
 
@@ -1759,6 +1790,16 @@ def _last_user_words(body: dict) -> str:
 # reminders are read only for the ultracode keyword Claude Code's own reminder carries,
 # and the workflow-authoring skill counts when it was invoked, not merely listed.
 _ULTRACODE = re.compile(r"\bultracode\b", re.I)
+# A mention that says ultracode is not on. Measured (influenca, devine): Claude Code's
+# compaction summary carried "(Ultracode is currently **off**; do not launch new Workflows
+# without explicit opt-in.)", the bare word read as the opt-in, and the user's "yep look
+# at it and continue" launched the whole agent graph in place of the next command.
+_ULTRACODE_OFF = re.compile(
+    r"\bultracode\b[\s*_`'\"]*(?:mode\s+)?(?:is|was|stays|remains|has\s+been|is\s+now)\s+"
+    r"(?:(?:currently|now|still|turned|switched|set)\s+)*[*_`'\"]*(?:off|disabled|not\s+(?:on|enabled|active))\b"
+    r"|\b(?:not|no|without|never|disable[sd]?|turn(?:ed)?\s+off)\s+(?:\w+\s+){0,2}[*_`'\"]*ultracode\b",
+    re.I,
+)
 _ASKED_FOR_WORKFLOW = re.compile(
     r"\bmulti-?agent\s+(?:workflow|orchestration)s?\b|\bthe\s+Workflow\s+tool\b|"
     r"\bfan\s+out\s+(?:\w+\s+)?(?:sub)?agents\b|"
@@ -1795,7 +1836,7 @@ def workflow_opted_in(body: dict) -> bool:
     opt-in, and by the third step of a tool loop the words that carried it are far back.
     """
     for text in _user_text_blocks(body):
-        if _ULTRACODE.search(text) or _INVOKED_WORKFLOW_SKILL.search(text):
+        if _ULTRACODE.search(_ULTRACODE_OFF.sub("", text)) or _INVOKED_WORKFLOW_SKILL.search(text):
             return True
         words = _REMINDERS.sub("", text)
         if _ASKED_FOR_WORKFLOW.search(words) or (
