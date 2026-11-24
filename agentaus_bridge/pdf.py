@@ -58,6 +58,30 @@ _ORDINARY = set(
 )
 
 
+def _windows_dirs() -> list[str]:
+    """Folders the Windows installers put the readers in, which may not be on PATH yet.
+
+    UB-Mannheim's tesseract installs to `Program Files\\Tesseract-OCR` and does not add itself
+    to PATH. winget installs poppler as a portable zip under its Packages folder (the
+    executables sit in `poppler-<version>\\Library\\bin`) and links them from WinGet\\Links,
+    which only reaches PATH in a new session.
+    """
+    program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+    local = os.environ.get("LOCALAPPDATA", "")
+    winget = os.path.join(local, "Microsoft", "WinGet") if local else ""
+    patterns = [
+        os.path.join(program_files, "Tesseract-OCR"),
+        os.path.join(program_files, "poppler*", "Library", "bin"),
+        os.path.join(program_files, "poppler*", "bin"),
+    ]
+    if winget:
+        patterns += [
+            os.path.join(winget, "Links"),
+            os.path.join(winget, "Packages", "oschwartz10612.Poppler_*", "poppler-*", "Library", "bin"),
+        ]
+    return [d for pattern in patterns for d in sorted(glob.glob(pattern), reverse=True)]
+
+
 def _tool(name: str) -> str | None:
     """A system binary, looked for where Homebrew and the system keep them.
 
@@ -71,18 +95,11 @@ def _tool(name: str) -> str | None:
         candidate = os.path.join(directory, name)
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
-    # Windows: winget installs poppler and tesseract to fixed folders that are not on
-    # PATH by default, so look there too.
-    program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
-    for pattern in (
-        rf"{program_files}\Tesseract-OCR\*",
-        rf"{program_files}\Poppler\*",
-        rf"{program_files}\poppler*\*",
-    ):
-        for candidate in glob.glob(pattern):
-            exe = os.path.join(candidate, f"{name}.exe")
-            if os.path.isfile(exe) and os.access(exe, os.X_OK):
-                return exe
+    if os.name == "nt":
+        for directory in _windows_dirs():
+            candidate = os.path.join(directory, f"{name}.exe")
+            if os.path.isfile(candidate):
+                return candidate
     return None
 
 

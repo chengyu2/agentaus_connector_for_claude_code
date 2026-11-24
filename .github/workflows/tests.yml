@@ -108,6 +108,15 @@ jobs:
           $env:INSTALL_DOCUMENT_READERS = "0"
           & .\scripts\install.ps1
 
+      # `powershell -ExecutionPolicy Bypass -File ...` runs Windows PowerShell 5.1, not pwsh 7,
+      # and the two treat native stderr differently, so run the installer under 5.1 too.
+      - name: Run install.ps1 under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $env:INSTALL_DOCUMENT_READERS = "0"
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Verify the bridge imports on Windows
         shell: pwsh
         run: |

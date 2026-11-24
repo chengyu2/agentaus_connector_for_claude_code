@@ -145,12 +145,19 @@ def _copy_project(root: str, dest: str) -> bool:
     return True
 
 
-def _python() -> str:
-    # On Windows `python3` is usually absent, and a Store-placeholder `python` can exist
-    # that opens the Microsoft Store instead of running. The interpreter already running
-    # this bridge is always real, so prefer it; `python3` is only a fallback for cases
-    # where sys.executable points somewhere unusable.
-    return sys.executable or shutil.which("python3")
+def _python() -> list[str]:
+    """The interpreter that imports the user's project: theirs, not the bridge's venv.
+
+    The guard only reports a module that imported cleanly before the edit, so it has to run
+    where the project's own packages are installed - the bridge's `.venv` (sys.executable)
+    has none of them, and every module with a third-party import would be skipped. On
+    Windows `python3` is usually absent or a Microsoft Store placeholder, so the `py`
+    launcher is used there instead.
+    """
+    if os.name == "nt":
+        launcher = shutil.which("py")
+        return [launcher, "-3"] if launcher else [sys.executable]
+    return [shutil.which("python3") or sys.executable]
 
 
 def probe(root: str, path: str, text: str, copy: str) -> tuple[bool, str]:
@@ -164,7 +171,7 @@ def probe(root: str, path: str, text: str, copy: str) -> tuple[bool, str]:
         fh.write(text)
     folder, module = _module_name(target, copy)
     try:
-        done = subprocess.run([_python(), "-c", _PROBE, folder, module, target], cwd=copy,
+        done = subprocess.run([*_python(), "-c", _PROBE, folder, module, target], cwd=copy,
                               stdin=subprocess.DEVNULL, capture_output=True, text=True,
                               timeout=IMPORT_SECONDS,
                               env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
