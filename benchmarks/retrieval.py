@@ -28,6 +28,7 @@ and a search that finds the key scores on the key.
 """
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import shutil
@@ -118,9 +119,12 @@ def _relative(path: str, root: str) -> str:
     """
     path = path.replace("\\", "/")
     if root:
-        base = root.rstrip("/") + "/"
-        if path.startswith(base):
-            path = path[len(base):]
+        # Both spellings of the root: Glob and Grep print resolved paths, and on macOS a
+        # temporary folder resolves from /var/folders to /private/var/folders.
+        for base in {root.rstrip("/") + "/", os.path.realpath(root).rstrip("/") + "/"}:
+            if path.startswith(base):
+                path = path[len(base):]
+                break
     while path.startswith("./"):
         path = path[2:]
     return path.lstrip("/")
@@ -147,11 +151,12 @@ def score(reply: str, expected_files: set, expected_symbols: set, root: str = ""
             "f1": f1, "symbol": symbol_hit}
 
 
-# Left out of the searched copy: everything that states an answer, and what no question
-# is about. Top-level Markdown goes too - the README quotes answers, and the API document
-# holds a key.
+# Left out of the searched copy: everything that states an answer, what no question is
+# about, and anything holding a secret. Top-level Markdown goes too - the README quotes
+# answers, and the API document holds a key. So does .env, which a model could otherwise
+# Read and quote into a reply that is saved to the run file.
 _HELD_BACK = {"benchmarks", "tests", "abbench", "docs", ".git", ".venv", "venv",
-              "node_modules", "__pycache__", ".pytest_cache"}
+              "node_modules", "__pycache__", ".pytest_cache", ".env", ".env.*"}
 
 
 def searchable_copy(root: str) -> str:
@@ -159,7 +164,8 @@ def searchable_copy(root: str) -> str:
     target = tempfile.mkdtemp(prefix="bench-retrieval-")
     for name in os.listdir(root):
         source = os.path.join(root, name)
-        if name in _HELD_BACK or (os.path.isfile(source) and name.endswith(".md")):
+        if (any(fnmatch.fnmatch(name, held) for held in _HELD_BACK)
+                or (os.path.isfile(source) and name.endswith(".md"))):
             continue
         if os.path.isdir(source):
             shutil.copytree(source, os.path.join(target, name), symlinks=True,
@@ -173,7 +179,8 @@ def run(model: str, limit: int | None, ask, totals, log=print, root: str | None 
     import harness
 
     repo = os.path.abspath(root or os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    copy = searchable_copy(repo)
+    # Resolved, so the root in the prompt matches the paths Glob and Grep print.
+    copy = os.path.realpath(searchable_copy(repo))
     rows = QUESTIONS[:limit] if limit else QUESTIONS
     cases = []
     try:

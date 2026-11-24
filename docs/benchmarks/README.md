@@ -42,8 +42,16 @@ the bridge reports the usage of its final upstream call, without the planner, th
 check or the model calls inside `agentaus_search`. Read an Agentaus arm's tokens as a floor.
 
 A failed call (bridge down, quota spent) never reached the model, so rates are taken over
-the cases that were answered, and failures are reported beside them. Each run file records
-the commit, the bridge's `/healthz`, and every raw reply next to its score.
+the cases that were answered, and failures are reported beside them. A turn that used up its
+tool rounds did reach the model and is scored as it stands; the `cut` column counts them.
+Each run file records the commit, the bridge's `/healthz`, and every raw reply next to its
+score. New run files are gitignored, because `documents` and `coverage` replies quote the
+tender folder.
+
+Run files from before format 2 (those without `_meta`) cannot be compared with later ones.
+Injection then ran each case once and its `n` counted calls, coverage reported the skill
+arm's count rather than the difference between arms, failed calls counted as wrong, and the
+retrieval, injection, documents and coverage scorers have all been corrected since.
 
 ### You do not need a second arm
 

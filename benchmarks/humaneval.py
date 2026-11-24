@@ -58,7 +58,8 @@ def extract_code(text: str, entry_point: str = "") -> str:
     """
     fenced = _FENCE.findall(text or "")
     if fenced:
-        defining = [b for b in fenced if entry_point and f"def {entry_point}" in b]
+        target = re.compile(rf"def {re.escape(entry_point)}\s*\(") if entry_point else None
+        defining = [b for b in fenced if target and target.search(b)]
         return max(defining or fenced, key=len).strip()
     return (text or "").strip()
 

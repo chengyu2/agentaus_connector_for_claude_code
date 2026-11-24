@@ -58,6 +58,12 @@ HEADLINE = {"humaneval": ("pass_at_1", "pass@1"),
 
 REPO = Path(__file__).resolve().parent.parent
 
+# Run files from before format 2 (no "_meta") do not compare with later ones: injection
+# then ran each case once, pasted, and its n counted calls; coverage's headline was the
+# skill arm's file count, not the difference between arms; failed calls counted as wrong
+# answers; and every scorer except humaneval's has since been corrected.
+RUN_FORMAT = 2
+
 # The bridge reports the usage of its final upstream call. The planner, the grounding
 # check and the model calls inside agentaus_search are not in it, so an Agentaus arm's
 # tokens are a floor, and comparing them with a Claude arm's flatters Agentaus.
@@ -100,7 +106,8 @@ def main() -> int:
     context = {"retrieval": {"root": args.root},
                "documents": {"corpus": args.corpus},
                "coverage": {"corpus": args.corpus}}
-    results: dict = {"_meta": {**harness.run_metadata(), "argv": sys.argv[1:],
+    results: dict = {"_meta": {**harness.run_metadata(), "format": RUN_FORMAT,
+                               "argv": sys.argv[1:],
                                "started": time.strftime("%Y-%m-%dT%H:%M:%S")}}
     for model in models:
         problem = harness.preflight(model)

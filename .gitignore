@@ -6,3 +6,7 @@ __pycache__/
 # Local settings backups
 .claude/settings_old.json
 .claude/settings.local.json
+
+# Benchmark run files hold every raw reply, and documents/coverage replies quote the
+# private tender folder. The runs already committed stay tracked.
+benchmarks/results/
