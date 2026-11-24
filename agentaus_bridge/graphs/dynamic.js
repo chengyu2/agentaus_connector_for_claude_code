@@ -23,7 +23,10 @@ const THINK = '[think-only]'
 const TASK = String((args && args.task) || '').trim()
 const CWD = String((args && args.cwd) || '').trim()
 const SKILLS = (args && args.skills) || {}
-const SCRATCH = `/tmp/agentaus-graph/${(CWD.replace(/^\/+/, '') || 'task').replace(/[^\w.-]+/g, '_')}-dyn`
+// Where scratch lives, as the bridge says (graph.scratch_root): /tmp, except on Windows, where
+// the bridge and Git Bash read /tmp as different folders and it is %TEMP% instead.
+const SCRATCH_ROOT = String((args && args.scratch_root) || '/tmp/agentaus-graph').trim()
+const SCRATCH = `${SCRATCH_ROOT}/${(CWD.replace(/^\/+/, '') || 'task').replace(/[^\w.-]+/g, '_')}-dyn`
 // Every copy is made from the project as it was when the work began. Measured: the scout,
 // solvers and checkers edited the live project, so each later copy started from someone
 // else's half-finished change and the last writer won.
@@ -169,7 +172,7 @@ function prompt(skill, title, lines, think) {
   return [
     MARK, think ? THINK : null, `# ${title}`, '',
     think ? 'Everything you need is below. Reply with Markdown only.' : `**Project folder:** \`${CWD}\` - every input file is there.`,
-    !think && READ_ONLY.has(skill) ? '**The project folder is read-only for you.** Never write, edit or patch anything in it - work in a copy under `/tmp`. Anything written there is undone before assembly.' : null,
+    !think && READ_ONLY.has(skill) ? `**The project folder is read-only for you.** Never write, edit or patch anything in it - work in a copy under \`${SCRATCH}\`. Anything written there is undone before assembly.` : null,
     '', '---', `## Your skill: ${skill}`, '', (SKILLS[skill] || '').replace(/^---[\s\S]*?---\s*/, '').trim(), '---', '',
     ...lines.filter(l => l !== null && l !== undefined),
     '', 'Print only what you need while you work - counts, `head`, a few rows. Never a whole file or table.',
@@ -2230,7 +2233,7 @@ const CHECKLIST = plan.subtasks.flatMap(st => {
     const f = functionOf(st)
     return [`- [ ] Subtask ${st.n} - **${st.title}**: the change is in ${f ? `\`${f.fn}\` in \`${f.file}\`` : 'the project'}${tag}`]
   }
-  const keys = keyValues(resultOf(st)).filter(k => !/\/tmp\/|\.(py|patch)\b|^- \*\*[^*]*(path|file)[^*]*:\*\*/i.test(k))
+  const keys = keyValues(resultOf(st)).filter(k => !k.includes(SCRATCH_ROOT) && !/\/tmp\/|\.(py|patch)\b|^- \*\*[^*]*(path|file)[^*]*:\*\*/i.test(k))
   return keys.length ? keys.map(k => k.replace(/^- /, `- [ ] Subtask ${st.n} - `) + tag) : [`- [ ] Subtask ${st.n} - **${st.title}**: its answer is in the deliverable${tag}`]
 }).join('\n')
 
