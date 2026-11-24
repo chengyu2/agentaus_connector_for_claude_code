@@ -95,8 +95,15 @@ user to paste a file you can read yourself.
 conversation unless the inputs genuinely changed; re-read the earlier result instead.
 Repeating a call you have already made wastes the turn and loses context.
 
-9. For anything beyond a one-line change, state the plan in two or three lines, then
-carry it out. Finish each part before starting the next.
+9. For anything beyond a one-line change, work through it one part at a time, finishing
+each part before starting the next. A short plan is fine, but only alongside the tool call
+that starts it, in the same reply.
+
+10. Keep going until the task is done. A reply with no tool call ends your turn, and
+nothing happens until the user writes again. So never end a reply on what you are about
+to do - "Let me look at the folder.", "I'll run the tests:", "Next, we will edit the
+file." Make that call now, in this reply. End your turn only with the finished result, or
+with a question only the user can answer.
 """
 
 ANALYSIS_GUIDANCE = """\
@@ -902,7 +909,8 @@ def guidance_for(body: dict, *, covered_by_skill: tuple = (), routing: bool = Tr
     if ran_an_analysis(body) and "analyse-data" not in covered_by_skill:
         notes += ANALYSIS_GUIDANCE
     routed = routing_section(body) if routing else ""
-    return prompt_style.headings(notes) + routed + tool_selection(body)
+    return (prompt_style.headings(notes) + write_now_note(body, working_directory_of(body))
+            + routed + tool_selection(body))
 
 
 def with_skill_descriptions(body: dict) -> tuple[dict, int]:
@@ -1270,6 +1278,152 @@ def read_turn_verdict(verdict: str) -> str:
     if word.startswith("STALLED"):
         return "stalled"
     return "answer"
+
+
+# The last sentence of a reply that says what the agent does next. Measured (influenca,
+# devine): "Let me look at what's actually inside the uv tools dir." ended the turn with no
+# call, and the user had to type "yep look at it and continue".
+_ANNOUNCED_STEP = re.compile(
+    r"^(?:(?:ok(?:ay)?|now|next|first|so|then|alright|right)[,:]?\s+)*"
+    r"(?!let\s+me\s+know\b)"
+    # A closing line names no step: "I'll be here if you need anything", "I'll leave the
+    # rest to you", "We'll see how it goes".
+    r"(?!(?:i'll|i\s+will|we'll|we\s+will)\s+(?:be\s+(?:here|around|happy|glad|available)|"
+    r"leave\b|see\s+how|let\s+you\b|keep\s+(?:an\s+eye|you\s+posted)))"
+    r"(?:let\s+me|let's|i'll|i\s+will|i'm\s+going\s+to|i\s+am\s+going\s+to|i\s+need\s+to|"
+    r"we'll|we\s+will|we\s+need\s+to|we're\s+going\s+to|time\s+to)\b",
+    re.I,
+)
+
+
+def announces_a_step(answer: str) -> bool:
+    """Whether a reply ends by announcing a step - "Let me look at...", "I'll run the
+    tests:" - rather than with a result or a question. Structural, so the plain case needs
+    no judge call. Only the last sentence counts: "I'll summarise:" followed by the summary
+    is an answer."""
+    text = re.sub(r"```.*?```", " ", answer or "", flags=re.S).strip()
+    if not text or text.endswith("?"):
+        return False
+    text = text.replace("\u2019", "'")
+    last = re.split(r"(?<=[.!:])\s+|\n+", text)[-1].strip(" *_`>-#")
+    return len(last) <= 300 and bool(_ANNOUNCED_STEP.match(last))
+
+
+# A file the request tells the agent to write: a writing verb, then within the same
+# sentence a file name with an extension. Measured (work experience A/B): asked to "Write
+# `instructions.md`" and "Write `drafts.md`", Agentaus spent 36 turns, wrote neither, and
+# ended on a report the judge read as an answer - one of the two needed no email at all.
+_FILE_NAME = r"((?:~|\.{1,2})?/?[\w.-]+(?:/[\w.-]+)*\.[A-Za-z][A-Za-z0-9]{0,4})\b"
+_WRITE_VERB = re.compile(
+    r"\b(?:write|create|save|produce|generate|draft|output|export)\b"
+    r"(?:(?:\s+(?:it|them|this|that|the|a|an|both|your|out|up|file|files|a\s+file\s+(?:called|named)))*"
+    r"|(?:\s+[\w-]+){0,4}?\s+(?:to|into|as|in)(?:\s+(?:a\s+)?(?:file\s+)?(?:called|named))?)"
+    r"\s*[:\-]?\s*[`'\"]?" + _FILE_NAME + r"[`'\"]?",
+    re.I,
+)
+# The rest of a list after the first name: "`instructions.md` and `drafts.md`", "a.md, b.md
+# and c.md". Measured (PR review): only the first of "write instructions.md and drafts.md"
+# was found, so one file written and one missing read as nothing missing.
+_MORE_FILES = re.compile(
+    r"\s*(?:,\s*(?:and\s+|or\s+|&\s+)?|\s+(?:and|or|&|plus)\s+)(?:the\s+|a\s+)?[`'\"]?"
+    + _FILE_NAME + r"[`'\"]?",
+    re.I,
+)
+# "e.g", "i.e" and the like have the shape of a file name and are not one.
+_ABBREVIATION = re.compile(r"(?:e\.g|i\.e|etc|vs|cf|a\.k\.a|n\.b)\.?", re.I)
+
+
+def missing_deliverables(request: str, cwd: str | None) -> list[tuple[str, str]]:
+    """(name as the request wrote it, path looked at) for each file the request says to
+    write that does not exist. Structural: no judge call. Only names that follow a writing
+    verb - "read `README.md`" names an input, not an output."""
+    if not request or not cwd:
+        return []
+    text = _REMINDERS.sub("", request)
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    names = []
+    for found in _WRITE_VERB.finditer(text):
+        names.append(found.group(1))
+        at = found.end()
+        while more := _MORE_FILES.match(text, at):
+            names.append(more.group(1))
+            at = more.end()
+    out, seen = [], set()
+    for name in names:
+        if name in seen or _ABBREVIATION.fullmatch(name):
+            continue
+        seen.add(name)
+        path = os.path.expanduser(name)
+        if not os.path.isabs(path):
+            path = os.path.join(cwd, path)
+        if not os.path.exists(path):
+            out.append((name, os.path.normpath(path)))
+    return out
+
+
+MISSING_DELIVERABLES_CORRECTION = """\
+<correction>
+## Not done yet
+
+The request asks you to write these files, and they do not exist:
+
+{files}
+
+## What to do now
+
+- Call `Write` for each one now, in this reply.
+- If part of what belongs in a file could not be found or done, still write the file:
+  put in everything you have, and say inside it what is missing and why.
+- Do not reply in text until every file exists.
+- If the request does not actually ask you to write one of them, say so in one line and
+  finish.
+</correction>
+"""
+
+
+# Tool calls since the user's message after which a request whose named files are still
+# missing is told to write them. Measured (work experience A/B, run 2): Agentaus found every
+# email it needed by call 33, said "I have the email context I need" five times, kept
+# reading, and the 40-minute limit came with neither file written.
+WRITE_NOW_AFTER_CALLS = 15
+
+
+def _since_last_request(body: dict) -> tuple[str, int]:
+    """The newest thing the user typed, and how many tool calls have run since."""
+    said, calls = "", 0
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content or []
+        if message.get("role") == "assistant":
+            calls += sum(1 for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use")
+            continue
+        if message.get("role") != "user":
+            continue
+        for b in blocks:
+            if not isinstance(b, dict) or b.get("type") != "text":
+                continue
+            typed = _REMINDERS.sub("", b.get("text") or "").strip()
+            if typed and "<task-notification>" not in typed and not typed.startswith(
+                    ("Base directory for this skill", "Launching skill")):
+                said, calls = typed, 0
+    return said, calls
+
+
+def write_now_note(body: dict, cwd: str | None) -> str:
+    """Guidance for a main loop that has run many calls with the requested files unwritten."""
+    said, calls = _since_last_request(body)
+    if calls < WRITE_NOW_AFTER_CALLS:
+        return ""
+    missing = missing_deliverables(said, cwd)
+    if not missing:
+        return ""
+    files = "\n".join(f"- `{name}`" for name, _ in missing)
+    return (f"\n## Write the requested files now\n\n{calls} tool calls have run since the "
+            f"request, and these files it asks for do not exist yet:\n\n{files}\n\n"
+            "- Stop gathering. What you have read is enough to write a first version.\n"
+            "- Call `Write` for each file in your next reply.\n"
+            "- Where something is still unknown, write the rest and say inside the file what "
+            "is missing.\n- You can improve a file after it exists.\n")
 
 
 def read_refusal_verdict(verdict: str) -> bool:
@@ -1765,6 +1919,16 @@ def _last_user_words(body: dict) -> str:
 # reminders are read only for the ultracode keyword Claude Code's own reminder carries,
 # and the workflow-authoring skill counts when it was invoked, not merely listed.
 _ULTRACODE = re.compile(r"\bultracode\b", re.I)
+# A mention that says ultracode is not on. Measured (influenca, devine): Claude Code's
+# compaction summary carried "(Ultracode is currently **off**; do not launch new Workflows
+# without explicit opt-in.)", the bare word read as the opt-in, and the user's "yep look
+# at it and continue" launched the whole agent graph in place of the next command.
+_ULTRACODE_OFF = re.compile(
+    r"\bultracode\b[\s*_`'\"]*(?:mode\s+)?(?:is|was|stays|remains|has\s+been|is\s+now)\s+"
+    r"(?:(?:currently|now|still|turned|switched|set)\s+)*[*_`'\"]*(?:off|disabled|not\s+(?:on|enabled|active))\b"
+    r"|\b(?:not|no|without|never|disable[sd]?|turn(?:ed)?\s+off)\s+(?:\w+\s+){0,2}[*_`'\"]*ultracode\b",
+    re.I,
+)
 _ASKED_FOR_WORKFLOW = re.compile(
     r"\bmulti-?agent\s+(?:workflow|orchestration)s?\b|\bthe\s+Workflow\s+tool\b|"
     r"\bfan\s+out\s+(?:\w+\s+)?(?:sub)?agents\b|"
@@ -1801,7 +1965,7 @@ def workflow_opted_in(body: dict) -> bool:
     opt-in, and by the third step of a tool loop the words that carried it are far back.
     """
     for text in _user_text_blocks(body):
-        if _ULTRACODE.search(text) or _INVOKED_WORKFLOW_SKILL.search(text):
+        if _ULTRACODE.search(_ULTRACODE_OFF.sub("", text)) or _INVOKED_WORKFLOW_SKILL.search(text):
             return True
         words = _REMINDERS.sub("", text)
         if _ASKED_FOR_WORKFLOW.search(words) or (
