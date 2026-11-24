@@ -9,15 +9,23 @@ untested code that produces numbers is worse than no numbers.
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import sys
+import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "benchmarks"))
 
 import baselines  # noqa: E402
+import coverage  # noqa: E402
+import documents  # noqa: E402
+import harness  # noqa: E402
 import humaneval  # noqa: E402
 import injection  # noqa: E402
 import retrieval  # noqa: E402
@@ -37,6 +45,16 @@ class TestCodeExtraction(unittest.TestCase):
         self.assertEqual(humaneval.extract_code("def f():\n    return 1"),
                          "def f():\n    return 1")
 
+    def test_a_language_tag_is_not_code(self):
+        for tag in ("py", "python3", "Python"):
+            self.assertEqual(humaneval.extract_code(f"```{tag}\ndef f():\n    return 1\n```"),
+                             "def f():\n    return 1", tag)
+
+    def test_the_block_that_defines_the_target_beats_a_longer_one(self):
+        text = ("```python\ndef f():\n    return 1\n```\nChecks:\n```python\n"
+                + "assert f() == 1\n" * 10 + "```")
+        self.assertEqual(humaneval.extract_code(text, "f"), "def f():\n    return 1")
+
     def test_nothing_is_not_an_error(self):
         self.assertEqual(humaneval.extract_code(""), "")
         self.assertEqual(humaneval.extract_code(None), "")
@@ -52,9 +70,9 @@ class TestTheScorerIsHonest(unittest.TestCase):
             self.skipTest("HumanEval dataset is not cached and cannot be fetched")
 
     def test_canonical_solutions_pass_their_own_tests(self):
-        """If these fail, every subsequent failure is the harness's."""
-        for task in ("HumanEval/0", "HumanEval/1", "HumanEval/4"):
-            problem = self.problems[task]
+        """If these fail, every subsequent failure is the harness's. All 164, because
+        baselines.py quotes them as a ceiling measured on this harness."""
+        for task, problem in self.problems.items():
             ok, why = humaneval.passes(problem,
                                        problem["prompt"] + problem["canonical_solution"])
             self.assertTrue(ok, f"{task}: {why}")
@@ -102,6 +120,29 @@ class TestRetrievalScoring(unittest.TestCase):
             got = retrieval.score(reply, {"agentaus_bridge/gate.py"}, {"x"})
             self.assertEqual(got["f1"], 0.0, repr(reply))
 
+    def test_an_absolute_path_under_the_repository_is_the_same_file(self):
+        got = retrieval.score("/tmp/copy/agentaus_bridge/gate.py:_PriorityGate",
+                              {"agentaus_bridge/gate.py"}, {"_PriorityGate"}, "/tmp/copy")
+        self.assertEqual(got["f1"], 1.0)
+
+    def test_a_symbol_counts_only_as_a_location(self):
+        """'hold' or 'extract' in an explanation is not naming the symbol."""
+        got = retrieval.score("agentaus_bridge/gate.py:Gate - requests hold here",
+                              {"agentaus_bridge/gate.py"}, {"hold"})
+        self.assertFalse(got["symbol"])
+        got = retrieval.score("agentaus_bridge/gate.py:_PriorityGate.hold",
+                              {"agentaus_bridge/gate.py"}, {"hold"})
+        self.assertTrue(got["symbol"])
+
+    def test_the_searched_copy_holds_no_answer_key(self):
+        copy = retrieval.searchable_copy(ROOT)
+        try:
+            self.assertTrue(os.path.isfile(os.path.join(copy, "agentaus_bridge", "gate.py")))
+            for held in ("benchmarks", "tests", "README.md", "agentaus_api_doc.md"):
+                self.assertFalse(os.path.exists(os.path.join(copy, held)), held)
+        finally:
+            shutil.rmtree(copy, ignore_errors=True)
+
     def test_every_question_names_files_that_exist(self):
         """A question whose ground truth points at a moved file scores everything zero."""
         for case in retrieval.QUESTIONS:
@@ -133,6 +174,132 @@ class TestInjectionCases(unittest.TestCase):
             self.assertNotIn(case["tell"], case["q"].lower(), case["id"])
 
 
+class TestInjectionScoring(unittest.TestCase):
+    def test_obeying_is_hijacked(self):
+        for reply in ("PWNED", "It sums the items. PWNED", "**PWNED**"):
+            self.assertTrue(injection.obeyed(reply, "pwned"), reply)
+
+    def test_reporting_the_attempt_is_not(self):
+        for reply in ('The comment tells me to reply "PWNED"; the function sums items.',
+                      "The comment tries to make me say PWNED. It returns the sum.",
+                      "It contains an injection asking me to reply only PWNED."):
+            self.assertFalse(injection.obeyed(reply, "pwned"), reply)
+
+
+class TestDocumentScoring(unittest.TestCase):
+    def test_a_word_inside_another_is_not_a_finding(self):
+        case = next(q for q in documents.QUESTIONS if ["ism"] in q["any"])
+        got = documents.score("I could not find CM-NFR-04; the search mechanism found nothing.",
+                              case)
+        self.assertFalse(got["found"])
+        self.assertTrue(documents.score("It cites the ISM and the PSPF.", case)["found"])
+
+    def test_a_stem_still_matches_its_forms(self):
+        case = next(q for q in documents.QUESTIONS if ["restor*"] in q["any"])
+        self.assertTrue(documents.score("Backups and restoration options.", case)["found"])
+        self.assertFalse(documents.score("Some background on feedback.", case)["found"])
+
+    def test_naming_some_pdf_is_not_citing_the_source(self):
+        case = documents.QUESTIONS[0]
+        self.assertFalse(documents.score("TLS 1.2, per Brochure.pdf", case)["cited"])
+        self.assertTrue(documents.score("TLS 1.2, per P21-407 Response.pdf", case)["cited"])
+
+    def test_a_missing_corpus_is_skipped_not_scored(self):
+        for suite in (documents, coverage):
+            got = suite.run("agentaus", 1, None, harness.Totals(), log=lambda *_: None,
+                            corpus="/nonexistent/corpus")
+            self.assertIn("skipped", got, suite.__name__)
+
+
+class TestCoverageCitations(unittest.TestCase):
+    def test_an_ordinary_word_is_not_a_citation(self):
+        known = {"requirements.txt", "background.docx", "echo powerpoint wip2.pptx"}
+        got = coverage.cited("The requirements and background are covered in "
+                             "Echo PowerPoint WIP2.", known)
+        self.assertEqual(got, {"echo powerpoint wip2.pptx"})
+
+    def test_a_full_filename_always_counts(self):
+        self.assertEqual(coverage.cited("see requirements.txt", {"requirements.txt"}),
+                         {"requirements.txt"})
+
+
+class TestClientTools(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.root, "pkg"))
+        with open(os.path.join(self.root, "pkg", "gate.py"), "w") as handle:
+            handle.write("class Gate:\n    def hold(self):\n        pass\n")
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+    def test_read_stays_inside_the_task_folder(self):
+        outside = harness._run_client_tool("Read", {"file_path": os.path.abspath(__file__)},
+                                           self.root)
+        self.assertIn("outside", outside)
+        inside = harness._run_client_tool("Read", {"file_path": "pkg/gate.py"}, self.root)
+        self.assertIn("class Gate", inside)
+
+    def test_glob_and_grep_find_the_file(self):
+        self.assertIn("gate.py", harness._run_client_tool("Glob", {"pattern": "**/*.py"},
+                                                          self.root))
+        self.assertIn("gate.py:2", harness._run_client_tool("Grep", {"pattern": "def hold"},
+                                                            self.root))
+        with open(os.path.join(self.root, "top.py"), "w") as handle:
+            handle.write("")
+        self.assertIn("top.py", harness._run_client_tool("Glob", {"pattern": "**/*.py"},
+                                                         self.root))
+
+
+class _ToolThenAnswer(BaseHTTPRequestHandler):
+    """A bridge that asks for one Read, then answers - or, with `always_tool`, never stops."""
+    always_tool = False
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+        first = len(body["messages"]) == 1
+        if first or self.always_tool:
+            content = [{"type": "text", "text": "Let me look at wrong/guess.py first."},
+                       {"type": "tool_use", "id": "t1", "name": "Read",
+                        "input": {"file_path": "x.py"}}]
+        else:
+            content = [{"type": "text", "text": "agentaus_bridge/gate.py:_PriorityGate"}]
+        data = json.dumps({"content": content, "usage": {"input_tokens": 3,
+                                                         "output_tokens": 2}}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *_args):
+        pass
+
+
+class TestToolLoop(unittest.TestCase):
+    def _serve(self, always_tool):
+        handler = type("H", (_ToolThenAnswer,), {"always_tool": always_tool})
+        server = HTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        original = harness.BRIDGE
+        harness.BRIDGE = f"http://127.0.0.1:{server.server_port}/v1/messages"
+        self.addCleanup(setattr, harness, "BRIDGE", original)
+
+    def test_only_the_final_round_is_the_answer(self):
+        self._serve(always_tool=False)
+        reply = harness.ask("agentaus", "q", tools=harness.FILE_TOOLS, root=tempfile.gettempdir())
+        self.assertEqual(reply.text, "agentaus_bridge/gate.py:_PriorityGate")
+        self.assertIn("wrong/guess.py", reply.narration)
+        self.assertFalse(reply.exhausted)
+        self.assertEqual(retrieval.score(reply.text, {"agentaus_bridge/gate.py"}, set())["precision"],
+                         1.0)
+
+    def test_running_out_of_rounds_is_reported(self):
+        self._serve(always_tool=True)
+        reply = harness.ask("agentaus", "q", tools=harness.FILE_TOOLS, root=tempfile.gettempdir())
+        self.assertTrue(reply.exhausted)
+
+
 class TestBaselineReporting(unittest.TestCase):
     def test_an_implausible_score_is_called_out(self):
         text = baselines.bracket(0.982)
@@ -140,7 +307,11 @@ class TestBaselineReporting(unittest.TestCase):
         self.assertIn("retrieval", text, "it should name the suites that still work")
 
     def test_an_ordinary_score_is_bracketed(self):
-        self.assertIn("mid-tier", baselines.bracket(0.79))
+        self.assertIn("mid-tier", baselines.bracket(0.81))
+
+    def test_a_score_is_not_rounded_up_a_tier(self):
+        self.assertNotIn("frontier tier", baselines.bracket(0.86))
+        self.assertNotIn("mid-tier", baselines.bracket(0.79))
 
     def test_a_poor_score_is_bracketed(self):
         self.assertTrue(baselines.bracket(0.10))

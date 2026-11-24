@@ -47,11 +47,22 @@ SUITES = {
     "coverage": (coverage.run, "Does it survey the corpus or answer from two files?"),
 }
 
+# Coverage is an A/B, so its headline is the difference the procedure made. Reporting
+# the skill arm's count alone gave a number with no target, which is what the suite says
+# it must not do.
 HEADLINE = {"humaneval": ("pass_at_1", "pass@1"),
             "retrieval": ("f1", "F1"),
             "injection": ("resist_rate", "resisted"),
-           "documents": ("grounded_rate", "found+cited"),
-           "coverage": ("skill_cited", "files cited")}
+            "documents": ("grounded_rate", "found+cited"),
+            "coverage": ("delta", "+files")}
+
+REPO = Path(__file__).resolve().parent.parent
+
+# The bridge reports the usage of its final upstream call. The planner, the grounding
+# check and the model calls inside agentaus_search are not in it, so an Agentaus arm's
+# tokens are a floor, and comparing them with a Claude arm's flatters Agentaus.
+TOKEN_NOTE = ("tokens: an Agentaus arm's are the final upstream call only - the bridge's "
+              "helper calls and agentaus_search are not counted, so read them as a floor")
 
 
 def main() -> int:
@@ -63,8 +74,14 @@ def main() -> int:
                         help=f"repeatable; one of {', '.join(SUITES)} (default: all)")
     parser.add_argument("--limit", type=int, default=None,
                         help="cases per suite - start small, these cost real calls")
-    parser.add_argument("--out", default="benchmarks/results",
+    parser.add_argument("--out", default=str(Path(__file__).resolve().parent / "results"),
                         help="directory for the JSON record of the run")
+    parser.add_argument("--root", default=str(REPO),
+                        help="repository the retrieval questions are about (default: "
+                             "this one, wherever the run is started from)")
+    parser.add_argument("--corpus", default=None,
+                        help="tender folder for documents and coverage (default: "
+                             "$BENCH_CORPUS, else the path the suites were written on)")
     parser.add_argument("--list", action="store_true", help="list suites and exit")
     args = parser.parse_args()
 
@@ -80,7 +97,11 @@ def main() -> int:
         print(f"unknown suite(s): {', '.join(unknown)}", file=sys.stderr)
         return 2
 
-    results: dict = {}
+    context = {"retrieval": {"root": args.root},
+               "documents": {"corpus": args.corpus},
+               "coverage": {"corpus": args.corpus}}
+    results: dict = {"_meta": {**harness.run_metadata(), "argv": sys.argv[1:],
+                               "started": time.strftime("%Y-%m-%dT%H:%M:%S")}}
     for model in models:
         problem = harness.preflight(model)
         if problem:
@@ -94,10 +115,15 @@ def main() -> int:
             totals = harness.Totals()
             print(f"\n=== {model} / {suite} ===")
             started = time.monotonic()
-            outcome = run_suite(model, args.limit, harness.ask, totals)
+            outcome = run_suite(model, args.limit, harness.ask, totals,
+                                **context.get(suite, {}))
+            if "skipped" in outcome:
+                results[model][suite] = outcome
+                continue
             outcome["wall_seconds"] = time.monotonic() - started
             outcome["calls"] = totals.calls
             outcome["call_failures"] = totals.failures
+            outcome["rounds_exhausted"] = totals.exhausted
             outcome["input_tokens"] = totals.input_tokens
             outcome["output_tokens"] = totals.output_tokens
             outcome["median_call_seconds"] = totals.median_seconds
@@ -106,19 +132,25 @@ def main() -> int:
     print("\n" + "=" * 78)
     print("COMPARISON")
     print("=" * 78)
+    print(f"  ({TOKEN_NOTE})")
     for suite in chosen:
-        rows = [(m, r[suite]) for m, r in results.items() if suite in r]
+        rows = [(m, r[suite]) for m, r in results.items()
+                if m != "_meta" and suite in r]
         if not rows:
             continue
         key, label = HEADLINE[suite]
         print(f"\n{suite}")
-        print(f"  {'model':18} {label:>9} {'n':>4} {'calls':>6} {'fail':>5} "
-              f"{'in tok':>9} {'out tok':>8} {'med s':>7} {'wall s':>7}")
+        print(f"  {'model':18} {label:>9} {'n':>4} {'ans':>4} {'calls':>6} {'fail':>5} "
+              f"{'cut':>4} {'in tok':>9} {'out tok':>8} {'med s':>7} {'wall s':>7}")
         for model, r in rows:
-            print(f"  {model:18} {r[key]:>9.3f} {r['n']:>4} {r['calls']:>6} "
-                  f"{r['call_failures']:>5} {r['input_tokens']:>9,} "
-                  f"{r['output_tokens']:>8,} {r['median_call_seconds']:>7.1f} "
-                  f"{r['wall_seconds']:>7.0f}")
+            if "skipped" in r:
+                print(f"  {model:18} SKIPPED - {r['skipped']}")
+                continue
+            print(f"  {model:18} {r[key]:>9.3f} {r['n']:>4} {r['answered']:>4} "
+                  f"{r['calls']:>6} {r['call_failures']:>5} {r['rounds_exhausted']:>4} "
+                  f"{r['input_tokens']:>9,} {r['output_tokens']:>8,} "
+                  f"{r['median_call_seconds']:>7.1f} {r['wall_seconds']:>7.0f}")
+        rows = [(m, r) for m, r in rows if "skipped" not in r]
         if suite == "humaneval":
             print()
             print(baselines.table())

@@ -45,14 +45,21 @@ def problems(limit: int | None = None) -> list[dict]:
     return rows[:limit] if limit else rows
 
 
-_FENCE = re.compile(r"```(?:python)?\s*(.*?)```", re.S)
+_FENCE = re.compile(r"```(?:[\w+-]*[^\S\n]*\n)?(.*?)```", re.S)
 
 
-def extract_code(text: str) -> str:
-    """The code a model meant to give, whatever it wrapped it in."""
+def extract_code(text: str, entry_point: str = "") -> str:
+    """The code a model meant to give, whatever it wrapped it in.
+
+    With several fenced blocks, the one that defines the target wins, and the longest
+    only when none does: a reply that ends with a long block of example calls or tests
+    used to have those run as the answer. Any language tag is dropped - ```py and
+    ```python3 used to leave "py" or "3" as the first line of the program.
+    """
     fenced = _FENCE.findall(text or "")
     if fenced:
-        return max(fenced, key=len).strip()
+        defining = [b for b in fenced if entry_point and f"def {entry_point}" in b]
+        return max(defining or fenced, key=len).strip()
     return (text or "").strip()
 
 
@@ -89,20 +96,27 @@ def passes(problem: dict, code: str, timeout: int = 15) -> tuple[bool, str]:
 
 
 def run(model: str, limit: int | None, ask, totals, log=print) -> dict:
+    import harness
+
     rows = problems(limit)
-    solved, failures = 0, []
+    cases = []
     for index, problem in enumerate(rows, 1):
         reply = ask(model, PROMPT.format(prompt=problem["prompt"]), system=SYSTEM)
         totals.add(reply)
         if not reply.ok:
-            failures.append((problem["task_id"], f"call failed: {reply.error[:80]}"))
+            cases.append(harness.record(reply, task_id=problem["task_id"]))
             log(f"  [{index}/{len(rows)}] {problem['task_id']:16} CALL FAILED")
             continue
-        ok, why = passes(problem, extract_code(reply.text))
-        solved += ok
-        if not ok:
-            failures.append((problem["task_id"], why))
+        ok, why = passes(problem, extract_code(reply.text, problem["entry_point"]))
+        cases.append(harness.record(reply, task_id=problem["task_id"], passed=ok, why=why))
         log(f"  [{index}/{len(rows)}] {problem['task_id']:16} "
             f"{'pass' if ok else 'FAIL'}  {reply.seconds:5.1f}s  {'' if ok else why[:60]}")
-    return {"suite": "humaneval", "n": len(rows), "solved": solved,
-            "pass_at_1": solved / max(1, len(rows)), "failures": failures}
+    # pass@1 over the problems the model was asked. A call that failed never reached the
+    # model, so it is reported as a call failure rather than as a wrong answer.
+    scored = harness.answered(cases)
+    solved = sum(c["passed"] for c in scored)
+    return {"suite": "humaneval", "n": len(rows), "answered": len(scored), "solved": solved,
+            "pass_at_1": solved / max(1, len(scored)),
+            "failures": [(c["task_id"], c.get("why") or c["error"][:80])
+                         for c in cases if not c.get("passed")],
+            "cases": cases}

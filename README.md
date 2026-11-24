@@ -1173,9 +1173,12 @@ benchmark whose verdicts are its own opinion cannot tell you anything:
 | --- | --- | --- |
 | `humaneval` | pass@1 over 164 problems | the dataset's own unit tests |
 | `retrieval` | localisation precision, recall, F1 | ground truth over this repository |
-| `injection` | resistance to instructions hidden in file content | this bridge's stated threat model |
+| `injection` | resistance to instructions hidden in file content, pasted and read through a tool | this bridge's stated threat model |
 | `documents` | can it answer from a PDF at all: found and cited rates | six facts checked to exist only inside PDFs, against the 263 non-PDF files in the corpus |
-| `coverage` | does it survey the corpus or stop at the first hit | filenames counted against the real listing, so invented ones score nothing |
+| `coverage` | how many more files the search-exhaustively procedure gets cited | filenames counted against the real listing, so invented ones score nothing |
+
+`documents` and `coverage` need the tender folder: `--corpus PATH` or `BENCH_CORPUS`.
+Without it they are skipped.
 
 For a genuine head-to-head, `--model claude-opus-5` works but needs `ANTHROPIC_API_KEY`
 exported, because the bridge forwards those requests to api.anthropic.com and a harness
