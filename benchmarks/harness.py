@@ -90,8 +90,9 @@ FILE_TOOLS = [
     _schema("Read", "Read a file from the filesystem.",
             {"file_path": {"type": "string"}}, ["file_path"]),
     _schema("Glob", "List files under a directory that match a glob pattern, such as "
-            "**/*.py.", {"pattern": {"type": "string"}, "path": {"type": "string"}},
-            ["pattern"]),
+            "**/*.py. The pattern is matched against each path relative to the directory "
+            "and against the file name alone, so *.py finds .py files at any depth.",
+            {"pattern": {"type": "string"}, "path": {"type": "string"}}, ["pattern"]),
     _schema("Grep", "Search file contents under a directory for a regular expression. "
             "Returns path:line: text for each match.",
             {"pattern": {"type": "string"}, "path": {"type": "string"}}, ["pattern"]),
@@ -129,7 +130,9 @@ def _glob(arguments: dict, root: str | None) -> str:
         return "That path is outside the folder this task is about."
     pattern = arguments.get("pattern") or "*"
     # fnmatch's * crosses "/", so **/*.py already reaches every depth except the top;
-    # the stripped form covers that.
+    # the stripped form covers that. Matching the bare file name as well is deliberate:
+    # a model that asks for *.py means every Python file, not only those at the top,
+    # and the schema says so.
     flat = pattern[3:] if pattern.startswith("**/") else pattern
     hits = [p for p in _walk(base)
             if fnmatch.fnmatch(os.path.relpath(p, base), pattern)

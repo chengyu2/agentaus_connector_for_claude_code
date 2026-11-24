@@ -45,7 +45,7 @@ def problems(limit: int | None = None) -> list[dict]:
     return rows[:limit] if limit else rows
 
 
-_FENCE = re.compile(r"```(?:[\w+-]*[^\S\n]*\n)?(.*?)```", re.S)
+_FENCE = re.compile(r"```(?:[\w.+-]*[^\S\n]*\n)?(.*?)```", re.S)
 
 
 def extract_code(text: str, entry_point: str = "") -> str:
@@ -53,8 +53,9 @@ def extract_code(text: str, entry_point: str = "") -> str:
 
     With several fenced blocks, the one that defines the target wins, and the longest
     only when none does: a reply that ends with a long block of example calls or tests
-    used to have those run as the answer. Any language tag is dropped - ```py and
-    ```python3 used to leave "py" or "3" as the first line of the program.
+    used to have those run as the answer. Any language tag is dropped - ```py,
+    ```python3 and ```python3.12 used to leave part of the tag as the first line of the
+    program.
     """
     fenced = _FENCE.findall(text or "")
     if fenced:
