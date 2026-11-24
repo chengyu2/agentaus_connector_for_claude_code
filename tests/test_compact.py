@@ -58,6 +58,16 @@ class _Counter:
 
 
 class TestSplit(unittest.TestCase):
+    def test_an_image_is_costed_as_its_note(self):
+        """One recent screenshot at its base64 size used to overflow keep_tokens and push
+        nearly the whole conversation into the head; Agentaus only ever receives its note."""
+        image = {"type": "image", "source": {"type": "base64", "data": "iVBORw0KGgo" + "A" * 800000}}
+        messages = convo(12)
+        messages[-3] = {"role": "user", "content": [image, {"type": "text", "text": "see this"}]}
+        _, tail = split_head_tail(messages, 20000)
+
+        self.assertGreater(len(tail), 3, "the image message overflowed the tail on its own")
+
     def test_newest_message_is_always_kept(self):
         messages = convo(20)
         _, tail = split_head_tail(messages, 500)
@@ -136,6 +146,20 @@ class TestRendering(unittest.TestCase):
         self.assertIn("Edit", text)
         self.assertIn("/src/server.py", text, "file paths must survive into the summary input")
         self.assertIn("patched", text)
+
+    def test_images_reach_the_summary_as_their_note_not_base64(self):
+        """The summary must still say the model never saw the image, and carry no base64."""
+        image = {"type": "image", "source": {"type": "base64", "data": "iVBORw0KGgo" + "A" * 4000}}
+        text = render_for_summary([
+            {"role": "user", "content": [image, {"type": "text", "text": "what is this?"}]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/a.png"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [image]}]},
+        ])
+
+        self.assertEqual(text.count("Image omitted"), 2)
+        self.assertNotIn("iVBORw0KGgo", text)
 
 
 class TestCompaction(unittest.TestCase):

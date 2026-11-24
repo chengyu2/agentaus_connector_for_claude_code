@@ -90,6 +90,7 @@ from .translate import (
     inject_bridge_tools,
     estimate_request_tokens,
     estimate_tokens,
+    has_unseen,
     raw_token_count,
     sse,
     trim_messages_to_fit,
@@ -3449,6 +3450,7 @@ async def _agentaus_event_stream(
                 answer_so_far,
                 tools_offered=bool(known),
                 called_a_tool=bool(mine or theirs),
+                answers_an_image=has_unseen((original.get("messages") or [])[-1:]),
             )
         ):
             async def classify() -> str:

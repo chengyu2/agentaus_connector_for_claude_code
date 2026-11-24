@@ -19,6 +19,8 @@ import json
 import re
 from typing import Any
 
+from .translate import content_text, has_unseen
+
 # Fields worth showing for a call, most identifying first. A `Read` is identified by its
 # path and a `Bash` by its command; showing the whole input instead would bury that in
 # JSON and cost tokens the ledger cannot afford to spend.
@@ -143,6 +145,9 @@ def _result_text(block: dict) -> str:
     content = block.get("content")
     if isinstance(content, str):
         return content
+    if has_unseen(content):
+        # The grounding check reads this as evidence: an image is its note, never base64.
+        return content_text(content)
     if isinstance(content, list):
         parts = [
             b.get("text", "")

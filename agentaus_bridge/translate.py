@@ -46,8 +46,67 @@ def _map_tool_choice(choice: Any) -> Any:
     return "auto"
 
 
+# Agentaus has no image input: the API drops image parts before the model sees them.
+# Measured: told nothing, it guessed - "two chess pieces" for a picture of four dice, from
+# the file name - and handed a screenshot tool's caption with the image silently gone, it
+# invented the text on screen. So every image says, in its own place, that it never
+# arrived, and the system prompt says so once for images it only hears about.
+NO_VISION_SYSTEM = (
+    "You cannot see images. The Agentaus API accepts text only, so no image, screenshot or "
+    "picture ever reaches you - attached, returned by a tool, or linked by a URL or file "
+    "path. Never describe or guess what an image shows, from its name or anything else. "
+    "Say you cannot view it, and ask for a description or the text it contains."
+)
+
+
+def unseen_note(kind: str) -> str:
+    """What stands in for an image or document block the model cannot receive."""
+    if kind == "document":
+        return ("[Document omitted: you cannot open attached documents, so this one never "
+                "reached you. Do not guess its contents; ask for the text you need.]")
+    return ("[Image omitted: you cannot see images, so this image never reached you. Do not "
+            "describe or guess what it shows; say you cannot view it, and ask for a "
+            "description or the text it contains.]")
+
+
+def _readable_document(block: dict) -> bool:
+    """A document whose source is plain text: Agentaus can read that, so it is not unseen."""
+    source = block.get("source")
+    return (block.get("type") == "document" and isinstance(source, dict)
+            and source.get("type") == "text" and isinstance(source.get("data"), str))
+
+
+def _is_unseen(block: dict) -> bool:
+    return block.get("type") == "image" or (
+        block.get("type") == "document" and not _readable_document(block))
+
+
+def attachment_text(block: dict) -> str:
+    """An image or document block as Agentaus receives it: a plain-text document's own
+    text, and anything else as the note saying it never arrived."""
+    if _readable_document(block):
+        title = block.get("title")
+        return (f"[Document: {title}]\n" if title else "") + block["source"]["data"]
+    return unseen_note(block.get("type", "image"))
+
+
+def has_unseen(content: Any) -> bool:
+    """Whether messages, content or a block hold an image or unreadable document, at any
+    depth - inside a tool_result, a search_result or any other container."""
+    if isinstance(content, list):
+        return any(has_unseen(block) for block in content)
+    if isinstance(content, dict):
+        return _is_unseen(content) or has_unseen(content.get("content"))
+    return False
+
+
 def _flatten_text(content: Any) -> str:
-    """Anthropic content may be a plain string or a list of typed blocks."""
+    """Anthropic content may be a plain string or a list of typed blocks.
+
+    Descends into any block that holds content of its own - a tool_result, a
+    search_result - so an image anywhere is replaced by its note, the same blocks
+    has_unseen finds.
+    """
     if content is None:
         return ""
     if isinstance(content, str):
@@ -60,12 +119,18 @@ def _flatten_text(content: Any) -> str:
             elif isinstance(block, dict):
                 if block.get("type") == "text":
                     parts.append(block.get("text", ""))
-                elif block.get("type") == "tool_result":
-                    parts.append(_flatten_text(block.get("content")))
+                elif block.get("type") in ("image", "document"):
+                    parts.append(attachment_text(block))
+                elif isinstance(block.get("content"), (list, str)):
+                    parts.append(_flatten_text(block["content"]))
         return "\n".join(p for p in parts if p)
     if isinstance(content, dict):
         return _flatten_text([content])
     return str(content)
+
+
+# For the bridge's other readers of conversation content: compaction and distillation.
+content_text = _flatten_text
 
 
 def _system_to_text(system: Any) -> str:
@@ -90,7 +155,9 @@ def _tool_result_payload(block: dict, tool_name: str = "") -> str:
     content = block.get("content")
     text = _flatten_text(content)
     if not text and isinstance(content, list):
-        # Non-text results (e.g. an image from a screenshot tool) still need a body.
+        # Other non-text results still need a body. Images never get here: each one
+        # already became its note, never its base64 (measured: a PNG sent as 5,000
+        # characters of base64 was called "corrupt" every time).
         text = json.dumps(content)[:8000]
     if not text:
         text = "(no output)"
@@ -99,6 +166,16 @@ def _tool_result_payload(block: dict, tool_name: str = "") -> str:
         return (
             prompt_style.data("tool_error", text, tool=tool_name or "unknown") + "\n"
             f"That call failed. Do not treat its output as an answer."
+        )
+    if has_unseen(content):
+        # "Use it to answer now, never ask for it" turned a missing screenshot into
+        # invented on-screen text. Reading the same file again cannot help either.
+        return (
+            prompt_style.data("tool_result", text, tool=tool_name or "unknown") + "\n"
+            f"The content above is the real output of your own {tool_name or 'tool'} call. "
+            f"The image or document in it was not included, because you cannot see images, "
+            f"and calling the tool again will not change that. Do not describe or guess "
+            f"what it shows: use any text above, and tell the user you cannot view the image."
         )
     return (
         prompt_style.data("tool_result", text, tool=tool_name or "unknown") + "\n"
@@ -155,6 +232,20 @@ def system_notes(body: dict) -> list:
     return notes
 
 
+def _with_no_vision_line(system_text: str, messages: Any) -> str:
+    """The system prompt with NO_VISION_SYSTEM appended.
+
+    Appended whenever there is a system prompt, so the model knows before it meets an
+    image it only hears about (a URL, a path). Also when there is none but the request
+    holds an image - which creates a system message, and so sets
+    system_prompt_overwrite and replaces Agentaus's own persona for that request. Claude
+    Code always sends a system prompt, so in practice that second case is other clients.
+    """
+    if system_text or has_unseen(messages):
+        return f"{system_text}\n\n{NO_VISION_SYSTEM}".strip()
+    return system_text
+
+
 def anthropic_request_to_agentaus(
     body: dict,
     *,
@@ -171,8 +262,9 @@ def anthropic_request_to_agentaus(
     # finished task replied to with "I have not read the Claude Docs workflow you
     # shared". They are context, so they join the system prompt, and the turn always
     # ends on what the user actually said.
-    system_text = "\n\n".join(t for t in [_system_to_text(body.get("system"))]
-                               + system_notes(body) if t)
+    system_text = _with_no_vision_line(
+        "\n\n".join(t for t in [_system_to_text(body.get("system"))] + system_notes(body) if t),
+        body.get("messages"))
     if system_text:
         messages.append({"role": "system", "content": system_text})
 
@@ -222,9 +314,8 @@ def anthropic_request_to_agentaus(
             elif btype == "tool_result":
                 pending_tool_results.append(block)
             elif btype in ("image", "document"):
-                # Agentaus accepts text only; describe the attachment instead of dropping it.
-                label = "image" if btype == "image" else "document"
-                text_parts.append(f"[{label} attachment omitted: the Agentaus API accepts text input only]")
+                # Agentaus accepts text only; say so where the attachment was.
+                text_parts.append(attachment_text(block))
             elif btype == "thinking":
                 # Reasoning blocks from a previous Claude turn: not replayable upstream.
                 continue
@@ -380,9 +471,25 @@ def raw_token_count(text: str) -> int:
     return count_tokens(text)
 
 
+def as_sent(value: Any) -> Any:
+    """`value` with each image or document block as the note that replaces it upstream."""
+    if isinstance(value, list):
+        return [as_sent(item) for item in value]
+    if isinstance(value, dict):
+        if value.get("type") in ("image", "document"):
+            return {"type": "text", "text": attachment_text(value)}
+        return {k: as_sent(v) for k, v in value.items()}
+    return value
+
+
 def estimate_request_tokens(body: dict) -> int:
+    # Images counted as the note Agentaus receives, not their base64: one screenshot's
+    # base64 alone can estimate past the whole 131k window and set off compaction.
+    messages = body.get("messages")
     blob = json.dumps(
-        {"s": body.get("system"), "m": body.get("messages"), "t": body.get("tools")},
+        {"s": body.get("system"),
+         "m": as_sent(messages) if has_unseen(messages) else messages,
+         "t": body.get("tools")},
         default=str,
     )
     return estimate_tokens(blob)

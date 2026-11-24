@@ -14,10 +14,12 @@ from xml_style import setUpModule, tearDownModule  # noqa: E402,F401
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agentaus_bridge.translate import (  # noqa: E402
+    NO_VISION_SYSTEM,
     AnthropicStreamBuilder,
     ToolCallAccumulator,
     agentaus_response_to_anthropic,
     anthropic_request_to_agentaus,
+    estimate_request_tokens,
 )
 
 
@@ -39,7 +41,8 @@ class TestRequestTranslation(unittest.TestCase):
                 "messages": [{"role": "user", "content": "hi"}],
             }
         )
-        self.assertEqual(result["messages"][0], {"role": "system", "content": "You are a coding agent."})
+        self.assertEqual(result["messages"][0],
+                         {"role": "system", "content": "You are a coding agent.\n\n" + NO_VISION_SYSTEM})
         # Without this flag Agentaus prepends its own persona.
         self.assertTrue(result["system_prompt_overwrite"])
 
@@ -151,9 +154,13 @@ class TestRequestTranslation(unittest.TestCase):
                 ]
             }
         )
-        body = result["messages"][0]["content"]
-        self.assertIn("image attachment omitted", body)
+        body = result["messages"][-1]["content"]
+        self.assertIn("Image omitted: you cannot see images", body)
         self.assertIn("what is this?", body)
+        # Even with no system prompt of its own, the request says the model has no vision.
+        # That creates a system message, so Agentaus's own persona is replaced too.
+        self.assertEqual(result["messages"][0], {"role": "system", "content": NO_VISION_SYSTEM})
+        self.assertTrue(result["system_prompt_overwrite"])
 
     def test_thinking_blocks_are_dropped(self):
         result = anthropic_request_to_agentaus(
@@ -176,6 +183,84 @@ class TestRequestTranslation(unittest.TestCase):
             {"messages": [{"role": "assistant", "content": []}, {"role": "user", "content": "hi"}]}
         )
         self.assertEqual([m["role"] for m in result["messages"]], ["user"])
+
+
+IMAGE = {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                     "data": "iVBORw0KGgo" + "A" * 50000}}
+
+
+def _read_result(content):
+    """A Read call whose tool_result carries `content`, translated."""
+    return anthropic_request_to_agentaus({
+        "system": "You are a coding agent.",
+        "messages": [
+            {"role": "user", "content": "What does /tmp/shot.png say?"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Read",
+                 "input": {"file_path": "/tmp/shot.png"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": content}]},
+        ],
+    })
+
+
+class TestNoVision(unittest.TestCase):
+    """Agentaus cannot see images, and every path an image takes must say so."""
+
+    def test_an_image_only_tool_result_is_a_note_not_base64(self):
+        tool = _read_result([IMAGE])["messages"][-1]
+        self.assertEqual(tool["role"], "tool")
+        self.assertIn("Image omitted: you cannot see images", tool["content"])
+        self.assertNotIn("iVBORw0KGgo", tool["content"])
+        self.assertIn("calling the tool again will not change that", tool["content"])
+        self.assertNotIn("never ask for it", tool["content"])
+
+    def test_a_caption_with_an_image_keeps_the_caption_and_notes_the_image(self):
+        tool = _read_result([{"type": "text", "text": "Screenshot captured."}, IMAGE])["messages"][-1]
+        self.assertIn("Screenshot captured.", tool["content"])
+        self.assertIn("Image omitted", tool["content"])
+        self.assertNotIn("never ask for it", tool["content"])
+
+    def test_an_image_nested_in_another_container_gets_its_note(self):
+        """has_unseen finds an image at any depth, so the note must appear at any depth
+        too - otherwise the empty text falls back to sending the base64."""
+        nested = [{"type": "search_result", "source": "https://x", "title": "x",
+                   "content": [{"type": "text", "text": "a caption"}, IMAGE]}]
+        tool = _read_result(nested)["messages"][-1]
+        self.assertIn("a caption", tool["content"])
+        self.assertIn("Image omitted", tool["content"])
+        self.assertNotIn("iVBORw0KGgo", tool["content"])
+
+    def test_a_plain_text_document_is_passed_through(self):
+        """A text-source document is readable, so it is neither omitted nor 'unseen'."""
+        doc = {"type": "document", "title": "notes.txt",
+               "source": {"type": "text", "media_type": "text/plain", "data": "the launch is on 3 May"}}
+        result = anthropic_request_to_agentaus({"messages": [{"role": "user", "content": [
+            doc, {"type": "text", "text": "when is the launch?"}]}]})
+        body = result["messages"][-1]["content"]
+        self.assertIn("the launch is on 3 May", body)
+        self.assertNotIn("Document omitted", body)
+        self.assertFalse(any(m["role"] == "system" for m in result["messages"]))
+
+    def test_a_text_tool_result_keeps_its_usual_framing(self):
+        tool = _read_result([{"type": "text", "text": "def main(): pass"}])["messages"][-1]
+        self.assertIn("never ask for it", tool["content"])
+        self.assertNotIn("Image omitted", tool["content"])
+
+    def test_every_request_says_the_model_cannot_see_images(self):
+        system = _read_result([{"type": "text", "text": "x"}])["messages"][0]["content"]
+        self.assertIn(NO_VISION_SYSTEM, system)
+
+    def test_a_document_attachment_is_noted_too(self):
+        result = anthropic_request_to_agentaus({"messages": [{"role": "user", "content": [
+            {"type": "document", "source": {"type": "base64", "data": "JVBERi0"}},
+            {"type": "text", "text": "summarise this"}]}]})
+        self.assertIn("Document omitted", result["messages"][-1]["content"])
+
+    def test_an_image_is_estimated_as_its_note_not_its_base64(self):
+        with_image = {"messages": [{"role": "user", "content": [
+            IMAGE, {"type": "text", "text": "what is this?"}]}]}
+        self.assertLess(estimate_request_tokens(with_image), 500)
 
 
 class TestResponseTranslation(unittest.TestCase):
