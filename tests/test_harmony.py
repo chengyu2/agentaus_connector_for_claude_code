@@ -11,9 +11,18 @@ markup was shown to the user as the answer, and the turn was spent.
 """
 
 import logging
+import os
+import sys
 import unittest
+from unittest import mock
 
-from agentaus_bridge import harmony, server
+import httpx  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from agentaus_bridge import harmony, server, throttle  # noqa: E402
+from agentaus_bridge.config import settings  # noqa: E402
 
 logging.getLogger("agentaus-bridge").setLevel(logging.CRITICAL)
 
@@ -106,6 +115,26 @@ class ServerIntegration(unittest.TestCase):
         content = cleaned["choices"][0]["message"]["content"]
         self.assertFalse(content, "markup must not survive into the client's answer")
 
+    def test_the_recovered_calls_are_put_back_into_the_response(self):
+        """The response must carry the calls, not only return them to the caller.
+
+        `_with_coerced_calls` writes name/argument corrections back into
+        `message.tool_calls`, and the translator builds the client's tool_use blocks
+        from it - calls left only in the returned dicts vanish at both, and an answer
+        stripped to nothing then reads as empty and is replaced by the fallback.
+        """
+        data = {"choices": [{"finish_reason": "stop",
+                             "message": {"content": OBSERVED, "tool_calls": None}}]}
+        cleaned, calls = server._recover_harmony_calls(data)
+        self.assertEqual(len(calls), 1)
+        message = cleaned["choices"][0]["message"]
+        [call] = message["tool_calls"]
+        self.assertEqual(call["id"], calls[0]["id"])
+        self.assertEqual(call["type"], "function")
+        self.assertEqual(call["function"]["name"], calls[0]["name"])
+        self.assertEqual(call["function"]["arguments"], calls[0]["arguments"])
+        self.assertEqual(cleaned["choices"][0]["finish_reason"], "tool_calls")
+
     def test_an_ordinary_response_is_returned_unchanged(self):
         data = {"choices": [{"message": {"content": "Plain answer."}}]}
         same, calls = server._recover_harmony_calls(data)
@@ -115,6 +144,99 @@ class ServerIntegration(unittest.TestCase):
     def test_an_empty_response_does_not_raise(self):
         self.assertEqual(server._recover_harmony_calls({})[1], [])
         self.assertEqual(server._recover_harmony_calls({"choices": []})[1], [])
+
+
+class EndToEndNonStreaming(unittest.TestCase):
+    """A recovered call must survive the whole buffered turn, not just the helper.
+
+    The helper tests prove the markup is parsed out of the text; this runs the handler
+    itself, as the live failure arrived: Agentaus answered 200 with a client tool call
+    written as Harmony markup. The client must get a tool_use block for it, corrected
+    in name and arguments, with stop_reason tool_use - not an empty turn replaced by
+    the fallback answer.
+    """
+
+    CALL = ('<|start|>assistant<|channel|>commentary to=functions.read '
+            '<|constrain|>json<|message|>{"file_path": "/a/b.py"}<|call|>')
+
+    BODY = {
+        "model": "agentaus",
+        "max_tokens": 100,
+        "tools": [{"name": "Read", "description": "Read a file.",
+                   "input_schema": {"type": "object",
+                                    "properties": {"file_path": {"type": "string"}},
+                                    "required": ["file_path"]}}],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "Read /a/b.py"}]}],
+        "stream": False,
+    }
+
+    def setUp(self):
+        self.saved = {k: getattr(settings, k) for k in (
+            "agentaus_api_key", "retry_backoff_seconds", "max_retries",
+            "agentaus_thinking", "agentaus_self_review", "agentaus_grounding_check",
+            "agentaus_syntax_check", "agentaus_upstream_concurrency",
+            "agentaus_tool_rounds", "agentaus_correction_rounds")}
+        settings.agentaus_api_key = "test-key"
+        settings.retry_backoff_seconds = 0.01
+        settings.max_retries = 0
+        settings.agentaus_thinking = False
+        settings.agentaus_self_review = False
+        settings.agentaus_grounding_check = False
+        settings.agentaus_syntax_check = False
+        settings.agentaus_upstream_concurrency = 10
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        for k, v in self.saved.items():
+            setattr(settings, k, v)
+        throttle.reset()
+
+    def post(self, responses):
+        """Run the buffered handler against a stand-in upstream that replies in turn."""
+        seen = []
+
+        async def upstream(client, url, *, json_body=None, **_):
+            seen.append(json_body)
+            return httpx.Response(200, json=responses[min(len(seen) - 1, len(responses) - 1)])
+
+        with mock.patch.object(server, "_post_with_retry", upstream), \
+                TestClient(server.app) as client:
+            r = client.post("/v1/messages", json=self.BODY)
+        return r, seen
+
+    def test_a_harmony_text_call_reaches_the_client_as_tool_use(self):
+        upstream = {"choices": [{"index": 0, "finish_reason": "stop",
+                                 "message": {"role": "assistant", "content": self.CALL}}]}
+        r, seen = self.post([upstream])
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(len(seen), 1,
+                         "the recovered call was lost and the empty-answer fallback ran")
+        message = r.json()
+        tool_uses = [b for b in message["content"] if b["type"] == "tool_use"]
+        self.assertEqual(len(tool_uses), 1, message["content"])
+        self.assertEqual(tool_uses[0]["name"], "Read",
+                         "the mangled name `read` must reach the client corrected")
+        self.assertEqual(tool_uses[0]["input"], {"file_path": "/a/b.py"})
+        self.assertEqual(message["stop_reason"], "tool_use")
+        for block in message["content"]:
+            if block["type"] == "text":
+                self.assertNotIn("<|", block["text"], "markup must not be shown as prose")
+
+    def test_a_harmony_bridge_call_still_runs_its_rounds(self):
+        search = ('<|start|>assistant<|channel|>commentary to=functions.agentaus_search '
+                  '<|constrain|>json<|message|>{"query":"gate"}<|call|>')
+        r, seen = self.post([
+            {"choices": [{"index": 0, "finish_reason": "stop",
+                          "message": {"role": "assistant", "content": search}}]},
+            {"choices": [{"index": 0, "finish_reason": "stop",
+                          "message": {"role": "assistant", "content": "Found it in gate.py."}}]},
+        ])
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(len(seen), 2, "the bridge-owned call must run through its round")
+        message = r.json()
+        self.assertEqual([b["type"] for b in message["content"]], ["text"])
+        self.assertEqual(message["content"][0]["text"], "Found it in gate.py.")
+        self.assertEqual(message["stop_reason"], "end_turn")
 
 
 if __name__ == "__main__":

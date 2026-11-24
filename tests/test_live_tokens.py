@@ -307,8 +307,10 @@ class ThePlanStreamsLive(unittest.TestCase):
                  "agentaus_thinking", "agentaus_thinking_visible", "agentaus_live_draft",
                  "agentaus_grounding_check", "agentaus_syntax_check", "agentaus_search",
                  "agentaus_web_search", "agentaus_inventory", "agentaus_zoom",
-                 "agentaus_investigate")
+                 "agentaus_investigate", "agentaus_plan_async")
         self._saved = {n: getattr(settings, n) for n in names}
+        # The blocking planner: the one whose plan streams before the answer call.
+        settings.agentaus_plan_async = False
         settings.agentaus_base_url = stub_server.url(self.stub)
         settings.agentaus_api_key = "test-key"
         settings.agentaus_self_review = False

@@ -64,11 +64,17 @@ class _Style(unittest.TestCase):
     style = "markdown"
 
     def setUp(self):
+        from xml_style import pin_full_prompt
+
         self._saved = settings.agentaus_prompt_style
+        self._saved_prompt = pin_full_prompt()
         settings.agentaus_prompt_style = self.style
 
     def tearDown(self):
+        from xml_style import restore
+
         settings.agentaus_prompt_style = self._saved
+        restore(self._saved_prompt)
 
 
 class TheDefaultIsMarkdown(unittest.TestCase):

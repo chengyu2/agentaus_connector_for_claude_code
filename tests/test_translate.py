@@ -370,6 +370,56 @@ class TestStreamBuilder(unittest.TestCase):
         self.assertEqual("".join(d["delta"]["partial_json"] for d in deltas), '{"path":"a.py"}')
         self.assertEqual(parsed[-2]["delta"]["stop_reason"], "tool_use")
 
+    def test_tool_block_beats_generic_stop_finish(self):
+        # A recovered tool call can arrive inside a stream Agentaus still finishes
+        # with the generic "stop"; the emitted tool_use blocks must not end up
+        # paired with end_turn.
+        builder = AnthropicStreamBuilder("agentaus", chunk_chars=0)
+        blob = (
+            builder.start()
+            + builder.tool_use("call_1", "Read", '{"path":"a.py"}')
+            + builder.finish("stop", None)
+        )
+        parsed = events(blob)
+        self.assertTrue(any(
+            e["type"] == "content_block_start" and e["content_block"]["type"] == "tool_use"
+            for e in parsed
+        ))
+        self.assertEqual(parsed[-2]["delta"]["stop_reason"], "tool_use")
+
+    def test_tool_block_beats_stop_finish_even_after_text(self):
+        builder = AnthropicStreamBuilder("agentaus", chunk_chars=0)
+        blob = (
+            builder.start()
+            + builder.text("let me look")
+            + builder.tool_use("call_1", "Bash", '{"cmd":"ls"}')
+            + builder.finish("stop", None)
+        )
+        parsed = events(blob)
+        self.assertEqual(parsed[-2]["delta"]["stop_reason"], "tool_use")
+
+    def test_text_stream_still_ends_end_turn(self):
+        builder = AnthropicStreamBuilder("agentaus", chunk_chars=0)
+        blob = builder.start() + builder.text("hello") + builder.finish("stop", None)
+        parsed = events(blob)
+        self.assertEqual(parsed[-2]["delta"]["stop_reason"], "end_turn")
+
+    def test_max_tokens_finish_still_wins_for_text(self):
+        builder = AnthropicStreamBuilder("agentaus", chunk_chars=0)
+        blob = builder.start() + builder.text("ab") + builder.finish("length", None)
+        parsed = events(blob)
+        self.assertEqual(parsed[-2]["delta"]["stop_reason"], "max_tokens")
+
+    def test_tool_block_keeps_tool_use_for_length_finish(self):
+        builder = AnthropicStreamBuilder("agentaus", chunk_chars=0)
+        blob = (
+            builder.start()
+            + builder.tool_use("call_1", "Read", '{"path":"a.py"}')
+            + builder.finish("length", None)
+        )
+        parsed = events(blob)
+        self.assertEqual(parsed[-2]["delta"]["stop_reason"], "tool_use")
+
     def test_ping_event_shape(self):
         self.assertEqual(events(AnthropicStreamBuilder.ping()), [{"type": "ping"}])
 
