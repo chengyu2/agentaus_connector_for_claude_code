@@ -8,7 +8,9 @@ Measured September 2026 with the Claude Code binary the VS Code extension ships 
 driven headless in a clean VS Code-equivalent session - fresh directory outside any
 repository, no memory, no inherited environment - once per arm. Tuned on dev halves,
 scored once on held-out halves; graded by tests, answer keys and independently computed
-reference numbers, with R scripts re-run from scratch. Harness in `abbench/`.
+reference numbers, with R scripts re-run from scratch. Harness in `abbench/` - the
+environment variables it needs on a new machine are documented in
+[`abbench/README.md`](../../abbench/README.md).
 
 | Suite | Agentaus, bridge before | Agentaus, this bridge | Claude Opus 5 | Median time, Agentaus / Opus |
 | --- | --- | --- | --- | --- |
