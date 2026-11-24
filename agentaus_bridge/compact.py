@@ -629,6 +629,8 @@ class ConversationCompactor:
 
         # Summary absent or still too large: drop the head outright. Worse, but it
         # keeps the turn alive, which is the whole point.
+        # Trim back to the compaction trigger (not the hard limit) so the next 3-5
+        # exchanges do not immediately re-trigger the same slow cycle.
         kept = list(tail)
         dropped = len(head)
         # `total(kept)` re-serialises the whole surviving body on every iteration,
@@ -647,8 +649,9 @@ class ConversationCompactor:
             return (estimate_tokens(body_head + ", ".join(frags[start:]) + body_tail)
                     + estimate_tokens("") + reserve)
 
+        trim_target = trigger  # == int(limit * threshold), e.g. 80% of 131k
         start = len(head)
-        while tail_total(start) > limit:
+        while tail_total(start) > trim_target:
             # Drop a whole turn at a time. Popping message by message is what lets the
             # list end up opening on a `tool_result` whose `tool_use` has just been
             # dropped, so advance to the next clean turn or stop.
