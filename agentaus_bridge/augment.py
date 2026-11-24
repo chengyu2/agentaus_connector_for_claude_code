@@ -909,7 +909,8 @@ def guidance_for(body: dict, *, covered_by_skill: tuple = (), routing: bool = Tr
     if ran_an_analysis(body) and "analyse-data" not in covered_by_skill:
         notes += ANALYSIS_GUIDANCE
     routed = routing_section(body) if routing else ""
-    return prompt_style.headings(notes) + routed + tool_selection(body)
+    return (prompt_style.headings(notes) + write_now_note(body, working_directory_of(body))
+            + routed + tool_selection(body))
 
 
 def with_skill_descriptions(body: dict) -> tuple[dict, int]:
@@ -1278,7 +1279,12 @@ def read_turn_verdict(verdict: str) -> str:
 # call, and the user had to type "yep look at it and continue".
 _ANNOUNCED_STEP = re.compile(
     r"^(?:(?:ok(?:ay)?|now|next|first|so|then|alright|right)[,:]?\s+)*"
-    r"(?!let\s+me\s+know\b)(?:let\s+me|let's|i'll|i\s+will|i'm\s+going\s+to|i\s+am\s+going\s+to|i\s+need\s+to|"
+    r"(?!let\s+me\s+know\b)"
+    # A closing line names no step: "I'll be here if you need anything", "I'll leave the
+    # rest to you", "We'll see how it goes".
+    r"(?!(?:i'll|i\s+will|we'll|we\s+will)\s+(?:be\s+(?:here|around|happy|glad|available)|"
+    r"leave\b|see\s+how|let\s+you\b|keep\s+(?:an\s+eye|you\s+posted)))"
+    r"(?:let\s+me|let's|i'll|i\s+will|i'm\s+going\s+to|i\s+am\s+going\s+to|i\s+need\s+to|"
     r"we'll|we\s+will|we\s+need\s+to|we're\s+going\s+to|time\s+to)\b",
     re.I,
 )
@@ -1295,6 +1301,105 @@ def announces_a_step(answer: str) -> bool:
     text = text.replace("\u2019", "'")
     last = re.split(r"(?<=[.!:])\s+|\n+", text)[-1].strip(" *_`>-#")
     return len(last) <= 300 and bool(_ANNOUNCED_STEP.match(last))
+
+
+# A file the request tells the agent to write: a writing verb, then within the same
+# sentence a file name with an extension. Measured (work experience A/B): asked to "Write
+# `instructions.md`" and "Write `drafts.md`", Agentaus spent 36 turns, wrote neither, and
+# ended on a report the judge read as an answer - one of the two needed no email at all.
+_WRITE_VERB = re.compile(
+    r"\b(?:write|create|save|produce|generate|draft|output|export)\b"
+    r"(?:(?:\s+(?:it|them|this|that|the|a|an|your|out|up|file|files|a\s+file\s+(?:called|named)))*"
+    r"|(?:\s+[\w-]+){0,4}?\s+(?:to|into|as|in)(?:\s+(?:a\s+)?(?:file\s+)?(?:called|named))?)"
+    r"\s*[:\-]?\s*[`'\"]?((?:~|\.{1,2})?/?[\w.-]+(?:/[\w.-]+)*\.[A-Za-z][A-Za-z0-9]{0,4})\b[`'\"]?",
+    re.I,
+)
+
+
+def missing_deliverables(request: str, cwd: str | None) -> list[tuple[str, str]]:
+    """(name as the request wrote it, path looked at) for each file the request says to
+    write that does not exist. Structural: no judge call. Only names that follow a writing
+    verb - "read `README.md`" names an input, not an output."""
+    if not request or not cwd:
+        return []
+    text = _REMINDERS.sub("", request)
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    out, seen = [], set()
+    for name in _WRITE_VERB.findall(text):
+        if name in seen or re.match(r"^(?:e\.g|i\.e|etc)\.", name, re.I):
+            continue
+        seen.add(name)
+        path = os.path.expanduser(name)
+        if not os.path.isabs(path):
+            path = os.path.join(cwd, path)
+        if not os.path.exists(path):
+            out.append((name, os.path.normpath(path)))
+    return out
+
+
+MISSING_DELIVERABLES_CORRECTION = """\
+<correction>
+## Not done yet
+
+The request asks you to write these files, and they do not exist:
+
+{files}
+
+## What to do now
+
+- Call `Write` for each one now, in this reply.
+- If part of what belongs in a file could not be found or done, still write the file:
+  put in everything you have, and say inside it what is missing and why.
+- Do not reply in text until every file exists.
+- If the request does not actually ask you to write one of them, say so in one line and
+  finish.
+</correction>
+"""
+
+
+# Tool calls since the user's message after which a request whose named files are still
+# missing is told to write them. Measured (work experience A/B, run 2): Agentaus found every
+# email it needed by call 33, said "I have the email context I need" five times, kept
+# reading, and the 40-minute limit came with neither file written.
+WRITE_NOW_AFTER_CALLS = 15
+
+
+def _since_last_request(body: dict) -> tuple[str, int]:
+    """The newest thing the user typed, and how many tool calls have run since."""
+    said, calls = "", 0
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content or []
+        if message.get("role") == "assistant":
+            calls += sum(1 for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use")
+            continue
+        if message.get("role") != "user":
+            continue
+        for b in blocks:
+            if not isinstance(b, dict) or b.get("type") != "text":
+                continue
+            typed = _REMINDERS.sub("", b.get("text") or "").strip()
+            if typed and "<task-notification>" not in typed and not typed.startswith(
+                    ("Base directory for this skill", "Launching skill")):
+                said, calls = typed, 0
+    return said, calls
+
+
+def write_now_note(body: dict, cwd: str | None) -> str:
+    """Guidance for a main loop that has run many calls with the requested files unwritten."""
+    said, calls = _since_last_request(body)
+    if calls < WRITE_NOW_AFTER_CALLS:
+        return ""
+    missing = missing_deliverables(said, cwd)
+    if not missing:
+        return ""
+    files = "\n".join(f"- `{name}`" for name, _ in missing)
+    return (f"\n## Write the requested files now\n\n{calls} tool calls have run since the "
+            f"request, and these files it asks for do not exist yet:\n\n{files}\n\n"
+            "- Stop gathering. What you have read is enough to write a first version.\n"
+            "- Call `Write` for each file in your next reply.\n"
+            "- Where something is still unknown, write the rest and say inside the file what "
+            "is missing.\n- You can improve a file after it exists.\n")
 
 
 def read_refusal_verdict(verdict: str) -> bool:

@@ -95,6 +95,9 @@ class WorkflowIsOfferedWhenTheUserOptsIn(unittest.TestCase):
                             "without explicit opt-in.)")
         self.assertNotIn("Workflow", self.offered(summary))
         self.assertFalse(augment.workflow_opted_in(self.body("do it without ultracode")))
+        # Stripping the "off" mention leaves a real opt-in standing.
+        self.assertTrue(augment.workflow_opted_in(self.body(
+            "ultracode is off but let's enable ultracode for this task")))
 
     def test_the_ultracode_reminder_is_an_opt_in(self):
         body = self.body('<system-reminder>The user included the keyword "ultracode"</system-reminder>do it')
@@ -444,14 +447,65 @@ class AnAnnouncedStepIsAStall(unittest.TestCase):
     def test_announcements_are_stalls(self):
         for text in ["Both greps are empty. Let me look at what's actually inside the uv tools dir.",
                      "We will apply multiple Edit calls.", "Next, I'll run the tests:",
+                     "Let me look at the folder...", "Next, I'll run the tests \u2014",
+                     "Let me think about that.",
                      "Fixed it.\n\n**Now let me verify the services load.**"]:
             self.assertTrue(augment.announces_a_step(text), text)
 
     def test_results_and_questions_are_not(self):
         for text in ["Done. The file is written.", "Let me know if you want more.",
                      "I'll summarise:\n\nThe config is at ~/.config/devine.", "Shall I move them?",
-                     "Let me run:\n```bash\nls\n```\nIt printed three files."]:
+                     "Let me run:\n```bash\nls\n```\nIt printed three files.",
+                     "Done, the file is written. I'll be here if you need anything else.",
+                     "That's everything. I'll leave the rest to you.",
+                     "All fixed. We'll see how it goes in CI."]:
             self.assertFalse(augment.announces_a_step(text), text)
+
+
+class FilesTheRequestNamesMustExist(unittest.TestCase):
+    def test_the_work_experience_request_names_two_files(self):
+        task = ("2. Write `instructions.md`: how a student runs the bridge.\n"
+                "4. Write `drafts.md`: a reply email to each student. Do NOT send any email.")
+        names = [n for n, _ in augment.missing_deliverables(task, "/nowhere")]
+        self.assertEqual(names, ["instructions.md", "drafts.md"])
+
+    def test_inputs_are_not_deliverables(self):
+        for task in ["Read README.md and tell me what it does", "Fix the bug in tools/bank.py",
+                     "look in config.py and write me a summary", "Create the summary, e.g. a table"]:
+            self.assertEqual(augment.missing_deliverables(task, "/nowhere"), [], task)
+
+    def test_a_file_that_exists_is_not_missing(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "answers.json"), "w").close()
+            self.assertEqual(augment.missing_deliverables("write answers to answers.json", d), [])
+            self.assertEqual([n for n, _ in augment.missing_deliverables(
+                "Save the results to out/report.csv", d)], ["out/report.csv"])
+
+
+class AfterManyCallsWriteTheFiles(unittest.TestCase):
+    def body(self, calls, request="Write `instructions.md` for the students."):
+        messages = [user(request)]
+        for i in range(calls):
+            messages += [{"role": "assistant", "content": [
+                             {"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {}}]},
+                         {"role": "user", "content": [
+                             {"type": "tool_result", "tool_use_id": f"t{i}", "content": "ok"}]}]
+        return {"messages": messages}
+
+    def test_no_nudge_while_the_work_is_young(self):
+        self.assertEqual(augment.write_now_note(self.body(3), "/nowhere"), "")
+
+    def test_a_nudge_once_many_calls_ran_and_the_file_is_missing(self):
+        note = augment.write_now_note(self.body(augment.WRITE_NOW_AFTER_CALLS), "/nowhere")
+        self.assertIn("`instructions.md`", note)
+        self.assertIn("Call `Write`", note)
+
+    def test_no_nudge_when_the_file_exists(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "instructions.md"), "w").close()
+            self.assertEqual(augment.write_now_note(self.body(30), d), "")
 
 
 class NothingToGroundAfterALaunch(unittest.TestCase):

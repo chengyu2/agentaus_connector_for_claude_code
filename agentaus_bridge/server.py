@@ -50,7 +50,9 @@ from .augment import (
     CLASSIFY_REFUSAL_INSTRUCTION,
     GROUNDING_INSTRUCTION,
     STRIP_UNGROUNDED_INSTRUCTION,
+    MISSING_DELIVERABLES_CORRECTION,
     announces_a_step,
+    missing_deliverables,
     could_be_a_refusal,
     awaiting_background,
     early_deliverable_writes,
@@ -1863,9 +1865,20 @@ def _tool_calls_made(body: dict) -> int:
 
 
 def _may_reask_stalled(body: dict, *, announced: bool = False) -> bool:
-    """Whether a reply judged stalled may be sent back. `announced`: it plainly says what it
-    does next ("Let me look at..."), so it is a stall whatever the judge would say, and gets
-    the larger per-message budget - a long task can announce every one of its steps."""
+    """Whether a reply judged stalled may be sent back, charging the budget if so.
+
+    Two counters per conversation, both reset by a new message from the user:
+
+    - `used`: re-asks since the model last made progress. Any tool call since the last
+      re-ask resets it, and at `_STALL_REASK_LIMIT` (2) no more are sent. This is what bounds
+      a misfire: a finished answer wrongly re-asked gets no tool call back, so it costs two
+      re-asks at most, whatever the per-message cap.
+    - `total`: re-asks for this user message, capped at `_STALL_REASKS_PER_MESSAGE` (judged
+      by the model) or `_STALL_ANNOUNCED_PER_MESSAGE` (`announced`: a reply that plainly
+      says what it does next, or ends without the files the request names). Only a model
+      that keeps making progress between re-asks reaches these caps - a long task can
+      announce every one of its steps.
+    """
     key = _stall_key(body)
     calls = _tool_calls_made(body)
     said = _last_user_text(body)
@@ -3460,6 +3473,11 @@ async def _agentaus_event_stream(
         answer_so_far = "".join(pending)
         is_refusal = False
         turn_verdict = "answer"
+        # Files the user's request says to write that are still not on disk. A main loop
+        # only: a graph agent's prompt names files the graph writes itself.
+        missing = [] if (mine or theirs or not known or is_subagent_turn(original)
+                         or awaiting_background(original)) else missing_deliverables(
+            _last_user_text(received), working_directory_of(received))
         if (
             corrections < settings.agentaus_correction_rounds
             # Started in the background and said so: the right reply, not a stall.
@@ -3469,7 +3487,11 @@ async def _agentaus_event_stream(
                 tools_offered=bool(known),
                 called_a_tool=bool(mine or theirs),
             )
-        ) and announces_a_step(answer_so_far):
+        ) and (missing or announces_a_step(answer_so_far)):
+            # An announcement is a step not taken, whatever is missing: asking it for the
+            # files at that point pushed a model to write them before it had read anything.
+            if announces_a_step(answer_so_far):
+                missing = []
             # It says what it will do next: a stall on its face, so no judge call to wait on.
             turn_verdict = "stalled"
         elif (
@@ -3504,7 +3526,7 @@ async def _agentaus_event_stream(
                      exc)
 
         if turn_verdict == "stalled" and not _may_reask_stalled(
-                original, announced=announces_a_step(answer_so_far)):
+                original, announced=bool(missing) or announces_a_step(answer_so_far)):
             rlog(logging.WARNING, "judged stalled again, but the re-ask budget for this "
                  "message is spent; forwarding the reply")
             turn_verdict = "answer"
@@ -3513,12 +3535,20 @@ async def _agentaus_event_stream(
             if is_refusal:
                 rlog(logging.WARNING,
                      "model refused to use tools it has; correcting and re-asking")
+            elif missing:
+                rlog(logging.WARNING, "turn ended without the file(s) the request names "
+                     "(%s); asking for them", ", ".join(n for n, _ in missing))
             else:
                 rlog(logging.WARNING,
                      "model announced a step and stopped; asking it to take the step")
             yield progress("re-asking: the reply " + (
-                "declined to use its tools" if is_refusal else "announced a step it did not take"))
-            correction = (REFUSAL_CORRECTION if is_refusal else STALLED_CORRECTION).format()
+                "declined to use its tools" if is_refusal
+                else "left out the file(s) the request asks for" if missing
+                else "announced a step it did not take"))
+            correction = (REFUSAL_CORRECTION.format() if is_refusal
+                          else MISSING_DELIVERABLES_CORRECTION.format(files="\n".join(
+                              f"- `{name}` (looked for `{path}`)" for name, path in missing))
+                          if missing else STALLED_CORRECTION.format())
             payload = {**payload, "messages": list(payload.get("messages") or []) + [
                 {"role": "assistant", "content": "".join(pending)[:2000]},
                 {"role": "user", "content": correction},
