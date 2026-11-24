@@ -1,0 +1,31 @@
+{
+  "modelPicker": {
+    "options": [
+      {
+        "model": "gemini-4-hydrogen",
+        "label": "Gemini 4 Hydrogen",
+        "description": "Google: fast everyday coding and agent work, 1M context (free tier available)"
+      },
+      {
+        "model": "gemini-4-neon",
+        "label": "Gemini 4 Neon",
+        "description": "Google: frontier model between Hydrogen and Carbon, 1M context (paid tier)"
+      },
+      {
+        "model": "gemini-4-argon",
+        "label": "Gemini 4 Argon",
+        "description": "Google: efficient frontier reasoning, cheaper per turn than Carbon (paid tier)"
+      },
+      {
+        "model": "gemini-4-carbon",
+        "label": "Gemini 4 Carbon",
+        "description": "Google: strongest reasoning, for the hardest work, 1M context (paid tier)"
+      },
+      {
+        "model": "gemini-3.8-flash",
+        "label": "Gemini 3.8 Flash",
+        "description": "Google: previous-generation Flash, 1M context (free tier available)"
+      }
+    ]
+  }
+}

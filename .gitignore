@@ -13,3 +13,6 @@ benchmarks/results/
 
 # Installer state (which settings files and services it wrote)
 .install-state.json
+
+# A contributor's personal launchers, notes and logs
+.1Isaac/

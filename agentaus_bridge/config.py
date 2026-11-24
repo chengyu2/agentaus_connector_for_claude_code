@@ -91,6 +91,39 @@ class Settings:
         default_factory=lambda: _bool("BRIDGE_PASSTHROUGH", True)
     )
 
+    # --- Gemini upstream (optional) -----------------------------------------------
+    # A model id starting with GEMINI_MODEL_PREFIX goes to Google's Gemini API, through its
+    # OpenAI-compatible endpoint, instead of to Agentaus or Anthropic. See gemini.py.
+    gemini_api_key: str = field(
+        default_factory=lambda: os.environ.get("GEMINI_API_KEY", "").strip()
+    )
+    gemini_base_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"
+        ).rstrip("/")
+    )
+    gemini_model_prefix: str = field(
+        default_factory=lambda: os.environ.get("GEMINI_MODEL_PREFIX", "gemini-").strip().lower()
+    )
+    # Listed by GET /v1/models for clients that read it. Claude Code's picker ignores ids
+    # without "claude" in them, so it takes its Gemini rows from scripts/gemini-models.json.
+    gemini_models: list[str] = field(
+        default_factory=lambda: _csv(
+            "GEMINI_MODELS",
+            ["gemini-4-hydrogen", "gemini-4-neon", "gemini-4-argon", "gemini-4-carbon",
+             "gemini-3.8-flash"],
+        )
+    )
+    # Upper bound on max_tokens. Each model's own limit is read from the API and wins when lower.
+    gemini_max_output_tokens: int = field(
+        default_factory=lambda: _int("GEMINI_MAX_OUTPUT_TOKENS", 65536)
+    )
+    # low, medium or high, sent as reasoning_effort on every Gemini turn. Empty follows the
+    # effort Claude Code asks for, or the model's own default when it asks for none.
+    gemini_reasoning_effort: str = field(
+        default_factory=lambda: os.environ.get("GEMINI_REASONING_EFFORT", "").strip().lower()
+    )
+
     # --- routing ------------------------------------------------------------------
     # Any model id containing one of these substrings routes to Agentaus.
     agentaus_model_markers: list[str] = field(
@@ -761,6 +794,11 @@ class Settings:
             return True
         lowered = (model or "").lower()
         return any(marker in lowered for marker in self.agentaus_model_markers)
+
+    def routes_to_gemini(self, model: str) -> bool:
+        if self.force_all_to_agentaus or not self.gemini_model_prefix:
+            return False
+        return (model or "").lower().startswith(self.gemini_model_prefix)
 
     @property
     def agentaus_url(self) -> str:

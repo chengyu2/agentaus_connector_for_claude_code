@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import attribution
 from . import documents
 from . import flight
+from . import gemini
 from . import graph
 from . import import_guard
 from . import harmony
@@ -182,6 +183,8 @@ async def healthz() -> JSONResponse:
             "passthrough": settings.passthrough_enabled,
             "anthropic_upstream": settings.anthropic_base_url,
             "model_markers": settings.agentaus_model_markers,
+            "gemini": {"key_configured": bool(settings.gemini_api_key),
+                       "model_prefix": settings.gemini_model_prefix},
             "context_limit": _context_limit(),
             "tokeniser": "tiktoken" if _has_tokeniser() else "chars/4 fallback",
             "token_calibration": {
@@ -295,6 +298,7 @@ async def list_models(request: Request) -> JSONResponse:
     models = list(live if live is not None else _MODELS_LAST["data"] or [])
     if not any(m.get("id") == AGENTAUS_MODEL["id"] for m in models):
         models.append(dict(AGENTAUS_MODEL))
+    models.extend(m for m in gemini.model_entries() if not any(x.get("id") == m["id"] for x in models))
     rlog(logging.INFO, "model list: %d model(s) served (%s)", len(models),
              "live from Anthropic" if live is not None
              else "Anthropic's last list" if _MODELS_LAST["data"] else "Agentaus only")
@@ -304,6 +308,17 @@ async def list_models(request: Request) -> JSONResponse:
         "first_id": models[0]["id"],
         "last_id": models[-1]["id"],
     })
+
+
+@app.get("/v1/models/{model_id:path}")
+async def get_model(request: Request, model_id: str) -> Response:
+    """One model. Claude Code asks for this before switching to an id it does not know (a
+    /model pick, a -p --model), and refuses the id unless the answer is a 200."""
+    if settings.routes_to_gemini(model_id):
+        return await gemini.lookup(request, model_id)
+    if settings.routes_to_agentaus(model_id):
+        return JSONResponse(dict(AGENTAUS_MODEL, id=model_id))
+    return await _passthrough(request, b"")
 
 
 # --------------------------------------------------------------------------------------
@@ -360,9 +375,19 @@ async def messages(request: Request) -> Response:
 
     model = body.get("model") or ""
     wants_stream = bool(body.get("stream"))
-    to_agentaus, inherited = _route(request, body, model, main_loop=True)
-
     _request_id.set(_new_request_id())
+
+    if settings.routes_to_gemini(model):
+        rlog(logging.INFO, "recv model=%s route=gemini stream=%s msgs=%d est=%d bytes=%d",
+             model, wants_stream, len(body.get("messages") or []),
+             estimate_request_tokens(body), len(raw))
+        # A Gemini main loop means the session is no longer on Agentaus, so its subagents
+        # stop following it there.
+        if body.get("tools") and not sessions.is_subagent(request.headers, body):
+            sessions.note_main_loop(sessions.session_of(request.headers), False)
+        return await gemini.handle(request, body, model, wants_stream, rlog)
+
+    to_agentaus, inherited = _route(request, body, model, main_loop=True)
     messages_in = len(body.get("messages") or [])
     rlog(
         logging.INFO,
@@ -392,6 +417,10 @@ async def count_tokens(request: Request) -> Response:
     except json.JSONDecodeError:
         body = {}
     model = body.get("model") or ""
+    if settings.routes_to_gemini(model):
+        # Gemini's countTokens takes its own request shape; the estimate only feeds Claude
+        # Code's context meter, as it does for Agentaus.
+        return JSONResponse({"input_tokens": estimate_request_tokens(body)})
     if _route(request, body, model, main_loop=False)[0]:
         # Agentaus exposes no tokenizer, so this is a char/4 estimate. It only feeds
         # Claude Code's context meter and auto-compact trigger, not billing.

@@ -441,6 +441,7 @@ Every request is routed on the `model` field in the request body:
 | Model id | Destination |
 | --- | --- |
 | contains `agentaus` | translated and sent to Agentaus |
+| starts with `gemini-` (when `GEMINI_API_KEY` is set) | translated and sent to Google Gemini; see [Gemini models](#gemini-models) |
 | anything else | forwarded byte-for-byte to `api.anthropic.com` |
 
 (When `BRIDGE_PASSTHROUGH=false` the second row also goes to Agentaus. See below.)
@@ -489,6 +490,42 @@ Switching mid-session moves the subagents with you, so the toggle is untouched. 
 main-loop turn (tools offered, no agent id) records the session's model, so a title or
 summary call cannot flip it. The log says `route=agentaus (subagent of an Agentaus session)` when
 it applies. Turn it off with `AGENTAUS_SUBAGENTS_FOLLOW_SESSION=false`.
+
+### Gemini models
+
+Google's Gemini models can sit in the same `/model` picker as Claude and Agentaus. Set
+`GEMINI_API_KEY` in `.env` (a key from https://aistudio.google.com/apikey), restart the
+bridge, and start Claude Code with the picker rows in `scripts/gemini-models.json`:
+
+```bash
+claude --settings scripts/gemini-models.json
+```
+
+`modelPicker` is only read from user, managed or `--settings` files, never from a
+project's `.claude/settings.json`, so the rows come in on the command line. Edit the file
+to list the models your key can use: Gemini 4 Carbon, Argon and Neon need a paid-tier key;
+Gemini 4 Hydrogen and 3.8 Flash work on the free tier.
+
+Any model id starting with `gemini-` goes to Gemini's OpenAI-compatible endpoint. None of
+the Agentaus scaffolding applies: Gemini sees images, reads its own tool results and has a
+1,048,576-token window, so the request is translated once and the answer translated back.
+Three things the bridge handles for it, all measured against the live API:
+
+- **Thought signatures.** Gemini 3 and 4 put a signature on the first tool call of each
+  step and refuse the next request (HTTP 400) if it is not sent back. Anthropic's
+  `tool_use` block has nowhere to carry it, so the bridge keeps it by call id. After a
+  restart, or for calls another model made earlier in the conversation, it sends Google's
+  documented placeholder instead.
+- **Model lookups.** Before switching to an id it does not know, Claude Code asks
+  `GET /v1/models/{id}` and refuses the model on anything but a 200. The bridge checks the
+  id with Google, so a typo is still refused.
+- **Overload.** `503 high demand` is common; the bridge retries twice before passing it
+  on, and Claude Code retries after that.
+
+A subagent started from a Gemini session runs on Claude Code's default Claude model, as
+Agentaus sessions did before the bridge made them follow their session. Settings:
+`GEMINI_MODEL_PREFIX`, `GEMINI_MODELS`, `GEMINI_MAX_OUTPUT_TOKENS` and
+`GEMINI_REASONING_EFFORT`, documented in `.env.example`.
 
 ---
 
