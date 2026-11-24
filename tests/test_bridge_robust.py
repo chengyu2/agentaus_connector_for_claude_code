@@ -206,10 +206,14 @@ class TimeUpTurns(_WithStub):
     def test_retries_stop_once_the_agent_runs_past_its_limit(self):
         # One request was retried for 2,627 s (d13). An ordinary turn that crosses its limit
         # while being retried is answered by the bridge at its next gateway failure.
-        stub = self.stub(lambda p: (524, 0.15, ""))
+        # The turn must still be inside its limit when sent and past it when the 524
+        # arrives. The clock is set after the app has started, and the margin is 0.5 s,
+        # because a 0.1 s margin set before startup was already spent on a slow runner
+        # and the turn went out as time-up.
+        stub = self.stub(lambda p: (524, 1.0, ""))
         first, later = self.agent("crosses")
-        self.backdate(first, settings.agentaus_graph_agent_max_s - 0.1)
         with TestClient(server.app) as client:
+            self.backdate(first, settings.agentaus_graph_agent_max_s - 0.5)
             r = client.post("/v1/messages", json={**later, "stream": True})
         self.assertEqual(len(stub.calls), 1)
         self.assertIn("tools", stub.calls[0], "it was an ordinary turn when it was sent")
