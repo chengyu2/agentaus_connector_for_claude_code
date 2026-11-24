@@ -1291,7 +1291,21 @@ _ANNOUNCED_STEP = re.compile(
     r"(?!(?:i'll|i\s+will|we'll|we\s+will)\s+(?:be\s+(?:here|around|happy|glad|available)|"
     r"leave\b|see\s+how|let\s+you\b|keep\s+(?:an\s+eye|you\s+posted)))"
     r"(?:let\s+me|let's|i'll|i\s+will|i'm\s+going\s+to|i\s+am\s+going\s+to|i\s+need\s+to|"
-    r"we'll|we\s+will|we\s+need\s+to|we're\s+going\s+to|time\s+to)\b",
+    r"we'll|we\s+will|we're\s+going\s+to|time\s+to)\s+"
+    # Then a tool-shaped action. Anything else - "I'll need your API key", "I will not
+    # delete those files", "Let me explain why", "Let's ship it!", "I'll stop here",
+    # "We need to run the migration on production" - is left to the judge, as it was
+    # before this structural check existed: re-asking it with "call the tool now" can
+    # replace a finished answer or push the model into a step nobody asked for.
+    r"(?:(?:now|also|just|quickly|first|then|actually|go\s+ahead\s+and|begin\s+by|start\s+by)\s+)*"
+    r"(?:look|check|read|open|run|re-?run|search|grep|find|edit|write|rewrite|create|fix|"
+    r"update|install|list|inspect|start|try|verify|apply|add|remove|delete|test|build|"
+    r"examine|review|investigate|explore|dig|compare|patch|modify|change|implement|"
+    r"download|fetch|move|copy|rename|launch|view|scan|compile|debug|trace|confirm|"
+    r"validate|pull|clone|restart|query|grab|load|scroll|navigate|click|take\s+a\s+look|"
+    r"have\s+a\s+look|analy[sz]e|re-?read|double-?check|go\s+through|continue|proceed|"
+    r"execute|commit|push|set\s+up|parse|extract|save|generate|call\s+(?:the|a)\b|"
+    r"exploring|checking|looking|reading|running|searching)\b",
     re.I,
 )
 
@@ -1313,7 +1327,9 @@ def announces_a_step(answer: str) -> bool:
 # sentence a file name with an extension. Measured (work experience A/B): asked to "Write
 # `instructions.md`" and "Write `drafts.md`", Agentaus spent 36 turns, wrote neither, and
 # ended on a report the judge read as an answer - one of the two needed no email at all.
-_FILE_NAME = r"((?:~|\.{1,2})?/?[\w.-]+(?:/[\w.-]+)*\.[A-Za-z][A-Za-z0-9]{0,4})\b"
+# The lookbehind keeps a name whole: without it "write answers.md" read as the article
+# "a" and a file "nswers.md".
+_FILE_NAME = r"(?<!\w)((?:~|\.{1,2})?/?[\w.-]+(?:/[\w.-]+)*\.[A-Za-z][A-Za-z0-9]{0,4})\b"
 _WRITE_VERB = re.compile(
     r"\b(?:write|create|save|produce|generate|draft|output|export)\b"
     r"(?:(?:\s+(?:it|them|this|that|the|a|an|both|your|out|up|file|files|a\s+file\s+(?:called|named)))*"
@@ -1331,26 +1347,80 @@ _MORE_FILES = re.compile(
 )
 # "e.g", "i.e" and the like have the shape of a file name and are not one.
 _ABBREVIATION = re.compile(r"(?:e\.g|i\.e|etc|vs|cf|a\.k\.a|n\.b)\.?", re.I)
+# A bare word.word counts as a file only with an extension files actually have: otherwise
+# "Node.js", "ASP.NET", "john.smith@...", "example.com" and "P.S" read as files to write.
+# A name in quotes or backticks, or with a directory in it, is taken as written. A name
+# with no dot at all ("Makefile") is never found, quoted or not, as before.
+_FILE_EXTENSIONS = frozenset("""
+    md markdown txt text csv tsv json jsonl ndjson yaml yml toml xml html htm css scss js
+    mjs cjs ts tsx jsx py ipynb rb go rs java kt swift c h cc cpp hpp cs php pl lua r sh
+    bash zsh fish ps1 bat cmd sql log ini cfg conf env lock pdf docx doc xlsx xls pptx ppt
+    odt ods odp rtf tex bib rst adoc png jpg jpeg gif svg webp ico mp3 mp4 wav mov zip tar
+    gz tgz bz2 xz 7z patch diff ics vcf eml srt vtt vue svelte astro mdx zig tf
+    tfvars hcl scala dart sol ex exs erl hs ml clj elm nim jl proto graphql gql gradle less
+    sass styl parquet org m db sqlite epub
+""".split())
+# Library and framework names spelt like JavaScript files.
+_NOT_A_FILE = re.compile(r"(?:node|next|nuxt|vue|three|chart|d3|express|ember|backbone|"
+                         r"angular|react|solid|svelte|alpine|socket\.io|moment|p5)\.js", re.I)
+# A writing verb counts only where it is the request: at the start of a clause, after
+# "please", "and", "then", "can you" and the like. Not "don't write config.yaml", "how to
+# write to output.csv", "why did the build generate dist/app.js", "the tool should create
+# out.json".
+_CLAUSE_START = re.compile(r"(?:[.!?;:](?=\s)|\n|,|\band\b|\bthen\b)")
+_REQUEST_LEAD = re.compile(
+    r"[\s\-*>#\d.)(\[\]]*"
+    r"(?:(?:step|task|part)\s*\d+[\s:.)\-]*|[a-z]\)\s*)?"
+    r"(?:(?:please|pls|also|now|then|next|finally|first|just|so|ok(?:ay)?|and)[,\s]+)*"
+    r"(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?(?:also\s+)?|"
+    r"(?:i|we)(?:\s+(?:want|need|would\s+like)|'d\s+like)\s+you\s+to\s+|"
+    r"you\s+(?:should|must|need\s+to|have\s+to)\s+|make\s+sure\s+(?:to|you)\s+|"
+    r"remember\s+to\s+|your\s+(?:task|job)\s+is\s+to\s+|help\s+me\s+|let's\s+|"
+    r"go\s+ahead\s+and\s+)?",
+    re.I,
+)
+
+
+def _asked_to_write(text: str, verb_at: int) -> bool:
+    """Whether the writing verb at `verb_at` is itself the request."""
+    before = text[:verb_at]
+    starts = [m.end() for m in _CLAUSE_START.finditer(before)]
+    return bool(_REQUEST_LEAD.fullmatch(before[starts[-1] if starts else 0:]))
+
+
+def _looks_like_a_file(text: str, name: str, start: int, end: int) -> bool:
+    if _ABBREVIATION.fullmatch(name) or _NOT_A_FILE.fullmatch(name):
+        return False
+    if text[end:end + 1] == "@" or text[start - 1:start] == "@":
+        return False
+    quoted = start > 0 and text[start - 1] in "`'\""
+    if quoted or "/" in name:
+        return True
+    return name.rsplit(".", 1)[-1].lower() in _FILE_EXTENSIONS
 
 
 def missing_deliverables(request: str, cwd: str | None) -> list[tuple[str, str]]:
     """(name as the request wrote it, path looked at) for each file the request says to
     write that does not exist. Structural: no judge call. Only names that follow a writing
-    verb - "read `README.md`" names an input, not an output."""
+    verb that is itself the request - "read `README.md`" names an input, "don't write
+    `config.yaml`" names nothing to write."""
     if not request or not cwd:
         return []
     text = _REMINDERS.sub("", request)
     text = re.sub(r"```.*?```", " ", text, flags=re.S)
     names = []
     for found in _WRITE_VERB.finditer(text):
-        names.append(found.group(1))
+        if not _asked_to_write(text, found.start()):
+            continue
+        found_names = [(found.group(1), found.start(1), found.end(1))]
         at = found.end()
         while more := _MORE_FILES.match(text, at):
-            names.append(more.group(1))
+            found_names.append((more.group(1), more.start(1), more.end(1)))
             at = more.end()
+        names += [n for n, s, e in found_names if _looks_like_a_file(text, n, s, e)]
     out, seen = [], set()
     for name in names:
-        if name in seen or _ABBREVIATION.fullmatch(name):
+        if name in seen:
             continue
         seen.add(name)
         path = os.path.expanduser(name)
@@ -1423,7 +1493,8 @@ def write_now_note(body: dict, cwd: str | None) -> str:
             "- Stop gathering. What you have read is enough to write a first version.\n"
             "- Call `Write` for each file in your next reply.\n"
             "- Where something is still unknown, write the rest and say inside the file what "
-            "is missing.\n- You can improve a file after it exists.\n")
+            "is missing.\n- You can improve a file after it exists.\n"
+            "- If the request does not actually ask you to write one of them, ignore it.\n")
 
 
 def read_refusal_verdict(verdict: str) -> bool:
@@ -1924,8 +1995,10 @@ _ULTRACODE = re.compile(r"\bultracode\b", re.I)
 # without explicit opt-in.)", the bare word read as the opt-in, and the user's "yep look
 # at it and continue" launched the whole agent graph in place of the next command.
 _ULTRACODE_OFF = re.compile(
-    r"\bultracode\b[\s*_`'\"]*(?:mode\s+)?(?:is|was|stays|remains|has\s+been|is\s+now)\s+"
-    r"(?:(?:currently|now|still|turned|switched|set)\s+)*[*_`'\"]*(?:off|disabled|not\s+(?:on|enabled|active))\b"
+    r"\bultracode\b[\s*_`'\":=]*(?:mode\s+)?(?:(?:is|was|stays|remains|has\s+been|is\s+now)\s+)?"
+    r"(?:(?:currently|now|still|turned|switched|set)\s+)*[*_`'\"]*(?:off|disabled|not\s+(?:on|enabled|active))\b(?!-)"
+    r"|\bultracode\b[\s*_`'\":]*(?:mode\s+)?(?:isn't|wasn't|is\s+not|was\s+not)\s+"
+    r"(?:(?:currently|turned|switched|set)\s+)*[*_`'\"]*(?:on|enabled|active)\b"
     r"|\b(?:not|no|without|never|disable[sd]?|turn(?:ed)?\s+off)\s+(?:\w+\s+){0,2}[*_`'\"]*ultracode\b",
     re.I,
 )
