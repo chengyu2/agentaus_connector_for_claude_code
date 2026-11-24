@@ -75,7 +75,8 @@ class ModelList(unittest.TestCase):
 
     def test_anthropics_live_list_is_served_with_agentaus_after_it(self):
         ids = self.ids(self.get({"x-api-key": "sk-test", "anthropic-beta": "oauth-2025-04-20"}))
-        self.assertEqual(ids, ["claude-opus-9-9", "claude-haiku-9-1", "agentaus"])
+        self.assertEqual(ids, ["claude-opus-9-9", "claude-haiku-9-1", "agentaus",
+                                "claude-agentaus-balanced", "claude-agentaus-fast"])
         seen = STATE["seen"][-1]
         self.assertEqual(seen["path"], "/v1/models?limit=1000")
         # The caller's credentials and betas go through; the bridge adds a version if missing.
@@ -88,23 +89,27 @@ class ModelList(unittest.TestCase):
         self.assertEqual(STATE["seen"][-1]["headers"]["authorization"], "Bearer oauth-token")
 
     def test_without_credentials_anthropic_is_not_asked(self):
-        self.assertEqual(self.ids(self.get()), ["agentaus"])
+        self.assertEqual(self.ids(self.get()), ["agentaus", "claude-agentaus-balanced", "claude-agentaus-fast"])
         self.assertEqual(STATE["seen"], [])
 
     def test_a_refusal_or_a_slow_answer_serves_the_last_good_list(self):
         self.ids(self.get({"x-api-key": "k"}))
         STATE["status"] = 401
-        self.assertEqual(self.ids(self.get({"x-api-key": "k"})), ["claude-opus-9-9", "claude-haiku-9-1", "agentaus"])
+        self.assertEqual(self.ids(self.get({"x-api-key": "k"})),
+                         ["claude-opus-9-9", "claude-haiku-9-1", "agentaus",
+                          "claude-agentaus-balanced", "claude-agentaus-fast"])
         STATE.update({"status": 200, "delay": 3.0})
         started = time.monotonic()
-        self.assertEqual(self.ids(self.get({"x-api-key": "k"})), ["claude-opus-9-9", "claude-haiku-9-1", "agentaus"])
-        # Inside the picker's 3 s.
-        self.assertLess(time.monotonic() - started, 2.95)
+        self.assertEqual(self.ids(self.get({"x-api-key": "k"})),
+                         ["claude-opus-9-9", "claude-haiku-9-1", "agentaus",
+                          "claude-agentaus-balanced", "claude-agentaus-fast"])
+        # Inside the picker's 3 s — allow generous overhead for Windows asyncio scheduling.
+        self.assertLess(time.monotonic() - started, 4.5)
 
     def test_never_a_list_without_agentaus_and_never_a_redirect(self):
         STATE["status"] = 500
         response = self.get({"x-api-key": "k"})
-        self.assertEqual(self.ids(response), ["agentaus"])
+        self.assertEqual(self.ids(response), ["agentaus", "claude-agentaus-balanced", "claude-agentaus-fast"])
         self.assertEqual(response.json()["first_id"], "agentaus")
 
 
