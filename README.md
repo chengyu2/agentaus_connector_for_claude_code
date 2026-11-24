@@ -754,7 +754,7 @@ translator drops them, the same as it does for Claude's own.
 
 The bridge makes Agentaus calls you never asked for: summarising a long history,
 checking that summary for gaps, reviewing an answer, planning a turn, reading every chunk
-of a haystack. `AGENTAUS_MAX_CONCURRENCY` (default 6) bounds all of them together.
+of a haystack. `AGENTAUS_MAX_CONCURRENCY` (default 8) bounds all of them together.
 
 Global rather than per-feature, deliberately: two features each capped at 6 permit 12, and
 the number that matters is how hard the bridge hits one upstream. Your own turn is never
