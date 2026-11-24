@@ -763,7 +763,10 @@ def pending_workflows(body: dict) -> set:
     launched, reported = set(), set()
     for message in body.get("messages") or []:
         content = message.get("content")
-        if message.get("role") != "user":
+        # A report can arrive as a `system` entry too. Measured (Claude Code 2.1.331): a stopped
+        # workflow's `<status>killed</status>` notification came that way, the launch was never
+        # seen to report back, and every Edit after it was refused as "still running".
+        if message.get("role") not in ("user", "system"):
             continue
         blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content or []
         for block in blocks:

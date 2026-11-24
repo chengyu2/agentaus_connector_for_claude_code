@@ -65,6 +65,36 @@ class WorkflowStillDeferred(unittest.TestCase):
         self.assertNotIn("the `Workflow` tool is not loaded", str(loaded))
 
 
+class AStoppedWorkflowIsNotStillRunning(unittest.TestCase):
+    """Claude Code 2.1.331 delivers a stopped workflow's notification as a `system` entry.
+    Read only from user messages, the launch never reported back, and the bridge refused every
+    Edit after it with "The workflow you launched (w5iah888s) is still running"."""
+
+    def body(self, notice_role):
+        launch = ("Workflow launched in background. Task ID: w5iah888s\n"
+                  "Summary: Scout, plan twice, review the plan, then run it")
+        notice = ("<task-notification>\n<task-id>w5iah888s</task-id>\n<status>killed</status>\n"
+                  "<summary>Task was stopped by the user.</summary>\n</task-notification>")
+        return {"model": "agentaus", "tools": [tool("Edit")], "messages": [
+            user("fix the compaction bugs"),
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "w1", "name": "Workflow",
+                                               "input": {"script": "export const meta = {}"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "w1", "content": launch}]},
+            {"role": notice_role, "content": notice},
+            user("carry on with the Agent tool")]}
+
+    def test_a_notice_in_a_system_entry_counts(self):
+        self.assertEqual(augment.pending_workflows(self.body("system")), set())
+
+    def test_a_notice_in_a_user_message_still_counts(self):
+        self.assertEqual(augment.pending_workflows(self.body("user")), set())
+
+    def test_with_no_notice_it_is_still_running(self):
+        body = self.body("system")
+        body["messages"].pop(3)
+        self.assertEqual(augment.pending_workflows(body), {"w5iah888s"})
+
+
 class WindowsWorkingDirectory(unittest.TestCase):
     def test_a_drive_letter_path_with_spaces_is_read_whole(self):
         system = ("Environment\n - Primary working directory: "
