@@ -10,3 +10,6 @@ __pycache__/
 # Benchmark run files hold every raw reply, and documents/coverage replies quote the
 # private tender folder. The runs already committed stay tracked.
 benchmarks/results/
+
+# Installer state (which settings files and services it wrote)
+.install-state.json

@@ -1,89 +1,79 @@
 """What the bridge needs installed before it serves a single request.
 
-The Python packages are required: install.sh puts them in the virtualenv, so they need
-nothing from the machine. The system readers (LibreOffice, poppler, tesseract) are
-optional. Without them a .docx or .xlsx is walked past and a scanned PDF page comes
-back blank, so the bridge names each missing one at startup - a tender response written
-without the document that held its evidence looks like a weak answer, not a missing tool.
+Only the core packages are required. Everything else is a component (see components.py):
+a document reader, a PDF tier, the code outline. The installer records which ones the user
+chose in AGENTAUS_COMPONENTS, and startup tells the two cases apart:
+
+- a chosen component that is missing is a broken install, so it is a warning that names
+  the command that fixes it - a tender response written without the document that held
+  its evidence looks like a weak answer, not a missing tool;
+- a component the user skipped is a choice, so it is one info line.
+
+An install that predates AGENTAUS_COMPONENTS counts as having chosen everything.
 """
 
 from __future__ import annotations
 
-import importlib
 import platform
-import sys
+
+from . import components
 
 MAC = platform.system() == "Darwin"
 WIN = platform.system() == "Windows"
 
-# (what, how it is found, why the bridge needs it, macOS install, Debian install, Windows install)
-SYSTEM = (
-    ("LibreOffice", "soffice", "reads .docx, .xlsx, .pptx with their tables intact",
-     "brew install --cask libreoffice", "sudo apt install libreoffice-writer libreoffice-calc libreoffice-impress",
-     "winget install --id TheDocumentFoundation.LibreOffice"),
-    ("poppler", "pdftotext", "the best PDF text tier, with column and table layout",
-     "brew install poppler", "sudo apt install poppler-utils",
-     "winget install --id oschwartz10612.Poppler"),
-    ("poppler", "pdftoppm", "renders scanned PDF pages for tesseract",
-     "brew install poppler", "sudo apt install poppler-utils",
-     "winget install --id oschwartz10612.Poppler"),
-    ("tesseract", "tesseract", "OCR for scanned PDF pages",
-     "brew install tesseract", "sudo apt install tesseract-ocr",
-     "winget install --id UB-Mannheim.TesseractOCR"),
-)
-# (module, pip package, why)
-PYTHON = (
-    ("pdfminer.high_level", "pdfminer.six", "the pure-Python PDF tier"),
-    ("pypdf", "pypdf", "the last PDF tier"),
-    ("tree_sitter", "tree-sitter", "exact declarations in the search outline"),
-    ("tree_sitter_language_pack", "tree-sitter-language-pack", "the outline's grammars"),
-) + ((
-    ("Vision", "pyobjc-framework-Vision", "macOS's own OCR, the first OCR tier"),
-    ("Quartz", "pyobjc-framework-Quartz", "renders PDF pages for Vision"),
-) if MAC else ())
-
 
 def _module(name: str) -> bool:
-    if name in sys.modules:
-        return True
-    try:
-        importlib.import_module(name)
-        return True
-    except Exception:  # noqa: BLE001 - a broken install is as missing as an absent one
-        return False
+    return components._module(name)
+
+
+def _platform() -> str:
+    return "windows" if WIN else ("darwin" if MAC else "linux")
+
+
+def _script() -> str:
+    return ".\\scripts\\install.ps1" if WIN else "./scripts/install.sh"
 
 
 def missing() -> list[str]:
-    """One line per missing required package, each with the command that installs it."""
-    out = []
-    for module, package, why in PYTHON:
-        if not _module(module):
-            out.append(f"{package} - {why}. Install: `.venv/bin/pip install -r requirements.txt`")
-    return out
-
-
-def optional_missing() -> list[str]:
-    """One line per missing system reader, each with the command that installs it."""
-    from . import documents, pdf
-    out = []
-    for what, binary, why, mac, debian, windows in SYSTEM:
-        found = documents.soffice() if binary == "soffice" else pdf._tool(binary)
-        if not found:
-            cmd = windows if WIN else (mac if MAC else debian)
-            out.append(f"{what} (`{binary}`) - {why}. Install: `{cmd}`")
-    return out
+    """One line per missing core package. Without these the bridge cannot start."""
+    core = components.BY_KEY["core"]
+    hint = components.install_hint(core, _platform())
+    return [f"{m} - the bridge itself. Install: `{hint}`"
+            for m in core.modules if not _module(m)]
 
 
 def report(lines: list[str]) -> str:
-    script = ".\\scripts\\install.ps1" if WIN else "./scripts/install.sh"
     return ("The bridge needs these Python packages and they are missing:\n"
             + "\n".join(f"  - {l}" for l in lines)
-            + f"\n\nOr run {script}, which installs all of them.")
+            + f"\n\nOr run {_script()}, which installs them.")
 
 
-def optional_report(lines: list[str]) -> str:
-    run = ("$env:INSTALL_DOCUMENT_READERS=1; .\\scripts\\install.ps1" if WIN
-           else "INSTALL_DOCUMENT_READERS=1 ./scripts/install.sh")
-    return ("Document reading is degraded; these readers are not installed:\n"
+def _line(component: components.Component) -> str:
+    return (f"{component.title} - without it {component.loses}. "
+            f"Install: `{components.install_hint(component, _platform())}`")
+
+
+def degraded(chosen: list[str] | None = None) -> list[str]:
+    """One line per chosen runtime component that is not actually installed."""
+    chosen = components.selected() if chosen is None else chosen
+    return [_line(c) for c in components.available(_platform())
+            if c.runtime and not c.locked and c.key in chosen and not components.present(c)]
+
+
+def degraded_report(lines: list[str]) -> str:
+    return ("These components were chosen at install but are not working:\n"
             + "\n".join(f"  - {l}" for l in lines)
-            + f"\n\nOr run {run}.")
+            + f"\n\nOr re-run {_script()} (or `agentaus-bridge components`) to repair them.")
+
+
+def skipped(chosen: list[str] | None = None) -> list[str]:
+    """The titles of runtime components this install chose not to have."""
+    chosen = components.selected() if chosen is None else chosen
+    return [c.title for c in components.available(_platform())
+            if c.runtime and c.key not in chosen]
+
+
+def optional_missing() -> list[str]:
+    """One line per system reader that is not installed, whatever was chosen."""
+    return [_line(c) for c in components.available(_platform())
+            if c.kind == "system" and not components.present(c)]

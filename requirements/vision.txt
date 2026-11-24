@@ -1,0 +1,3 @@
+# Component "vision": macOS's own OCR, the first OCR tier, and the page rendering it reads from.
+pyobjc-framework-Vision>=10.0; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"

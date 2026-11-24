@@ -1,0 +1,3 @@
+# The interactive installer (python -m agentaus_bridge setup). Not needed to run the bridge.
+questionary>=2.0
+rich>=13.0

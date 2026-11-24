@@ -61,8 +61,9 @@ runs only when the one above cannot:
 3. declaration pass  approximate, any language, always available
 ```
 
-Tree-sitter is a [requirement](../../README.md#requirements), installed from `requirements.txt`, so rung
-one is always there. The lower rungs remain for a grammar that fails on one file.
+Tree-sitter is the `outline` [component](../../README.md#requirements), installed by the recommended
+and full presets (and by `requirements.txt`). The lower rungs cover an install that skipped it, and a
+grammar that fails on one file.
 
 ## Zoom: from a citation to something you can write with
 

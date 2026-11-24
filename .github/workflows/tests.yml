@@ -65,7 +65,9 @@ jobs:
           python-version: "3.12"
           activate-environment: true
           enable-cache: true
-          cache-dependency-glob: requirements.txt
+          cache-dependency-glob: |
+            requirements.txt
+            requirements/*.txt
 
       - name: Install Python dependencies
         run: uv pip install -r requirements.txt pytest pytest-xdist
@@ -76,9 +78,9 @@ jobs:
         timeout-minutes: 10
         run: python -m pytest tests -n auto --dist loadfile -o python_files='test_*.py' -p no:cacheprovider -q -ra --durations=10
 
-  # Windows has no bash, so the scripts/install.sh path never runs there. This job at least
-  # proves the three .ps1 scripts parse and that install.ps1 completes the offline part the
-  # reviewer asked for: virtualenv creation, dependency install and the requirements check.
+  # Windows has no bash, so the scripts/install.sh path never runs there. This job proves the
+  # three .ps1 scripts parse and that install.ps1 completes an unattended install: virtualenv,
+  # the chosen components, the scheduled task and command, and their removal.
   # A live `-m agentaus_bridge --check` needs the AGENTAUS_API_KEY secret, so it is not part
   # of CI; the requirements check inside install.ps1 covers the same failure modes that used
   # to slip through (a missing package reported as success).
@@ -102,11 +104,22 @@ jobs:
             Write-Host "parsed OK: $f"
           }
 
-      - name: Run install.ps1 (virtualenv, dependencies, requirements check)
+      # The guided setup, unattended. The unquoted pdf,outline is deliberate: PowerShell makes
+      # it an array, and install.ps1 must hand setup one "pdf,outline" string. The service and
+      # command are real: a Task Scheduler task and agentaus-bridge.cmd, removed again below.
+      - name: Run install.ps1 (bootstrap, guided setup with --yes)
         shell: pwsh
         run: |
           $env:INSTALL_DOCUMENT_READERS = "0"
-          & .\scripts\install.ps1
+          & .\scripts\install.ps1 --yes --preset minimal --with pdf,outline,service,command --settings none --no-check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ScheduledTask -TaskName AgentausBridge | Format-List TaskName, State
+          & "$HOME\.local\bin\agentaus-bridge.cmd" status
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$HOME\.local\bin\agentaus-bridge.cmd" uninstall --yes
+          if (Get-ScheduledTask -TaskName AgentausBridge -ErrorAction SilentlyContinue) { throw "task still registered" }
+          Start-Sleep -Seconds 6
+          if (Test-Path "$HOME\.local\bin\agentaus-bridge.cmd") { throw "agentaus-bridge.cmd was not removed" }
 
       # `powershell -ExecutionPolicy Bypass -File ...` runs Windows PowerShell 5.1, not pwsh 7,
       # and the two treat native stderr differently, so run the installer under 5.1 too.
@@ -114,10 +127,41 @@ jobs:
         shell: powershell
         run: |
           $env:INSTALL_DOCUMENT_READERS = "0"
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 --yes --preset minimal --with pdf,outline --settings none --no-check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify the bridge imports on Windows
         shell: pwsh
         run: |
           & .\.venv\Scripts\python.exe -c "from agentaus_bridge import requirements, documents, pdf; print('bridge import OK')"
+
+  # scripts/install.sh, unattended, on each Unix the installer supports. As root in the
+  # Fedora and Arch containers and with passwordless sudo on the runners, so the poppler
+  # component really goes through apt, dnf, pacman and brew.
+  install-unix:
+    name: install.sh / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: ubuntu, os: ubuntu-latest, container: "" }
+          - { name: macos, os: macos-latest, container: "" }
+          - { name: fedora, os: ubuntu-latest, container: "fedora:latest", prep: "dnf install -y git python3" }
+          - { name: arch, os: ubuntu-latest, container: "archlinux:latest", prep: "pacman -Syu --noconfirm --needed git python" }
+    steps:
+      - name: Prepare the container
+        if: matrix.prep
+        run: ${{ matrix.prep }}
+      - uses: actions/checkout@v7
+      - name: Run install.sh with --yes
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          ./scripts/install.sh --yes --preset minimal --with pdf,poppler,outline,command --settings none --no-check
+          ~/.local/bin/agentaus-bridge status
+          command -v pdftotext
+          ~/.local/bin/agentaus-bridge uninstall --yes
