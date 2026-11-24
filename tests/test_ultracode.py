@@ -102,6 +102,7 @@ class WorkflowIsOfferedWhenTheUserOptsIn(unittest.TestCase):
                      "ultracode isn't on, so do it yourself", "Ultracode is not enabled."]:
             self.assertFalse(augment.workflow_opted_in(self.body(said)), said)
         self.assertTrue(augment.workflow_opted_in(self.body("ultracode: map the repo")))
+        self.assertTrue(augment.workflow_opted_in(self.body("ultracode off-by-one fix")))
 
     def test_the_ultracode_reminder_is_an_opt_in(self):
         body = self.body('<system-reminder>The user included the keyword "ultracode"</system-reminder>do it')
@@ -475,12 +476,16 @@ class AnAnnouncedStepIsAStall(unittest.TestCase):
                      "All tests pass. Let's ship it!",
                      "I'll stop here.", "Let's call it done.",
                      "We'll want to add a regression test later.",
-                     "Let me think about that."]:
+                     "Let me think about that.", "Let me see.", "I'll get back to you.",
+                     "I'll use British spelling from now on."]:
             self.assertFalse(augment.announces_a_step(text), text)
 
     def test_a_tool_step_after_a_lead_in_word_is_still_a_stall(self):
         for text in ["Now let me just check the logs.", "I'm going to open the config.",
-                     "Okay, I'll go ahead and run the build.", "Time to search the repo."]:
+                     "Okay, I'll go ahead and run the build.", "Time to search the repo.",
+                     "Let me take a look at the logs.", "I'll double-check the config.",
+                     "Let me begin by exploring the repo.", "I need to read the file first.",
+                     "I'll set up the venv."]:
             self.assertTrue(augment.announces_a_step(text), text)
 
 
@@ -543,6 +548,15 @@ class FilesTheRequestNamesMustExist(unittest.TestCase):
             "Please create `report.final` for me": ["report.final"],
             "- Write CHANGELOG.md": ["CHANGELOG.md"],
             "Read the RFQ. Then write answers.md": ["answers.md"],
+            "I'd like you to create report.docx": ["report.docx"],
+            "You should write notes.md": ["notes.md"],
+            "Make sure to write report.md": ["report.md"],
+            "Your job is to produce brief.md": ["brief.md"],
+            "We need you to write b.md": ["b.md"],
+            "Step 2 - write drafts.md": ["drafts.md"],
+            "a) write a.md": ["a.md"],
+            "Write main.tf": ["main.tf"],
+            "Create App.vue": ["App.vue"],
         }
         for task, want in cases.items():
             self.assertEqual([n for n, _ in augment.missing_deliverables(task, "/nowhere")],

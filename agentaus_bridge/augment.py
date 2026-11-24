@@ -1290,19 +1290,22 @@ _ANNOUNCED_STEP = re.compile(
     # rest to you", "We'll see how it goes".
     r"(?!(?:i'll|i\s+will|we'll|we\s+will)\s+(?:be\s+(?:here|around|happy|glad|available)|"
     r"leave\b|see\s+how|let\s+you\b|keep\s+(?:an\s+eye|you\s+posted)))"
-    r"(?:let\s+me|let's|i'll|i\s+will|i'm\s+going\s+to|i\s+am\s+going\s+to|"
+    r"(?:let\s+me|let's|i'll|i\s+will|i'm\s+going\s+to|i\s+am\s+going\s+to|i\s+need\s+to|"
     r"we'll|we\s+will|we're\s+going\s+to|time\s+to)\s+"
     # Then a tool-shaped action. Anything else - "I'll need your API key", "I will not
     # delete those files", "Let me explain why", "Let's ship it!", "I'll stop here",
     # "We need to run the migration on production" - is left to the judge, as it was
     # before this structural check existed: re-asking it with "call the tool now" can
     # replace a finished answer or push the model into a step nobody asked for.
-    r"(?:(?:now|also|just|quickly|first|then|actually|go\s+ahead\s+and)\s+)*"
+    r"(?:(?:now|also|just|quickly|first|then|actually|go\s+ahead\s+and|begin\s+by|start\s+by)\s+)*"
     r"(?:look|check|read|open|run|re-?run|search|grep|find|edit|write|rewrite|create|fix|"
     r"update|install|list|inspect|start|try|verify|apply|add|remove|delete|test|build|"
     r"examine|review|investigate|explore|dig|compare|patch|modify|change|implement|"
-    r"download|fetch|move|copy|rename|launch|use|view|scan|compile|debug|trace|confirm|"
-    r"validate|get|pull|clone|restart|see|query|grab|load|scroll|navigate|click|type)\b",
+    r"download|fetch|move|copy|rename|launch|view|scan|compile|debug|trace|confirm|"
+    r"validate|pull|clone|restart|query|grab|load|scroll|navigate|click|take\s+a\s+look|"
+    r"have\s+a\s+look|analy[sz]e|re-?read|double-?check|go\s+through|continue|proceed|"
+    r"execute|commit|push|set\s+up|parse|extract|save|generate|call\s+(?:the|a)\b|"
+    r"exploring|checking|looking|reading|running|searching)\b",
     re.I,
 )
 
@@ -1352,7 +1355,9 @@ _FILE_EXTENSIONS = frozenset("""
     mjs cjs ts tsx jsx py ipynb rb go rs java kt swift c h cc cpp hpp cs php pl lua r sh
     bash zsh fish ps1 bat cmd sql log ini cfg conf env lock pdf docx doc xlsx xls pptx ppt
     odt ods odp rtf tex bib rst adoc png jpg jpeg gif svg webp ico mp3 mp4 wav mov zip tar
-    gz tgz bz2 xz 7z patch diff ics vcf eml srt vtt dockerfile
+    gz tgz bz2 xz 7z patch diff ics vcf eml srt vtt dockerfile vue svelte astro mdx zig tf
+    tfvars hcl scala dart sol ex exs erl hs ml clj elm nim jl proto graphql gql gradle less
+    sass styl parquet org m db sqlite epub
 """.split())
 # Library and framework names spelt like JavaScript files.
 _NOT_A_FILE = re.compile(r"(?:node|next|nuxt|vue|three|chart|d3|express|ember|backbone|"
@@ -1364,9 +1369,13 @@ _NOT_A_FILE = re.compile(r"(?:node|next|nuxt|vue|three|chart|d3|express|ember|ba
 _CLAUSE_START = re.compile(r"(?:[.!?;:](?=\s)|\n|,|\band\b|\bthen\b)")
 _REQUEST_LEAD = re.compile(
     r"[\s\-*>#\d.)(\[\]]*"
-    r"(?:(?:please|also|now|then|next|finally|first|just|so|ok(?:ay)?|and)[,\s]+)*"
+    r"(?:(?:step|task|part)\s*\d+[\s:.)\-]*|[a-z]\)\s*)?"
+    r"(?:(?:please|pls|also|now|then|next|finally|first|just|so|ok(?:ay)?|and)[,\s]+)*"
     r"(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?(?:also\s+)?|"
-    r"i\s+(?:want|need|would\s+like|'d\s+like)\s+you\s+to\s+|go\s+ahead\s+and\s+)?",
+    r"(?:i|we)(?:\s+(?:want|need|would\s+like)|'d\s+like)\s+you\s+to\s+|"
+    r"you\s+(?:should|must|need\s+to|have\s+to)\s+|make\s+sure\s+(?:to|you)\s+|"
+    r"remember\s+to\s+|your\s+(?:task|job)\s+is\s+to\s+|help\s+me\s+|let's\s+|"
+    r"go\s+ahead\s+and\s+)?",
     re.I,
 )
 
@@ -1986,7 +1995,7 @@ _ULTRACODE = re.compile(r"\bultracode\b", re.I)
 # at it and continue" launched the whole agent graph in place of the next command.
 _ULTRACODE_OFF = re.compile(
     r"\bultracode\b[\s*_`'\":=]*(?:mode\s+)?(?:(?:is|was|stays|remains|has\s+been|is\s+now)\s+)?"
-    r"(?:(?:currently|now|still|turned|switched|set)\s+)*[*_`'\"]*(?:off|disabled|not\s+(?:on|enabled|active))\b"
+    r"(?:(?:currently|now|still|turned|switched|set)\s+)*[*_`'\"]*(?:off|disabled|not\s+(?:on|enabled|active))\b(?!-)"
     r"|\bultracode\b[\s*_`'\":]*(?:mode\s+)?(?:isn't|wasn't|is\s+not|was\s+not)\s+"
     r"(?:(?:currently|turned|switched|set)\s+)*[*_`'\"]*(?:on|enabled|active)\b"
     r"|\b(?:not|no|without|never|disable[sd]?|turn(?:ed)?\s+off)\s+(?:\w+\s+){0,2}[*_`'\"]*ultracode\b",
