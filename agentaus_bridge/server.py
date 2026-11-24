@@ -519,8 +519,12 @@ def _is_rate_limited(why: str) -> bool:
 async def _sleep_before_retry(attempt: int, why: str) -> None:
     delay = _retry_delay(attempt)
     if _is_rate_limited(why):
-        cap = settings.rate_limit_max_delay_seconds
-        delay = min(delay, cap + random.uniform(0, cap / 2))
+        # A 429 (Agentaus or the Anthropic passthrough) waits at most
+        # BRIDGE_RATE_LIMIT_MAX_DELAY - a real ceiling, jittered over its upper half so
+        # concurrent retries spread out. The ceiling is floored at 1 s so a cap of 0
+        # cannot become a zero-delay retry loop.
+        ceiling = max(settings.rate_limit_max_delay_seconds, 1.0)
+        delay = min(delay, ceiling * random.uniform(0.5, 1.0))
     rlog(logging.WARNING, "upstream attempt %d failed (%s); retrying in %.2fs", attempt + 1, why, delay)
     # Neither the failed attempt nor this wait counts against the turn's timeout: retrying
     # through a slump is waiting, not being wedged (see flight.Flight.served).
@@ -877,12 +881,21 @@ async def _helper_call(
     return ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
 
 
+class _HelperText(str):
+    """A helper reply that remembers how it ended. Still a plain `str` to every caller; a
+    pass that would REPLACE an answer with it reads `finish_reason`, because a reply cut
+    off at the token limit reads as a finished one."""
+
+    finish_reason: str | None = None
+
+
 async def _stream_helper(
     client: httpx.AsyncClient, payload: dict, text: str, started_at: float, on_piece=None
 ) -> str:
     """Consume a streamed helper reply and return the assembled content."""
     parts: list[str] = []
     first_byte = 0.0
+    finish: str | None = None
     async with client.stream(
         "POST", settings.agentaus_url, json=payload, headers=_agentaus_headers()
     ) as upstream:
@@ -898,6 +911,7 @@ async def _stream_helper(
                 _learn_limit_from(message)
                 raise RuntimeError(message[:200] or "error inside the helper stream")
             for choice in chunk.get("choices") or []:
+                finish = choice.get("finish_reason") or finish
                 piece = (choice.get("delta") or {}).get("content")
                 if piece:
                     if not parts:
@@ -907,7 +921,9 @@ async def _stream_helper(
                         on_piece(piece)
     rlog(logging.DEBUG, "helper stream ok in %.1fs (first byte %.1fs, %d chars in)",
          time.monotonic() - started_at, first_byte, len(text))
-    return "".join(parts)
+    reply = _HelperText("".join(parts))
+    reply.finish_reason = finish
+    return reply
 
 
 async def _answer_without_tools(client: httpx.AsyncClient, payload: dict) -> str:
@@ -1052,6 +1068,28 @@ def _bridge_evidence(ran: dict | None, *, result_chars: int = 2500,
     )
 
 
+# A grounding revision shorter than this share of the answer is not used. The pass is told
+# to strip unsupported claims and keep the rest, so a sound revision is most of the
+# original; one under half of it is far likelier a reply cut off mid-answer, or a note ABOUT
+# the answer ("REVISED" then "removed the claim about X") than an answer that was mostly
+# invented. Keeping the original loses only a cleanup; using the stub loses the answer.
+_MIN_REVISION_SHARE = 0.5
+
+
+def _revision_usable(answer: str, revised: str, reply: str) -> bool:
+    """Whether a grounding rewrite may replace `answer`. `reply` is the helper reply it came
+    from, which says whether the model stopped on its own or hit the token limit."""
+    if getattr(reply, "finish_reason", None) == "length":
+        rlog(logging.WARNING, "grounding revision was cut off at the token limit; "
+             "keeping the answer")
+        return False
+    if len(revised) < _MIN_REVISION_SHARE * len(answer):
+        rlog(logging.WARNING, "grounding revision is %d chars against the answer's %d; "
+             "keeping the answer", len(revised), len(answer))
+        return False
+    return True
+
+
 async def _check_grounding(
     client: httpx.AsyncClient, body: dict, answer: str, bridge_ran: dict | None = None
 ) -> str:
@@ -1085,7 +1123,7 @@ async def _check_grounding(
                     GROUNDING_ONE_PASS_INSTRUCTION.format(ledger=ran, answer=answer[:12000]),
                 )
             revised = grounding_revision(reply)
-            if revised:
+            if revised and _revision_usable(answer, revised, reply):
                 rlog(logging.WARNING, "grounding check found unsupported claims (one pass)")
                 rlog(logging.INFO, "stripped ungrounded claims (%d -> %d chars)",
                      len(answer), len(revised))
@@ -1110,7 +1148,8 @@ async def _check_grounding(
                     answer=answer[:12000], gaps=gaps[:4000]
                 ),
             )
-        if revised and revised.strip():
+        if (revised and revised.strip()
+                and _revision_usable(answer, revised.strip(), revised)):
             rlog(logging.INFO, "stripped ungrounded claims (%d -> %d chars)",
                  len(answer), len(revised))
             return revised.strip()
@@ -1180,7 +1219,8 @@ async def _self_review(client: httpx.AsyncClient, request_text: str, answer: str
     return answer
 
 
-async def _plan_turn(client: httpx.AsyncClient, body: dict, on_piece=None) -> str:
+async def _plan_turn(client: httpx.AsyncClient, body: dict, on_piece=None,
+                     priority: str = "urgent") -> str:
     """Ask Agentaus to plan this turn before it answers it.
 
     Agentaus has no native thinking mode, so left alone it answers from the first thing
@@ -1190,9 +1230,13 @@ async def _plan_turn(client: httpx.AsyncClient, body: dict, on_piece=None) -> st
 
     Never raises. A failed plan returns "" and the turn proceeds unplanned, exactly as
     it does today - a broken planner must not cost the user their answer.
+
+    `priority` is "urgent" when the turn is blocked on the plan. A plan written beside the
+    turn's first call (plans.py) blocks nothing, so it passes "normal": as urgent it took
+    the gate ahead of the calls the turn is actually waiting on.
     """
     try:
-        async with hold("planning", "urgent"):
+        async with hold("planning", priority):
             # Streamed when someone is watching it form, so the plan appears as it is
             # written rather than all at once after five to fifteen silent seconds.
             plan = await _agentaus_summarise(
@@ -2851,7 +2895,9 @@ async def _handle_agentaus(
             # the turn carries the plan once it is written. See plans.py.
             if should_think(fitted):
                 planned_body = fitted
-                if plans.start(turn_key, lambda: _plan_turn(client, planned_body)):
+                if plans.start(turn_key,
+                               lambda: _plan_turn(client, planned_body, priority="normal"),
+                               session=sessions.session_of(request.headers)):
                     rlog(logging.INFO, "planning in the background; first call goes unplanned")
             elif mid_tool_loop(fitted) and not is_subagent_turn(fitted):
                 waited = await plans.wait_once(turn_key, settings.agentaus_plan_wait_seconds)
@@ -2981,8 +3027,11 @@ async def _handle_agentaus(
                 corrections += 1
                 rlog(logging.WARNING, "model invented %d tool name(s): %s; correcting",
                      len(invented), ", ".join(c["name"] for c in invented))
-                payload = _with_tool_results(
-                    payload, invented, [_correction_for(c, known) for c in invented])
+                # The valid siblings of a batch are answered "not run" rather than
+                # dropped from history - see batching.answer_batch.
+                payload = _with_tool_results(payload, *batching.answer_batch(
+                    calls, [(c, batching.correction_for(c) or _correction_for(c, known))
+                            for c in invented]))
                 continue
             # The guards and the graph's task read the body as the client sent it, not the
             # compacted one - see _graph_reruns.
@@ -3006,7 +3055,7 @@ async def _handle_agentaus(
                 rlog(logging.WARNING, "%d malformed tool call(s): %s; correcting",
                      len(broken), "; ".join(m for _, m in broken)[:300])
                 payload = _with_tool_results(
-                    payload, [c for c, _ in broken], [m for _, m in broken])
+                    payload, *batching.answer_batch(mine + _theirs, broken))
                 continue
             if broken:
                 rlog(logging.WARNING, "forwarding %d malformed tool call(s) - out of "
@@ -3281,7 +3330,7 @@ async def _answer_buffered(request: Request, key: str, run, model: str) -> Respo
         "far). The bridge keeps it going: retry the request and it will get this turn's answer.")
 
 
-async def _agentaus_event_stream(
+async def _unguarded_event_stream(
     client: httpx.AsyncClient,
     payload: dict,
     original: dict,
@@ -3296,6 +3345,7 @@ async def _agentaus_event_stream(
     stop_retrying: Callable[[], bool] | None = None,
     time_up_text: Callable[[], str] | None = None,
     request_kind: str = "normal",
+    checks: set | None = None,
 ) -> AsyncIterator[bytes]:
     """Produce a valid Anthropic SSE stream from an Agentaus response.
 
@@ -3638,8 +3688,11 @@ async def _agentaus_event_stream(
             rlog(logging.INFO, "invented call(s) as sent: %s",
                  "; ".join(f"{c['name']}({str(c.get('arguments'))[:200]})" for c in invented))
             yield progress("correcting a call to a tool that does not exist")
-            payload = _with_tool_results(
-                payload, invented, [_correction_for(c, known) for c in invented])
+            # The valid siblings of a batch are answered "not run" rather than dropped
+            # from history - see batching.answer_batch.
+            payload = _with_tool_results(payload, *batching.answer_batch(
+                calls, [(c, batching.correction_for(c) or _correction_for(c, known))
+                        for c in invented]))
             pending = []
             continue
         if invented:
@@ -3670,7 +3723,7 @@ async def _agentaus_event_stream(
             rlog(logging.INFO, "malformed call(s) as sent: %s",
                  "; ".join(f"{c['name']}({str(c.get('arguments'))[:200]})" for c, _ in broken))
             payload = _with_tool_results(
-                payload, [c for c, _ in broken], [m for _, m in broken])
+                payload, *batching.answer_batch(mine + theirs, broken))
             pending = []
             continue
         if broken:
@@ -3743,6 +3796,8 @@ async def _agentaus_event_stream(
                 early = _answer_check(client, original, guess, ran)
                 if early is not None:
                     speculative = (guess, asyncio.ensure_future(early))
+                    if checks is not None:
+                        checks.add(speculative[1])
             try:
                 box = {}
                 async for beat in _waiting(classify(), builder, box):
@@ -3829,6 +3884,10 @@ async def _agentaus_event_stream(
                 if gate_force:
                     forced_from = payload.get("tool_choice", "(none)")
                     payload = {**payload, "tool_choice": "required"}
+                # The overlapped check was checking the answer this re-ask replaces.
+                if speculative is not None:
+                    speculative[1].cancel()
+                    speculative = None
                 pending = []
                 continue
 
@@ -3911,6 +3970,24 @@ async def _agentaus_event_stream(
         finish_reason,
         usage,
     )
+
+
+async def _agentaus_event_stream(*args, **kwargs) -> AsyncIterator[bytes]:
+    """`_unguarded_event_stream`, with the answer check it may start early (the overlapped
+    check, AGENTAUS_OVERLAP_CHECKS) cancelled however the stream ends. That check is a task
+    of its own, so a client that disconnects mid-turn - which closes this generator at
+    whichever `yield` it had reached - would otherwise leave it running: an upstream call
+    and a gate slot spent on an answer nobody will read. A wrapper rather than a
+    try/finally inside, so the stream's own code and output are untouched."""
+    checks: set = set()
+    stream = _unguarded_event_stream(*args, checks=checks, **kwargs)
+    try:
+        async for piece in stream:
+            yield piece
+    finally:
+        for task in checks:
+            task.cancel()
+        await stream.aclose()
 
 
 async def _keepalive(

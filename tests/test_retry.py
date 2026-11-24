@@ -543,3 +543,33 @@ class RateLimitBackoffIsShort(unittest.TestCase):
             asyncio.run(server._sleep_before_retry(8, "HTTP 503"))
         self.assertLessEqual(waits[0], 30.0)
         self.assertGreaterEqual(waits[1], 256.0)
+
+    def _429_waits(self, cap, uniform):
+        import asyncio
+        from unittest import mock
+
+        from agentaus_bridge import server
+        from agentaus_bridge.config import settings
+
+        waits = []
+
+        async def fake_sleep(s):
+            waits.append(s)
+
+        with mock.patch.object(settings, "retry_backoff_seconds", 1.0), \
+             mock.patch.object(settings, "retry_max_delay_seconds", 300.0), \
+             mock.patch.object(settings, "rate_limit_max_delay_seconds", cap), \
+             mock.patch.object(server.random, "uniform", uniform), \
+             mock.patch.object(server.asyncio, "sleep", fake_sleep):
+            asyncio.run(server._sleep_before_retry(8, "HTTP 429"))
+        return waits
+
+    def test_429_ceiling_is_never_exceeded(self):
+        # The jitter used to be added on top of the cap: up to 1.5x the documented ceiling.
+        self.assertLessEqual(self._429_waits(20.0, lambda a, b: b)[0], 20.0)
+        self.assertGreaterEqual(self._429_waits(20.0, lambda a, b: a)[0], 10.0)
+
+    def test_zero_cap_does_not_spin(self):
+        wait = self._429_waits(0.0, lambda a, b: b)[0]
+        self.assertGreater(wait, 0.0)
+        self.assertLessEqual(wait, 1.0)

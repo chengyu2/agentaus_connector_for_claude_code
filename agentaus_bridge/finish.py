@@ -38,8 +38,11 @@ _LOOK_ONLY = {
     "rg", "ag", "find", "fd", "wc", "echo", "printf", "pwd", "cd", "file", "stat", "du",
     "df", "which", "type", "diff", "cmp", "sort", "uniq", "cut", "tr", "awk", "sed", "nl",
     "true", "git", "mkdir", "touch", "cp", "mv", "rm", "chmod", "realpath", "basename",
-    "dirname", "date", "env", "export", "set", "column", "xxd", "od", "hexdump", "jq",
+    "dirname", "date", "export", "set", "column", "xxd", "od", "hexdump", "jq",
 }
+# Words that run the command after them: `env PYTHONPATH=src python -m pytest` runs pytest,
+# so the word after them (and after their options and VAR=value settings) is the one judged.
+_PREFIXES = {"env", "command", "exec", "time", "nice", "timeout", "sudo", "xargs"}
 
 # A test runner's own summary of a failed run. Deliberately narrow: a program that
 # prints "Error:" on purpose (an interpreter's error messages, a validator's output) must
@@ -57,6 +60,27 @@ _DELIVERABLE = re.compile(
     r"[^.,:;\n`]{0,40}?`([\w./-]+\.[A-Za-z0-9]{1,5})`",
     re.IGNORECASE,
 )
+# A dotted name is a file only with a file's extension (or a directory in it): "Write a test
+# for `Parser.parse`", "a wrapper around `requests.get`" name code, and the gate would
+# otherwise insist the model create them.
+_FILE_EXTENSIONS = CODE_EXTENSIONS | {
+    ".json", ".jsonl", ".md", ".txt", ".csv", ".tsv", ".yaml", ".yml", ".toml", ".ini",
+    ".cfg", ".conf", ".env", ".html", ".htm", ".css", ".scss", ".xml", ".svg", ".log",
+    ".rst", ".adoc", ".ipynb", ".lock", ".out", ".patch", ".diff", ".db", ".sqlite",
+    ".parquet", ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".tar", ".gz", ".tgz", ".zip",
+    ".bak", ".proto", ".graphql", ".tex", ".bib", ".dat", ".bin", ".pem",
+}
+# "Do not create `backup.tar`", "never write to `secrets.env`": a file the request forbids.
+_NEGATED = re.compile(r"\b(?:not|never|don'?t|doesn'?t|avoid|without|no need)\b",
+                      re.IGNORECASE)
+_CLAUSE_END = re.compile(r"[.;:!?,\n]|\bbut\b", re.IGNORECASE)
+# A request for a test that is meant to fail - "a failing test", "a test that reproduces
+# the bug": its failing run is the deliverable. "Reproduce the bug, then fix it" is not.
+_WANTS_FAILING = re.compile(
+    r"\bfail(?:ing|s)\s+(?:\w+\s+){0,2}?tests?\b"
+    r"|\b(?:tests?|test case|script)\s+(?:that|which|to)\s+(?:fails?|reproduc)"
+    r"|\breproduc\w*\s+(?:\w+\s+){0,2}?tests?\b|\breproduces the (?:bug|issue|failure)\b",
+    re.IGNORECASE)
 # A document the request names as the authority: `SPEC.md`, `docs/RULES.md`.
 _DOC = re.compile(r"`([\w./-]+\.(?:md|rst|adoc))`")
 # Numbered list items, bullets, and the bold heads of quoted items (tickets, stories).
@@ -95,6 +119,25 @@ def _is_user_text(message: dict) -> bool:
         return False
     text = _REMINDER.sub("", text).strip()
     return bool(text) and "<task-notification>" not in text
+
+
+def latest_request(messages: list) -> str:
+    """The last thing the user actually said - the request this turn is answering. A
+    skill's body, which arrives as user text after its `Skill` call, is not one."""
+    latest, in_skill = "", False
+    for m in messages:
+        content = m.get("content")
+        if m.get("role") == "assistant":
+            in_skill = isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Skill"
+                for b in content)
+            continue
+        if in_skill or not _is_user_text(m):
+            continue
+        text = content if isinstance(content, str) else "\n".join(
+            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+        latest = _REMINDER.sub("", text).strip()
+    return latest
 
 
 def turn_events(messages: list) -> list[tuple[str, dict, str, bool]]:
@@ -158,21 +201,50 @@ def _segments(command: str) -> list[list[str]]:
     return out
 
 
+def _command_words(words: list[str]) -> list[str]:
+    """A simple command's words from the one that does the work: past `FOO=1`, `env`,
+    `timeout 60`, `nice -n 5` and the like."""
+    while words:
+        head = os.path.basename(words[0])
+        if re.match(r"^\w+=", words[0]):  # FOO=1 cmd
+            words = words[1:]
+        elif head in _PREFIXES:
+            if head == "command" and any(w in ("-v", "-V") for w in words[1:2]):
+                return []  # `command -v python` only looks the name up
+            words = words[1:]
+            while words and (words[0].startswith("-") or re.match(r"^\w+=", words[0])
+                             or re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", words[0])):
+                words = words[1:]  # options, settings, a timeout's duration, a niceness
+        else:
+            return words
+    return words
+
+
+def _segment_runs(words: list[str]) -> bool:
+    words = _command_words(words)
+    if not words:
+        return False
+    head = os.path.basename(words[0])
+    if head == "find" and any(w in ("-exec", "-execdir", "-ok", "-okdir") for w in words):
+        return True
+    # `sed -i` changes a file but runs nothing; an in-place edit of code is counted as an
+    # edit by _sed_edits instead.
+    return head not in _LOOK_ONLY
+
+
 def runs_something(command: str) -> bool:
     """Whether a shell command executes anything, rather than only looking at files."""
-    for words in _segments(command):
-        while words and re.match(r"^\w+=", words[0]):  # FOO=1 cmd
-            words = words[1:]
-        if not words:
-            continue
-        head = os.path.basename(words[0])
-        if head in ("sudo", "timeout", "time", "nice", "xargs"):
-            return True
-        if head == "sed" and "-i" not in words:
-            continue
-        if head not in _LOOK_ONLY:
-            return True
-    return False
+    return any(_segment_runs(words) for words in _segments(command))
+
+
+def _sed_edits(words: list[str]) -> list[str]:
+    """The code files a `sed -i` segment edits in place - an edit like any Edit call."""
+    words = _command_words(words)
+    if not words or os.path.basename(words[0]) != "sed":
+        return []
+    if not any(w.startswith("-i") or w.startswith("--in-place") for w in words[1:]):
+        return []
+    return [w for w in words[1:] if not w.startswith("-") and is_code(w)]
 
 
 def verification_state(messages: list) -> dict:
@@ -186,12 +258,22 @@ def verification_state(messages: list) -> dict:
     for name, args, result, err in turn_events(messages):
         path = _edited_path(name, args)
         if path and is_code(path):
+            if err:  # refused ("String to replace not found"): nothing changed
+                continue
             edits += 1
             unrun[path] = None
             last_run_output = None
-        elif name == "Bash" and runs_something(str(args.get("command") or "")):
-            unrun.clear()
-            last_run_output = result
+        elif name == "Bash":
+            # In order: `sed -i ... app.py && pytest` is verified, `pytest; sed -i` is not.
+            for words in _segments(str(args.get("command") or "")):
+                changed = _sed_edits(words)
+                if changed:
+                    edits += len(changed)
+                    unrun.update((p, None) for p in changed)
+                    last_run_output = None
+                elif _segment_runs(words):
+                    unrun.clear()
+                    last_run_output = result
     failed = None
     if last_run_output and _FAILED_RUN.search(last_run_output):
         failed = last_run_output[-1500:]
@@ -201,8 +283,15 @@ def verification_state(messages: list) -> dict:
 def deliverables(request: str) -> list[str]:
     """Files the request asks to be produced, in the order named."""
     seen = []
-    for m in _DELIVERABLE.finditer(request or ""):
+    request = request or ""
+    for m in _DELIVERABLE.finditer(request):
         name = m.group(1)
+        if "/" not in name and os.path.splitext(name)[1].lower() not in _FILE_EXTENSIONS:
+            continue
+        clause = request[:m.start(1)]
+        ends = list(_CLAUSE_END.finditer(clause))
+        if _NEGATED.search(clause[ends[-1].end() if ends else 0:]):
+            continue
         if name not in seen:
             seen.append(name)
     return seen
@@ -215,9 +304,9 @@ def missing_deliverables(request: str, cwd: str | None, messages: list) -> list[
     if not wanted:
         return []
     written = set()
-    for name, args, _r, _e in turn_events(messages):
+    for name, args, _r, err in turn_events(messages):
         path = _edited_path(name, args)
-        if path:
+        if path and not err:
             written.add(path)
         elif name == "Bash":
             written.add(str(args.get("command") or ""))
@@ -360,7 +449,7 @@ def deliverable_nudge(request: str, cwd: str | None, messages: list, *,
     calls = len(turn_events(messages))
     if calls < after_calls:
         return ""
-    missing = missing_deliverables(request, cwd, messages)
+    missing = missing_deliverables(latest_request(messages) or request, cwd, messages)
     if not missing:
         return ""
     one = len(missing) == 1
@@ -390,8 +479,12 @@ def finish_gate(key: str, request: str, messages: list, cwd: str | None, *,
                 can_run: bool, checklist_on: bool = True) -> tuple[str, str, bool]:
     """Decide whether a final answer should go back to the model.
 
-    Returns (kind, correction, force_tool) - kind "" means let the answer through."""
-    missing = missing_deliverables(request, cwd, messages)
+    Returns (kind, correction, force_tool) - kind "" means let the answer through.
+
+    `request` is the conversation's first message; the files asked for are read off the
+    latest one, since a later "now write `notes.md`" is what this turn answers."""
+    ask = latest_request(messages) or request
+    missing = missing_deliverables(ask, cwd, messages)
     if missing and _take(key, "deliverable"):
         one = len(missing) == 1
         return ("deliverable", DELIVERABLE_CORRECTION.format(
@@ -400,9 +493,12 @@ def finish_gate(key: str, request: str, messages: list, cwd: str | None, *,
     if can_run and state["unrun"] and _take(key, "unverified"):
         return ("unverified", UNVERIFIED_CORRECTION.format(
             files=_quote_files(state["unrun"], cwd)), True)
-    if can_run and state["failed"] and _take(key, "failed"):
-        return ("failed", FAILED_CORRECTION.format(output=state["failed"].strip()), True)
-    if (checklist_on and state["edits"] + len(deliverables(request)) > 0
+    # Not forced: "if it cannot be fixed, say why" must be answerable without a tool call.
+    # And a request for a failing test is done when its run fails.
+    if (can_run and state["failed"] and not _WANTS_FAILING.search(ask)
+            and _take(key, "failed")):
+        return ("failed", FAILED_CORRECTION.format(output=state["failed"].strip()), False)
+    if (checklist_on and state["edits"] + len(deliverables(ask)) > 0
             and wants_checklist(request, cwd) and _take(key, "checklist")):
         return ("checklist", checklist_text(request, cwd), False)
     return ("", "", False)

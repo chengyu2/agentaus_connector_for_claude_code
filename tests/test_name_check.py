@@ -101,6 +101,17 @@ class NameCheck(unittest.TestCase):
     def test_comprehension_name_is_attributed_to_its_function(self):
         self.assertEqual(name_check.undefined(AFTER, "s.py"), [("scale_points", 1, "k")])
 
+    def test_lambda_and_comprehension_edits_are_seen_in_their_function(self):
+        src = ("def f(xs):\n    g = lambda x: x * k\n    a = {x: m for x in xs}\n"
+               "    b = {x * n for x in xs}\n    return g, a, b\n")
+        found = name_check.undefined(src, "f.py", lines={2, 3, 4})
+        self.assertEqual(sorted(n for _, _, n in found), ["k", "m", "n"])
+        self.assertEqual({f for f, _, _ in found}, {"f"})
+
+    def test_local_variable_annotation_is_not_evaluated(self):
+        src = "def f():\n    x: Undef = 1\n    y: Other = 2\n    return x, y, Other\n"
+        self.assertEqual(name_check.undefined(src, "f.py"), [("f", 1, "Other")])
+
 
 if __name__ == "__main__":
     unittest.main()

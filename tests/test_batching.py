@@ -157,6 +157,101 @@ class Expand(unittest.TestCase):
         out = batching.wrap_payload({"tools": TOOLS, "messages": history})["messages"][1:]
         self.assertEqual(json.loads(out[0]["tool_calls"][0]["function"]["arguments"]), asked)
 
+    def test_id_less_calls_expand_to_different_ids_each_time(self):
+        call = {"name": "run_tools", "arguments": json.dumps({"tool_uses": [
+            {"recipient_name": "Read", "parameters": {}},
+            {"recipient_name": "Grep", "parameters": {}}]})}
+        first = [c["id"] for c in batching.expand_calls([dict(call)])]
+        second = [c["id"] for c in batching.expand_calls([dict(call)])]
+        self.assertEqual(len(set(first + second)), 4)
+
+    def test_tool_uses_sent_as_a_json_string(self):
+        uses = [{"recipient_name": "Read", "parameters": {"file_path": "a"}},
+                {"recipient_name": "Grep", "parameters": {"pattern": "b"}}]
+        calls = [{"id": "k", "name": "run_tools",
+                  "arguments": json.dumps({"tool_uses": json.dumps(uses)})}]
+        self.assertEqual([c["name"] for c in batching.expand_calls(calls)], ["Read", "Grep"])
+
+    def test_both_paths_accept_the_same_spellings(self):
+        args = json.dumps({"tool_uses": [{"recipient_name": "Read", "parameters": {}},
+                                         {"recipient_name": "Grep", "parameters": {}}]})
+        for name in ("run_tools", "functions.run_tools", "run-tools", "Run_Tools"):
+            streamed = batching.expand_calls([{"id": "k", "name": name, "arguments": args}])
+            self.assertEqual([c["name"] for c in streamed], ["Read", "Grep"], name)
+            data = {"choices": [{"message": {"role": "assistant", "tool_calls": [
+                {"id": "k", "type": "function",
+                 "function": {"name": name, "arguments": args}}]}}]}
+            buffered = batching.expand_response(data)["choices"][0]["message"]["tool_calls"]
+            self.assertEqual([c["function"]["name"] for c in buffered], ["Read", "Grep"], name)
+        self.assertFalse(batching.is_dispatch("Read"))
+
+
+class Corrections(unittest.TestCase):
+    def test_unexpandable_run_tools_gets_the_usage_not_invented(self):
+        for args in ({"tool_uses": []}, {}, "{not json"):
+            raw = args if isinstance(args, str) else json.dumps(args)
+            [call] = batching.expand_calls([{"id": "k", "name": "run_tools", "arguments": raw}])
+            self.assertEqual(batching.correction_for(call), batching.USAGE, args)
+        self.assertIn("non-empty list of {recipient_name, parameters}", batching.USAGE)
+
+    def test_nested_run_tools_gets_the_usage(self):
+        calls = batching.expand_calls([{"id": "k", "name": "run_tools", "arguments":
+                                        json.dumps({"tool_uses": [
+            {"recipient_name": "Read", "parameters": {}},
+            {"recipient_name": "functions.run_tools", "parameters": {"tool_uses": []}}]})}])
+        self.assertIsNone(batching.correction_for(calls[0]))
+        self.assertEqual(batching.correction_for(calls[1]), batching.USAGE)
+
+    def test_valid_siblings_are_answered_not_run(self):
+        good = {"id": "k-u0", "name": "Read", "arguments": "{}"}
+        bad = {"id": "k-u1", "name": "open_file", "arguments": "{}"}
+        renamed = {**good, "name": "Read", "asked_as": "read"}   # the partition's copy
+        calls, results = batching.answer_batch([good, bad], [(bad, "no such tool")])
+        self.assertEqual([c["id"] for c in calls], ["k-u1", "k-u0"])
+        self.assertEqual(results, ["no such tool", batching.NOT_RUN])
+        calls, _ = batching.answer_batch([renamed, bad], [(good, "bad args")])
+        self.assertEqual([c["id"] for c in calls], ["k-u0", "k-u1"])
+
+    def test_not_run_siblings_survive_the_collapse(self):
+        good = {"id": "k-u0", "name": "Read", "arguments": '{"file_path": "a"}'}
+        bad = {"id": "k-u1", "name": "open_file", "arguments": "{}"}
+        calls, results = batching.answer_batch([good, bad], [(bad, "no such tool")])
+        history = [{"role": "assistant", "content": None, "tool_calls": [
+            {"id": c["id"], "type": "function",
+             "function": {"name": c["name"], "arguments": c["arguments"]}} for c in calls]}]
+        history += [{"role": "tool", "tool_call_id": c["id"], "content": r}
+                    for c, r in zip(calls, results)]
+        out = batching.wrap_payload({"tools": TOOLS, "messages": history})["messages"][1:]
+        self.assertIn("no such tool", out[1]["content"])
+        self.assertIn("not run: another call in the same reply", out[1]["content"])
+
+
+class CollapseAcrossMessages(unittest.TestCase):
+    @staticmethod
+    def _batch(ids, results):
+        return [{"role": "assistant", "content": None, "tool_calls": [
+            {"id": i, "type": "function", "function": {"name": "Read", "arguments": "{}"}}
+            for i in ids]}] + [{"role": "tool", "tool_call_id": i, "content": r}
+                               for i, r in zip(ids, results)]
+
+    def test_reused_ids_stay_with_their_own_message(self):
+        """harmony.py numbers recovered calls from harmony_0 in every response."""
+        ids = ["harmony_0", "harmony_1"]
+        messages = self._batch(ids, ["A0", "A1"]) + self._batch(ids, ["B0", "B1"])
+        out = batching.wrap_payload({"tools": TOOLS, "messages": messages})["messages"][1:]
+        self.assertEqual([m["role"] for m in out], ["assistant", "tool", "assistant", "tool"])
+        self.assertIn("A0", out[1]["content"])
+        self.assertIn("A1", out[1]["content"])
+        self.assertNotIn("B0", out[1]["content"])
+        self.assertIn("B0", out[3]["content"])
+        self.assertIn("B1", out[3]["content"])
+
+    def test_reused_id_after_a_single_call_is_not_folded_back(self):
+        messages = self._batch(["c0", "c1"], ["A0", "A1"]) + self._batch(["c0"], ["S"])
+        out = batching.wrap_payload({"tools": TOOLS, "messages": messages})["messages"][1:]
+        self.assertEqual(out[3], {"role": "tool", "tool_call_id": "c0", "content": "S"})
+        self.assertNotIn("S", out[1]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()

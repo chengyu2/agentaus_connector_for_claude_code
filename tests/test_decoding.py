@@ -40,6 +40,24 @@ class DecodingTests(unittest.TestCase):
     def test_garbage_is_ignored(self):
         self.assertNotIn("temperature", self.build("warm"))
 
+    def test_non_finite_or_out_of_range_is_ignored(self):
+        import json
+        for t, p in (("nan", "nan"), ("inf", "-inf"), ("-0.1", "0"), ("2.5", "1.5")):
+            payload = self.build(t, p)
+            self.assertNotIn("temperature", payload, t)
+            self.assertNotIn("top_p", payload, p)
+            json.dumps(payload, allow_nan=False)  # must still serialise
+        payload = self.build("0", "1")
+        self.assertEqual((payload["temperature"], payload["top_p"]), (0.0, 1.0))
+        self.assertEqual(self.build("2")["temperature"], 2.0)
+
+    def test_bad_value_warns_once(self):
+        with self.assertLogs("agentaus-bridge", "WARNING") as logs:
+            self.build("nan-once-test")
+            self.build("nan-once-test")
+            self.build(temperature="", top_p="7")
+        self.assertEqual(len(logs.records), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

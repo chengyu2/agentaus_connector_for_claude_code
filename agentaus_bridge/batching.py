@@ -29,9 +29,58 @@ sent upstream is changed.
 from __future__ import annotations
 
 import json
+import re
+import uuid
 from typing import Any
 
 DISPATCH = "run_tools"
+
+# How models dress up a function name: `functions.run_tools`, `run-tools`, `Run_Tools`.
+_PREFIX = re.compile(r"^(?:functions|function|tools|tool|default_api)[._\-:]+", re.I)
+
+USAGE = ("run_tools needs tool_uses: a non-empty list of {recipient_name, parameters}, "
+         "one item per call, each naming one of the other functions (not run_tools "
+         "itself). For a single call, call that function directly.")
+
+NOT_RUN = ("(not run: another call in the same reply was rejected - see its result. "
+           "Call this one again if you still need it.)")
+
+
+def is_dispatch(name: Any) -> bool:
+    """Whether `name` is the dispatcher, however the model spelled it. One test for the
+    buffered and streaming paths, which used to disagree (exact `run_tools` vs any case
+    and `run-tools`), so the same reply expanded on one path and not the other."""
+    bare = _PREFIX.sub("", str(name or "").strip())
+    return re.sub(r"[\s_\-.]", "", bare.lower()) == DISPATCH.replace("_", "")
+
+
+def correction_for(call: dict) -> str | None:
+    """The correction for a dispatcher call that could not be expanded, else None.
+
+    `run_tools` is never in the native payload's tool list (only the upstream copy has
+    it), so without this an empty or unreadable run_tools call - or one nested inside
+    tool_uses - was answered "There is no tool named 'run_tools'. You invented it", which
+    tells the model to stop batching rather than how to batch."""
+    return USAGE if is_dispatch(call.get("name")) else None
+
+
+def answer_batch(batch: list, answered: list) -> tuple[list, list]:
+    """(calls, results) for a correction round: each (call, message) in `answered`, then
+    every other call of the same reply in `batch` with NOT_RUN.
+
+    With batching, one reply carries several calls; a correction round used to send back
+    only the rejected ones, so the valid siblings vanished from history and the model
+    could assume they ran. A sibling is matched by identity or id - the partition hands
+    back renamed copies of calls."""
+    calls = [c for c, _ in answered]
+    results = [m for _, m in answered]
+    for call in batch:
+        if any(call is c or (call.get("id") and call.get("id") == c.get("id"))
+               for c in calls):
+            continue
+        calls.append(call)
+        results.append(NOT_RUN)
+    return calls, results
 
 _DESCRIPTION = (
     "Run SEVERAL of the other functions in one step. Only ONE function call per reply is "
@@ -117,21 +166,28 @@ def _label(index: int, name: str, args: Any) -> str:
 def _collapse_history(messages: list) -> list:
     """Each assistant message's tool calls -> one dispatcher call; their results -> one."""
     out: list = []
-    owner: dict = {}          # tool_call_id -> (group id, position in group)
-    groups: dict = {}         # group id -> {"calls": [...], "results": {pos: text}, "slot": idx}
+    owner: dict = {}          # tool_call_id -> (group key, position), latest message only
+    groups: dict = {}         # index in `out` of the rewritten call -> {"gid", "calls", ...}
     for message in messages:
         role = message.get("role")
+        if role == "assistant":
+            # A result answers the assistant message just before it, and ids are not
+            # unique across a conversation: harmony.py numbers recovered calls from
+            # harmony_0 in every response. A map spanning the whole history folded a
+            # later result into an earlier group, or blanked that group's placeholder.
+            owner = {}
         if role == "assistant" and len(message.get("tool_calls") or []) > 1:
             calls = message["tool_calls"]
             gid = calls[0].get("id") or f"call_{len(groups)}"
+            key = len(out)
             uses = []
             for pos, call in enumerate(calls):
                 fn = call.get("function") or {}
                 args = _args_of(call)
                 uses.append({"recipient_name": fn.get("name") or "",
                              "parameters": args if isinstance(args, dict) else {"_raw": args}})
-                owner[call.get("id") or ""] = (gid, pos)
-            groups[gid] = {"calls": calls, "results": {}, "slot": None}
+                owner[call.get("id") or ""] = (key, pos)
+            groups[key] = {"gid": gid, "calls": calls, "results": {}, "slot": None}
             out.append({
                 **message,
                 "tool_calls": [{
@@ -143,16 +199,16 @@ def _collapse_history(messages: list) -> list:
             })
             continue
         if role == "tool" and message.get("tool_call_id") in owner:
-            gid, pos = owner[message["tool_call_id"]]
-            group = groups[gid]
+            key, pos = owner[message["tool_call_id"]]
+            group = groups[key]
             group["results"][pos] = _text_of(message.get("content"))
             if group["slot"] is None:
                 group["slot"] = len(out)
-                out.append({"role": "tool", "tool_call_id": gid, "content": ""})
+                out.append({"role": "tool", "tool_call_id": group["gid"], "content": ""})
             continue
         out.append(message)
 
-    for gid, group in groups.items():
+    for group in groups.values():
         if group["slot"] is None:
             continue
         calls = group["calls"]
@@ -165,7 +221,7 @@ def _collapse_history(messages: list) -> list:
                 result = group["results"].get(pos, "(no result: this use was not run)")
                 parts.append(f"{_label(pos, fn.get('name') or '', _args_of(call))}\n{result}")
             content = "\n\n".join(parts)
-        out[group["slot"]] = {"role": "tool", "tool_call_id": gid, "content": content}
+        out[group["slot"]] = {"role": "tool", "tool_call_id": group["gid"], "content": content}
     return out
 
 
@@ -198,8 +254,15 @@ def _uses_of(args: Any) -> list | None:
     if not isinstance(args, dict):
         return None
     for key in ("tool_uses", "calls", "tools", "uses"):
-        if isinstance(args.get(key), list):
-            return args[key]
+        value = args.get(key)
+        if isinstance(value, str):
+            # The list sent JSON-encoded inside the arguments, as a string.
+            try:
+                value = json.loads(value)
+            except ValueError:
+                continue
+        if isinstance(value, list):
+            return value
     # One use written flat: {"recipient_name": "Read", "parameters": {...}}.
     if any(k in args for k in ("recipient_name", "tool", "name")):
         return [args]
@@ -231,11 +294,11 @@ def _use_args(use: dict) -> Any:
 def expand_calls(calls: list) -> list:
     """Replace each dispatcher call with the real calls it carries (accumulator shape:
     {"id", "name", "arguments"}). Anything else passes through untouched, and a
-    dispatcher call that cannot be read is left as it is - the bridge then treats it as
-    a call to a tool that does not exist and corrects it."""
+    dispatcher call that cannot be read is left as it is - the bridge then corrects it
+    with `correction_for`."""
     out: list = []
     for call in calls:
-        if (call.get("name") or "").replace("-", "_").lower() != DISPATCH:
+        if not is_dispatch(call.get("name")):
             out.append(call)
             continue
         raw = call.get("arguments")
@@ -248,7 +311,9 @@ def expand_calls(calls: list) -> list:
         if not uses:
             out.append(call)
             continue
-        base = call.get("id") or "call"
+        # Unique, not a constant: an id-less call expanded to call-u0, call-u1 in every
+        # reply, and repeated ids across a conversation confuse _collapse_history.
+        base = call.get("id") or f"call_{uuid.uuid4().hex[:16]}"
         expanded = []
         for i, use in enumerate(uses):
             if not isinstance(use, dict) or not _use_name(use):
@@ -272,7 +337,7 @@ def expand_response(data: dict) -> dict:
     choice = dict(choices[0] or {})
     message = dict(choice.get("message") or {})
     raw_calls = message.get("tool_calls") or []
-    if not any(((c or {}).get("function") or {}).get("name") == DISPATCH for c in raw_calls):
+    if not any(is_dispatch(((c or {}).get("function") or {}).get("name")) for c in raw_calls):
         return data
     flat = [{"id": c.get("id") or "", "name": (c.get("function") or {}).get("name") or "",
              "arguments": (c.get("function") or {}).get("arguments") or "{}"}

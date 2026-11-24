@@ -1057,11 +1057,11 @@ below are what cut that:
 | Change | Setting | What it saves |
 | --- | --- | --- |
 | Several tool calls in one reply | `AGENTAUS_BATCH_TOOLS` | Agentaus writes parallel tool calls, but its API returns only one and drops the rest. The bridge offers a `run_tools` tool whose argument is a list of calls and hands Claude Code the whole list at once. Reading seven files is one round trip instead of seven: 32% fewer Agentaus calls on the benchmark |
-| A shorter prompt | `AGENTAUS_PROMPT_DIET` | The first request drops from about 13,500 tokens to 7,400: a short operating block replaces the long notes, long tool descriptions are capped, and the skill library listing, skill routing and `agentaus_investigate` are left out. Turn any of them back on by name (`AGENTAUS_SKILL_LIBRARY=true` and so on) |
+| A shorter prompt | `AGENTAUS_PROMPT_DIET` | The first request drops from about 13,500 tokens to 8,700: a short operating block replaces the long notes, long descriptions of non-core tools are capped (Bash, Edit, Write, Read, Agent, Skill and the like keep their full manuals, safety rules included), and the skill library listing, skill routing and `agentaus_investigate` are left out. Turn any of them back on by name (`AGENTAUS_SKILL_LIBRARY=true` and so on) |
 | A lower temperature | `AGENTAUS_TEMPERATURE` | `0.2`: fewer calls per task, each a little faster. Empty sends none |
 | The planner beside the first call | `AGENTAUS_PLAN_ASYNC` | 23 s per turn that used to come first |
 | One-call grounding check, started beside the stall check | `AGENTAUS_GROUNDING_ONE_PASS`, `AGENTAUS_OVERLAP_CHECKS` | The check and its rewrite were two calls; the syntax fix no longer runs on printed command output, where it cost 11-38 s and could never succeed |
-| A short wait after HTTP 429 | `BRIDGE_RATE_LIMIT_MAX_DELAY` | Agentaus limits each tenant's request rate. The outage backoff grew to about 256 s per attempt under it, and every timeout in the benchmark baseline came from that wait. A 429 now waits at most about 20 s |
+| A short wait after HTTP 429 | `BRIDGE_RATE_LIMIT_MAX_DELAY` | Agentaus limits each tenant's request rate. The outage backoff grew to about 256 s per attempt under it, and every timeout in the benchmark baseline came from that wait. A 429 now waits at most 20 s (between 10 and 20 s, jittered) |
 
 Some changes keep a turn from ending early or wrong, each at no cost unless it fires:
 
@@ -1135,7 +1135,7 @@ tuning, search limits, retries and timeouts, and the ultracode agent graph, is i
 | `AGENTAUS_PROMPT_DIET` | `true` | A shorter prompt: see [Speed](#speed-fewer-and-cheaper-agentaus-calls). Turns `AGENTAUS_SKILL_LIBRARY`, `AGENTAUS_SKILL_ROUTING` and `AGENTAUS_INVESTIGATE` off unless they are set |
 | `AGENTAUS_TEMPERATURE` | `0.2` | Sampling temperature for main-loop calls. Empty sends none; `client` forwards Claude Code's |
 | `AGENTAUS_FINISH_GATE` | `true` | Re-ask a turn that ends with a requested file missing, an edit never run, or tests still failing |
-| `BRIDGE_RATE_LIMIT_MAX_DELAY` | `20` | Ceiling on the wait after an HTTP 429, which is a rate window rather than an outage |
+| `BRIDGE_RATE_LIMIT_MAX_DELAY` | `20` | Ceiling on the wait after an HTTP 429, which is a rate window rather than an outage. Each wait falls between half the ceiling and the ceiling; values under 1 count as 1 |
 | `AGENTAUS_SKILL_ROUTING` | `true`, `false` under the prompt diet | Restore project skill descriptions and route skills/subagents by "if this, use that" |
 | `AGENTAUS_SKILL_LIBRARY` | `true`, `false` under the prompt diet | Offer the bridge's own skill library to Agentaus in every project |
 | `AGENTAUS_SUBAGENTS_FOLLOW_SESSION` | `true` | A subagent runs on the model its session's main loop is on |

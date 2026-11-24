@@ -43,6 +43,44 @@ def _args(value) -> dict:
     return {}
 
 
+def _inline(table) -> bool:
+    """A function-type scope that is not a `def`: a lambda, or a comprehension before
+    Python 3.12. Their names vary by version (`lambda`, `listcomp`, `<genexpr>`), but a
+    comprehension always takes its iterable as the parameter `.0`, which no def can have,
+    and no def can be named `lambda`."""
+    name = table.get_name()
+    return name.startswith("<") or name == "lambda" or ".0" in table.get_parameters()
+
+
+def _annotation_only(tree) -> dict:
+    """{(def line, end line): names the function uses only in annotations of its local
+    variables}. Python never evaluates those (`x: Undef = 1` inside a def), so they cannot
+    raise NameError."""
+    out = {}
+
+    def scan(nodes, ann, used):
+        for node in nodes:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                a, u = set(), set()
+                scan(node.body, a, u)
+                out[(node.lineno, node.end_lineno or node.lineno)] = a - u
+                scan(node.decorator_list + [node.args] + ([node.returns] if node.returns else []),
+                     ann, used)
+            elif isinstance(node, ast.ClassDef):  # a class body's annotations are evaluated
+                scan(node.body, None, set())
+                scan(node.decorator_list + node.bases + node.keywords, ann, used)
+            elif isinstance(node, ast.AnnAssign) and ann is not None:
+                ann.update(n.id for n in ast.walk(node.annotation) if isinstance(n, ast.Name))
+                scan([node.target] + ([node.value] if node.value else []), ann, used)
+            else:
+                if isinstance(node, ast.Name):
+                    used.add(node.id)
+                scan(list(ast.iter_child_nodes(node)), ann, used)
+
+    scan(tree.body, None, set())
+    return out
+
+
 def undefined(text: str, filename: str, lines: set | None = None) -> list:
     """[(function name, def line, name)] for names in functions that can only raise
     NameError. `lines` limits it to functions overlapping those 1-based line numbers."""
@@ -59,15 +97,16 @@ def undefined(text: str, filename: str, lines: set | None = None) -> list:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             spans.setdefault(node.name, []).append((node.lineno, node.end_lineno or node.lineno))
     known = {s.get_name() for s in top.get_symbols()} | _BUILTINS
+    unevaluated = _annotation_only(tree)
     tables = []
 
     def collect(table, owner):
         for child in table.get_children():
             here = owner
             if child.get_type() == "function":
-                # A comprehension or lambda is its own scope before Python 3.12; its names
-                # are reported against the function it is written in.
-                here = child if not child.get_name().startswith("<") or owner is None else owner
+                # A comprehension or lambda is its own scope (comprehensions only before
+                # Python 3.12); its names are reported against the def it is written in.
+                here = owner if _inline(child) else child
                 tables.append((child, here))
                 known.update(s.get_name() for s in child.get_symbols() if s.is_declared_global())
             elif child.get_type() == "class":
@@ -83,7 +122,7 @@ def undefined(text: str, filename: str, lines: set | None = None) -> list:
 
     out, seen = [], set()
     for table, owner in tables:
-        if owner is None or owner.get_name().startswith("<"):
+        if owner is None:
             continue
         sp = span(owner)
         if lines is not None and (sp is None or not any(sp[0] <= n <= sp[1] for n in lines)):
@@ -94,7 +133,8 @@ def undefined(text: str, filename: str, lines: set | None = None) -> list:
             # "top" global (it takes the name for the module's).
             if (s.is_referenced() and s.is_global() and not s.is_declared_global()
                     and not s.is_local() and not s.is_parameter() and not s.is_free()
-                    and name not in known and (owner.get_name(), name) not in seen):
+                    and name not in known and name not in unevaluated.get(sp, ())
+                    and (owner.get_name(), name) not in seen):
                 seen.add((owner.get_name(), name))
                 out.append((owner.get_name(), sp[0] if sp else owner.get_lineno(), name))
     return out

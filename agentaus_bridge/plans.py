@@ -26,10 +26,11 @@ _MAX_AGE_SECONDS = 3 * 3600
 
 
 class _Entry:
-    __slots__ = ("task", "text", "shown", "at", "started", "waited")
+    __slots__ = ("task", "text", "shown", "at", "started", "waited", "session")
 
-    def __init__(self, task: asyncio.Task) -> None:
+    def __init__(self, task: asyncio.Task, session: str | None = None) -> None:
         self.task = task
+        self.session = session
         self.text: str | None = None
         self.shown = False
         self.at = time.monotonic()
@@ -43,10 +44,12 @@ _turns: "OrderedDict[str, _Entry]" = OrderedDict()
 def turn_key(session: str | None, texts: list) -> str | None:
     """The turn a request belongs to: its session, how many things the user has said, and
     the last of them. A tool round trip keeps all three; a new user message changes them.
-    None when there is nothing to key on."""
-    if not texts:
+    None when there is nothing to key on - including no session: two sessionless clients
+    that open with the same message would otherwise share one plan, so such a request
+    takes the blocking planner instead, which plans each request for itself."""
+    if not texts or not session:
         return None
-    raw = "\x00".join([session or "", str(len(texts)), texts[0][:4000], texts[-1][:4000]])
+    raw = "\x00".join([session, str(len(texts)), texts[0][:4000], texts[-1][:4000]])
     return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
 
 
@@ -60,11 +63,22 @@ def _prune() -> None:
             old.task.cancel()
 
 
-def start(key: str, make: Callable[[], Awaitable[str]]) -> bool:
+def start(key: str, make: Callable[[], Awaitable[str]], session: str | None = None) -> bool:
     """Start planning the turn `key` in the background, unless it already is. Returns
-    whether a new plan was started (a client re-send of the same request reuses one)."""
+    whether a new plan was started (a client re-send of the same request reuses one).
+
+    A new turn in `session` cancels that session's plans still being written: the user has
+    moved on, nothing will ask for them again, and each holds a gate slot and an upstream
+    call that the new turn's own requests are now queued behind. Only a main loop's new
+    message starts a plan (never a subagent or a tool round trip), so this cannot cancel a
+    plan its own turn is still waiting for."""
     if key in _turns:
         return False
+    if session:
+        for old_key in [k for k, e in _turns.items()
+                        if e.session == session and not e.task.done()]:
+            _turns.pop(old_key).task.cancel()
+            log.info("a new turn started; cancelled the previous turn's unfinished plan")
     entry: _Entry
 
     async def run() -> str:
@@ -78,7 +92,7 @@ def start(key: str, make: Callable[[], Awaitable[str]]) -> bool:
                  time.monotonic() - entry.started, len(entry.text))
         return entry.text
 
-    entry = _Entry(asyncio.get_running_loop().create_task(run()))
+    entry = _Entry(asyncio.get_running_loop().create_task(run()), session)
     _turns[key] = entry
     _prune()
     return True

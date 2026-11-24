@@ -46,6 +46,35 @@ class VerificationTests(unittest.TestCase):
         self.assertTrue(finish.runs_something("cd /w && python -m pytest -q 2>&1 | tail -5"))
         self.assertTrue(finish.runs_something("ls; python3 -c 'import shapes'"))
 
+    def test_prefix_words_judge_the_command_after_them(self):
+        self.assertTrue(finish.runs_something("env PYTHONPATH=src python -m pytest -q"))
+        self.assertTrue(finish.runs_something("timeout 60 nice -n 5 python app.py"))
+        self.assertTrue(finish.runs_something("command python3 app.py"))
+        self.assertFalse(finish.runs_something("env | grep PATH"))
+        self.assertFalse(finish.runs_something("command -v python3"))
+        self.assertFalse(finish.runs_something("time cat app.py"))
+
+    def test_find_exec_runs(self):
+        self.assertTrue(finish.runs_something("find tests -name '*.py' -exec python {} \\;"))
+        self.assertFalse(finish.runs_something("find . -name '*.py'"))
+
+    def test_sed_in_place_on_code_is_an_edit(self):
+        m = convo((("Bash", {"command": "python -m pytest -q"}), "3 passed"),
+                  (("Bash", {"command": "sed -i 's/k/factor/' app.py"}), ""))
+        self.assertEqual(finish.verification_state(m)["unrun"], ["app.py"])
+        m = convo((("Bash", {"command": "sed -i 's/k/factor/' app.py && python -m pytest"}),
+                   "3 passed"))
+        self.assertEqual(finish.verification_state(m)["unrun"], [])
+        self.assertFalse(finish.runs_something("sed -n 1,20p app.py"))
+
+    def test_failed_edit_is_not_an_edit(self):
+        m = convo((("Edit", {"file_path": "/w/app.py"}), "ok"),
+                  (("Bash", {"command": "python -m pytest"}), "3 passed"))
+        m.append({"role": "assistant", "content": [_use(9, "Edit", file_path="/w/app.py")]})
+        m.append({"role": "user", "content": [_res(9, "String to replace not found", err=True)]})
+        st = finish.verification_state(m)
+        self.assertEqual((st["unrun"], st["edits"]), ([], 1))
+
     def test_doc_edits_are_not_gated(self):
         m = convo((("Write", {"file_path": "/w/answers.md"}), "ok"))
         self.assertEqual(finish.verification_state(m)["unrun"], [])
@@ -74,6 +103,29 @@ class RequestTests(unittest.TestCase):
         self.assertEqual(finish.deliverables("Write `answers.json` with exactly these keys"),
                          ["answers.json"])
         self.assertEqual(finish.deliverables("Implement the interpreter in `tally.py`"), [])
+
+    def test_code_names_are_not_deliverables(self):
+        for req in ("Write a test for `Parser.parse`.", "Create a wrapper around `requests.get`.",
+                    "Write a helper using `os.path` to join them."):
+            self.assertEqual(finish.deliverables(req), [], req)
+        self.assertEqual(finish.deliverables("Save it to `out/result.data`."), ["out/result.data"])
+
+    def test_negated_files_are_not_deliverables(self):
+        req = ("Do not create `backup.tar`. Never write to `secrets.env`. "
+               "Don't touch the config, but write `report.md`.")
+        self.assertEqual(finish.deliverables(req), ["report.md"])
+
+    def test_deliverables_come_from_the_latest_request(self):
+        m = convo((("Write", {"file_path": "/w/answers.json"}), "ok"),
+                  request="Write `answers.json`.")
+        m.append({"role": "assistant", "content": "done"})
+        m.append({"role": "user", "content": "Now write `notes.md` summarising it."})
+        self.assertEqual(finish.latest_request(m), "Now write `notes.md` summarising it.")
+        finish._USED.clear()
+        kind, text, _ = finish.finish_gate("l", "Write `answers.json`.", m, None, can_run=True)
+        self.assertEqual(kind, "deliverable")
+        self.assertIn("notes.md", text)
+        self.assertNotIn("answers.json", text)
 
     def test_missing_deliverable_on_disk(self):
         with tempfile.TemporaryDirectory() as d:
@@ -111,6 +163,21 @@ class GateTests(unittest.TestCase):
             self.assertEqual(kind, "unverified")
             self.assertTrue(force)
         self.assertEqual(finish.finish_gate("k", "Fix it.", m, None, can_run=True)[0], "")
+
+    def test_failed_run_is_not_forced(self):
+        out = "....F\n=========== 1 failed, 4 passed in 0.12s ===========\n"
+        m = convo((("Edit", {"file_path": "/w/app.py"}), "ok"),
+                  (("Bash", {"command": "python -m pytest"}), out), request="Fix it.")
+        self.assertEqual(finish.finish_gate("f", "Fix it.", m, None, can_run=True)[::2],
+                         ("failed", False))
+
+    def test_failing_test_request_is_not_sent_back(self):
+        out = "....F\n=========== 1 failed, 4 passed in 0.12s ===========\n"
+        for req in ("Write a failing test for the parser bug.",
+                    "Add a test that reproduces the bug in `app.py`."):
+            m = convo((("Edit", {"file_path": "/w/test_app.py"}), "ok"),
+                      (("Bash", {"command": "python -m pytest"}), out), request=req)
+            self.assertEqual(finish.finish_gate("r" + req, req, m, None, can_run=True)[0], "", req)
 
     def test_checklist_once_after_work(self):
         req = "Do:\n1. first requirement here\n2. second requirement here\n3. third one here ok\n"

@@ -11,8 +11,9 @@ diet on:
   (see augment.guidance_for);
 - the skill library, routing section and the rarely used bridge tools default off
   (see config._DIET);
-- `slim()` caps every tool description and parameter description, and drops the Claude
-  Code system-prompt sections that do not apply to this model.
+- `slim()` caps tool descriptions (except the core tools', see `UNCAPPED_TOOLS`) and
+  parameter descriptions, and drops the Claude Code system-prompt sections that do not
+  apply to this model.
 
 Nothing here changes what a tool does or accepts: schemas keep every property, only the
 prose about them is shortened.
@@ -57,31 +58,74 @@ _DROP_LINES = re.compile(
 DESCRIPTION_CAP = 900
 PARAMETER_CAP = 200
 
+# Tools whose descriptions are never capped. Their manuals carry the rules that keep the
+# model safe and correct, often past the first heading: Bash's "# Instructions" and its
+# git section (only commit when asked, never force push, never change git config), Edit's
+# read-first and unique-match rules, Agent/Skill's when-to-use. No length rule can tell a
+# safety paragraph from filler, so these are left whole; the savings are in the long tail
+# of other tools (MCP servers, web, todo, plan mode). Parameter prose is still shortened.
+UNCAPPED_TOOLS = frozenset({
+    "Bash", "Edit", "Write", "MultiEdit", "NotebookEdit", "Agent", "Task", "Skill", "Read",
+})
+
+# Where a dropped section ends: the next `#`/`##` heading, or the environment block when
+# it has no heading of its own (older Claude Code: "Here is useful information about the
+# environment..." followed by <env>...</env>). Stopping early at a subheading can leave a
+# stray subsection behind; running on would delete the environment.
+_SECTION_END = r"(?=^#{1,2} |^Here is useful information|^\s*<env>|\Z)"
+
 
 def _drop_sections(text: str) -> str:
     for name in _DROP_SECTIONS:
-        text = re.sub(rf"(?ms)^# {re.escape(name)}\s*$.*?(?=^# |\Z)", "", text)
+        text = re.sub(rf"(?ms)^# {re.escape(name)}\s*$.*?{_SECTION_END}", "", text)
     return _DROP_LINES.sub("", text)
 
 
+def _headings(text: str):
+    """Offsets of Markdown headings (`#` to `###`) outside ``` code fences."""
+    pos, fenced = 0, False
+    for line in text.splitlines(keepends=True):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        elif not fenced and re.match(r"#{1,3} ", line):
+            yield pos
+        pos += len(line)
+
+
 def _cap(text: str, limit: int) -> str:
-    """`text` cut to `limit` chars at a section heading or line boundary."""
+    """`text` cut to `limit` chars at a section heading or line boundary.
+
+    A heading is used only in the second half of the budget: cutting at one far short of
+    the cap threw away most of what the cap allows.
+    """
     if len(text) <= limit:
         return text
-    heading = re.search(r"(?m)^#{1,3} ", text)
-    if heading and 0 < heading.start() <= limit:
-        return text[: heading.start()].rstrip()
+    near = [h for h in _headings(text) if limit // 2 <= h <= limit]
+    if near:
+        return text[: near[-1]].rstrip()
     cut = text.rfind("\n", 0, limit)
     if cut < limit // 2:
         cut = text.rfind(". ", 0, limit) + 1
     return text[: cut if cut > 0 else limit].rstrip()
 
 
+# A sentence end: `.`/`!`/`?` followed by whitespace and a capital letter, not after a
+# common abbreviation ("e.g. ", "i.e. ", "etc. ", "vs. ").
+_SENTENCE_END = re.compile(
+    r"(?<!\be\.g)(?<!\bi\.e)(?<!\betc)(?<!\bvs)[.!?](?=\s+[A-Z])"
+)
+
+
 def _first_sentence(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
-    end = text.find(". ", 0, limit)
-    return text[: end + 1] if end > 0 else text[:limit].rstrip() + "..."
+    end = _SENTENCE_END.search(text, 0, limit)
+    return text[: end.end()] if end else text[:limit].rstrip() + "..."
+
+
+# Schema keys whose values are data, not schema: a "description" inside them is a value
+# (a default object, an example, an enum member) and must not be rewritten.
+_DATA_KEYS = frozenset({"default", "examples", "example", "enum", "const"})
 
 
 def _slim_schema(schema):
@@ -90,6 +134,8 @@ def _slim_schema(schema):
         for key, value in schema.items():
             if key == "description" and isinstance(value, str):
                 out[key] = _first_sentence(value, PARAMETER_CAP)
+            elif key in _DATA_KEYS:
+                out[key] = value
             else:
                 out[key] = _slim_schema(value)
         return out
@@ -102,7 +148,7 @@ def _slim_tool(tool: dict) -> dict:
     if not isinstance(tool, dict):
         return tool
     out = dict(tool)
-    if isinstance(out.get("description"), str):
+    if isinstance(out.get("description"), str) and out.get("name") not in UNCAPPED_TOOLS:
         out["description"] = _cap(out["description"], DESCRIPTION_CAP)
     if isinstance(out.get("input_schema"), dict):
         out["input_schema"] = _slim_schema(out["input_schema"])

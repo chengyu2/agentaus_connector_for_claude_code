@@ -35,8 +35,9 @@ def _float(name: str, default: float) -> float:
 # it changes the defaults of the settings below that add prompt weight (each can still be
 # set explicitly). See diet.py.
 # On by default: measured head-to-head on ten Claude Code tasks, two runs each, with
-# temperature 0.2 it cut the first request from 13.5k to 7.4k tokens, upstream calls per
-# run from 27 to 18 and wall time by 19%, at no cost in score.
+# temperature 0.2 it cut the first request from 13.5k to 7.4k tokens (8.7k since the core
+# tools keep their full descriptions), upstream calls per run from 27 to 18 and wall time
+# by 19%, at no cost in score.
 _DIET = _bool("AGENTAUS_PROMPT_DIET", True)
 
 

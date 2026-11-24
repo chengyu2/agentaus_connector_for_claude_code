@@ -46,10 +46,14 @@ def blocks(text: str, *, strict: bool = False) -> list[str]:
     what a command printed - "15 passed in 0.02s", a CSV row, a report table - so one only
     counts as Python when a line of it opens like Python. Measured over 30 benchmark runs:
     four syntax fixes, all on such output, 11-38 s each, and none of them could succeed.
+
+    It is the block's FIRST non-blank line that must open like Python, not any line: a
+    pytest failure report quotes the failing test, so `    def test_x():` sits inside
+    output that is not a program at all.
     """
     found = [m.group("body") for m in _FENCED.finditer(text or "")
              if m.group("lang").lower() in _PY_LANGS
-             and not (strict and not m.group("lang") and not _LOOKS_LIKE_PYTHON.search(
+             and not (strict and not m.group("lang") and not _LOOKS_LIKE_PYTHON.match(
                  m.group("body")))]
     if found:
         return found

@@ -148,6 +148,27 @@ class PythonIsolation(unittest.TestCase):
             cmd = "python3 -I - <<'EOF'\nimport json\nEOF"
             self.assertEqual(self.run_repair(cmd, d), cmd)
 
+    def test_stdlib_name_shadowed_in_cwd_keeps_isolation(self):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "random.py"), "w").close()
+            cmd = "python3 -I - <<'EOF'\nimport random\nEOF"
+            self.assertEqual(self.run_repair(cmd, d), cmd)
+
+    def test_only_the_invocation_that_imports_is_rewritten(self):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "solutions.py"), "w").close()
+            cmd = ("echo 'python -I is safer'; python3 -I -c 'import json' && "
+                   "python3 -I -c 'from solutions import f'")
+            self.assertEqual(self.run_repair(cmd, d), (
+                "echo 'python -I is safer'; python3 -I -c 'import json' && "
+                "python3 -E -s -c 'from solutions import f'"))
+            cmd = "python3 -I - <<'EOF'\nimport solutions\nEOF\npython3 -I other.py"
+            self.assertEqual(self.run_repair(cmd, d),
+                             "python3 -E -s - <<'EOF'\nimport solutions\nEOF\npython3 -I other.py")
+            cmd = "cat <<'EOF'\npython -I x.py\nEOF\npython -I -m solutions"
+            self.assertEqual(self.run_repair(cmd, d),
+                             "cat <<'EOF'\npython -I x.py\nEOF\npython -E -s -m solutions")
+
 
 if __name__ == "__main__":
     unittest.main()
