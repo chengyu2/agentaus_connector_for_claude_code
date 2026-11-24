@@ -25,6 +25,7 @@ import html as htmllib
 import json
 import logging
 import os
+import pathlib
 import re
 import shutil
 import subprocess
@@ -47,7 +48,8 @@ OFFICE_SUFFIXES = {
 
 # Where soffice usually lives. Checked in order; the configured path wins. Windows is
 # included because winget installs LibreOffice to a fixed folder that is not on PATH.
-_WINDOWS = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+# ProgramW6432 is the 64-bit folder even under a 32-bit Python, where PROGRAMFILES is (x86).
+_WINDOWS = os.environ.get("ProgramW6432") or os.environ.get("PROGRAMFILES", r"C:\Program Files")
 _CANDIDATES = (
     "/Applications/LibreOffice.app/Contents/MacOS/soffice",
     "/usr/bin/soffice",
@@ -257,7 +259,7 @@ def extract(path: str) -> str:
                     # A private profile per conversion. Without it, concurrent soffice
                     # invocations fight over the shared user profile and one silently
                     # produces nothing - and search runs several at once.
-                    f"-env:UserInstallation=file://{workdir}/profile",
+                    "-env:UserInstallation=" + pathlib.Path(workdir, "profile").as_uri(),
                     "--headless", "--norestore",
                     "--convert-to", "html",
                     "--outdir", workdir, path,

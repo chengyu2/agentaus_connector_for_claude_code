@@ -13,7 +13,7 @@ try {
         exit 1
     }
 
-    & $VENV_PY -m agentaus_bridge $args
+    & $VENV_PY -m agentaus_bridge @args
     exit $LASTEXITCODE
 } finally {
     Pop-Location

@@ -66,7 +66,7 @@ def _windows_dirs() -> list[str]:
     executables sit in `poppler-<version>\\Library\\bin`) and links them from WinGet\\Links,
     which only reaches PATH in a new session.
     """
-    program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+    program_files = os.environ.get("ProgramW6432") or os.environ.get("PROGRAMFILES", r"C:\Program Files")
     local = os.environ.get("LOCALAPPDATA", "")
     winget = os.path.join(local, "Microsoft", "WinGet") if local else ""
     patterns = [

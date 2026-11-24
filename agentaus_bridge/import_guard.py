@@ -152,11 +152,11 @@ def _python() -> list[str]:
     where the project's own packages are installed - the bridge's `.venv` (sys.executable)
     has none of them, and every module with a third-party import would be skipped. On
     Windows `python3` is usually absent or a Microsoft Store placeholder, so the `py`
-    launcher is used there instead.
+    launcher is used there instead - without a version flag, which would make it ignore an
+    active VIRTUAL_ENV - then `python` (a Store install has no launcher).
     """
     if os.name == "nt":
-        launcher = shutil.which("py")
-        return [launcher, "-3"] if launcher else [sys.executable]
+        return [shutil.which("py") or shutil.which("python") or sys.executable]
     return [shutil.which("python3") or sys.executable]
 
 

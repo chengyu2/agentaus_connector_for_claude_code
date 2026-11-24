@@ -75,14 +75,15 @@ def optional_missing() -> list[str]:
 
 
 def report(lines: list[str]) -> str:
-    script = "install.ps1" if WIN else "install.sh"
+    script = ".\\scripts\\install.ps1" if WIN else "./scripts/install.sh"
     return ("The bridge needs these Python packages and they are missing:\n"
             + "\n".join(f"  - {l}" for l in lines)
-            + f"\n\nOr run ./scripts/{script}, which installs all of them.")
+            + f"\n\nOr run {script}, which installs all of them.")
 
 
 def optional_report(lines: list[str]) -> str:
-    script = "install.ps1" if WIN else "install.sh"
+    run = ("$env:INSTALL_DOCUMENT_READERS=1; .\\scripts\\install.ps1" if WIN
+           else "INSTALL_DOCUMENT_READERS=1 ./scripts/install.sh")
     return ("Document reading is degraded; these readers are not installed:\n"
             + "\n".join(f"  - {l}" for l in lines)
-            + f"\n\nOr run INSTALL_DOCUMENT_READERS=1 ./scripts/{script}.")
+            + f"\n\nOr run {run}.")

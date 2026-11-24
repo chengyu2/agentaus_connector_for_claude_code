@@ -54,7 +54,8 @@ $env:ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION = "Sovereign Australian model, se
 # through the bridge's passthrough while Agentaus is billed to its own key.
 
 try {
-    & claude $args
+    # @args (not $args): if `claude` is npm's claude.ps1 shim, $args would arrive as one string.
+    & claude @args
 } finally {
     foreach ($name in $Saved.Keys) {
         if ($null -eq $Saved[$name]) {

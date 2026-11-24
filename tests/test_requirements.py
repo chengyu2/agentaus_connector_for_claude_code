@@ -23,7 +23,8 @@ class Missing(unittest.TestCase):
             self.assertEqual(requirements.optional_missing(), [])
 
     def test_each_missing_reader_is_named_with_its_install_command(self):
-        with mock.patch.object(documents, "soffice", return_value=None), \
+        with mock.patch.object(requirements, "WIN", False), \
+                mock.patch.object(documents, "soffice", return_value=None), \
                 mock.patch.object(pdf, "_tool", side_effect=lambda n: None if n == "tesseract" else "/x/" + n), \
                 mock.patch.object(requirements, "_module", side_effect=lambda m: m != "pdfminer.high_level"):
             lines = requirements.missing()
@@ -35,6 +36,17 @@ class Missing(unittest.TestCase):
         self.assertTrue(any(l.startswith("LibreOffice") and "libreoffice" in l for l in optional))
         self.assertTrue(any(l.startswith("tesseract") and "install tesseract" in l.replace("tesseract-ocr", "tesseract") for l in optional))
         self.assertIn("INSTALL_DOCUMENT_READERS=1", requirements.optional_report(optional))
+
+    def test_windows_hints_are_winget_and_powershell(self):
+        with mock.patch.object(requirements, "WIN", True), \
+                mock.patch.object(documents, "soffice", return_value=None), \
+                mock.patch.object(pdf, "_tool", return_value=None):
+            optional = requirements.optional_missing()
+            report = requirements.optional_report(optional)
+            missing = requirements.report(["x"])
+        self.assertTrue(all("winget install --id" in l for l in optional))
+        self.assertIn("$env:INSTALL_DOCUMENT_READERS=1; .\\scripts\\install.ps1", report)
+        self.assertIn(".\\scripts\\install.ps1", missing)
 
     def test_the_bridge_refuses_to_start_without_them(self):
         from agentaus_bridge.config import settings
