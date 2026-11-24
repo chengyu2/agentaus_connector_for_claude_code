@@ -193,7 +193,71 @@ Run `osascript dedupe.applescript "<account>" "<subject>" list`, read it, then r
 with `delete`. Drafts that had no attachment by design are deleted too: drop the attachment
 test (`(count mail attachments of d) > 0`) when the drafts carry none.
 
-## 5. Create the event, and invite people
+## 5. Send drafts - only when the user said to send
+
+AppleScript cannot send a saved draft: `open` shows it in a reading window, with nothing to
+send. Rebuild it as a new message - same sender, recipient, subject, text and attachments -
+send that, then delete the draft. One person at a time:
+
+```applescript
+on run argv
+	-- argv: account, exact subject, recipient address, a scratch folder
+	set acct to item 1 of argv
+	set subj to item 2 of argv
+	set toAddr to item 3 of argv
+	set dest to item 4 of argv
+	with timeout of 180 seconds
+		tell application "Mail"
+			set mb to item 1 of (mailboxes of account acct whose name is "Drafts")
+			set ds to (messages of mb whose subject is subj)
+			set d to missing value
+			repeat with x in ds
+				if (count to recipients of x) is 1 and address of item 1 of to recipients of x is toAddr then set d to contents of x
+			end repeat
+			if d is missing value then return "NO DRAFT for " & toAddr
+			set body to content of d
+			set fromId to sender of d
+			set fileList to {}
+			repeat with a in mail attachments of d
+				set p to dest & "/" & (name of a)
+				save a in POSIX file p
+				set end of fileList to p
+			end repeat
+			-- the draft's text already ends with the signature: do not add it again
+			set om to make new outgoing message with properties {subject:subj, content:body, visible:true, sender:fromId}
+			set message signature of om to missing value
+			tell om
+				make new to recipient at end of to recipients with properties {address:toAddr}
+				repeat with p in fileList
+					tell content to make new attachment with properties {file name:(POSIX file p)} at after last paragraph
+				end repeat
+			end tell
+			delay 3
+			if (count attachments of content of om) is not (count fileList) then return "ATTACHMENT MISSING for " & toAddr
+			send om
+			delay 2
+			delete d
+			return "SENT " & toAddr & " (" & (count fileList) & " attachment)"
+		end tell
+	end timeout
+end run
+```
+
+Run: `osascript send.applescript "<account>" "<exact subject>" "<recipient>" /path/to/scratch/folder`,
+once per recipient. It prints `SENT <address>`; anything else means that one was not sent.
+
+- `files` is a reserved word inside `tell application "Mail"`: name a list of paths
+  `fileList`, or the script stops with "Can't set every file".
+- The draft's text already ends with the signature, so the rebuilt message adds none
+  (`message signature ... missing value`). The signature's logo image is not carried over.
+- **After each send, look for a prompt** before the next one: list Mail's windows and their
+  sheets (`tell application "System Events" to tell process "Mail" to get count sheets of
+  every window`). A "Save / Don't Save / Cancel" sheet means a message window was closed
+  unsaved - stop and tell the user rather than clicking it.
+- Check at the end: the number of messages with that subject in `Sent Items` (or
+  `Sent Mail`) grew by the number of people, and none are left in `Drafts`.
+
+## 6. Create the event, and invite people
 
 ### The trap
 
@@ -264,14 +328,14 @@ open("invite-ada.ics", "w", newline="").write(text)
 
 The time zone is the user's (`readlink /etc/localtime` names it), not UTC.
 
-## 6. Dates given without a month or year
+## 7. Dates given without a month or year
 
 "Friday the 27th" is the next date that is both a Friday and the 27th. Check before using it:
 `python3 -c "import datetime; print(datetime.date(2026, 11, 27).strftime('%A'))"`. If that is
 not the weekday the user named, ask rather than guess. A length the user did not give (an
 interview's) is an assumption: say which one you made.
 
-## 7. Finish by reporting what exists
+## 8. Finish by reporting what exists
 
 Read back and report: how many drafts are in which account's `Drafts`, and to whom; the
 event's calendar, start and location; and that nothing was sent, so the invitations go out
