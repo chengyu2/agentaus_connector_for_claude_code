@@ -501,12 +501,22 @@ FAKE_BRIDGE = textwrap.dedent('''
 
 
 def free_port(parity):
+    # Linux hands out ports of one parity for bind(0), so a port of the other parity never
+    # comes back: take its neighbour instead, and check that one is free too.
     while True:
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             p = s.getsockname()[1]
-        if p % 2 == parity and p not in loop.PROTECTED_PORTS:
-            return p
+        if p % 2 != parity:
+            p = p + 1 if p < 65535 else p - 1
+        if p in loop.PROTECTED_PORTS:
+            continue
+        with socket.socket() as s:
+            try:
+                s.bind(("127.0.0.1", p))
+            except OSError:
+                continue
+        return p
 
 
 class OneBridge(unittest.TestCase):
