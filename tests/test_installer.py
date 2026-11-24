@@ -186,8 +186,10 @@ class Platforms(unittest.TestCase):
         text = A.command_text(Path(r"C:\Users\me\.agentaus-bridge"), windows=True)
         self.assertTrue(text.startswith("@echo off"))
         self.assertIn('cd /d "C:\\Users\\me\\.agentaus-bridge"', text)
-        self.assertIn("-m agentaus_bridge status", text)
-        self.assertIn("-m agentaus_bridge %*", text)
+        self.assertIn("-m agentaus_bridge status & exit /b", text)
+        self.assertIn("-m agentaus_bridge %* & exit /b", text)
+        # uninstall deletes this file while it runs: the call must be on the last line
+        self.assertIn("-m agentaus_bridge %*", text.strip().splitlines()[-1])
 
     def test_windows_task_scripts_have_no_double_quotes(self):
         for action in ("start", "restart", "stop", "remove", "status"):

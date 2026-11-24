@@ -450,11 +450,9 @@ rem Remove it (with the service and settings) using: agentaus-bridge uninstall
 setlocal
 set "AGENTAUS_INSTALL_CWD=%CD%"
 cd /d "{root}" || exit /b 1
-if "%~1"=="" (
-  "{python}" -m agentaus_bridge status
-) else (
-  "{python}" -m agentaus_bridge %*
-)
+rem One parsed line that ends in exit /b: cmd reads a batch file as it runs, and
+rem `uninstall` deletes this one, so nothing may be read after Python returns.
+if "%~1"=="" ("{python}" -m agentaus_bridge status & exit /b) else ("{python}" -m agentaus_bridge %* & exit /b)
 """
     return f"""#!/bin/sh
 # The Agentaus bridge's command, written by its installer.
