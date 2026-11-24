@@ -469,6 +469,23 @@ class FilesTheRequestNamesMustExist(unittest.TestCase):
         names = [n for n, _ in augment.missing_deliverables(task, "/nowhere")]
         self.assertEqual(names, ["instructions.md", "drafts.md"])
 
+    def test_every_file_in_a_list_counts(self):
+        # PR review: only the first name of a list was found, so one file written and one
+        # missing read as nothing missing.
+        cases = {
+            "write instructions.md and drafts.md": ["instructions.md", "drafts.md"],
+            "Write `instructions.md` and `drafts.md`": ["instructions.md", "drafts.md"],
+            "Write both readme.md and changes.log for the repo": ["readme.md", "changes.log"],
+            "Write a.md, b.md and c.md": ["a.md", "b.md", "c.md"],
+            "Save the results to out/report.csv and out/summary.md": ["out/report.csv", "out/summary.md"],
+            "Write notes.txt, then read main.py and config.py": ["notes.txt"],
+        }
+        for task, want in cases.items():
+            self.assertEqual([n for n, _ in augment.missing_deliverables(task, "/nowhere")], want, task)
+
+    def test_an_abbreviation_is_not_a_file(self):
+        self.assertEqual(augment.missing_deliverables("write E.g. output.md", "/nowhere"), [])
+
     def test_inputs_are_not_deliverables(self):
         for task in ["Read README.md and tell me what it does", "Fix the bug in tools/bank.py",
                      "look in config.py and write me a summary", "Create the summary, e.g. a table"]:

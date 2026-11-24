@@ -1313,13 +1313,24 @@ def announces_a_step(answer: str) -> bool:
 # sentence a file name with an extension. Measured (work experience A/B): asked to "Write
 # `instructions.md`" and "Write `drafts.md`", Agentaus spent 36 turns, wrote neither, and
 # ended on a report the judge read as an answer - one of the two needed no email at all.
+_FILE_NAME = r"((?:~|\.{1,2})?/?[\w.-]+(?:/[\w.-]+)*\.[A-Za-z][A-Za-z0-9]{0,4})\b"
 _WRITE_VERB = re.compile(
     r"\b(?:write|create|save|produce|generate|draft|output|export)\b"
-    r"(?:(?:\s+(?:it|them|this|that|the|a|an|your|out|up|file|files|a\s+file\s+(?:called|named)))*"
+    r"(?:(?:\s+(?:it|them|this|that|the|a|an|both|your|out|up|file|files|a\s+file\s+(?:called|named)))*"
     r"|(?:\s+[\w-]+){0,4}?\s+(?:to|into|as|in)(?:\s+(?:a\s+)?(?:file\s+)?(?:called|named))?)"
-    r"\s*[:\-]?\s*[`'\"]?((?:~|\.{1,2})?/?[\w.-]+(?:/[\w.-]+)*\.[A-Za-z][A-Za-z0-9]{0,4})\b[`'\"]?",
+    r"\s*[:\-]?\s*[`'\"]?" + _FILE_NAME + r"[`'\"]?",
     re.I,
 )
+# The rest of a list after the first name: "`instructions.md` and `drafts.md`", "a.md, b.md
+# and c.md". Measured (PR review): only the first of "write instructions.md and drafts.md"
+# was found, so one file written and one missing read as nothing missing.
+_MORE_FILES = re.compile(
+    r"\s*(?:,\s*(?:and\s+|or\s+|&\s+)?|\s+(?:and|or|&|plus)\s+)(?:the\s+|a\s+)?[`'\"]?"
+    + _FILE_NAME + r"[`'\"]?",
+    re.I,
+)
+# "e.g", "i.e" and the like have the shape of a file name and are not one.
+_ABBREVIATION = re.compile(r"(?:e\.g|i\.e|etc|vs|cf|a\.k\.a|n\.b)\.?", re.I)
 
 
 def missing_deliverables(request: str, cwd: str | None) -> list[tuple[str, str]]:
@@ -1330,9 +1341,16 @@ def missing_deliverables(request: str, cwd: str | None) -> list[tuple[str, str]]
         return []
     text = _REMINDERS.sub("", request)
     text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    names = []
+    for found in _WRITE_VERB.finditer(text):
+        names.append(found.group(1))
+        at = found.end()
+        while more := _MORE_FILES.match(text, at):
+            names.append(more.group(1))
+            at = more.end()
     out, seen = [], set()
-    for name in _WRITE_VERB.findall(text):
-        if name in seen or re.match(r"^(?:e\.g|i\.e|etc)\.", name, re.I):
+    for name in names:
+        if name in seen or _ABBREVIATION.fullmatch(name):
             continue
         seen.add(name)
         path = os.path.expanduser(name)
