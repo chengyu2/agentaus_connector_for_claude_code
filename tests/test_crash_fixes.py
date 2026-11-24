@@ -18,9 +18,8 @@ import json
 import os
 import sys
 import tempfile
-import threading
 import unittest
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -28,6 +27,8 @@ import httpx  # noqa: E402
 
 from agentaus_bridge import server, tools  # noqa: E402
 from agentaus_bridge.config import settings  # noqa: E402
+
+import stub_server  # noqa: E402
 
 
 def run(coro):
@@ -85,7 +86,6 @@ class Transient(unittest.TestCase):
             "The engine prompt length 224662 exceeds the max_model_len 131072"))
 
 
-PORT = 9961
 STATE = {"calls": 0, "mode": "stream"}
 DROP = "peer closed connection without sending complete message body (incomplete chunked read)"
 
@@ -126,20 +126,17 @@ class _DropsOnce(BaseHTTPRequestHandler):
 class InBandDropsAreRetried(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        HTTPServer.allow_reuse_address = True
-        cls.stub = HTTPServer(("127.0.0.1", PORT), _DropsOnce)
-        threading.Thread(target=cls.stub.serve_forever, daemon=True).start()
+        cls.stub = stub_server.start(_DropsOnce)
 
     @classmethod
     def tearDownClass(cls):
-        cls.stub.shutdown()
-        cls.stub.server_close()
+        stub_server.stop(cls.stub)
 
     def setUp(self):
         STATE["calls"] = 0
         self._saved = (settings.agentaus_base_url, settings.agentaus_api_key,
                        settings.retry_backoff_seconds, settings.agentaus_self_review)
-        settings.agentaus_base_url = f"http://127.0.0.1:{PORT}"
+        settings.agentaus_base_url = stub_server.url(self.stub)
         settings.agentaus_api_key = "test-key"
         settings.retry_backoff_seconds = 0.01
         settings.agentaus_self_review = False

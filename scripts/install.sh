@@ -22,6 +22,8 @@ if [[ "${INSTALL_DOCUMENT_READERS:-0}" == "1" ]]; then
   elif command -v apt-get >/dev/null; then
     sudo apt-get update
     sudo apt-get install -y libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils tesseract-ocr
+  elif command -v dnf >/dev/null; then
+    sudo dnf install -y libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils tesseract
   else
     echo "Install LibreOffice, poppler (pdftotext, pdftoppm) and tesseract with your package manager." >&2
   fi

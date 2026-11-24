@@ -97,6 +97,13 @@ class TestEvidenceForTheGroundingCheck(unittest.TestCase):
         self.assertIn("coef=0.8492778865371", text)
         self.assertIn("se=0.9584713297165", text)
 
+    def test_an_image_result_is_evidence_as_its_note(self):
+        """The grounding check cannot read base64; it must see that the image never arrived."""
+        image = {"type": "image", "source": {"type": "base64", "data": "iVBORw0KGgo" + "A" * 4000}}
+        text = ledger.render_evidence([call("a", "Read", file_path="/a.png"), result("a", [image])])
+        self.assertIn("Image omitted", text)
+        self.assertNotIn("iVBORw0KGgo", text)
+
     def test_the_plain_ledger_still_carries_no_output(self):
         """The two callers want opposite things, and the cheap one must stay cheap."""
         messages = [call("a", "Bash", command="python fit.py"), result("a", "coef=0.849")]
@@ -149,6 +156,16 @@ class TestDistillation(unittest.TestCase):
 
         summarise.seen = seen  # type: ignore[attr-defined]
         return summarise
+
+    def test_an_image_result_is_never_distilled(self):
+        """A screenshot's base64 is not text to condense; it reaches the model as its note."""
+        stub = self.stub()
+        d = ResultDistiller(stub, threshold_tokens=500, chunk_tokens=4000)
+        image = {"type": "image", "source": {"type": "base64", "data": "iVBORw0KGgo" + "A" * 40000}}
+        body = {"messages": [call("a", "Read", file_path="shot.png"), result("a", [image])]}
+
+        run(d.distill(body))
+        self.assertEqual(stub.seen, [], "the image's base64 was sent to be summarised")
 
     def test_a_large_result_is_condensed(self):
         stub = self.stub()
