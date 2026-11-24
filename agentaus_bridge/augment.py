@@ -1317,7 +1317,9 @@ _FILE_NAME = r"((?:~|\.{1,2})?/?[\w.-]+(?:/[\w.-]+)*\.[A-Za-z][A-Za-z0-9]{0,4})\
 _WRITE_VERB = re.compile(
     r"\b(?:write|create|save|produce|generate|draft|output|export)\b"
     r"(?:(?:\s+(?:it|them|this|that|the|a|an|both|your|out|up|file|files|a\s+file\s+(?:called|named)))*"
-    r"|(?:\s+[\w-]+){0,4}?\s+(?:to|into|as|in)(?:\s+(?:a\s+)?(?:file\s+)?(?:called|named))?)"
+    r"|(?:\s+[\w-]+){0,4}?\s+(?:to|into|as|in)(?:\s+(?:a\s+)?(?:file\s+)?(?:called|named))?"
+    # "write the results, e.g. output.md and notes.md" (PR review).
+    r"|(?:\s+[\w-]+){0,4}?,?\s+(?:e\.g\.?|i\.e\.?|such\s+as|namely),?)"
     r"\s*[:\-]?\s*[`'\"]?" + _FILE_NAME + r"[`'\"]?",
     re.I,
 )
