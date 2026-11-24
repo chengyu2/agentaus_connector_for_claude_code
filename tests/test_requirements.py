@@ -36,6 +36,37 @@ class Missing(unittest.TestCase):
         self.assertTrue(any(l.startswith("tesseract") and "install tesseract" in l.replace("tesseract-ocr", "tesseract") for l in optional))
         self.assertIn("INSTALL_DOCUMENT_READERS=1", requirements.optional_report(optional))
 
+    def test_fedora_is_told_to_use_dnf(self):
+        with mock.patch.object(requirements, "FAMILY", "fedora"), \
+                mock.patch.object(documents, "soffice", return_value=None), \
+                mock.patch.object(pdf, "_tool", return_value=None):
+            optional = requirements.optional_missing()
+        self.assertEqual(len(optional), 4)
+        self.assertTrue(all("sudo dnf install" in l for l in optional))
+        self.assertTrue(any("tesseract-langpack-eng" in l for l in optional))
+
+    def test_the_family_comes_from_os_release(self):
+        cases = (
+            ({"ID": "fedora"}, "fedora"),
+            ({"ID": "rocky", "ID_LIKE": "rhel centos fedora"}, "fedora"),
+            ({"ID": "ubuntu", "ID_LIKE": "debian"}, "debian"),
+            ({"ID": "debian"}, "debian"),
+        )
+        for release, family in cases:
+            with mock.patch.object(requirements, "MAC", False), \
+                    mock.patch.object(requirements.platform, "freedesktop_os_release", return_value=release):
+                self.assertEqual(requirements._family(), family, release)
+
+    def test_without_os_release_the_package_manager_decides(self):
+        with mock.patch.object(requirements, "MAC", False), \
+                mock.patch.object(requirements.platform, "freedesktop_os_release", side_effect=OSError), \
+                mock.patch.object(requirements.shutil, "which", side_effect=lambda n: "/usr/bin/dnf" if n == "dnf" else None):
+            self.assertEqual(requirements._family(), "fedora")
+        with mock.patch.object(requirements, "MAC", False), \
+                mock.patch.object(requirements.platform, "freedesktop_os_release", side_effect=OSError), \
+                mock.patch.object(requirements.shutil, "which", return_value=None):
+            self.assertEqual(requirements._family(), "debian")
+
     def test_the_bridge_refuses_to_start_without_them(self):
         from agentaus_bridge.config import settings
         with mock.patch.object(settings, "agentaus_api_key", "k"), \

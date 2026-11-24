@@ -73,13 +73,13 @@ tesseract are optional: without them the bridge starts, logs a warning naming ea
 reader, and walks past the documents it cannot read. `INSTALL_DOCUMENT_READERS=1
 ./scripts/install.sh` installs them as well.
 
-| Requirement | Reads | macOS | Debian / Ubuntu |
-| --- | --- | --- | --- |
-| Python 3.11+ | - | `brew install python` | `sudo apt install python3 python3-venv` |
-| **LibreOffice** | `.docx`, `.xlsx`, `.pptx`, tables intact | `brew install --cask libreoffice` | `sudo apt install libreoffice-writer libreoffice-calc libreoffice-impress` |
-| **poppler** (`pdftotext`, `pdftoppm`) | PDF text with its layout; scanned pages for OCR | `brew install poppler` | `sudo apt install poppler-utils` |
-| **tesseract** | Scanned PDF pages | `brew install tesseract` | `sudo apt install tesseract-ocr` |
-| Python packages in `requirements.txt` | PDF fallbacks (`pdfminer.six`, `pypdf`), the code outline (`tree-sitter`), macOS Vision OCR (`pyobjc`) | `pip install -r requirements.txt` | same |
+| Requirement | Reads | macOS | Debian / Ubuntu | Fedora |
+| --- | --- | --- | --- | --- |
+| Python 3.11+ | - | `brew install python` | `sudo apt install python3 python3-venv` | `sudo dnf install python3` |
+| **LibreOffice** | `.docx`, `.xlsx`, `.pptx`, tables intact | `brew install --cask libreoffice` | `sudo apt install libreoffice-writer libreoffice-calc libreoffice-impress` | `sudo dnf install libreoffice-writer libreoffice-calc libreoffice-impress` |
+| **poppler** (`pdftotext`, `pdftoppm`) | PDF text with its layout; scanned pages for OCR | `brew install poppler` | `sudo apt install poppler-utils` | `sudo dnf install poppler-utils` |
+| **tesseract** | Scanned PDF pages | `brew install tesseract` | `sudo apt install tesseract-ocr` | `sudo dnf install tesseract tesseract-langpack-eng` |
+| Python packages in `requirements.txt` | PDF fallbacks (`pdfminer.six`, `pypdf`), the code outline (`tree-sitter`), macOS Vision OCR (`pyobjc`) | `pip install -r requirements.txt` | same | same |
 
 ```bash
 git clone https://github.com/chengyu2/agentaus_connector_for_claude_code.git
@@ -1412,6 +1412,7 @@ nobody finds until a number is wrong in a tender response.
 ```
 macOS   brew install --cask libreoffice
 Debian  sudo apt install libreoffice-writer libreoffice-calc
+Fedora  sudo dnf install libreoffice-writer libreoffice-calc
 ```
 
 Nothing to configure afterwards — `soffice` is found on `$PATH` or in the usual

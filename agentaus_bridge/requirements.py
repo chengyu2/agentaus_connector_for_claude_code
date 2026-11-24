@@ -11,20 +11,49 @@ from __future__ import annotations
 
 import importlib
 import platform
+import shutil
 import sys
 
 MAC = platform.system() == "Darwin"
 
-# (what, how it is found, why the bridge needs it, macOS install, Debian install)
+
+def _family() -> str:
+    """Which install commands to print: "mac", "fedora" (dnf) or "debian" (apt, and the
+    fallback for any other Linux)."""
+    if MAC:
+        return "mac"
+    try:
+        release = platform.freedesktop_os_release()
+    except OSError:
+        release = {}
+    ids = {release.get("ID", "")} | set(release.get("ID_LIKE", "").split())
+    if ids & {"fedora", "rhel", "centos"}:
+        return "fedora"
+    if ids & {"debian", "ubuntu"}:
+        return "debian"
+    return "fedora" if shutil.which("dnf") and not shutil.which("apt-get") else "debian"
+
+
+FAMILY = _family()
+
+# (what, how it is found, why the bridge needs it, {family: install command})
 SYSTEM = (
-    ("LibreOffice", "soffice", "reads .docx, .xlsx, .pptx with their tables intact",
-     "brew install --cask libreoffice", "sudo apt install libreoffice-writer libreoffice-calc libreoffice-impress"),
-    ("poppler", "pdftotext", "the best PDF text tier, with column and table layout",
-     "brew install poppler", "sudo apt install poppler-utils"),
-    ("poppler", "pdftoppm", "renders scanned PDF pages for tesseract",
-     "brew install poppler", "sudo apt install poppler-utils"),
-    ("tesseract", "tesseract", "OCR for scanned PDF pages",
-     "brew install tesseract", "sudo apt install tesseract-ocr"),
+    ("LibreOffice", "soffice", "reads .docx, .xlsx, .pptx with their tables intact", {
+        "mac": "brew install --cask libreoffice",
+        "debian": "sudo apt install libreoffice-writer libreoffice-calc libreoffice-impress",
+        "fedora": "sudo dnf install libreoffice-writer libreoffice-calc libreoffice-impress"}),
+    ("poppler", "pdftotext", "the best PDF text tier, with column and table layout", {
+        "mac": "brew install poppler",
+        "debian": "sudo apt install poppler-utils",
+        "fedora": "sudo dnf install poppler-utils"}),
+    ("poppler", "pdftoppm", "renders scanned PDF pages for tesseract", {
+        "mac": "brew install poppler",
+        "debian": "sudo apt install poppler-utils",
+        "fedora": "sudo dnf install poppler-utils"}),
+    ("tesseract", "tesseract", "OCR for scanned PDF pages", {
+        "mac": "brew install tesseract",
+        "debian": "sudo apt install tesseract-ocr",
+        "fedora": "sudo dnf install tesseract tesseract-langpack-eng"}),
 )
 # (module, pip package, why)
 PYTHON = (
@@ -61,10 +90,10 @@ def optional_missing() -> list[str]:
     """One line per missing system reader, each with the command that installs it."""
     from . import documents, pdf
     out = []
-    for what, binary, why, mac, debian in SYSTEM:
+    for what, binary, why, install in SYSTEM:
         found = documents.soffice() if binary == "soffice" else pdf._tool(binary)
         if not found:
-            out.append(f"{what} (`{binary}`) - {why}. Install: `{mac if MAC else debian}`")
+            out.append(f"{what} (`{binary}`) - {why}. Install: `{install[FAMILY]}`")
     return out
 
 
