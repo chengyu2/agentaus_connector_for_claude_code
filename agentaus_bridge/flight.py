@@ -268,11 +268,16 @@ async def subscribe(f: Flight) -> AsyncIterator[bytes]:
         while True:
             async with f.cond:
                 await f.cond.wait_for(lambda: len(f.events) > i or f.done)
-                fresh, finished = f.events[i:], f.done
-            i += len(fresh)
-            for chunk in fresh:
-                yield chunk
-            if finished and i >= len(f.events):
+                finished = f.done
+                # Read by index, no slicing: f.events[i:] on every wake copied the whole
+                # unread tail - a fresh list per chunk and O(n²) copying over a long
+                # turn. The buffer only ever grows while the flight is alive, so the
+                # index is all the bookkeeping needed.
+                n = len(f.events)
+            while i < n:
+                yield f.events[i]
+                i += 1
+            if finished and i >= n:
                 return
     finally:
         _detach(f)
@@ -319,7 +324,10 @@ async def collect_stream(f: Flight, timeout: float,
     try:
         if not await _until(f, lambda: f.done, timeout, gone):
             return None
-        return list(f.events)
+        # The flight is done (the wait above), so the buffer is stable: return it
+        # directly rather than copying. `list(f.events)` doubled peak memory on every
+        # buffered join of a streamed turn, and `assemble` only reads.
+        return f.events
     finally:
         _detach(f)
 

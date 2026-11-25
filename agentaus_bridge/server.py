@@ -4016,6 +4016,14 @@ async def _agentaus_event_stream(*args, **kwargs) -> AsyncIterator[bytes]:
         await stream.aclose()
 
 
+# How far ahead of a slow client the relay may buffer. An unbounded queue lets the
+# producer run away with the entire stream held in memory; past this it blocks
+# instead, pushing back to the flight and eventually the upstream socket. The
+# consumer is always draining (a get() is pending whenever the loop is waiting),
+# so a bound cannot stall a stream that is actually being read.
+_KEEPALIVE_QUEUE_BOUND = 256
+
+
 async def _keepalive(
     source: AsyncIterator[bytes],
     interval: float,
@@ -4036,7 +4044,12 @@ async def _keepalive(
 
     A turn from _handle_agentaus passes no deadline here: its flight holds it (flight.py).
     """
-    queue: asyncio.Queue = asyncio.Queue()
+    # Bounded: an unbounded queue lets the producer run ahead of a slow client and
+    # buffer the entire upstream stream in memory. Past this cap the producer blocks
+    # instead - backpressure all the way to the upstream socket - and the consumer is
+    # always draining (a get() is pending whenever the loop is waiting), so a bound
+    # cannot stall a stream that is actually being read.
+    queue: asyncio.Queue = asyncio.Queue(maxsize=_KEEPALIVE_QUEUE_BOUND)
     sentinel = object()
     started = time.monotonic()
     down_at_start = throttle.down_total()
