@@ -4,8 +4,8 @@ Each case here is a wrong score the pilot actually produced or a review found by
 the code: "Confidence: 0.85" read as 0.85%, ten tied answers split into right and wrong
 bins, "Q3 2025 revenue: $5,266.06" graded on the year, "600 (the 900 is disabled)" failed
 for naming the value it rejects, "3 or more orders: 17" graded on the 3, a hedged guess
-passed as an honest "cannot tell", and a write_file into a directory the container made
-ending the whole run.
+passed as an honest "cannot tell", a write_file into a directory the container made
+ending the whole run, and `cat` on a PNG reported as bad arguments.
 """
 
 from __future__ import annotations
@@ -213,6 +213,17 @@ class ToolErrorsReachTheModel(unittest.TestCase):
         call = {"function": {"name": "write_file",
                              "arguments": json.dumps({"path": "pkg/mod.py", "content": "x"})}}
         self.assertIn("Permission denied", agent._execute(call, box, None))
+
+    def test_reading_a_binary_file_returns_text(self):
+        import subprocess
+        from benchmarks.calibration import sandbox
+        box = sandbox.Sandbox.__new__(sandbox.Sandbox)
+        box.name = "calib-test"
+        done = subprocess.CompletedProcess([], 0, stdout=b"\x89PNG\r\n\x1a\n\x00", stderr=b"")
+        with mock.patch.object(sandbox.subprocess, "run", return_value=done):
+            out = box.read_file("signups.png")
+        self.assertIn("PNG", out)
+        self.assertNotIn("exit code", out)
 
 
 if __name__ == "__main__":

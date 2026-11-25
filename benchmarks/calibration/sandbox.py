@@ -41,10 +41,11 @@ class Sandbox:
     def bash(self, command: str, timeout: int = 60) -> str:
         try:
             done = subprocess.run(["docker", "exec", self.name, "bash", "-lc", command],
-                                  capture_output=True, text=True, timeout=timeout)
+                                  capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             return f"[command timed out after {timeout}s]"
-        out = (done.stdout + done.stderr) or "(no output)"
+        # Not text=True: `cat signups.png` would raise UnicodeDecodeError instead of answering.
+        out = (done.stdout + done.stderr).decode("utf-8", errors="replace") or "(no output)"
         if len(out) > OUTPUT_CHARS:
             out = out[:OUTPUT_CHARS] + f"\n[... {len(out) - OUTPUT_CHARS} more characters]"
         return out + ("" if done.returncode == 0 else f"\n[exit code {done.returncode}]")

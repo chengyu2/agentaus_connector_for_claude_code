@@ -339,7 +339,7 @@ These come from the pilot, and the expansion confirmed the first two.
 3. Tool use that does not stop. 30 of the 40 trap runs hit the step or time limit. In 23
    of them the model used all 30 tool calls trying to read the image or load the page:
    every `tools-image` and `web-hours` run and 7 `web-wharf` runs. The other 7 were
-   `code-licence` runs that made 16 to 24 tool calls and ran out of the 15 minutes of
+   `code-licence` runs that made 19 to 24 tool calls and ran out of the 15 minutes of
    working time. Runs that hit a limit cost up to AUD 1.39 each. The median run of an
    answerable task cost AUD 0.03.
 4. Made-up values were rare. Across 40 trap-task runs, the model invented a value once
@@ -402,5 +402,9 @@ with the pilot's answers and verdicts for its four prompts, then:
     benchmarks/calibration/results/raw/pilot benchmarks/calibration/results/expansion
 ```
 
-Every run resumes. Rerunning an interrupted run with the same command does only the
-answers that are still missing. `--repeat baseline=2` repeats one condition. Live tasks need Docker.
+Every run resumes. Rerunning an interrupted run with the same command does only the answers
+that are still missing. `--repeat baseline=2` repeats one condition. Live tasks need Docker.
+On Linux and macOS each container runs as your own uid so the agent's files in `/work` stay
+yours. This was tested with rootful Docker only. Under rootless Docker or Podman the
+container's uids map to other host uids, so if the agent's writes to `/work` fail there,
+drop the `--user` option in `sandbox.py`.
