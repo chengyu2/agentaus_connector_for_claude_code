@@ -24,6 +24,43 @@ export ANTHROPIC_CUSTOM_MODEL_OPTION="agentaus"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="Agentaus (Trellis Data)"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="Sovereign Australian model, served via the local Agentaus bridge"
 
+# Claude Code does not recognise the id `agentaus` and would assume a 1M-token window,
+# compacting long after Agentaus's 131,072-token limit. CLAUDE_CODE_MAX_CONTEXT_TOKENS
+# corrects that for unrecognised ids only - unless DISABLE_COMPACT is set, when Claude Code
+# applies it to every model and Opus or Sonnet would stop at 131,072 too. So it is set here,
+# for this one session, never in a settings file, and left out when DISABLE_COMPACT is set
+# in the shell or named in a settings file the session reads. A value you set yourself wins.
+#
+# Where Claude Code looks: .claude/settings.json in the folder it starts in, and
+# .claude/settings.local.json there or - on macOS and Linux, started below the top of a
+# git repository - at the repository's root (the main checkout, for a linked worktree).
+# So the local file is checked in all three places; one too many only leaves the window
+# to the bridge. scripts/claude-agentaus.ps1 checks the same files.
+project_roots() {
+  git rev-parse --show-toplevel 2>/dev/null || true
+  git worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p' || true
+}
+compact_disabled() {
+  case "$(printf '%s' "${DISABLE_COMPACT:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+    1|true|yes|on) return 0 ;;
+  esac
+  local files=("${CLAUDE_CONFIG_DIR:-${HOME}/.claude}/settings.json"
+               .claude/settings.json .claude/settings.local.json)
+  local root
+  while IFS= read -r root; do
+    [ -n "$root" ] && files+=("$root/.claude/settings.local.json")
+  done < <(project_roots)
+  grep -qs '"DISABLE_COMPACT"' "${files[@]}"
+}
+if [ -z "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}" ]; then
+  if compact_disabled; then
+    echo "DISABLE_COMPACT is set, so Claude Code is not told Agentaus's 131,072-token window" \
+         "(it would cap Claude models too); the bridge trims long Agentaus conversations instead." >&2
+  else
+    export CLAUDE_CODE_MAX_CONTEXT_TOKENS=131072
+  fi
+fi
+
 # NOTE: do NOT set CLAUDE_CODE_ATTRIBUTION_HEADER=0 here. Behind a custom
 # ANTHROPIC_BASE_URL it also strips the block from auto-mode permission-classifier
 # requests, which the API then declines with 401 and auto mode breaks on every
