@@ -92,7 +92,22 @@ def _json_outline(body: str, path: str) -> list[tuple[int, int, str]]:
     except (json.JSONDecodeError, ValueError):
         return []
     if isinstance(data, dict):
-        return [(1, 1, f"key: {k}") for k in list(data)[:200]]
+        keys = list(data)[:200]
+        if not keys:
+            return []
+        # `json.loads` throws the layout away, so each key is found again in the raw
+        # text - a heading at line 1 for every key makes every section but the last
+        # claim zero tokens, and the last claim the whole file.
+        lines = body.splitlines()
+        found = []
+        search_from = 1
+        for k in keys:
+            target = f'"{k}"'
+            number = next((n for n in range(search_from, len(lines) + 1)
+                           if target in lines[n - 1]), search_from)
+            search_from = number
+            found.append((number, 1, f"key: {k}"))
+        return found
     if isinstance(data, list) and data and isinstance(data[0], dict):
         return [(1, 1, f"list of {len(data)} objects, fields: "
                        + ", ".join(list(data[0])[:12]))]
@@ -222,8 +237,11 @@ def render(paths: list[str], read=None, *, max_lines: int = 600) -> str:
         out.append(f"- `{path}` ({total} tokens)" if md
                    else f'<file path="{path}" tokens="{total}">')
         for index, (line, depth, title) in enumerate(headings):
-            # A section runs to the next heading, or to the end of the file.
-            end = headings[index + 1][0] - 1 if index + 1 < len(headings) else len(lines)
+            # A section runs to the next heading, or to the end of the file - never to
+            # before its own line: headings can share a line (minified JSON), and a
+            # section of nothing advertises a cost it does not have.
+            end = (max(line, headings[index + 1][0] - 1)
+                   if index + 1 < len(headings) else len(lines))
             size = count_tokens("\n".join(lines[line - 1:end]))
             if md:
                 out.append(f"  - line {line}, depth {depth}, {size} tokens: {title}")

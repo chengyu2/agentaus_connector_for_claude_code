@@ -134,6 +134,37 @@ class TestJsonIsIndexedByKey(unittest.TestCase):
     def test_malformed_json_yields_nothing_rather_than_raising(self):
         self.assertEqual(outline.of_file("/x/a.json", reader({"/x/a.json": "{oops"})), [])
 
+    def test_keys_get_their_real_line(self):
+        """A key's line is where it sits in the raw text, not line 1 for all of them -
+        else every section but the last advertises zero tokens."""
+        body = '{\n  "alpha": 1,\n  "beta": 2,\n  "gamma": 3\n}'
+        got = outline.of_file("/x/a.json", reader({"/x/a.json": body}))
+        self.assertEqual([(line, title) for line, _d, title in got],
+                         [(2, "key: alpha"), (3, "key: beta"), (4, "key: gamma")])
+
+    def test_key_lines_never_go_backwards(self):
+        """A key that is not literally in the text (an escaped one, say) lands on the
+        previous key's line rather than rewinding the scan."""
+        body = '{\n  "first": 1,\n  "caf\\u00e9": 2,\n  "last": 3\n}'
+        got = outline.of_file("/x/a.json", reader({"/x/a.json": body}))
+        lines = [line for line, _d, _t in got]
+        self.assertEqual(lines, sorted(lines))
+
+    def test_json_sections_state_a_real_cost(self):
+        body = '{\n  "alpha": 1,\n  "beta": 2,\n  "gamma": 3\n}'
+        text = outline.render(["/x/a.json"], read=reader({"/x/a.json": body}))
+        sizes = re.findall(r'<section [^>]*tokens="(\d+)"', text)
+        self.assertEqual(len(sizes), 3)
+        self.assertTrue(all(int(v) > 0 for v in sizes), f"zero-cost sections: {sizes}")
+
+    def test_minified_json_still_prices_every_key(self):
+        """All keys share one line, so each section is priced at that line at least."""
+        body = '{"alpha": 1, "beta": 2}'
+        text = outline.render(["/x/a.json"], read=reader({"/x/a.json": body}))
+        sizes = re.findall(r'<section [^>]*tokens="(\d+)"', text)
+        self.assertEqual(len(sizes), 2)
+        self.assertTrue(all(int(v) > 0 for v in sizes), f"zero-cost sections: {sizes}")
+
 
 class TestRenderingAndPicking(unittest.TestCase):
     def test_render_is_tagged_and_carries_line_numbers(self):
