@@ -269,10 +269,10 @@ async def subscribe(f: Flight) -> AsyncIterator[bytes]:
             async with f.cond:
                 await f.cond.wait_for(lambda: len(f.events) > i or f.done)
                 finished = f.done
-                # Read by index, no slicing: f.events[i:] on every wake copied the whole
-                # unread tail - a fresh list per chunk and O(n²) copying over a long
-                # turn. The buffer only ever grows while the flight is alive, so the
-                # index is all the bookkeeping needed.
+                # Read by index, no slicing. For a live subscriber f.events[i:] is
+                # usually one element, but a full replay (a re-send joining a long
+                # turn) re-sliced the unread tail on every wake. f.events is only ever
+                # appended to, so the index is all the bookkeeping needed.
                 n = len(f.events)
             while i < n:
                 yield f.events[i]
@@ -324,9 +324,10 @@ async def collect_stream(f: Flight, timeout: float,
     try:
         if not await _until(f, lambda: f.done, timeout, gone):
             return None
-        # The flight is done (the wait above), so the buffer is stable: return it
-        # directly rather than copying. `list(f.events)` doubled peak memory on every
-        # buffered join of a streamed turn, and `assemble` only reads.
+        # The flight is done (the wait above), so nothing appends to the buffer any
+        # more: return it rather than a shallow copy of its pointer array. It is the
+        # flight's own list, shared with later joiners of a kept flight, so callers
+        # must not mutate it (`assemble` only reads).
         return f.events
     finally:
         _detach(f)
