@@ -97,7 +97,7 @@ lists only the common settings. A few internal tuning knobs are documented only 
 | `BRIDGE_RETRY_BACKOFF` | `1` | Base backoff in seconds; doubles per attempt, plus jitter |
 | `BRIDGE_RETRY_MAX_DELAY` | `300` | Ceiling on a single backoff wait |
 | `BRIDGE_RATE_LIMIT_MAX_DELAY` | `20` | Ceiling on the wait after an HTTP 429, from Agentaus or the Anthropic passthrough: each wait is jittered between half the ceiling and the ceiling, and never exceeds it (values under 1 count as 1). A 429 is Agentaus' per-tenant rate window, which reopens in seconds; the outage backoff above is for outages |
-| `BRIDGE_TOKEN` | *(empty)* | Require this token from clients; empty means no client auth |
+| `BRIDGE_TOKEN` | *(empty)* | Require this token from clients; empty means no client auth. Clients send it as `x-agentaus-bridge-token` (preferred) or, legacy, as `x-api-key`/`Authorization: Bearer`. Guards `/v1/messages`, `/v1/messages/count_tokens` and `/v1/models`; the health probes stay open |
 | `BRIDGE_LOG_LEVEL` | `info` | `debug` for per-request detail |
 | `BRIDGE_LOG_BODIES` | `false` | Log full request bodies — **includes your source code** |
 
