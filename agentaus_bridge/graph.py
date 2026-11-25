@@ -41,12 +41,12 @@ log = logging.getLogger("agentaus-bridge")
 
 MARK = "[agentaus-graph]"
 _GRAPHS = Path(__file__).parent / "graphs"
-SCRIPT = (_GRAPHS / "solve.js").read_text()
-DYNAMIC_SCRIPT = (_GRAPHS / "dynamic.js").read_text()
+SCRIPT = (_GRAPHS / "solve.js").read_text(encoding="utf-8")
+DYNAMIC_SCRIPT = (_GRAPHS / "dynamic.js").read_text(encoding="utf-8")
 # Every role in the dynamic graph works from a skill file: scout, plan, review-plan, solve,
 # merge, check, assemble, fix. Passed in with the script, so no agent spends a call reading
 # its own instructions off disk.
-SKILLS = {p.stem: p.read_text() for p in sorted((_GRAPHS / "skills").glob("*.md"))}
+SKILLS = {p.stem: p.read_text(encoding="utf-8") for p in sorted((_GRAPHS / "skills").glob("*.md"))}
 
 
 def script_for() -> str:
@@ -510,7 +510,7 @@ def limited(thunk):
 # "0/0 pass" read as a pass. Measured: 26 agents ran this on a module with no `>>>` lines and
 # went on as if their change were tested.
 NONE = "no docstring examples - write the docstring's prose examples as asserts yourself"
-cases = [(call, want) for fn in ast.parse(open(spec).read()).body
+cases = [(call, want) for fn in ast.parse(open(spec, encoding='utf-8').read()).body
          if isinstance(fn, ast.FunctionDef) and not (only and fn.name != only)
          for call, want in examples(fn)]
 # Not '__main__': a candidate's `if __name__ == '__main__':` block must not run (or wait on stdin).
@@ -518,7 +518,7 @@ ns = {'__name__': 'candidate', '__file__': os.path.abspath(cand)}
 sys.path.insert(0, os.path.dirname(os.path.abspath(cand)))
 sys.argv = [cand]
 try:
-    limited(lambda: exec(compile(open(cand).read(), cand, 'exec'), ns))
+    limited(lambda: exec(compile(open(cand, encoding='utf-8').read(), cand, 'exec'), ns))
 except BaseException as e:
     print(f'MISMATCH import {cand}: {e!r}')
     print(f'0/{len(cases)} docstring examples pass' if cases else NONE)

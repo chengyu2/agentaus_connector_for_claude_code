@@ -588,6 +588,22 @@ on work where losing early context would be worse than failing.
 
 ---
 
+## Getting warned when a chat gets long
+
+A reply to you is your early warning. When the conversation a turn carries is estimated
+at or above `LONG_CHAT_WARN_RATIO` (default 0.8) of Agentaus' 131,072-token window, the
+bridge appends one line to the end of the reply:
+
+> ⚠️ This chat is getting long (about 85% of Agentaus's limit). Start a new one with + for faster replies.
+
+It uses the same token estimate and window the context-window logic already uses — no
+separate counter. It only rides replies on a session's *main loop*: subagent, title and
+summary calls never carry it, and it never lands inside a tool-call block. It appears at
+most once every 10 eligible turns per session, so it nudges instead of nagging. Set
+`LONG_CHAT_WARN_RATIO=0` in `.env` to turn it off.
+
+---
+
 ## Changing the port
 
 The bridge listens on `127.0.0.1:8787` by default. If something else already owns that
@@ -1202,6 +1218,91 @@ that blocks Anthropic entirely those will report errors while inference keeps wo
 
 ---
 
+## Using it from iOS (or any phone)
+
+Claude Code itself has **no iOS client** — Anthropic ships it for macOS, Windows and
+Linux only. So you can never run *Claude Code* on the iPhone. What you **can** do is reach
+**Agentaus** from the phone, through the bridge running on your PC/Mac, using any chat app
+that accepts a custom "OpenAI-compatible" server address.
+
+The bridge normally fronts the **Anthropic Messages API**, which no phone client
+understands. It also speaks **OpenAI chat-completions**, via a second endpoint added for
+exactly this:
+
+| Endpoint | What it speaks | For |
+| --- | --- | --- |
+| `POST /v1/messages` | Anthropic Messages API (SSE) | Claude Code |
+| `POST /v1/chat/completions` | OpenAI chat-completions (JSON or SSE) | iOS / any OpenAI-compatible client |
+
+The OpenAI endpoint reuses the bridge's whole Agentaus pipeline — compaction, retries,
+live tokens — so a phone chat gets the same treatment as a Claude Code turn. It is gated by
+the same optional `BRIDGE_TOKEN` as `/v1/messages`, and it **always** routes to Agentaus
+(there is no passthrough on the phone path).
+
+### Step 1 — let the bridge onto the network
+
+By default the bridge listens on `127.0.0.1`, your own machine only. Edit `.env`:
+
+```dotenv
+BRIDGE_HOST=0.0.0.0
+BRIDGE_TOKEN=pick-a-long-random-string
+```
+
+`0.0.0.0` makes it reachable from other devices on your Wi-Fi. `BRIDGE_TOKEN` is the
+password — **required** once you leave loopback, because otherwise anyone on your network
+can burn your Agentaus quota. Restart the bridge after editing.
+
+### Step 2 — find your PC's address on your network
+
+On macOS: **System Settings → Wi-Fi → Details**. On Windows: `ipconfig` — look for
+`IPv4 Address` (often `192.168.x.x`). The phone and the PC must be on the **same network**.
+
+Sanity-check the bridge answers from the PC's own terminal:
+
+```bash
+curl -s http://127.0.0.1:8787/healthz
+```
+
+and confirm the phone can reach it — from the mobile browser, open
+`http://<your-pc-ip>:8787/healthz`. You should see a JSON reply. If the phone browser
+cannot load it, the PC's firewall is blocking port 8787 (allow it, or fix the network
+before continuing).
+
+### Step 3 — point a phone client at it
+
+Any app that lets you set a custom **API base URL** + **API key** and claims OpenAI
+compatibility can talk to Agentaus. Configure it with:
+
+| Setting | Value |
+| --- | --- |
+| Base URL | `http://<your-pc-ip>:8787/v1` |
+| API key | your `BRIDGE_TOKEN` (anything non-empty when token auth is off) |
+| Model | anything — the bridge routes every phone request to Agentaus |
+
+The bridge accepts the key as `Authorization: Bearer <token>` or `x-api-key`, both of which
+the mainstream apps send. Start a chat: the turn goes to Canberra through the bridge on
+your PC.
+
+### What the phone does not get
+
+- **Side-by-side Claude models** — the phone path is Agentaus only; the PC keeps the
+  `/model` switcher.
+- **Files, tools or permission prompts** — a phone chat is plain prose. The bridge's own
+  tools (`agentaus_search`, document reading) are driven by Claude Code's schemas, which
+  phone clients do not send, so those calls are not offered.
+- **Access from outside your Wi-Fi** — see below.
+
+### Taking it beyond the house (port forwarding, briefly)
+
+To reach the bridge from anywhere — on cellular data, at the office — you port-forward
+port 8787 on your router to your PC and use the router's **public IP** instead of the
+LAN address. Do this only behind a strong `BRIDGE_TOKEN` and an HTTPS tunnel if you can —
+plain HTTP across the internet means your prompts and answers travel unencrypted. The
+simplest robust option is a Tailscale/Tailnet or similar forwarding layer so the phone and
+the PC share a private network without opening your router to the internet at all.
+
+---
+
 ## Running it in the background
 
 To avoid keeping a terminal open, install a background agent. The installer does this for
@@ -1390,6 +1491,46 @@ pass another path. How to read its report, and the rest of the log lines:
 
 More symptoms, including DNS failures on macOS, stream errors and a generic-assistant tone:
 [docs/operating/troubleshooting.md](docs/operating/troubleshooting.md#symptoms).
+
+---
+
+## Live statistics: /stats and /stats.json
+
+Since the bridge started, it keeps counters in memory (`agentaus_bridge/stats.py`) and
+records them at the same points that already log each event. Open them in a browser:
+
+- **http://127.0.0.1:8787/stats** — a self-contained dark-mode page, no external
+  CSS/JS, that auto-refreshes every 10 seconds.
+- **http://127.0.0.1:8787/stats.json** — the same data as JSON.
+
+You get requests split into Agentaus vs Claude passthrough (count, average and slowest
+response time), input and output tokens sent to Agentaus, how many times history was
+compacted or trimmed and the tokens saved, errors by type (401, 429, timeout, 5xx), and
+bridge uptime and version. Only this machine (`127.0.0.1` / `::1`) may read either page;
+anything else gets **403 even when `BRIDGE_TOKEN` is set**, because these counters are
+for the operator. The pages show numbers only — never prompts, file contents or keys.
+The counters reset when the bridge restarts.
+
+## Diagnose the install: --doctor
+
+For an interactive setup check, run:
+
+```
+python -m agentaus_bridge --doctor
+```
+
+It prints one line per check with a green ✅ (or `[OK]` if the console cannot render
+glyphs) and, for anything failing, the exact command or step to fix it tuned to your OS
+(PowerShell/winget on Windows, brew on macOS, apt on Linux). It checks: Python 3.9+,
+that you are running the repo's `.venv`, that every `requirements.txt` dependency
+imports, the document readers (`soffice`, `pdftotext`, `pdftoppm`, `tesseract`), that
+`.env` exists with `AGENTAUS_API_KEY` set (it says *set*, never prints it), one tiny live
+API call, that the configured port is free or already serving a bridge (`/healthz`),
+that a non-loopback `BRIDGE_HOST` has a `BRIDGE_TOKEN`, that `~/.claude/settings.json`
+and this repo's `.claude/settings.json` point at this bridge with the `agentaus` model
+option, that `.claude/skills` exists, and that `.gitignore` covers `.env` / `*.log` /
+`.venv/` with nothing over 50 MB tracked. Use `--doctor --offline` to skip the live API
+call. Exits 0 when everything passes, 1 when anything does not.
 
 ---
 

@@ -30,6 +30,32 @@ _main_loop: "OrderedDict[str, tuple[bool, float]]" = OrderedDict()
 # What each session's user asked for, so its subagents can be shown it. See
 # `request_of`.
 _requests: "OrderedDict[str, tuple[str, float]]" = OrderedDict()
+# Long-chat warning throttle: how many eligible turns since each session was last
+# warned, so the warning shows at most once per `every` turns and does not nag.
+_since_warn: "OrderedDict[str, int]" = OrderedDict()
+
+
+def warn_due(session: str | None, every: int = 10) -> bool:
+    """Whether the long-chat warning may be shown to `session` now.
+
+    Called only once per request, on an over-threshold main-loop turn. The first
+    such turn always warns; thereafter a warning is allowed only once every
+    `every` eligible turns. Bounded like the other per-session state.
+    """
+    if not session:
+        return False
+    with _lock:
+        if session not in _since_warn:
+            _since_warn[session] = 1
+            while len(_since_warn) > _MAX_SESSIONS:
+                _since_warn.popitem(last=False)
+            return True
+        since = _since_warn[session] + 1
+        if since <= every:
+            _since_warn[session] = since
+            return False
+        _since_warn[session] = 1
+        return True
 
 
 def session_of(headers) -> str | None:
@@ -104,3 +130,4 @@ def reset() -> None:
     with _lock:
         _main_loop.clear()
         _requests.clear()
+        _since_warn.clear()

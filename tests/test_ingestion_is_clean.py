@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -53,8 +54,8 @@ def _html():
 
 def _convert(src: str, fmt: str, outdir: str) -> str:
     """Convert with LibreOffice into `outdir`; return the produced file's path."""
-    profile = os.path.join(outdir, "profile")
-    subprocess.run([documents.soffice(), f"-env:UserInstallation=file://{profile}",
+    profile = Path(outdir, "profile").as_uri()
+    subprocess.run([documents.soffice(), f"-env:UserInstallation={profile}",
                     "--headless", "--norestore", "--convert-to", fmt, "--outdir", outdir, src],
                    capture_output=True, timeout=180, check=False)
     stem = os.path.splitext(os.path.basename(src))[0]

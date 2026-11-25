@@ -47,6 +47,7 @@ from . import repair
 from . import syntax
 from . import throttle
 from . import schema as tool_schema
+from . import stats as bridge_stats
 from . import tools as bridge_tools
 from .augment import (
     ADJUDICATE_INSTRUCTION,
@@ -108,6 +109,7 @@ from .translate import (
     sse,
     trim_messages_to_fit,
 )
+from . import mobile
 
 log = logging.getLogger("agentaus-bridge")
 
@@ -239,6 +241,26 @@ async def healthz_upstream() -> JSONResponse:
                          "flights": flight.running(), "source_hash": _SOURCE_HASH})
 
 
+@app.get("/stats.json")
+async def stats_json(request: Request) -> Response:
+    """Live counters as JSON. Only this machine may read them - even with BRIDGE_TOKEN
+    set, a phone or another host gets 403: these numbers are for the operator only."""
+    host = request.client.host if request.client else ""
+    if host not in _LOOPBACK:
+        return JSONResponse({"detail": "stats are only available on this machine"},
+                            status_code=403)
+    return JSONResponse(bridge_stats.snapshot())
+
+
+@app.get("/stats")
+async def stats_page(request: Request) -> Response:
+    host = request.client.host if request.client else ""
+    if host not in _LOOPBACK:
+        return JSONResponse({"detail": "stats are only available on this machine"},
+                            status_code=403)
+    return Response(bridge_stats.page_html(), media_type="text/html; charset=utf-8")
+
+
 # Claude Code's model picker, when CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1, asks the gateway
 # for GET /v1/models?limit=1000 at startup, waits 3 s, keeps ids containing "claude" or
 # "anthropic", and falls back to its cache or built-in list on any failure or redirect. The
@@ -320,9 +342,27 @@ async def list_models(request: Request) -> JSONResponse:
 # Auth guard (optional, for non-localhost deployments)
 # --------------------------------------------------------------------------------------
 
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
 def _client_authorised(request: Request) -> bool:
+    """A request is allowed if no token is set, it comes from this machine, or it
+    carries the token.
+
+    Claude Code on this machine sends its own Anthropic credentials in `x-api-key` /
+    `Authorization` (needed for passthrough), so it can never also present
+    BRIDGE_TOKEN. Before loopback was trusted, setting a token for phone access made
+    every local Claude Code request fail with "401 Invalid bridge token" and loop on
+    sign-in. Only clients on other machines (the phone) need the token.
+    """
     if not settings.bridge_token:
         return True
+    client = request.client.host if request.client else ""
+    if client in _LOOPBACK:
+        return True
+    dedicated = request.headers.get("x-bridge-token") or ""
+    if dedicated:
+        return dedicated == settings.bridge_token
     supplied = request.headers.get("x-api-key") or ""
     auth = request.headers.get("authorization") or ""
     if auth.lower().startswith("bearer "):
@@ -407,6 +447,79 @@ async def count_tokens(request: Request) -> Response:
         # Claude Code's context meter and auto-compact trigger, not billing.
         return JSONResponse({"input_tokens": estimate_request_tokens(body)})
     return await _passthrough(request, raw)
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request) -> Response:
+    """An OpenAI-style endpoint so a phone client on the LAN can talk to Agentaus.
+
+    The bridge normally fronts the Anthropic Messages API, which no ordinary chat
+    client understands. This endpoint speaks OpenAI chat-completions instead: it takes
+    the familiar `{"messages": [...], "stream": ...}` body, shapes it the way the
+    Agentaus pipeline expects, runs it through `_handle_agentaus` - compaction,
+    retries, keepalives and all - and translates the reply back to OpenAI shape.
+
+    It is gated by the same optional `BRIDGE_TOKEN` as `/v1/messages`, sent as
+    `Authorization: Bearer <token>` or `x-api-key`, and exists so an iOS / mobile
+    client pointed at `http://<host>:8787/v1` can reach Agentaus without exposing the
+    Agentaus key. There is deliberately no passthrough here: a mobile turn always goes
+    to Agentaus.
+    """
+    if not _client_authorised(request):
+        return JSONResponse(
+            {"error": {"message": "Invalid bridge token", "type": "authentication_error",
+                       "code": 401}},
+            status_code=401,
+        )
+
+    raw = await request.body()
+    try:
+        body = json.loads(raw or b"{}")
+    except json.JSONDecodeError as exc:
+        return JSONResponse(
+            {"error": {"message": f"Malformed JSON body: {exc}", "type": "invalid_request_error",
+                       "code": 400}},
+            status_code=400,
+        )
+
+    wants_stream = bool(body.get("stream"))
+    model = body.get("model") or "agentaus"
+    anthropic_body = _openai_to_anthropic(body)
+
+    _request_id.set(_new_request_id())
+    rlog(logging.INFO, "recv mobile model=%s stream=%s msgs=%d",
+         model, wants_stream, len(anthropic_body.get("messages") or []))
+
+    response = await _handle_agentaus(request, anthropic_body, "agentaus", wants_stream)
+
+    if wants_stream:
+        # The Agentaus pipeline already streams Anthropic SSE frames; re-emit them as
+        # OpenAI chat.completion.chunk deltas, ending in data: [DONE].
+        return StreamingResponse(
+            mobile.openai_chat_stream(response.body_iterator, model),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # A buffered reply is a JSONResponse holding an Anthropic-shaped assistant message;
+    # translate that into an OpenAI chat.completion.
+    data = json.loads(response.body)
+    return JSONResponse(mobile.anthropic_message_to_openai(data, model))
+
+
+def _openai_to_anthropic(body: dict) -> dict:
+    """Shape an OpenAI chat-completions body for the Agentaus pipeline.
+
+    A plain phone chat sends `messages` of string `role`/`content` pairs, which the
+    Anthropic request translator already handles - system messages become the system
+    prompt (so a phone user can set a persona), and the turn always ends on the user's
+    latest message. Everything always routes to Agentaus here, so `model` is pinned.
+    """
+    out: dict = {"model": "agentaus", "messages": body.get("messages") or [],
+                 "stream": bool(body.get("stream"))}
+    if body.get("max_tokens"):
+        out["max_tokens"] = body["max_tokens"]
+    return out
 
 
 # --------------------------------------------------------------------------------------
@@ -2273,6 +2386,35 @@ def _agentaus_error_text(err: dict) -> str:
     return f"Agentaus error: {message}"
 
 
+def _long_chat_warning(pct: int) -> str:
+    """One line telling the user the chat is near Agentaus' context limit.
+
+    `pct` is the estimated usage as a whole-number percentage of the window.
+    Kept here so the buffered and streamed reply paths share the exact wording.
+    """
+    return (f"⚠️ This chat is getting long (about {pct}% of Agentaus's limit). "
+            "Start a new one with + for faster replies.")
+
+
+def _long_chat_warning_pct(request: Request, body: dict, estimate: int, limit: int) -> int | None:
+    """Estimated % of Agentaus' window to warn about, or None when no warning is due.
+
+    Gated to a real main-loop reply: never a subagent, and never Claude Code's own
+    tool-less calls (title, summary, refusal-classify). The first time a conversation
+    crosses `LONG_CHAT_WARN_RATIO` the user is warned, then at most once every 10
+    eligible turns so it does not nag. Threshold of 0 disables the feature.
+    """
+    ratio = settings.long_chat_warn_ratio
+    if ratio <= 0 or limit <= 0 or not body.get("tools") or is_subagent_turn(body):
+        return None
+    pct = int(estimate * 100 / limit)
+    if pct < int(ratio * 100):
+        return None
+    if not sessions.warn_due(sessions.session_of(request.headers)):
+        return None
+    return pct
+
+
 async def _fit_to_window(
     request: Request, body: dict, *, limit: int, reserve: int, scale: float
 ) -> dict:
@@ -2307,20 +2449,22 @@ async def _fit_to_window(
         fitted["system"] = _with_summary(
             body.get("system"), plan["summary"], plan["summarised"]
         )
-        rlog(logging.WARNING, 
+        rlog(logging.WARNING,
             "compacted %d oldest message(s) into a summary for a %d-token target "
             "(~%d -> ~%d tokens)",
             plan["summarised"], target, estimated, estimate_request_tokens(fitted),
         )
+        bridge_stats.record_compact("compact", estimated - estimate_request_tokens(fitted))
         return _clipped_to(fitted, target, reserve)
     if plan["method"] == "trimmed":
         fitted = {**body, "messages": plan["messages"]}
         fitted["system"] = _with_trim_notice(body.get("system"), plan["dropped"])
-        rlog(logging.WARNING, 
+        rlog(logging.WARNING,
             "summarisation could not reach the %d-token target; dropped %d oldest "
             "message(s) instead (~%d -> ~%d tokens)",
             target, plan["dropped"], estimated, estimate_request_tokens(fitted),
         )
+        bridge_stats.record_compact("trim", estimated - estimate_request_tokens(fitted))
         return _clipped_to(fitted, target, reserve)
     return _clipped_to(body, target, reserve)
 
@@ -2712,6 +2856,11 @@ async def _handle_agentaus(
     limit = _context_limit()
     reserved = int(body.get("max_tokens") or 0)
     original_estimate = estimate_request_tokens(body)
+    # Whether the long-chat warning belongs on this turn's reply. Decided once, on the
+    # request as received, so buffered and streamed paths agree: None for a subagent or
+    # tool-less (title/summary) call, an int percent otherwise, with the once-per-10-turns
+    # throttle already applied.
+    warn_pct = _long_chat_warning_pct(request, body, original_estimate, limit)
     # The body as the client sent it. `body` is rebound to the fitted one below, and a
     # compacted body has lost the turns the guards and the graph's task are read from.
     received = body
@@ -3258,12 +3407,24 @@ async def _handle_agentaus(
             model=display_model,
             thinking=plan_holder["text"] if settings.agentaus_thinking_visible else None,
         )
+        # Low, not part of the model's answer: the warning is the bridge talking. Only
+        # on a text reply - never when the turn ends in tool calls the client will run.
+        if warn_pct is not None and not any(
+            b.get("type") == "tool_use" for b in message["content"]
+        ):
+            message = {**message, "content": list(message["content"]) + [
+                {"type": "text", "text": _long_chat_warning(warn_pct)},
+            ]}
         rlog(logging.INFO,
             "POST /v1/messages model=%s route=agentaus stream=false -> 200 in %.1fs in=%s out=%s",
             display_model,
             time.monotonic() - started,
             message["usage"]["input_tokens"],
             message["usage"]["output_tokens"],
+        )
+        bridge_stats.record_request(
+            "agentaus", time.monotonic() - started,
+            message["usage"]["input_tokens"], message["usage"]["output_tokens"],
         )
         return JSONResponse(message)
 
@@ -3362,6 +3523,7 @@ async def _handle_agentaus(
                 library=library_holder["names"], plain_text=plain_text,
                 client_body=received, stop_retrying=stop_retrying,
                 time_up_text=time_up_text, request_kind=request_kind,
+                warn_pct=warn_pct,
             ):
                 yield chunk
         except asyncio.CancelledError:
@@ -3460,6 +3622,7 @@ async def _unguarded_event_stream(
     time_up_text: Callable[[], str] | None = None,
     request_kind: str = "normal",
     checks: set | None = None,
+    warn_pct: int | None = None,
 ) -> AsyncIterator[bytes]:
     """Produce a valid Anthropic SSE stream from an Agentaus response.
 
@@ -4113,14 +4276,23 @@ async def _unguarded_event_stream(
     for call in theirs:
         yield builder.tool_use(call["id"], call["name"], call["arguments"])
 
+    # The long-chat warning rides the end of the text answer. Only when the turn is a
+    # text reply - never inside a tool-call block, which the client is about to run.
+    if warn_pct is not None and not theirs:
+        yield builder.text("\n\n" + _long_chat_warning(warn_pct))
+
     _calibrate_from_usage(original, usage)
     yield builder.finish(finish_reason, usage)
-    rlog(logging.INFO, 
+    rlog(logging.INFO,
         "POST /v1/messages model=%s route=agentaus stream=true -> 200 in %.1fs finish=%s usage=%s",
         model,
         time.monotonic() - started,
         finish_reason,
         usage,
+    )
+    bridge_stats.record_request(
+        "agentaus", time.monotonic() - started,
+        (usage or {}).get("input_tokens") or 0, (usage or {}).get("output_tokens") or 0,
     )
 
 
@@ -4291,6 +4463,8 @@ async def _passthrough(request: Request, raw: bytes) -> Response:
 
     is_event_stream = "text/event-stream" in (upstream.headers.get("content-type") or "")
 
+    passthrough_started = time.monotonic()
+
     async def body_iterator() -> AsyncIterator[bytes]:
         try:
             # aiter_bytes() decompresses as it streams. aiter_raw() would hand back the
@@ -4317,6 +4491,7 @@ async def _passthrough(request: Request, raw: bytes) -> Response:
 
     rlog(logging.INFO, "passthrough -> %s %d", url.split("//", 1)[-1][:60],
          upstream.status_code)
+    bridge_stats.record_request("anthropic", time.monotonic() - passthrough_started)
 
     return StreamingResponse(
         body_iterator(),
@@ -4355,6 +4530,12 @@ def _upstream_error_response(status: int, text: str) -> JSONResponse:
     # of its cause - which is precisely the case a malformed-request bug presents as.
     rlog(logging.WARNING, "agentaus rejected the request: HTTP %d %s",
          status, (text or "")[:1000])
+    if status == 401:
+        bridge_stats.record_error("401")
+    elif status == 429:
+        bridge_stats.record_error("429")
+    elif status >= 500:
+        bridge_stats.record_error("5xx")
     return _error_response(
         status, _error_type_for_status(status), f"Agentaus error: {text[:500]}"
     )

@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -205,7 +206,7 @@ class TestRepairingClientSideReads(unittest.TestCase):
         with open(src, "w") as fh:
             fh.write("Heading\nA line of real content\n")
         subprocess.run([documents.soffice(),
-                        f"-env:UserInstallation=file://{directory}/profile",
+                        f"-env:UserInstallation={Path(directory, 'profile').as_uri()}",
                         "--headless", "--convert-to", "docx", "--outdir", directory, src],
                        capture_output=True, timeout=120)
         return os.path.join(directory, "src.docx")

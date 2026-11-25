@@ -56,6 +56,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Verify the Agentaus credential and exit without starting the server",
     )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run install/config checks and exit without starting the server",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="With --doctor, skip the live API credential check",
+    )
     args = parser.parse_args(argv)
 
     env_path = Path(args.env_file)
@@ -81,6 +91,13 @@ def main(argv: list[str] | None = None) -> int:
     log = logging.getLogger("agentaus-bridge")
     if count:
         log.info("loaded %d settings from %s", count, env_path)
+
+    if args.doctor:
+        # Deliberately before the key/requirements hard-exits below: --doctor must be
+        # able to *report* those problems, not die on them.
+        from . import doctor
+
+        return doctor.run(offline=args.offline)
 
     if not settings.agentaus_api_key:
         log.error(
@@ -108,6 +125,28 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         return _check(settings)
 
+    if settings.host not in ("127.0.0.1", "::1", "localhost") and not settings.bridge_token:
+        log.warning(
+            "BRIDGE_HOST=%s exposes the bridge to your whole network with no BRIDGE_TOKEN: "
+            "anyone on this Wi-Fi could spend your Agentaus credit. Set BRIDGE_TOKEN in .env.",
+            settings.host,
+        )
+
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind((settings.host if settings.host != "localhost" else "127.0.0.1",
+                        settings.port))
+        except OSError:
+            log.error(
+                "Port %s is already in use - most likely an older bridge is still running "
+                "(check other terminal windows, or the autostart task). Stop it first, or "
+                "start this one with --port <other> and update ANTHROPIC_BASE_URL to match.",
+                settings.port,
+            )
+            return 4
+
     import uvicorn
 
     uvicorn.run(
@@ -117,6 +156,9 @@ def main(argv: list[str] | None = None) -> int:
         log_level=settings.log_level,
         access_log=False,
         timeout_keep_alive=75,
+        # Ctrl+C used to hang on "Waiting for connections to close" while Claude Code
+        # held a stream open. Give in-flight requests a few seconds, then exit.
+        timeout_graceful_shutdown=5,
     )
     return 0
 

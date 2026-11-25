@@ -260,6 +260,13 @@ class Settings:
     agentaus_compact_threshold: float = field(
         default_factory=lambda: _float("AGENTAUS_COMPACT_THRESHOLD", 0.8)
     )
+    # Warn the user when a main-loop reply's conversation is estimated at or above this
+    # fraction of the window, so they start a fresh chat instead of discovering the
+    # limit the hard way. 0 disables. Read from the same estimate and window the
+    # context-window logic already uses.
+    long_chat_warn_ratio: float = field(
+        default_factory=lambda: _float("LONG_CHAT_WARN_RATIO", 0.8)
+    )
     # How much of the budget stays verbatim. The rest becomes the summarised head.
     agentaus_keep_fraction: float = field(
         default_factory=lambda: _float("AGENTAUS_KEEP_FRACTION", 0.5)

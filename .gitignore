@@ -5,6 +5,7 @@ __pycache__/
 
 # Local settings backups
 .claude/settings_old.json
+.claude/settings_bkp.json
 .claude/settings.local.json
 
 # Benchmark run files hold every raw reply, and documents/coverage replies quote the
@@ -16,3 +17,12 @@ benchmarks/results/
 
 # Temporary Isaac folder
 .1Isaac/
+
+# Bridge logs hold full prompts and source code, and grow without limit
+*.log
+*.log.1
+.autostart/bridge.log*
+
+# Local scratch: test payloads and per-trial courtroom records
+payload.json
+courtroom/case.md
