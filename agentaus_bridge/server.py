@@ -162,13 +162,44 @@ def _anthropic_request_headers(request: Request) -> dict:
     headers = {
         key: value
         for key, value in request.headers.items()
-        if key.lower() not in _STRIP_REQUEST_HEADERS
+        if key.lower() not in _STRIP_REQUEST_HEADERS and key.lower() != BRIDGE_TOKEN_HEADER
     }
-    headers.pop(BRIDGE_TOKEN_HEADER, None)
     for name, value in list(headers.items()):
         if _header_carries_bridge_token(name, value):
             del headers[name]
     return headers
+
+
+_WARNED_BRIDGE_TOKEN_ONLY_CREDENTIAL = False
+
+
+def _warn_if_bridge_token_was_the_only_credential(request: Request, headers: dict) -> None:
+    """Say why Anthropic is about to answer 401, once per process.
+
+    Before the dedicated header existed, running BRIDGE_TOKEN with Claude passthrough
+    only worked by setting BRIDGE_TOKEN to the caller's own Anthropic key, which was then
+    forwarded unchanged. That header is now stripped as the bridge token, so such a setup
+    reaches Anthropic with no credential at all and nothing else in the log says why.
+    """
+    global _WARNED_BRIDGE_TOKEN_ONLY_CREDENTIAL
+    if _WARNED_BRIDGE_TOKEN_ONLY_CREDENTIAL:
+        return
+    auth_names = {"x-api-key", "authorization"}
+    if any(key.lower() in auth_names for key in headers):
+        return  # a real credential survived
+    if not any(_header_carries_bridge_token(key, value)
+               for key, value in request.headers.items() if key.lower() in auth_names):
+        return  # the caller sent no credential to strip; Anthropic's 401 is self-explanatory
+    _WARNED_BRIDGE_TOKEN_ONLY_CREDENTIAL = True
+    rlog(
+        logging.WARNING,
+        "Claude request forwarded to Anthropic with no credential: the only x-api-key/"
+        "Authorization the client sent equals BRIDGE_TOKEN, and the bridge token is never "
+        "passed upstream. If BRIDGE_TOKEN is your Anthropic key, set BRIDGE_TOKEN to a "
+        "separate secret, send it as the %s header (Claude Code: ANTHROPIC_CUSTOM_HEADERS), "
+        "and keep your real key in x-api-key.",
+        BRIDGE_TOKEN_HEADER,
+    )
 
 
 def _credential_key(headers: dict) -> str:
@@ -226,6 +257,15 @@ async def _startup() -> None:
     )
     if not settings.agentaus_api_key:
         log.warning("AGENTAUS_API_KEY is not set - Agentaus requests will fail with 401")
+    if settings.bridge_token.startswith("sk-ant-") and settings.passthrough_enabled:
+        log.warning(
+            "BRIDGE_TOKEN looks like an Anthropic API key. The bridge token is stripped "
+            "before any request goes to Anthropic, so Claude requests that carry only that "
+            "key will reach Anthropic with no credential and fail with 401. Set "
+            "BRIDGE_TOKEN to a separate secret, send it as the %s header, and keep your "
+            "Anthropic key in x-api-key.",
+            BRIDGE_TOKEN_HEADER,
+        )
 
 
 @app.on_event("shutdown")
@@ -407,17 +447,25 @@ def _client_authorised(request: Request) -> bool:
     Preferred: the dedicated `x-agentaus-bridge-token` header, which is for the bridge
     alone and never forwarded upstream. Legacy (kept for existing Agentaus-only clients
     such as abbench scripts and bridges configured before the dedicated header existed):
-    `x-api-key` or `Authorization: Bearer`. Compared in constant time either way.
+    `x-api-key` or `Authorization: Bearer`; a match in either is enough, so the other
+    can carry the caller's real Anthropic credential. A dedicated header, when sent, is
+    the only one checked. Compared in constant time either way.
     """
     if not settings.bridge_token:
         return True
-    supplied = request.headers.get(BRIDGE_TOKEN_HEADER) or ""
-    if not supplied:
-        supplied = request.headers.get("x-api-key") or ""
-        auth = request.headers.get("authorization") or ""
-        if auth.lower().startswith("bearer "):
-            supplied = supplied or auth[7:]
-    return _same_secret(supplied, settings.bridge_token)
+    dedicated = request.headers.get(BRIDGE_TOKEN_HEADER) or ""
+    if dedicated:
+        return _same_secret(dedicated, settings.bridge_token)
+    # Legacy: either auth header may hold the bridge token, and the other one the caller's
+    # real Anthropic credential (x-api-key or OAuth Bearer). Accept a match in either -
+    # no weaker, as the exact token must still be presented - and compare both, so the
+    # time taken does not depend on which one matched.
+    api_key = request.headers.get("x-api-key") or ""
+    auth = request.headers.get("authorization") or ""
+    bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    key_matches = bool(api_key) and _same_secret(api_key, settings.bridge_token)
+    bearer_matches = bool(bearer) and _same_secret(bearer, settings.bridge_token)
+    return key_matches or bearer_matches
 
 
 # --------------------------------------------------------------------------------------
@@ -4341,6 +4389,7 @@ async def _passthrough(request: Request, raw: bytes) -> Response:
         url = f"{url}?{request.url.query}"
 
     headers = _anthropic_request_headers(request)
+    _warn_if_bridge_token_was_the_only_credential(request, headers)
 
     # Retry the connect only. Nothing has been written to the client yet, so replaying
     # the identical body is invisible; once we start streaming the response back a

@@ -98,6 +98,7 @@ class BridgeAuth(unittest.TestCase):
         from agentaus_bridge.config import settings
         STATE.update({"status": 200, "delay": 0.0, "seen": []})
         server._MODELS_LAST.clear()
+        server._WARNED_BRIDGE_TOKEN_ONLY_CREDENTIAL = False
         self._saved = (settings.bridge_token, settings.anthropic_base_url)
         settings.bridge_token = BRIDGE_TOKEN
         settings.anthropic_base_url = stub_server.url(self.server)
@@ -217,9 +218,10 @@ class BridgeAuth(unittest.TestCase):
                          "the caller's real credential was lost")
         self.assertNotIn(BRIDGE_TOKEN, json.dumps(upstream["headers"]))
 
-    def test_legacy_bridge_bearer_is_dropped_and_a_separate_key_survives(self):
+    def test_dedicated_header_plus_bridge_bearer_drops_the_bearer_and_keeps_the_key(self):
         # Authenticated with the dedicated header; the legacy Bearer header carries the
-        # bridge token too, and must not carry it to Anthropic.
+        # bridge token too, and must not carry it to Anthropic. (The pure legacy pairing,
+        # without the dedicated header, is covered further down.)
         from agentaus_bridge import server
         headers = {server.BRIDGE_TOKEN_HEADER: BRIDGE_TOKEN,
                    "authorization": f"Bearer {BRIDGE_TOKEN}", "x-api-key": ANTHROPIC_KEY}
@@ -230,6 +232,72 @@ class BridgeAuth(unittest.TestCase):
         self.assertEqual(upstream["headers"].get("x-api-key"), ANTHROPIC_KEY)
         self.assertNotIn("authorization", upstream["headers"])
         self.assertNotIn(BRIDGE_TOKEN, json.dumps(upstream["headers"]))
+
+    def test_pure_legacy_bearer_with_a_real_key_authorises_and_forwards_the_key_only(self):
+        # No dedicated header: the bridge token rides in Authorization: Bearer and the
+        # caller's real Anthropic key in x-api-key (issue #66).
+        headers = {"authorization": f"Bearer {BRIDGE_TOKEN}", "x-api-key": ANTHROPIC_KEY}
+        with self.client() as client:
+            for method, path, body in (("post", "/v1/messages", self.messages_body()),
+                                       ("post", "/v1/messages/count_tokens", self.count_body()),
+                                       ("get", "/v1/models", None)):
+                kwargs = {"headers": headers}
+                if body is not None:
+                    kwargs["json"] = body
+                response = getattr(client, method)(path, **kwargs)
+                self.assertEqual(response.status_code, 200, f"{path}: {response.text}")
+                upstream = self.last_upstream()
+                self.assertEqual(upstream["headers"].get("x-api-key"), ANTHROPIC_KEY, path)
+                self.assertNotIn("authorization", upstream["headers"], path)
+                self.assertNotIn(BRIDGE_TOKEN, json.dumps(upstream["headers"]), path)
+
+    def test_legacy_headers_that_both_miss_the_token_are_refused(self):
+        headers = {"authorization": "Bearer not-the-token", "x-api-key": ANTHROPIC_KEY}
+        with self.client() as client:
+            self.assertEqual(
+                client.post("/v1/messages", json=self.messages_body(),
+                            headers=headers).status_code, 401)
+            self.assertEqual(client.get("/v1/models", headers=headers).status_code, 401)
+        self.assertEqual(STATE["seen"], [])
+
+    def test_a_case_variant_dedicated_header_is_still_stripped(self):
+        headers = {"X-Agentaus-Bridge-Token": BRIDGE_TOKEN, "x-api-key": ANTHROPIC_KEY}
+        with self.client() as client:
+            response = client.post("/v1/messages", json=self.messages_body(), headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        upstream = self.last_upstream()
+        self.assertEqual(upstream["headers"].get("x-api-key"), ANTHROPIC_KEY)
+        self.assertNotIn(BRIDGE_TOKEN, json.dumps(upstream["headers"]))
+
+    def test_forwarding_with_the_bridge_token_as_the_only_credential_warns_once(self):
+        # Issue #67: BRIDGE_TOKEN set to the caller's own Anthropic key. The header is
+        # stripped, so Anthropic gets no credential; the log must say why, once.
+        with self.client() as client:
+            with self.assertLogs("agentaus-bridge", level="WARNING") as logs:
+                for _ in range(2):
+                    client.post("/v1/messages", json=self.messages_body(),
+                                headers={"x-api-key": BRIDGE_TOKEN})
+        warnings = [line for line in logs.output if "no credential" in line]
+        self.assertEqual(len(warnings), 1, logs.output)
+        self.assertIn("x-agentaus-bridge-token", warnings[0])
+        self.assertNotIn(BRIDGE_TOKEN, "\n".join(logs.output), "the token was logged")
+
+    def test_a_real_credential_alongside_the_token_does_not_warn(self):
+        from agentaus_bridge import server
+        headers = {"authorization": f"Bearer {BRIDGE_TOKEN}", "x-api-key": ANTHROPIC_KEY}
+        with self.client() as client:
+            client.post("/v1/messages", json=self.messages_body(), headers=headers)
+        self.assertFalse(server._WARNED_BRIDGE_TOKEN_ONLY_CREDENTIAL)
+
+    def test_startup_warns_when_the_bridge_token_looks_like_an_anthropic_key(self):
+        from agentaus_bridge.config import settings
+        settings.bridge_token = "sk-ant-api03-looks-real"
+        with self.assertLogs("agentaus-bridge", level="WARNING") as logs:
+            with self.client():
+                pass
+        self.assertTrue(any("looks like an Anthropic API key" in line for line in logs.output),
+                        logs.output)
+        self.assertNotIn("sk-ant-api03-looks-real", "\n".join(logs.output))
 
     def test_a_legacy_client_with_no_other_credential_forwards_no_credential(self):
         """Legacy Agentaus-only clients auth with the bridge token alone. It must not be

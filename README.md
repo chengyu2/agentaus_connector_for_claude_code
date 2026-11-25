@@ -1424,7 +1424,19 @@ secret never reaches Anthropic. A different value in the other auth header (your
 | --- | --- |
 | `x-agentaus-bridge-token: <bridge>` + `x-api-key: sk-ant-...` | `x-api-key: sk-ant-...` |
 | `x-agentaus-bridge-token: <bridge>` + `Authorization: Bearer <oauth>` | `Authorization: Bearer <oauth>` |
+| `Authorization: Bearer <bridge>` + `x-api-key: sk-ant-...` (legacy) | `x-api-key: sk-ant-...` |
+| `x-api-key: <bridge>` + `Authorization: Bearer <oauth>` (legacy) | `Authorization: Bearer <oauth>` |
 | `x-api-key: <bridge>` (legacy, Agentaus-only client) | no credential, so Anthropic answers 401 |
+
+**Upgrading: if your `BRIDGE_TOKEN` is your Anthropic key.** Older versions forwarded the
+header that held the bridge token to Anthropic unchanged, so the only way to combine
+`BRIDGE_TOKEN` with Claude passthrough was to set it to the same `sk-ant-...` key Claude
+Code sends. That key now counts as the bridge token and is removed before the request
+goes upstream, so every Claude request reaches Anthropic with no credential and fails
+with 401. The bridge logs a warning at startup when `BRIDGE_TOKEN` starts with `sk-ant-`,
+and again the first time a request is forwarded without a credential. To fix it, set
+`BRIDGE_TOKEN` to a separate secret, send that secret in the `x-agentaus-bridge-token`
+header (see above), and keep your Anthropic key in `x-api-key` as before.
 
 Tokens are compared in constant time.
 
