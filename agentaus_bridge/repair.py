@@ -467,7 +467,9 @@ def _file_text(path: str, pending: dict | None) -> str | None:
 def _repair_edits(name: str, args: dict, pending: dict | None) -> tuple[list, str | None]:
     """Repair an Edit's or MultiEdit's old_string against the file - or against the text the
     calls before it in this response leave, held in `pending` by path. In place. Returns
-    (what changed, a correction for an edit that is already in the file)."""
+    (what changed, a correction for an edit that is already in the file). An edit that
+    cannot be applied is recorded in what changed and ends the group: Claude Code applies
+    a MultiEdit all-or-nothing, so nothing lands and `pending` keeps the pre-call state."""
     path = args.get("file_path")
     if not isinstance(path, str) or not os.path.isabs(path):
         return [], None
@@ -476,13 +478,25 @@ def _repair_edits(name: str, args: dict, pending: dict | None) -> tuple[list, st
         return [], None
     edits = [args] if name == "Edit" else [e for e in args.get("edits") or [] if isinstance(e, dict)]
     changed = []
-    for edit in edits:
+    for n, edit in enumerate(edits, 1):
         old, new = edit.get("old_string"), edit.get("new_string")
-        if not isinstance(old, str) or not isinstance(new, str) or text is None:
-            text = None
-            continue
+        if not isinstance(old, str) or not isinstance(new, str):
+            # Claude Code refuses the malformed edit and, all-or-nothing, the group with
+            # it: nothing lands, so the edits after it are not examined and `pending`
+            # keeps the pre-call state.
+            changed.append(f"edit {n}: old_string/new_string not strings; not applied")
+            break
+        if not old:
+            # Checked before any count: "" is in every text len(text) + 1 times, which made
+            # the notice below report a nonsense count.
+            changed.append(f"edit {n}: old_string is empty for {path}; not applied")
+            break
         if edit.get("replace_all"):
-            text = text.replace(old, new) if old and old in text else None
+            if old in text:
+                text = text.replace(old, new)
+            else:
+                changed.append(f"edit {n}: old_string not found in {path}; replace_all not applied")
+                break
             continue
         fixed = repair_edit(text, old, new)
         if fixed and fixed[0] == APPLIED:
@@ -492,12 +506,24 @@ def _repair_edits(name: str, args: dict, pending: dict | None) -> tuple[list, st
         if fixed:
             edit["old_string"], edit["new_string"] = old, new = fixed[0], fixed[1]
             changed.append(f"old_string: {fixed[2]}")
-        text = text.replace(old, new, 1) if old and text.count(old) == 1 else None
-    if pending is not None:
-        if text is None:
-            pending.pop(path, None)
+        if old and text.count(old) == 1:
+            text = text.replace(old, new, 1)
         else:
+            # The count is against the text the edits before this one leave - what Claude
+            # Code itself matches when it refuses the group here and applies none of it.
+            why = (f"old_string occurs {text.count(old)} times in {path}" if old
+                   else f"old_string is empty for {path}")
+            changed.append(f"edit {n}: {why}; not applied")
+            break
+    else:
+        if pending is not None:
             pending[path] = text
+        return changed, None
+    if n < len(edits):
+        # Later old_strings were written assuming the earlier edits land; against the
+        # pre-call text they would say nothing true, so they are left as sent.
+        changed.append(f"{len(edits) - n} later edit(s) not applied: the call is refused "
+                       "as a whole")
     return changed, None
 
 
