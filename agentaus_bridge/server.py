@@ -510,10 +510,19 @@ def _retry_delay(attempt: int) -> float:
     calls alongside the main turn, and without it they would all retry in lockstep and
     re-hammer an upstream that is already struggling.
     """
-    base = settings.retry_backoff_seconds * (2 ** min(attempt, 30))
-    return min(base, settings.retry_max_delay_seconds) + random.uniform(
-        0, settings.retry_backoff_seconds
-    )
+    backoff = settings.retry_backoff_seconds
+    ceiling = settings.retry_max_delay_seconds
+    base = backoff * (2 ** min(attempt, 30))
+    # Bound the TOTAL at the ceiling while keeping jitter alive at saturation - a
+    # fleet of clients retrying a long outage must not fall back into lockstep, which
+    # is exactly what capping after the jitter would cause. So one jitter interval is
+    # reserved under the ceiling: below saturation the curve is unchanged, at
+    # saturation the pause still spreads over the final interval [ceiling - backoff, ceiling].
+    # A ceiling tighter than one backoff interval leaves no room to reserve, so there
+    # the pause just spreads over [0, ceiling].
+    if ceiling <= backoff:
+        return random.uniform(0, max(ceiling, 0.0))
+    return min(base, ceiling - backoff) + random.uniform(0, backoff)
 
 
 def _is_rate_limited(why: str) -> bool:
