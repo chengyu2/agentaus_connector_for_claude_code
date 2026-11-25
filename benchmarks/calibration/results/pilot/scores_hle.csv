@@ -1,0 +1,161 @@
+id,condition,repeat,partition,answer_type,category,correct,confidence,confidence_missing,truncated,reasked,final_path,output_tokens,cost_aud
+66ea7d2cc321286a5288ef06,baseline,0,reasoning,exactMatch,Math,0,1.0,True,True,True,missing,53248,0.357834
+66edf49c46d28f04618d6498,baseline,0,knowledge,exactMatch,Computer Science/AI,0,0.95,False,False,False,direct,12542,0.084499
+66f57e3ddc7259d8b5bb0b46,baseline,0,knowledge,exactMatch,Other,0,0.6,False,False,False,direct,20037,0.134717
+66f5fa6547b598f037ec67fd,baseline,0,knowledge,exactMatch,Math,0,0.82,False,False,False,direct,15536,0.104423
+66ffaae1068d942d32104650,baseline,0,reasoning,multipleChoice,Math,0,0.92,False,False,False,direct,17070,0.114933
+670c149e9d374d71ed99e5e5,baseline,0,knowledge,exactMatch,Humanities/Social Science,0,0.85,False,False,False,direct,1722,0.011842
+67130fff5fcf1fbb43d4a687,baseline,0,reasoning,multipleChoice,Math,0,0.98,False,False,False,direct,0,0.0
+6717bd1d443232c907a31720,baseline,0,reasoning,exactMatch,Math,0,0.78,False,True,True,reask_none,49403,0.332148
+671fc9508c7c5056012df16a,baseline,0,knowledge,multipleChoice,Other,0,0.85,False,False,False,direct,1118,0.007834
+672255e153af61d9b29732b8,baseline,0,reasoning,exactMatch,Math,0,0.9,False,False,False,direct,4346,0.029535
+6724e08542ec04c22a24aaa5,baseline,0,reasoning,exactMatch,Math,0,0.78,False,False,False,direct,31001,0.20856
+6725e470de551b21db6a0f0d,baseline,0,knowledge,exactMatch,Other,0,0.85,False,False,False,direct,4468,0.030262
+672604100aae355a51195cdf,baseline,0,reasoning,exactMatch,Math,0,0.7,False,True,True,reask_none,50432,0.340007
+672b2749f64de603265f9fc4,baseline,0,knowledge,multipleChoice,Biology/Medicine,0,0.7,False,True,True,reask_none,49451,0.332454
+672c2ab86195c23913d66c90,baseline,0,knowledge,exactMatch,Chemistry,0,0.85,False,False,False,direct,7422,0.049999
+6738f778851b80b033aa8654,baseline,0,reasoning,multipleChoice,Math,0,0.7,False,True,True,reask_none,49824,0.335269
+6798867ef44b5aad9f2a54c3,baseline,0,knowledge,exactMatch,Engineering,0,0.85,False,False,False,direct,4078,0.027634
+679cade8165d45e7a4d26886,baseline,0,knowledge,exactMatch,Other,0,0.9,False,False,False,direct,0,0.0
+67a55e5426c698ac1c11802e,baseline,0,reasoning,exactMatch,Math,0,0.85,False,True,True,reask_none,49408,0.332365
+67c5e471a7e99910049ad4bc,baseline,0,reasoning,exactMatch,Computer Science/AI,1,0.9,False,False,False,direct,2719,0.018528
+66ea7d2cc321286a5288ef06,candidates,0,reasoning,exactMatch,Math,0,0.3,False,True,True,reask_none,49334,0.331922
+66edf49c46d28f04618d6498,candidates,0,knowledge,exactMatch,Computer Science/AI,0,0.7,False,True,True,reask_none,49423,0.332849
+66f57e3ddc7259d8b5bb0b46,candidates,0,knowledge,exactMatch,Other,0,0.82,False,True,True,reask_none,49274,0.331856
+66f5fa6547b598f037ec67fd,candidates,0,knowledge,exactMatch,Math,0,0.88,False,True,True,reask_high,37848,0.25452
+66ffaae1068d942d32104650,candidates,0,reasoning,multipleChoice,Math,0,0.85,False,True,True,reask_none,49492,0.333606
+670c149e9d374d71ed99e5e5,candidates,0,knowledge,exactMatch,Humanities/Social Science,0,0.85,False,False,False,direct,4344,0.029513
+67130fff5fcf1fbb43d4a687,candidates,0,reasoning,multipleChoice,Math,0,0.95,False,False,False,direct,2938,0.020266
+6717bd1d443232c907a31720,candidates,0,reasoning,exactMatch,Math,0,0.7,False,False,False,direct,30950,0.207849
+671fc9508c7c5056012df16a,candidates,0,knowledge,multipleChoice,Other,1,0.88,False,False,False,direct,5525,0.037465
+672255e153af61d9b29732b8,candidates,0,reasoning,exactMatch,Math,1,0.93,False,False,False,direct,5209,0.035421
+6724e08542ec04c22a24aaa5,candidates,0,reasoning,exactMatch,Math,0,0.7,False,True,True,reask_none,49493,0.334476
+6725e470de551b21db6a0f0d,candidates,0,knowledge,exactMatch,Other,0,0.55,False,False,False,direct,14467,0.097359
+672604100aae355a51195cdf,candidates,0,reasoning,exactMatch,Math,0,1.0,True,True,True,missing,53248,0.359186
+672b2749f64de603265f9fc4,candidates,0,knowledge,multipleChoice,Biology/Medicine,0,0.6,False,True,True,reask_none,49394,0.332383
+672c2ab86195c23913d66c90,candidates,0,knowledge,exactMatch,Chemistry,0,0.85,False,False,False,direct,7447,0.050271
+6738f778851b80b033aa8654,candidates,0,reasoning,multipleChoice,Math,0,0.8,False,False,False,direct,11509,0.077695
+6798867ef44b5aad9f2a54c3,candidates,0,knowledge,exactMatch,Engineering,0,0.78,False,False,False,direct,3906,0.026585
+679cade8165d45e7a4d26886,candidates,0,knowledge,exactMatch,Other,1,0.85,False,False,False,direct,987,0.006977
+67a55e5426c698ac1c11802e,candidates,0,reasoning,exactMatch,Math,0,1.0,True,True,True,missing,53248,0.358404
+67c5e471a7e99910049ad4bc,candidates,0,reasoning,exactMatch,Computer Science/AI,1,0.75,False,False,False,direct,3770,0.025674
+66ea7d2cc321286a5288ef06,combined,0,reasoning,exactMatch,Math,0,0.05,False,True,True,reask_none,49329,0.33377
+66edf49c46d28f04618d6498,combined,0,knowledge,exactMatch,Computer Science/AI,0,0.15,False,True,True,reask_none,49585,0.335817
+66f57e3ddc7259d8b5bb0b46,combined,0,knowledge,exactMatch,Other,0,1.0,True,True,True,missing,53248,0.360364
+66f5fa6547b598f037ec67fd,combined,0,knowledge,exactMatch,Math,0,0.55,False,True,True,reask_none,49782,0.336729
+66ffaae1068d942d32104650,combined,0,reasoning,multipleChoice,Math,0,0.6,False,True,True,reask_none,49544,0.335836
+670c149e9d374d71ed99e5e5,combined,0,knowledge,exactMatch,Humanities/Social Science,0,0.4,False,False,False,direct,19751,0.133367
+67130fff5fcf1fbb43d4a687,combined,0,reasoning,multipleChoice,Math,0,0.92,False,False,False,direct,5011,0.034782
+6717bd1d443232c907a31720,combined,0,reasoning,exactMatch,Math,0,0.1,False,True,True,reask_none,49339,0.333912
+671fc9508c7c5056012df16a,combined,0,knowledge,multipleChoice,Other,0,0.85,False,False,False,direct,2374,0.01698
+672255e153af61d9b29732b8,combined,0,reasoning,exactMatch,Math,0,0.75,False,False,False,direct,6554,0.045059
+6724e08542ec04c22a24aaa5,combined,0,reasoning,exactMatch,Math,0,0.6,False,True,True,reask_none,49561,0.336814
+6725e470de551b21db6a0f0d,combined,0,knowledge,exactMatch,Other,0,0.6,False,False,False,direct,15970,0.108056
+672604100aae355a51195cdf,combined,0,reasoning,exactMatch,Math,0,1.0,True,True,True,missing,53248,0.361068
+672b2749f64de603265f9fc4,combined,0,knowledge,multipleChoice,Biology/Medicine,0,0.3,False,True,True,reask_none,49366,0.334077
+672c2ab86195c23913d66c90,combined,0,knowledge,exactMatch,Chemistry,0,0.6,False,False,False,direct,16931,0.114441
+6738f778851b80b033aa8654,combined,0,reasoning,multipleChoice,Math,0,0.7,False,False,False,direct,19769,0.133664
+6798867ef44b5aad9f2a54c3,combined,0,knowledge,exactMatch,Engineering,0,0.75,False,False,False,direct,6376,0.043761
+679cade8165d45e7a4d26886,combined,0,knowledge,exactMatch,Other,1,0.65,False,False,False,direct,2860,0.020153
+67a55e5426c698ac1c11802e,combined,0,reasoning,exactMatch,Math,0,0.6,False,True,True,reask_none,49293,0.333787
+67c5e471a7e99910049ad4bc,combined,0,reasoning,exactMatch,Computer Science/AI,1,0.7,False,False,False,direct,2539,0.018053
+66ea7d2cc321286a5288ef06,flag,0,reasoning,exactMatch,Math,0,0.0,False,True,True,reask_none,49350,0.332085
+66edf49c46d28f04618d6498,flag,0,knowledge,exactMatch,Computer Science/AI,0,0.6,False,True,True,reask_none,49452,0.3331
+66f57e3ddc7259d8b5bb0b46,flag,0,knowledge,exactMatch,Other,0,0.0,False,True,True,reask_none,49309,0.332147
+66f5fa6547b598f037ec67fd,flag,0,knowledge,exactMatch,Math,0,0.85,False,True,True,reask_high,42904,0.288433
+66ffaae1068d942d32104650,flag,0,reasoning,multipleChoice,Math,0,1.0,True,True,True,missing,53248,0.358827
+670c149e9d374d71ed99e5e5,flag,0,knowledge,exactMatch,Humanities/Social Science,0,0.9,False,False,False,direct,1562,0.010892
+67130fff5fcf1fbb43d4a687,flag,0,reasoning,multipleChoice,Math,0,0.82,False,False,False,direct,4798,0.032747
+6717bd1d443232c907a31720,flag,0,reasoning,exactMatch,Math,0,0.2,False,True,True,reask_none,49338,0.332079
+671fc9508c7c5056012df16a,flag,0,knowledge,multipleChoice,Other,0,0.85,False,False,False,direct,4318,0.029396
+672255e153af61d9b29732b8,flag,0,reasoning,exactMatch,Math,1,0.96,False,False,False,direct,4900,0.033369
+6724e08542ec04c22a24aaa5,flag,0,reasoning,exactMatch,Math,0,0.65,False,True,True,reask_none,50050,0.338264
+6725e470de551b21db6a0f0d,flag,0,knowledge,exactMatch,Other,0,0.55,False,False,False,direct,16344,0.109954
+672604100aae355a51195cdf,flag,0,reasoning,exactMatch,Math,0,0.7,False,True,True,reask_none,51434,0.347088
+672b2749f64de603265f9fc4,flag,0,knowledge,multipleChoice,Biology/Medicine,0,0.7,False,True,True,reask_none,49364,0.332238
+672c2ab86195c23913d66c90,flag,0,knowledge,exactMatch,Chemistry,0,0.85,False,False,False,direct,18624,0.125175
+6738f778851b80b033aa8654,flag,0,reasoning,multipleChoice,Math,0,0.78,False,False,False,direct,27557,0.185235
+6798867ef44b5aad9f2a54c3,flag,0,knowledge,exactMatch,Engineering,0,0.75,False,False,False,direct,5152,0.034952
+679cade8165d45e7a4d26886,flag,0,knowledge,exactMatch,Other,1,0.75,False,False,False,direct,2245,0.015424
+67a55e5426c698ac1c11802e,flag,0,reasoning,exactMatch,Math,0,0.85,False,True,True,reask_none,49415,0.332779
+67c5e471a7e99910049ad4bc,flag,0,reasoning,exactMatch,Computer Science/AI,0,0.85,False,False,False,direct,6242,0.042255
+66ea7d2cc321286a5288ef06,frequency,0,reasoning,exactMatch,Math,0,0.1,False,True,True,reask_none,49281,0.331755
+66edf49c46d28f04618d6498,frequency,0,knowledge,exactMatch,Computer Science/AI,0,0.65,False,True,True,reask_none,49568,0.33401
+66f57e3ddc7259d8b5bb0b46,frequency,0,knowledge,exactMatch,Other,0,0.3,False,True,True,reask_none,49905,0.336273
+66f5fa6547b598f037ec67fd,frequency,0,knowledge,exactMatch,Math,0,0.7,False,True,True,reask_none,49359,0.332201
+66ffaae1068d942d32104650,frequency,0,reasoning,multipleChoice,Math,1,0.85,False,True,True,reask_none,49363,0.33293
+670c149e9d374d71ed99e5e5,frequency,0,knowledge,exactMatch,Humanities/Social Science,0,0.6,False,False,False,direct,19609,0.131851
+67130fff5fcf1fbb43d4a687,frequency,0,reasoning,multipleChoice,Math,0,0.95,False,False,False,direct,3956,0.02715
+6717bd1d443232c907a31720,frequency,0,reasoning,exactMatch,Math,0,0.6,False,True,True,reask_none,49665,0.334403
+671fc9508c7c5056012df16a,frequency,0,knowledge,multipleChoice,Other,1,0.85,False,False,False,direct,0,0.0
+672255e153af61d9b29732b8,frequency,0,reasoning,exactMatch,Math,0,0.85,False,False,False,direct,5867,0.039892
+6724e08542ec04c22a24aaa5,frequency,0,reasoning,exactMatch,Math,0,0.65,False,True,True,reask_none,49637,0.33563
+6725e470de551b21db6a0f0d,frequency,0,knowledge,exactMatch,Other,0,0.75,False,False,False,direct,5384,0.036566
+672604100aae355a51195cdf,frequency,0,reasoning,exactMatch,Math,0,1.0,True,True,True,missing,53248,0.359374
+672b2749f64de603265f9fc4,frequency,0,knowledge,multipleChoice,Biology/Medicine,0,0.6,False,True,True,reask_none,49388,0.332532
+672c2ab86195c23913d66c90,frequency,0,knowledge,exactMatch,Chemistry,0,0.85,False,False,False,direct,2932,0.020083
+6738f778851b80b033aa8654,frequency,0,reasoning,multipleChoice,Math,0,0.7,False,False,False,direct,26977,0.181394
+6798867ef44b5aad9f2a54c3,frequency,0,knowledge,exactMatch,Engineering,0,0.8,False,False,False,direct,6718,0.045488
+679cade8165d45e7a4d26886,frequency,0,knowledge,exactMatch,Other,1,0.85,False,False,False,direct,1383,0.009693
+67a55e5426c698ac1c11802e,frequency,0,reasoning,exactMatch,Math,0,0.6,False,True,True,reask_none,49507,0.333528
+67c5e471a7e99910049ad4bc,frequency,0,reasoning,exactMatch,Computer Science/AI,1,0.9,False,False,False,direct,868,0.006293
+66ea7d2cc321286a5288ef06,limits,0,reasoning,exactMatch,Math,0,0.0,False,True,True,reask_none,49227,0.331266
+66edf49c46d28f04618d6498,limits,0,knowledge,exactMatch,Computer Science/AI,0,0.65,False,True,True,reask_none,49634,0.334324
+66f57e3ddc7259d8b5bb0b46,limits,0,knowledge,exactMatch,Other,0,0.0,False,False,True,reask_none,45756,0.310037
+66f5fa6547b598f037ec67fd,limits,0,knowledge,exactMatch,Math,0,0.8,False,True,True,reask_high,46301,0.311196
+66ffaae1068d942d32104650,limits,0,reasoning,multipleChoice,Math,1,0.85,False,True,True,reask_none,49577,0.334237
+670c149e9d374d71ed99e5e5,limits,0,knowledge,exactMatch,Humanities/Social Science,0,0.72,False,False,False,direct,5733,0.038839
+67130fff5fcf1fbb43d4a687,limits,0,reasoning,multipleChoice,Math,0,0.95,False,False,False,direct,3625,0.024889
+6717bd1d443232c907a31720,limits,0,reasoning,exactMatch,Math,0,0.9,False,False,False,direct,20150,0.13551
+671fc9508c7c5056012df16a,limits,0,knowledge,multipleChoice,Other,0,0.85,False,False,False,direct,1254,0.008869
+672255e153af61d9b29732b8,limits,0,reasoning,exactMatch,Math,1,0.9,False,False,False,direct,5793,0.039354
+6724e08542ec04c22a24aaa5,limits,0,reasoning,exactMatch,Math,0,0.7,False,False,False,direct,30613,0.206085
+6725e470de551b21db6a0f0d,limits,0,knowledge,exactMatch,Other,0,0.55,False,False,False,direct,18271,0.122866
+672604100aae355a51195cdf,limits,0,reasoning,exactMatch,Math,0,0.7,False,True,True,reask_none,50291,0.339435
+672b2749f64de603265f9fc4,limits,0,knowledge,multipleChoice,Biology/Medicine,0,0.7,False,True,True,reask_none,50982,0.343084
+672c2ab86195c23913d66c90,limits,0,knowledge,exactMatch,Chemistry,0,0.8,False,False,False,direct,15592,0.104863
+6738f778851b80b033aa8654,limits,0,reasoning,multipleChoice,Math,0,0.6,False,True,True,reask_none,49503,0.333491
+6798867ef44b5aad9f2a54c3,limits,0,knowledge,exactMatch,Engineering,0,0.7,False,False,False,direct,13540,0.091153
+679cade8165d45e7a4d26886,limits,0,knowledge,exactMatch,Other,1,0.8,False,False,False,direct,1558,0.010823
+67a55e5426c698ac1c11802e,limits,0,reasoning,exactMatch,Math,0,0.9,False,True,True,reask_none,49421,0.332824
+67c5e471a7e99910049ad4bc,limits,0,reasoning,exactMatch,Computer Science/AI,1,0.8,False,False,False,direct,5446,0.036923
+66ea7d2cc321286a5288ef06,opposite,0,reasoning,exactMatch,Math,0,1.0,True,True,True,missing,53248,0.358038
+66edf49c46d28f04618d6498,opposite,0,knowledge,exactMatch,Computer Science/AI,0,0.7,False,True,True,reask_none,49288,0.331838
+66f57e3ddc7259d8b5bb0b46,opposite,0,knowledge,exactMatch,Other,0,0.6,False,True,True,reask_none,52803,0.355393
+66f5fa6547b598f037ec67fd,opposite,0,knowledge,exactMatch,Math,0,0.3,False,True,True,reask_none,49896,0.335503
+66ffaae1068d942d32104650,opposite,0,reasoning,multipleChoice,Math,0,0.8,False,True,True,reask_none,49596,0.334196
+670c149e9d374d71ed99e5e5,opposite,0,knowledge,exactMatch,Humanities/Social Science,0,0.75,False,False,False,direct,10908,0.073456
+67130fff5fcf1fbb43d4a687,opposite,0,reasoning,multipleChoice,Math,0,0.95,False,False,False,direct,3222,0.022133
+6717bd1d443232c907a31720,opposite,0,reasoning,exactMatch,Math,0,0.6,False,True,True,reask_none,49521,0.333142
+671fc9508c7c5056012df16a,opposite,0,knowledge,multipleChoice,Other,0,0.9,False,False,False,direct,4579,0.031091
+672255e153af61d9b29732b8,opposite,0,reasoning,exactMatch,Math,1,0.7,False,False,False,direct,11519,0.077662
+6724e08542ec04c22a24aaa5,opposite,0,reasoning,exactMatch,Math,0,0.8,False,False,False,direct,27953,0.188206
+6725e470de551b21db6a0f0d,opposite,0,knowledge,exactMatch,Other,0,0.8,False,False,False,direct,5396,0.036548
+672604100aae355a51195cdf,opposite,0,reasoning,exactMatch,Math,0,1.0,True,True,True,missing,53248,0.359079
+672b2749f64de603265f9fc4,opposite,0,knowledge,multipleChoice,Biology/Medicine,0,0.55,False,True,True,reask_none,49474,0.332812
+672c2ab86195c23913d66c90,opposite,0,knowledge,exactMatch,Chemistry,0,0.85,False,False,False,direct,5878,0.039723
+6738f778851b80b033aa8654,opposite,0,reasoning,multipleChoice,Math,0,0.8,False,False,False,direct,0,0.0
+6798867ef44b5aad9f2a54c3,opposite,0,knowledge,exactMatch,Engineering,1,0.7,False,False,False,direct,17129,0.115143
+679cade8165d45e7a4d26886,opposite,0,knowledge,exactMatch,Other,1,0.88,False,False,False,direct,1414,0.009802
+67a55e5426c698ac1c11802e,opposite,0,reasoning,exactMatch,Math,0,1.0,True,True,True,missing,53248,0.358297
+67c5e471a7e99910049ad4bc,opposite,0,reasoning,exactMatch,Computer Science/AI,1,0.9,False,False,False,direct,1961,0.013518
+66ea7d2cc321286a5288ef06,verify,0,reasoning,exactMatch,Math,0,0.0,False,True,True,reask_none,49281,0.331623
+66edf49c46d28f04618d6498,verify,0,knowledge,exactMatch,Computer Science/AI,0,0.95,False,True,True,reask_none,49371,0.332557
+66f57e3ddc7259d8b5bb0b46,verify,0,knowledge,exactMatch,Other,0,0.0,False,True,True,reask_none,49251,0.331758
+66f5fa6547b598f037ec67fd,verify,0,knowledge,exactMatch,Math,0,0.75,False,True,True,reask_none,49421,0.332484
+66ffaae1068d942d32104650,verify,0,reasoning,multipleChoice,Math,1,0.85,False,True,True,reask_none,49397,0.333025
+670c149e9d374d71ed99e5e5,verify,0,knowledge,exactMatch,Humanities/Social Science,0,0.75,False,False,False,direct,3809,0.025947
+67130fff5fcf1fbb43d4a687,verify,0,reasoning,multipleChoice,Math,0,0.95,False,False,False,direct,2271,0.015816
+6717bd1d443232c907a31720,verify,0,reasoning,exactMatch,Math,0,0.85,False,True,True,reask_none,49387,0.332408
+671fc9508c7c5056012df16a,verify,0,knowledge,multipleChoice,Other,1,0.85,False,False,False,direct,3397,0.023226
+672255e153af61d9b29732b8,verify,0,reasoning,exactMatch,Math,1,0.95,False,False,False,direct,6449,0.043747
+6724e08542ec04c22a24aaa5,verify,0,reasoning,exactMatch,Math,0,0.65,False,False,False,direct,28987,0.195189
+6725e470de551b21db6a0f0d,verify,0,knowledge,exactMatch,Other,0,0.0,False,False,False,direct,7398,0.050015
+672604100aae355a51195cdf,verify,0,reasoning,exactMatch,Math,0,0.7,False,True,True,reask_none,50183,0.338706
+672b2749f64de603265f9fc4,verify,0,knowledge,multipleChoice,Biology/Medicine,0,0.65,False,True,True,reask_none,49309,0.33187
+672c2ab86195c23913d66c90,verify,0,knowledge,exactMatch,Chemistry,0,0.85,False,False,False,direct,13411,0.090248
+6738f778851b80b033aa8654,verify,0,reasoning,multipleChoice,Math,0,0.85,False,True,True,reask_none,49339,0.332387
+6798867ef44b5aad9f2a54c3,verify,0,knowledge,exactMatch,Engineering,0,0.8,False,False,False,direct,6366,0.043086
+679cade8165d45e7a4d26886,verify,0,knowledge,exactMatch,Other,1,0.85,False,False,False,direct,1022,0.00723
+67a55e5426c698ac1c11802e,verify,0,reasoning,exactMatch,Math,0,0.85,False,True,True,reask_none,49240,0.331606
+67c5e471a7e99910049ad4bc,verify,0,reasoning,exactMatch,Computer Science/AI,0,0.9,False,False,False,direct,847,0.006108
