@@ -405,7 +405,7 @@ def _quality_from_settings() -> str:
     for name, preset in _QUALITY_PRESETS.items():
         if all(getattr(settings, attr, None) == val for attr, val in preset.items()):
             return name
-    return "low"
+    return "unknown"
 
 _QUALITY_MODE: str = _quality_from_settings()
 
@@ -536,8 +536,10 @@ _CLEAR_CONTEXT_NEXT: bool = False
 
 
 @app.post("/clear-context")
-async def clear_context_post() -> JSONResponse:
-    """Set a one-shot flag: the next request will have all but its last message stripped."""
+async def clear_context_post(request: Request) -> JSONResponse:
+    """Set a one-shot flag: the next request will have all but its last user message stripped."""
+    if not _client_authorised(request):
+        return _error_response(401, "authentication_error", "Invalid bridge token")
     global _CLEAR_CONTEXT_NEXT
     _CLEAR_CONTEXT_NEXT = True
     return JSONResponse({"status": "ok", "message": "Context will be cleared on the next request."})
@@ -555,6 +557,8 @@ async def quality_post(
     request: Request,
     mode: str = Form(default=""),
 ) -> Response:
+    if not _client_authorised(request):
+        return _error_response(401, "authentication_error", "Invalid bridge token")
     if not mode:
         try:
             body = await request.json()
@@ -586,15 +590,22 @@ async def messages(request: Request) -> Response:
     global _CLEAR_CONTEXT_NEXT
     if _CLEAR_CONTEXT_NEXT:
         _CLEAR_CONTEXT_NEXT = False
-        messages = body.get("messages") or []
-        if len(messages) > 1:
-            body = {**body, "messages": messages[-1:]}
-            rlog(logging.INFO, "context cleared: stripped %d message(s), keeping only the last",
-                 len(messages) - 1)
+        all_msgs = body.get("messages") or []
+        # Walk back to the last user-role message; keeping an assistant or tool_result
+        # as the first message would make the request malformed.
+        last_user = next(
+            (i for i in range(len(all_msgs) - 1, -1, -1)
+             if (all_msgs[i].get("role") == "user")),
+            None,
+        )
+        if last_user is not None and last_user > 0:
+            body = {**body, "messages": all_msgs[last_user:]}
+            rlog(logging.INFO, "context cleared: stripped %d message(s), keeping from last user turn",
+                 last_user)
 
     model = body.get("model") or ""
     if model in _MODEL_TO_QUALITY:
-        _apply_quality_mode(_MODEL_TO_QUALITY[model])
+        _request_quality.set(_QUALITY_PRESETS[_MODEL_TO_QUALITY[model]])
     if model in _AGENTAUS_VARIANT_IDS:
         body = {**body, "model": "agentaus"}
         model = "agentaus"
@@ -647,6 +658,15 @@ async def count_tokens(request: Request) -> Response:
 # what made a 90-second stall hard to read: sixty identical "200 OK" lines and no way
 # to tell which was the actual turn.
 _request_id: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+_request_quality: contextvars.ContextVar[dict | None] = contextvars.ContextVar("request_quality", default=None)
+
+
+def _eff(attr: str):
+    """Per-request quality override when a variant model was named, else the global setting."""
+    override = _request_quality.get()
+    if override is not None and attr in override:
+        return override[attr]
+    return getattr(settings, attr)
 
 
 def _new_request_id() -> str:
@@ -3216,7 +3236,7 @@ async def _handle_agentaus(
 
         # Measured (d12 c1913): the planning pass took 254 s and failed with 524 before a
         # graph main loop's first turn reached the model - a turn whose job is to call Workflow.
-        thinking_on = settings.agentaus_thinking and not _graph_not_started(received)
+        thinking_on = _eff("agentaus_thinking") and not _graph_not_started(received)
         if thinking_on and settings.agentaus_plan_async and turn_key is not None:
             # Planned beside the first call rather than before it; every later request of
             # the turn carries the plan once it is written. See plans.py.
@@ -3467,7 +3487,7 @@ async def _handle_agentaus(
         # Review only a plain text answer. A turn that calls tools is mid-task, and
         # rewriting it would break the tool_use the client is waiting on.
         if (
-            settings.agentaus_self_review
+            _eff("agentaus_self_review")
             and _checks_apply(body)
             and not msg0.get("tool_calls")
             and not ran
@@ -3745,7 +3765,7 @@ async def _unguarded_event_stream(
     # Any of the passes that may rewrite it: tied to self-review alone, turning review off
     # silently turned off the grounding check and the syntax fix as well - the buffered path
     # never did that.
-    buffering = (settings.agentaus_self_review or settings.agentaus_grounding_check
+    buffering = (_eff("agentaus_self_review") or settings.agentaus_grounding_check
                  or settings.agentaus_syntax_check) and _checks_apply(original)
     pending: list[str] = []
 

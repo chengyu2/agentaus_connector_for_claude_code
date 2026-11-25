@@ -30,7 +30,11 @@ Update the value in the .env file using Python (works on all platforms):
 python -c "
 import re, pathlib
 p = pathlib.Path('.env')
-p.write_text(re.sub(r'^AGENTAUS_MAX_CONCURRENCY=\d+', 'AGENTAUS_MAX_CONCURRENCY=VALUE', p.read_text(), flags=re.M))
+text = p.read_text()
+new, n = re.subn(r'^AGENTAUS_MAX_CONCURRENCY=\d+', 'AGENTAUS_MAX_CONCURRENCY=VALUE', text, flags=re.M)
+if not n:
+    new = text.rstrip() + '\nAGENTAUS_MAX_CONCURRENCY=VALUE\n'
+p.write_text(new)
 "
 ```
 

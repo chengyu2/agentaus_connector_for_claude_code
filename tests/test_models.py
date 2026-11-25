@@ -103,8 +103,9 @@ class ModelList(unittest.TestCase):
         self.assertEqual(self.ids(self.get({"x-api-key": "k"})),
                          ["claude-opus-9-9", "claude-haiku-9-1", "agentaus",
                           "claude-agentaus-balanced", "claude-agentaus-fast"])
-        # Inside the picker's 3 s — allow generous overhead for Windows asyncio scheduling.
-        self.assertLess(time.monotonic() - started, 4.5)
+        # Inside the picker's 3 s — Windows asyncio scheduling adds overhead.
+        limit = 3.5 if sys.platform == "win32" else 2.95
+        self.assertLess(time.monotonic() - started, limit)
 
     def test_never_a_list_without_agentaus_and_never_a_redirect(self):
         STATE["status"] = 500

@@ -726,7 +726,6 @@ class ImportGuard(unittest.TestCase):
 # --- 8. The session record and the main loop's instructions --------------------------------
 
 class SessionRecord(unittest.TestCase):
-    @unittest.skipIf(sys.platform == "win32", "scratch_of() uses /tmp paths not writable on Windows")
     def test_the_graph_session_survives_a_bridge_restart(self):
         cwd = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, cwd, True)

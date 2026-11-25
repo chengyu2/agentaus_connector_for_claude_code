@@ -1,2 +1,5 @@
 Set WshShell = CreateObject("WScript.Shell")
-WshShell.Run """C:\Users\eg_12\agentaus_connector_for_claude_code\.venv\Scripts\python.exe"" -m agentaus_bridge", 0, False
+Set fso = CreateObject("Scripting.FileSystemObject")
+repoDir = fso.GetParentFolderName(fso.GetParentFolderName(WScript.ScriptFullName))
+python = fso.BuildPath(repoDir, ".venv\Scripts\python.exe")
+WshShell.Run """" & python & """ -m agentaus_bridge", 0, False

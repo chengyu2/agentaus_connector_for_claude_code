@@ -649,7 +649,7 @@ class ConversationCompactor:
             return (estimate_tokens(body_head + ", ".join(frags[start:]) + body_tail)
                     + estimate_tokens("") + reserve)
 
-        trim_target = trigger  # == int(limit * threshold), e.g. 80% of 131k
+        trim_target = min(trigger, limit)  # clamp: threshold > 1.0 must not exceed limit
         start = len(head)
         while tail_total(start) > trim_target:
             # Drop a whole turn at a time. Popping message by message is what lets the
