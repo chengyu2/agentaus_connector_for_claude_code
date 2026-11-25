@@ -24,6 +24,10 @@ export ANTHROPIC_CUSTOM_MODEL_OPTION="agentaus"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="Agentaus (Trellis Data)"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="Sovereign Australian model, served via the local Agentaus bridge"
 
+# Claude Code does not recognise the id `agentaus` and would assume a 1M-token window,
+# compacting long after Agentaus's real limit. This applies only to unrecognised ids.
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-131072}"
+
 # NOTE: do NOT set CLAUDE_CODE_ATTRIBUTION_HEADER=0 here. Behind a custom
 # ANTHROPIC_BASE_URL it also strips the block from auto-mode permission-classifier
 # requests, which the API then declines with 401 and auto mode breaks on every

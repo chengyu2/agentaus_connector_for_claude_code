@@ -296,7 +296,8 @@ probably holds your model and permission preferences:
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
     "ANTHROPIC_CUSTOM_MODEL_OPTION": "agentaus",
     "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Agentaus (Trellis Data)",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Sovereign Australian model via the local Agentaus bridge"
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Sovereign Australian model via the local Agentaus bridge",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "131072"
   }
 }
 ```
@@ -339,10 +340,17 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
 export ANTHROPIC_CUSTOM_MODEL_OPTION="agentaus"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="Agentaus (Trellis Data)"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="Sovereign Australian model via the local bridge"
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=131072
 claude
 ```
 
 Lasts as long as the shell. Useful for a one-off test, not for daily use.
+
+An `env` block in a settings file wins over these exports. If `~/.claude/settings.json`
+already sets `ANTHROPIC_BASE_URL` (Option 1), an exported value is ignored and the session
+still talks to the bridge that file names. To point one run elsewhere, such as a second
+bridge on another port, pass it as flag settings, which outrank the settings files:
+`claude --settings '{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8788"}}'`.
 
 ### Whichever you choose, restart afterwards
 
@@ -608,7 +616,8 @@ BRIDGE_PORT=9100
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:9100",
     "ANTHROPIC_CUSTOM_MODEL_OPTION": "agentaus",
     "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Agentaus (Trellis Data)",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Sovereign Australian model via the local Agentaus bridge"
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Sovereign Australian model via the local Agentaus bridge",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "131072"
   }
 }
 ```

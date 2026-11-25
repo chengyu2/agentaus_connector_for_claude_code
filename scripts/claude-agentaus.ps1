@@ -37,12 +37,16 @@ $Saved = @{
     ANTHROPIC_CUSTOM_MODEL_OPTION      = $env:ANTHROPIC_CUSTOM_MODEL_OPTION
     ANTHROPIC_CUSTOM_MODEL_OPTION_NAME = $env:ANTHROPIC_CUSTOM_MODEL_OPTION_NAME
     ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION = $env:ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS     = $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS
 }
 
 $env:ANTHROPIC_BASE_URL = $BridgeUrl
 $env:ANTHROPIC_CUSTOM_MODEL_OPTION = "agentaus"
 $env:ANTHROPIC_CUSTOM_MODEL_OPTION_NAME = "Agentaus (Trellis Data)"
 $env:ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION = "Sovereign Australian model, served via the local Agentaus bridge"
+# Claude Code does not recognise the id `agentaus` and would assume a 1M-token window,
+# compacting long after Agentaus's real limit. This applies only to unrecognised ids.
+if (-not $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS) { $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "131072" }
 
 # NOTE: do NOT set CLAUDE_CODE_ATTRIBUTION_HEADER=0 here. Behind a custom
 # ANTHROPIC_BASE_URL it also strips the block from auto-mode permission-classifier

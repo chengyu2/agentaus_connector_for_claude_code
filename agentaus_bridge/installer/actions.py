@@ -170,12 +170,19 @@ def save_state(runner: Runner, state: dict, root: Path | None = None) -> None:
 
 # --- Claude Code settings ---------------------------------------------------------------
 
+# Claude Code does not recognise the id `agentaus`, so without this it assumes a 1M-token
+# window and only compacts long after Agentaus's 131,072-token limit has been passed. The
+# variable applies only to ids Claude Code does not recognise, so Claude models keep theirs.
+AGENTAUS_CONTEXT_TOKENS = 131072
+
+
 def bridge_env(port: int) -> dict[str, str]:
     return {
         "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
         "ANTHROPIC_CUSTOM_MODEL_OPTION": "agentaus",
         "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Agentaus (Trellis Data)",
         "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Sovereign Australian model via the local Agentaus bridge",
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(AGENTAUS_CONTEXT_TOKENS),
     }
 
 
