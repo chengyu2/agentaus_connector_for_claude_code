@@ -515,15 +515,11 @@ def _retry_delay(attempt: int) -> float:
     )
 
 
-# A failed gateway attempt usually took Agentaus's ~125 s timeout before it failed.
-_FAILED_ATTEMPT_S = 125.0
-
-
 def _is_rate_limited(why: str) -> bool:
     return why.startswith("HTTP 429")
 
 
-async def _sleep_before_retry(attempt: int, why: str) -> None:
+async def _sleep_before_retry(attempt: int, why: str, attempt_s: float = 0.0) -> None:
     delay = _retry_delay(attempt)
     if _is_rate_limited(why):
         # A 429 (Agentaus or the Anthropic passthrough) waits at most
@@ -534,8 +530,10 @@ async def _sleep_before_retry(attempt: int, why: str) -> None:
         delay = min(delay, ceiling * random.uniform(0.5, 1.0))
     rlog(logging.WARNING, "upstream attempt %d failed (%s); retrying in %.2fs", attempt + 1, why, delay)
     # Neither the failed attempt nor this wait counts against the turn's timeout: retrying
-    # through a slump is waiting, not being wedged (see flight.Flight.served).
-    flight.note_wait(delay + (_FAILED_ATTEMPT_S if why.startswith(("HTTP 52", "HTTP 504", "ReadTimeout")) else 0.0))
+    # through a slump is waiting, not being wedged (see flight.Flight.served). The attempt
+    # is credited for how long it actually took - a gateway failure dies near the 125 s
+    # timeout, a refused connection in milliseconds - not for a flat guess.
+    flight.note_wait(delay + max(0.0, attempt_s))
     await asyncio.sleep(delay)
 
 
@@ -632,6 +630,7 @@ async def _post_with_retry(
     failed_before = False
     for attempt in range(settings.max_retries + 1):
         throttle.REQUEST_KIND.set(kind if not failed_before or kind != "normal" else "retry")
+        attempt_started = time.monotonic()
         try:
             async with _watching_for_stall(f"upstream POST (attempt {attempt + 1})"):
                 if stream_upstream:
@@ -644,7 +643,8 @@ async def _post_with_retry(
             if (not _is_retryable_exception(exc) or attempt == settings.max_retries
                     or (give_up is not None and give_up())):
                 raise
-            await _sleep_before_retry(attempt, _describe(exc))
+            await _sleep_before_retry(
+                attempt, _describe(exc), time.monotonic() - attempt_started)
             continue
         finally:
             throttle.REQUEST_KIND.set("normal")
@@ -664,7 +664,8 @@ async def _post_with_retry(
                      "it", response.status_code)
                 return response
             await response.aread()  # release the connection before sleeping
-            await _sleep_before_retry(attempt, f"HTTP {response.status_code}")
+            await _sleep_before_retry(
+                attempt, f"HTTP {response.status_code}", time.monotonic() - attempt_started)
             continue
         if response.status_code == 200 and attempt < settings.max_retries:
             # An HTTP 200 carrying an error object: retry it when it is the upstream's own
@@ -675,7 +676,8 @@ async def _post_with_retry(
                 in_band = None
             if isinstance(in_band, dict) and _is_transient(str(in_band.get("message") or "")):
                 await _sleep_before_retry(
-                    attempt, f"in-band: {str(in_band.get('message'))[:60]}")
+                    attempt, f"in-band: {str(in_band.get('message'))[:60]}",
+                    time.monotonic() - attempt_started)
                 continue
         return response
 
@@ -3479,6 +3481,7 @@ async def _unguarded_event_stream(
             usage = None
             accumulator = ToolCallAccumulator()
             retry_reason: str | None = None
+            attempt_started = time.monotonic()
             throttle.REQUEST_KIND.set(
                 "retry" if failed_once and request_kind == "normal" else request_kind)
 
@@ -3683,7 +3686,8 @@ async def _unguarded_event_stream(
             if retry_reason:
                 if live_started:
                     yield progress(f"retrying: {retry_reason}")
-                await _sleep_before_retry(attempt, retry_reason)
+                await _sleep_before_retry(
+                    attempt, retry_reason, time.monotonic() - attempt_started)
                 attempt += 1
                 continue
             break
@@ -4133,20 +4137,24 @@ async def _passthrough(request: Request, raw: bytes) -> Response:
             request.method, url, headers=headers, content=raw
         )
         try:
+            attempt_started = time.monotonic()
             upstream = await client.send(upstream_request, stream=True)
         except httpx.HTTPError as exc:
             if not _is_retryable_exception(exc) or attempt == settings.max_retries:
                 return _error_response(
                     502, "api_error", f"Upstream Anthropic request failed: {exc}"
                 )
-            await _sleep_before_retry(attempt, _describe(exc))
+            await _sleep_before_retry(
+                attempt, _describe(exc), time.monotonic() - attempt_started)
             continue
 
         # Anthropic's own retry policy, not the Agentaus one: 402 is a billing error
         # here and goes straight back to the client with its body untouched.
         if upstream.status_code in _PASSTHROUGH_RETRYABLE_STATUS and attempt < settings.max_retries:
             await upstream.aclose()
-            await _sleep_before_retry(attempt, f"HTTP {upstream.status_code}")
+            await _sleep_before_retry(
+                attempt, f"HTTP {upstream.status_code}",
+                time.monotonic() - attempt_started)
             continue
         break
 
