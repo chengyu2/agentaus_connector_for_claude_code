@@ -11,6 +11,7 @@ import asyncio
 import os
 import sys
 import unittest
+from unittest import mock
 from xml_style import setUpModule, tearDownModule  # noqa: E402,F401
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -239,6 +240,61 @@ class TestDistillation(unittest.TestCase):
         body = {"messages": [call("a", "Read", file_path="big.py"), result("a", self.BIG)]}
         out = run(d.distill(body))
         self.assertEqual(out["messages"][1]["content"][0]["content"], self.BIG)
+
+    def test_a_rejected_condensation_is_cached_as_rejected(self):
+        """The verdict is cached, not just the condensation: a later turn with the
+        same result emits the raw block again without paying for the model call.
+        """
+        stub = self.stub(answer="x" * 200_000)
+        d = ResultDistiller(stub, threshold_tokens=500)
+        body = {"messages": [call("a", "Read", file_path="big.py"), result("a", self.BIG)]}
+
+        first = run(d.distill(body))
+        self.assertEqual(first["messages"][1]["content"][0]["content"], self.BIG)
+        calls_after_first = len(stub.seen)
+
+        second = run(d.distill(body))
+
+        self.assertEqual(len(stub.seen), calls_after_first, "the rejection was re-condensed")
+        self.assertEqual(second["messages"][1]["content"][0]["content"], self.BIG)
+        self.assertEqual(d.hits, 1, "the cached rejection did not count as a hit")
+
+    def test_the_gate_is_not_re_run_on_a_cached_rejection(self):
+        """What the rejection marker buys over caching the condensation alone: the
+        growth gate is paid at most once per unique output, not on every later hit.
+        """
+        answer = "x" * 200_000
+        stub = self.stub(answer=answer)
+        d = ResultDistiller(stub, threshold_tokens=500)
+        body = {"messages": [call("a", "Read", file_path="big.py"), result("a", self.BIG)]}
+
+        counted = []
+
+        def counting(text):
+            counted.append(text)
+            return estimate_tokens(text)
+
+        with mock.patch("agentaus_bridge.distill.estimate_tokens", counting):
+            run(d.distill(body))
+            run(d.distill(body))
+
+        self.assertEqual(counted.count(answer), 1, "the gate re-ran on the cached rejection")
+
+    def test_an_accepted_condensation_stays_cached_and_emitted(self):
+        """Control for the rejection cache: a good condensation is unaffected."""
+        stub = self.stub()
+        d = ResultDistiller(stub, threshold_tokens=500)
+        body = {"messages": [call("a", "Read", file_path="big.py"), result("a", self.BIG)]}
+
+        first = run(d.distill(body))
+        calls_after_first = len(stub.seen)
+        second = run(d.distill(body))
+
+        self.assertEqual(len(stub.seen), calls_after_first, "it re-condensed")
+        self.assertIn("Condensed by the bridge",
+                      second["messages"][1]["content"][0]["content"])
+        self.assertEqual(first["messages"][1]["content"][0]["content"],
+                         second["messages"][1]["content"][0]["content"])
 
     def test_typography_is_normalised(self):
         d = ResultDistiller(self.stub(answer="see $$retry_budget_ms$$ in EU‑WEST‑2"),

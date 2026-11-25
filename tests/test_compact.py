@@ -582,6 +582,23 @@ class TestIncrementalCompaction(unittest.TestCase):
 
         self.assertGreater(counter.calls, 0, "a changed prefix was wrongly reused")
 
+    def test_find_prefix_skips_a_cold_cache_without_hashing(self):
+        """The miss path that dominates real traffic: nothing cached must cost nothing."""
+        c = ConversationCompactor(_Counter(), verify=False)
+        self.assertIsNone(c._find_prefix(self.session(10)))
+
+    def test_find_prefix_chooses_the_longest_cached_match(self):
+        """Several stored prefixes cover the head; the longest matching one wins, and
+        entries whose stored hash does not match their claimed length are skipped."""
+        c = ConversationCompactor(_Counter(), verify=False)
+        head = self.session(10)
+        c._prefixes = [
+            (6, c._key(head[:5]), "stale"),   # length 6 but hashes an OLDER head
+            (2, c._key(head[:2]), "short"),
+            (6, c._key(head[:6]), "long"),
+        ]
+        self.assertEqual(c._find_prefix(head), (6, "long"))
+
 
 class TestPriorityGate(unittest.TestCase):
     """Not every bridge call is equally urgent, and a plain semaphore cannot say so.
@@ -693,6 +710,56 @@ class TestPriorityGate(unittest.TestCase):
     async def _take(self):
         async with self.gate.hold("probe", "normal"):
             return True
+
+    def test_a_waiter_cancelled_while_queued_is_skipped_when_the_slot_frees(self):
+        """Lazy deletion leaves the dead waiter in the heap; the release must sweep it
+        and reach the live waiter rather than "serve" a future nobody awaits (which
+        would consume a slot for the rest of the turn)."""
+        import asyncio as aio
+        order = []
+
+        async def worker(name):
+            async with self.gate.hold(name, "normal"):
+                order.append(name)
+
+        async def main():
+            async with self.gate.hold("holder", "normal"):
+                ghost = aio.ensure_future(worker("ghost"))
+                await aio.sleep(0.005)
+                live = aio.ensure_future(worker("live"))
+                await aio.sleep(0.005)
+                ghost.cancel()
+                try:
+                    await ghost
+                except aio.CancelledError:
+                    pass
+            # The holder's release must skip the dead ghost and let the live waiter in.
+            await aio.wait_for(live, timeout=1.0)
+
+        run(main())
+        self.assertEqual(order, ["live"], f"the dead waiter was served: {order}")
+
+    def test_a_waiter_cancelled_after_a_same_tick_grant_passes_the_slot_on(self):
+        """Release hands the slot to a queued waiter and the cancel lands before it
+        resumes (release and cancel in the same tick, so it cannot have): the grant
+        must be passed on, never consumed by a task that will not run."""
+        import asyncio as aio
+
+        async def main():
+            g = self.gate.gate()
+            await g.acquire(1)  # take the only slot
+            doomed = aio.ensure_future(g.acquire(1))
+            await aio.sleep(0)  # let it queue behind us
+            g.release()  # grant the slot to it, same tick...
+            doomed.cancel()  # ...and cancel before it can resume
+            try:
+                await doomed
+            except aio.CancelledError:
+                pass
+            # The slot must be usable again immediately.
+            await aio.wait_for(self._take(), timeout=1.0)
+
+        run(main())
 
     def test_the_cap_follows_a_settings_change(self):
         self.settings.agentaus_max_concurrency = 5

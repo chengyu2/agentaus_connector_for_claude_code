@@ -28,6 +28,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 
 from .config import settings
 
@@ -251,19 +252,31 @@ def _tesseract_ocr(path: str, wanted: list[int]) -> dict[int, str]:
     out: dict[int, str] = {}
     for index in wanted:
         try:
-            page = subprocess.run(
-                [render, "-f", str(index + 1), "-l", str(index + 1),
-                 "-r", str(settings.agentaus_pdf_dpi), "-png", path],  # no root: stdout
-                capture_output=True,
-                timeout=settings.agentaus_pdf_timeout_seconds,
-                check=True,
-            ).stdout
-            done = subprocess.run(
-                [tesseract, "-", "-", "--psm", "3"],
-                input=page, capture_output=True,
-                timeout=settings.agentaus_pdf_timeout_seconds,
-                check=True,
-            )
+            # Relying on pdftoppm's no-prefix behaviour is not safe: poppler 24.x
+            # wrote the page to stdout, 26.x drops it as a PNG in the CWD and leaves
+            # it there. Ask for a file in a temp dir instead; -singlefile drops the
+            # page-number suffix, so the name is deterministic.
+            with tempfile.TemporaryDirectory(prefix="agentaus-pdf-ocr-") as workdir:
+                prefix = os.path.join(workdir, "page")
+                subprocess.run(
+                    [render, "-f", str(index + 1), "-l", str(index + 1),
+                     "-r", str(settings.agentaus_pdf_dpi), "-png", "-singlefile",
+                     path, prefix],
+                    capture_output=True,
+                    timeout=settings.agentaus_pdf_timeout_seconds,
+                    check=True,
+                )
+                produced = glob.glob(prefix + "*.png")
+                if not produced:
+                    continue
+                with open(produced[0], "rb") as handle:
+                    page = handle.read()
+                done = subprocess.run(
+                    [tesseract, "-", "-", "--psm", "3"],
+                    input=page, capture_output=True,
+                    timeout=settings.agentaus_pdf_timeout_seconds,
+                    check=True,
+                )
         except (subprocess.SubprocessError, OSError) as exc:
             log.debug("tesseract failed on page %d of %s (%s)", index + 1, path, exc)
             continue
