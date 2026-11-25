@@ -34,7 +34,7 @@ lists only the common settings. A few internal tuning knobs are documented only 
 | `AGENTAUS_SEARCH_MAX_CHUNKS` | `120` | Ceiling on calls for one search. Truncation is reported in the result, never silent |
 | `AGENTAUS_SEARCH_MIN_CANDIDATES` | `3` | Below this many shortlisted files, distrust the shortlist and read everything |
 | `AGENTAUS_SEARCH_MAX_FILE_BYTES` | `1048576` | Skip files larger than this |
-| `AGENTAUS_SEARCH_ROOTS` | *(empty)* | Colon-separated directories search may read. Empty allows any absolute path, matching Claude Code's own `Read` |
+| `AGENTAUS_SEARCH_ROOTS` | *(empty)* | Colon-separated directories search may read. Empty confines reads to the request's working directory (the bridge process's cwd when none was named), plus the bridge's skill library |
 | `AGENTAUS_SEARCH_MAX_FILES` | `5000` | Ceiling on files one search or inventory walk returns. Hitting it is stated in the result |
 | `AGENTAUS_TOOL_TIMEOUT` | `480` | Wall-clock ceiling on one bridge tool call. The model gets a result saying it was stopped, and the worker thread stops too. `0` disables |
 | `AGENTAUS_DOCUMENT_CACHE_CHARS` | `67108864` | Converted document text kept in memory, least recently used evicted first |

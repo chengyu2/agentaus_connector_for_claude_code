@@ -171,8 +171,8 @@ async def run_inventory(path: str, glob: str | None, default_path: str | None = 
         return (f"{path} is the whole disk, not a project. Pass the absolute path of the "
                 f"project or folder to search - the working directory, if you do not know "
                 f"which.")
-    if not _allowed_root(path):
-        return f"{path} is outside AGENTAUS_SEARCH_ROOTS, which this bridge is confined to."
+    if not _allowed_root(path, default_path):
+        return _outside_roots(path)
     if os.path.isfile(path):
         path = os.path.dirname(path)
 
@@ -438,16 +438,24 @@ def _is_secret(name: str, path: str | None = None) -> bool:
     return False
 
 
-def _allowed_root(path: str) -> bool:
+def _allowed_root(path: str, default_path: str | None = None) -> bool:
     """Whether `path` is inside a configured search root.
 
-    An empty AGENTAUS_SEARCH_ROOTS allows anything absolute, which matches what Claude
-    Code's own Read tool would let the model open. Setting it confines the bridge, which
-    matters because these reads never reach Claude Code's permission prompts.
+    An empty AGENTAUS_SEARCH_ROOTS does not mean "read anything": these reads never
+    reach Claude Code's permission prompts, so "anything" let a search follow a model's
+    guess to a sibling project or the home directory. It means "confine to the working
+    directory the request named" - the same default Claude Code itself operates under.
+    The bridge's own process cwd is the fallback only when no request named one, because
+    the process is not the session: it may be launched from anywhere.
+
+    Setting AGENTAUS_SEARCH_ROOTS confines further, to those roots instead.
     """
     roots = [r for r in settings.agentaus_search_roots.split(":") if r.strip()]
     if not roots:
-        return True
+        base = os.path.expanduser(default_path or os.getcwd())
+        if not os.path.isabs(base):
+            base = os.path.abspath(base)
+        roots = [base]
     from .skills import LIBRARY
     roots.append(LIBRARY)       # the bridge's own skills are always readable
     resolved = os.path.realpath(path)
@@ -455,6 +463,14 @@ def _allowed_root(path: str) -> bool:
         resolved == os.path.realpath(r) or resolved.startswith(os.path.realpath(r) + os.sep)
         for r in roots
     )
+
+
+def _outside_roots(path: str) -> str:
+    """The refusal for a path `_allowed_root` rejected, naming the limit that applied."""
+    if settings.agentaus_search_roots.strip():
+        return f"{path} is outside AGENTAUS_SEARCH_ROOTS, which this bridge is confined to."
+    return (f"{path} is outside the session's working directory, which this bridge is "
+            f"confined to. Set AGENTAUS_SEARCH_ROOTS to allow other trees.")
 
 
 class ToolDeadline(Exception):
@@ -959,10 +975,8 @@ async def run_search(
         return (f"{path} is the whole disk, not a project. Pass the absolute path of the "
                 f"project or folder to search - the working directory, if you do not know "
                 f"which.")
-    if not _allowed_root(path):
-        return (
-            f"{path} is outside AGENTAUS_SEARCH_ROOTS, which this bridge is confined to."
-        )
+    if not _allowed_root(path, default_path):
+        return _outside_roots(path)
 
     # Every step that touches the disk runs in a worker thread. They read every file in
     # the tree, and reading a document is a LibreOffice or PDF conversion; done on the
@@ -1197,6 +1211,8 @@ async def run_investigate(
         path = default_path if not path else os.path.join(default_path, path)
     if not os.path.isabs(path):
         return f"agentaus_investigate needs an absolute path; got {path!r}."
+    if not _allowed_root(path, default_path):
+        return _outside_roots(path)
 
     started_at = time.monotonic()
     reports = await asyncio.gather(*[
@@ -1419,8 +1435,8 @@ def _zoom(
         file_path = default_path if not file_path else os.path.join(default_path, file_path)
     if not os.path.isabs(file_path):
         return f"agentaus_zoom needs an absolute path; got {file_path!r}."
-    if not _allowed_root(file_path):
-        return f"{file_path} is outside AGENTAUS_SEARCH_ROOTS."
+    if not _allowed_root(file_path, default_path):
+        return _outside_roots(file_path)
     if not enumerate_files(file_path):
         if documents.is_office_document(file_path) and not documents.available(file_path):
             return (f"{file_path} is an office document and no reader for it is "

@@ -12,7 +12,6 @@ import asyncio
 import json
 import os
 import sys
-import threading
 import time
 import unittest
 from unittest import mock
@@ -22,11 +21,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import httpx  # noqa: E402
 
+import stub_server  # noqa: E402
 from agentaus_bridge import finish, plans, server, syntax  # noqa: E402
 from agentaus_bridge.augment import grounding_revision, with_plan  # noqa: E402
 from agentaus_bridge.config import settings  # noqa: E402
 
-PORT = 9961
 PLAN_SECONDS = 0.8
 CHECK_SECONDS = 0.6
 CALLS: list[dict] = []
@@ -110,18 +109,15 @@ class TheFirstCallDoesNotWaitForThePlan(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        ThreadingHTTPServer.allow_reuse_address = True
-        cls.stub = ThreadingHTTPServer(("127.0.0.1", PORT), _Upstream)
-        threading.Thread(target=cls.stub.serve_forever, daemon=True).start()
+        cls.stub = stub_server.start(_Upstream, ThreadingHTTPServer)
 
     @classmethod
     def tearDownClass(cls):
-        cls.stub.shutdown()
-        cls.stub.server_close()
+        stub_server.stop(cls.stub)
 
     def setUp(self):
         self._saved = {n: getattr(settings, n) for n in self.NAMES}
-        settings.agentaus_base_url = f"http://127.0.0.1:{PORT}"
+        settings.agentaus_base_url = stub_server.url(self.stub)
         settings.agentaus_api_key = "test-key"
         settings.agentaus_thinking = True
         settings.agentaus_plan_async = True
@@ -416,11 +412,10 @@ class AGroundingRevisionThatLosesTheAnswer(unittest.TestCase):
         self.assertEqual(self._check(gaps, most, one_pass=False), most.strip())
 
     def test_the_streamed_helper_reports_how_it_ended(self):
-        settings.agentaus_base_url = f"http://127.0.0.1:{PORT}"
+        stub = stub_server.start(_Upstream, ThreadingHTTPServer)
+        settings.agentaus_base_url = stub_server.url(stub)
         settings.agentaus_api_key = "test-key"
         settings.agentaus_stream_helpers = True
-        stub = ThreadingHTTPServer(("127.0.0.1", PORT), _Upstream)
-        threading.Thread(target=stub.serve_forever, daemon=True).start()
 
         async def go():
             async with httpx.AsyncClient() as client:
@@ -430,8 +425,7 @@ class AGroundingRevisionThatLosesTheAnswer(unittest.TestCase):
         try:
             cut, whole = run(go())
         finally:
-            stub.shutdown()
-            stub.server_close()
+            stub_server.stop(stub)
         self.assertEqual(cut.finish_reason, "length")
         self.assertEqual(whole.finish_reason, "stop")
 

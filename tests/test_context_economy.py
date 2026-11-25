@@ -268,7 +268,7 @@ class TestInvestigate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tree:
             with open(os.path.join(tree, "gate.py"), "w") as fh:
                 fh.write("import asyncio\n_gate = asyncio.Semaphore(6)\n")
-            out = run(tools.run_investigate("where is the cap", tree, call_))
+            out = run(tools.run_investigate("where is the cap", tree, call_, default_path=tree))
 
         angles = [p for p in seen if p.startswith("A developer is searching")]
         self.assertEqual(len(angles), 3, "not every lens ran")
@@ -289,7 +289,7 @@ class TestInvestigate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tree:
             with open(os.path.join(tree, "a.py"), "w") as fh:
                 fh.write("alpha = 1\n")
-            out = run(tools.run_investigate("where is alpha", tree, call_))
+            out = run(tools.run_investigate("where is alpha", tree, call_, default_path=tree))
 
         self.assertIn("nothing here is corroborated", out)
         self.assertNotIn("## Established", out)
@@ -303,7 +303,7 @@ class TestInvestigate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tree:
             with open(os.path.join(tree, "a.py"), "w") as fh:
                 fh.write("alpha = 1\n")
-            out = run(tools.run_investigate("where is the parser", tree, call_))
+            out = run(tools.run_investigate("where is the parser", tree, call_, default_path=tree))
         self.assertIn("None of the", out)
 
     def test_a_relative_path_is_refused(self):

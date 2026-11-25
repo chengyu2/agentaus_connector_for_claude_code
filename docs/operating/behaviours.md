@@ -50,7 +50,8 @@ Two consequences worth knowing:
 
 `agentaus_search` and `agentaus_zoom` are the exception in the other direction: the bridge
 runs those itself, so they never reach a permission prompt. They are read-only and
-confined by `AGENTAUS_SEARCH_ROOTS`.
+confined by `AGENTAUS_SEARCH_ROOTS` — to the request's working directory when it is
+unset, and to the named roots when it is set.
 
 ## Truncated tool output is read back from disk
 

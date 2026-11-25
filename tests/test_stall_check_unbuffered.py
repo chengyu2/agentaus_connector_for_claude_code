@@ -11,12 +11,12 @@ from __future__ import annotations
 import json
 import os
 import sys
-import threading
 import unittest
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import stub_server  # noqa: E402
 from agentaus_bridge import server  # noqa: E402
 from agentaus_bridge.config import settings  # noqa: E402
 
@@ -58,16 +58,11 @@ class _Upstream(BaseHTTPRequestHandler):
 class StallCheckWithoutBuffering(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        HTTPServer.allow_reuse_address = True
-        # Port 0: test_helper_latency.py runs its own stub, and pytest-xdist may run both files at once.
-        cls.stub = HTTPServer(("127.0.0.1", 0), _Upstream)
-        cls.port = cls.stub.server_address[1]
-        threading.Thread(target=cls.stub.serve_forever, daemon=True).start()
+        cls.stub = stub_server.start(_Upstream)
 
     @classmethod
     def tearDownClass(cls):
-        cls.stub.shutdown()
-        cls.stub.server_close()
+        stub_server.stop(cls.stub)
 
     def setUp(self):
         CALLS.clear()
@@ -75,7 +70,7 @@ class StallCheckWithoutBuffering(unittest.TestCase):
         names = ("agentaus_base_url", "agentaus_api_key", "agentaus_self_review",
                  "agentaus_thinking", "agentaus_grounding_check")
         self._saved = {n: getattr(settings, n) for n in names}
-        settings.agentaus_base_url = f"http://127.0.0.1:{self.port}"
+        settings.agentaus_base_url = stub_server.url(self.stub)
         settings.agentaus_api_key = "test-key"
         settings.agentaus_self_review = False
         settings.agentaus_thinking = False

@@ -471,6 +471,13 @@ class _Phase:
 _RETRYABLE_STATUS = {402, 408, 425, 429, 500, 502, 503, 504,
                      520, 521, 522, 523, 524, 525, 526, 527}
 
+# The passthrough talks to Anthropic, whose 402 is a billing error - a final answer
+# about the client's account, not an outage. Retrying it with backoff would stall the
+# turn for nothing, so 402 is explicitly excluded here while the Agentaus policy above
+# keeps it deliberately for its own quota outages (the throttle waits those out).
+# Everything else - gateway blips, capacity - stays retryable.
+_PASSTHROUGH_RETRYABLE_STATUS = _RETRYABLE_STATUS - {402}
+
 # Connection-level faults that never reached the application upstream. A DNS blip
 # ("nodename nor servname provided") arrives as ConnectError; a dropped keep-alive
 # socket arrives as RemoteProtocolError or ConnectError depending on timing.
@@ -4135,7 +4142,9 @@ async def _passthrough(request: Request, raw: bytes) -> Response:
             await _sleep_before_retry(attempt, _describe(exc))
             continue
 
-        if upstream.status_code in _RETRYABLE_STATUS and attempt < settings.max_retries:
+        # Anthropic's own retry policy, not the Agentaus one: 402 is a billing error
+        # here and goes straight back to the client with its body untouched.
+        if upstream.status_code in _PASSTHROUGH_RETRYABLE_STATUS and attempt < settings.max_retries:
             await upstream.aclose()
             await _sleep_before_retry(attempt, f"HTTP {upstream.status_code}")
             continue
