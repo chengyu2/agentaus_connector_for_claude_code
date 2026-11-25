@@ -12,6 +12,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
+import math
 import os
 import re
 
@@ -360,7 +362,53 @@ def anthropic_request_to_agentaus(
         choice = _map_tool_choice(body.get("tool_choice")) or "auto"
         payload["tool_choice"] = choice
 
+    payload.update(decoding_params(body))
     return payload
+
+
+def _number(raw: str) -> float | None:
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+# Accepted ranges. `nan`/`inf` parse as floats but are not JSON, so letting one through
+# would make every main-loop request fail to serialise.
+_DECODING_RANGE = {
+    "temperature": lambda v: 0.0 <= v <= 2.0,
+    "top_p": lambda v: 0.0 < v <= 1.0,
+}
+_decoding_warned: set[tuple[str, str]] = set()
+
+
+def decoding_params(body: dict) -> dict:
+    """`temperature` / `top_p` for a main-loop request, from AGENTAUS_TEMPERATURE/TOP_P.
+
+    Unset sends nothing (Agentaus' default). `client` forwards Claude Code's own value.
+    A value that is not a finite number in range (temperature 0-2, top_p above 0 up to 1)
+    sends nothing, with a warning logged once per bad value.
+    """
+    from .config import settings
+    out: dict[str, Any] = {}
+    for key, raw in (("temperature", settings.agentaus_temperature),
+                     ("top_p", settings.agentaus_top_p)):
+        raw = (raw or "").strip().lower()
+        if not raw:
+            continue
+        value = body.get(key) if raw == "client" else _number(raw)
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and _DECODING_RANGE[key](value)):
+            out[key] = value
+        elif value is not None or raw != "client":
+            # Absent from the request under `client` is normal (thinking on); anything
+            # else here is a bad value.
+            shown = repr(value) if raw == "client" else raw
+            if (key, shown) not in _decoding_warned:
+                _decoding_warned.add((key, shown))
+                logging.getLogger("agentaus-bridge").warning(
+                    "ignoring %s=%s: not a finite number in range; sending none", key, shown)
+    return out
 
 
 def _map_tools(tools: Any) -> list[dict]:
@@ -855,7 +903,11 @@ class AnthropicStreamBuilder:
 
     def finish(self, finish_reason: str | None, usage: dict | None) -> bytes:
         out = self._close_open_block()
-        if finish_reason:
+        if finish_reason and self.stop_reason != "tool_use":
+            # Once a tool block is on the wire this is a tool turn, even when a
+            # recovered call arrived in a stream Agentaus finished with generic
+            # "stop". A later finish reason must not contradict the tool_use blocks
+            # the client has already seen.
             self.stop_reason = _STOP_REASON.get(finish_reason, self.stop_reason)
         usage = usage or {}
         output_tokens = int(

@@ -22,7 +22,9 @@ const TASK = String((args && args.task) || '').trim()
 const CWD = String((args && args.cwd) || '').trim()
 // Keyed on the whole working-directory path: two projects with the same folder name must
 // not read each other's extracted documents.
-const SCRATCH = `/tmp/agentaus-graph/${(CWD.replace(/^\/+/, '') || 'task').replace(/[^\w.-]+/g, '_')}`
+// Where scratch lives, as the bridge says (graph.scratch_root): /tmp, except on Windows.
+const SCRATCH_ROOT = String((args && args.scratch_root) || '/tmp/agentaus-graph').trim()
+const SCRATCH = `${SCRATCH_ROOT}/${(CWD.replace(/^\/+/, '') || 'task').replace(/[^\w.-]+/g, '_')}`
 
 // Agentaus starts answering 524s past about eight sessions at once, so every agent()
 // call waits for one of WIDTH slots, however much the graph fans out.

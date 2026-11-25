@@ -78,7 +78,8 @@ for, and restoring the descriptions inside Claude Code's list did not move it ei
 list is the last thing in a long system prompt, and the planner never saw it at all.
 
 So the bridge now does three things when `Skill` or `Agent` is on the wire
-(`AGENTAUS_SKILL_ROUTING`, on by default):
+(`AGENTAUS_SKILL_ROUTING`; on by default without the prompt diet, off under
+`AGENTAUS_PROMPT_DIET` - which is on by default - unless set to `true`):
 
 1. **Descriptions go back into the listing**, read from each skill's own front matter.
 2. **A "Skills and subagents" section is added to the guidance**: one line per skill and
@@ -121,7 +122,8 @@ plugins (attribution in its `NOTICE`), rewritten for this model in annotated Mar
 | `mac-mail-calendar` | Written here (macOS): find and read Apple Mail emails and their attachments, save drafts from a chosen account, and create Calendar events with `.ics` invitations - Calendar's AppleScript silently adds no attendees |
 
 Claude Code has never heard of them, so the bridge serves them itself
-(`AGENTAUS_SKILL_LIBRARY`, on by default). It adds them to the listing, after the project's
+(`AGENTAUS_SKILL_LIBRARY`; off under `AGENTAUS_PROMPT_DIET`, which is on by default, unless
+set to `true`). It adds them to the listing, after the project's
 own skills and before Claude Code's bundled ones, and runs any `Skill` call that names one
 like its own tools. They reach every project, including one with no `.claude/skills`, and
 Claude sessions never see them. A project skill with the same name stays the project's.

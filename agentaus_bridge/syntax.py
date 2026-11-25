@@ -39,10 +39,22 @@ _LOOKS_LIKE_PYTHON = re.compile(
 )
 
 
-def blocks(text: str) -> list[str]:
-    """Python source in an answer: fenced blocks, or the whole thing if it is bare code."""
+def blocks(text: str, *, strict: bool = False) -> list[str]:
+    """Python source in an answer: fenced blocks, or the whole thing if it is bare code.
+
+    `strict` is for an answer that ends a tool loop. Its unlabelled blocks are almost always
+    what a command printed - "15 passed in 0.02s", a CSV row, a report table - so one only
+    counts as Python when a line of it opens like Python. Measured over 30 benchmark runs:
+    four syntax fixes, all on such output, 11-38 s each, and none of them could succeed.
+
+    It is the block's FIRST non-blank line that must open like Python, not any line: a
+    pytest failure report quotes the failing test, so `    def test_x():` sits inside
+    output that is not a program at all.
+    """
     found = [m.group("body") for m in _FENCED.finditer(text or "")
-             if m.group("lang").lower() in _PY_LANGS]
+             if m.group("lang").lower() in _PY_LANGS
+             and not (strict and not m.group("lang") and not _LOOKS_LIKE_PYTHON.match(
+                 m.group("body")))]
     if found:
         return found
     body = (text or "").strip()
@@ -53,9 +65,9 @@ def blocks(text: str) -> list[str]:
     return []
 
 
-def first_error(text: str) -> str:
+def first_error(text: str, *, strict: bool = False) -> str:
     """The first syntax error in the answer's Python, or "" if it all parses."""
-    for source in blocks(text):
+    for source in blocks(text, strict=strict):
         try:
             ast.parse(source)
         except SyntaxError as exc:

@@ -64,11 +64,17 @@ class _Style(unittest.TestCase):
     style = "markdown"
 
     def setUp(self):
+        from xml_style import pin_full_prompt
+
         self._saved = settings.agentaus_prompt_style
+        self._saved_prompt = pin_full_prompt()
         settings.agentaus_prompt_style = self.style
 
     def tearDown(self):
+        from xml_style import restore
+
         settings.agentaus_prompt_style = self._saved
+        restore(self._saved_prompt)
 
 
 class TheDefaultIsMarkdown(unittest.TestCase):
@@ -202,7 +208,7 @@ class ToolOutputs(_Style):
             path = os.path.join(tree, "doc.md")
             with open(path, "w") as handle:
                 handle.write("# Heading\n" + "".join(f"line {n}\n" for n in range(1, 30)))
-            out = run(tools.run_zoom(path, 5, None))
+            out = run(tools.run_zoom(path, 5, None, default_path=tree))
         self.assertIn("### Passage", out)
         self.assertIn(f"- file: `{path}`", out)
         self.assertIn("- complete: `true`", out)
@@ -214,7 +220,7 @@ class ToolOutputs(_Style):
             for name in ("a.py", "b.py", "docs/readme.md"):
                 with open(os.path.join(tree, name), "w") as handle:
                     handle.write("# title\nbody\n")
-            out = run(tools.run_inventory(tree, None))
+            out = run(tools.run_inventory(tree, None, default_path=tree))
         self.assertIn(f"## Inventory of `{tree}`", out)
         self.assertIn("3 files in 2 folders.", out)
         self.assertIn("| kind | files |", out)
@@ -259,7 +265,7 @@ class SearchBehaviour(_Style):
             with open(os.path.join(tree, "other.py"), "w") as handle:
                 handle.write("x = 1\n")
             call = _searcher("Semaphore", "2: _limit = asyncio.Semaphore(6)")
-            out = run(tools.run_search("where do we cap calls", tree, None, call))
+            out = run(tools.run_search("where do we cap calls", tree, None, call, default_path=tree))
         chunks = [p for p in call.seen if "Decide whether the excerpt" in p]
         self.assertTrue(chunks)
         self.assertTrue(all("### Excerpt" in p and "<excerpt" not in p for p in chunks))
@@ -271,7 +277,7 @@ class SearchBehaviour(_Style):
             with open(os.path.join(tree, "gate.py"), "w") as handle:
                 handle.write("import asyncio\n_gate = asyncio.Semaphore(6)\n")
             call = _searcher("Semaphore", "2: _gate = asyncio.Semaphore(6)")
-            out = run(tools.run_investigate("where is the cap", tree, call))
+            out = run(tools.run_investigate("where is the cap", tree, call, default_path=tree))
         self.assertIn("Established", out)
         merge = [p for p in call.seen if "Three independent searches" in p]
         self.assertTrue(merge and "### Reports" in merge[0])

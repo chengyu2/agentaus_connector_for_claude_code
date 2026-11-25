@@ -10,8 +10,8 @@ any subagent - a subagent that silently runs on Claude is not an Agentaus subage
     python abbench/skill_use.py --arm opus --port 8796 --runs 1
     python abbench/skill_use.py --summary
 
-Runs live under /Users/cheng/agentaus_ab_runs/skill_use, outside git and outside the
-user's Claude memory, like the rest of abbench.
+Runs live under <AB_RUNS>/skill_use, outside git and outside the user's Claude memory,
+like the rest of abbench.
 """
 
 from __future__ import annotations
@@ -27,15 +27,17 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-REPO = HERE.parent
-RUNS = Path("/Users/cheng/agentaus_ab_runs/skill_use")
-SMALL = Path("/Users/cheng/agentaus_ab_runs/_fixture_skills")
-
 import sys  # noqa: E402
 
-sys.path.insert(0, str(HERE))
-from ab import CC, clean_env  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ab import claude_binary, clean_env, runs_root  # noqa: E402
+
+# This probe's runs sit under the abbench runs root; fixture skills beside them
+# (set AB_FIXTURE_SKILLS to keep them elsewhere).
+RUNS = runs_root() / "skill_use"
+SMALL = Path(os.environ.get("AB_FIXTURE_SKILLS") or runs_root() / "_fixture_skills")
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
 
 
 @dataclass
@@ -101,7 +103,7 @@ def run_one(arm: str, port: int, task: Task, n: int) -> dict:
     settings = json.dumps({"env": {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
                                    "ANTHROPIC_CUSTOM_MODEL_OPTION": "agentaus"},
                            "autoMemoryEnabled": False})
-    cmd = [CC, "-p", "--model", model, "--settings", settings,
+    cmd = [str(claude_binary()), "-p", "--model", model, "--settings", settings,
            "--output-format", "stream-json", "--verbose",
            "--permission-mode", "bypassPermissions", "--max-turns", "25",
            "--disallowedTools", "Edit", "Write", "NotebookEdit", "WebSearch", "WebFetch"]

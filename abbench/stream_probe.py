@@ -1,6 +1,11 @@
 """Run one real Claude Code turn and timestamp every stream event it receives."""
 import json, subprocess, sys, tempfile, time
-CC = "/Users/cheng/.vscode/extensions/anthropic.claude-code-2.1.278-darwin-arm64/resources/native-binary/claude"
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ab import claude_binary  # noqa: E402
+
+CC = str(claude_binary())
 port, prompt = sys.argv[1], sys.argv[2]
 settings = json.dumps({"env": {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
                                "ANTHROPIC_CUSTOM_MODEL_OPTION": "agentaus"}})

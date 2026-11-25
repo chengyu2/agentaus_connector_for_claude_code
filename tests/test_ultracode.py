@@ -998,10 +998,10 @@ class TheDynamicGraph(unittest.TestCase):
 
         self.assertFalse(os.path.exists(old), "the scratch folder starts empty")
         # The earlier run's folder is set aside, not deleted. See TheGraphRoundD12Fixes.
-        [aside] = [n for n in os.listdir("/tmp/agentaus-graph")
+        [aside] = [n for n in os.listdir(graph.scratch_root())
                    if n.startswith(os.path.basename(graph.scratch_of(cwd)) + ".prev")]
-        self.addCleanup(shutil.rmtree, os.path.join("/tmp/agentaus-graph", aside), True)
-        self.assertTrue(os.path.isdir(os.path.join("/tmp/agentaus-graph", aside, "leftover")))
+        self.addCleanup(shutil.rmtree, os.path.join(graph.scratch_root(), aside), True)
+        self.assertTrue(os.path.isdir(os.path.join(graph.scratch_root(), aside, "leftover")))
         self.assertTrue(os.path.isfile(os.path.join(args["pristine"], "solutions.py")))
         self.assertFalse(os.path.exists(os.path.join(args["pristine"], ".git")))
         [text] = args["texts"]
@@ -1030,8 +1030,8 @@ class TheDynamicGraph(unittest.TestCase):
                 self.assertTrue(r.stdout.startswith("MISMATCH import"), r.stdout)
 
     def test_the_scratch_folder_is_named_as_the_graph_names_it(self):
-        self.assertEqual(graph.scratch_of("/Users/x/my proj"), "/tmp/agentaus-graph/Users_x_my_proj-dyn")
-        self.assertEqual(graph.scratch_of(""), "/tmp/agentaus-graph/task-dyn")
+        self.assertEqual(graph.scratch_of("/Users/x/my proj"), f"{graph.scratch_root()}/Users_x_my_proj-dyn")
+        self.assertEqual(graph.scratch_of(""), f"{graph.scratch_root()}/task-dyn")
 
     def test_an_agent_past_its_time_is_asked_for_its_result_without_tools(self):
         from agentaus_bridge.config import settings
