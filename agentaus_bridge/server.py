@@ -2425,6 +2425,11 @@ def _is_over_length(text: str) -> bool:
 # it: it classified a 3,642-token payload as "possibly too big" and spent eight minutes
 # recompacting 3% of a context window while a six-token probe to the same endpoint was
 # also timing out.
+#
+# (Without a real tokeniser the estimate itself is only chars/4, so this threshold is
+# effectively half the window: _worth_refitting doubles the fallback estimate, because
+# an under-count there misclassifies an oversized request as a sick upstream and replays
+# it into the same timeout forever.)
 _REFIT_WORTH_TRYING_ABOVE = 1.0
 
 
@@ -2433,10 +2438,19 @@ def _worth_refitting(body: dict, limit: int) -> bool:
 
     Distinguishes "the conversation does not fit" from "the upstream is unwell". Both
     arrive as HTTP 524 and only the first is something the bridge can act on.
+
+    Without a real tokeniser the estimate is chars/4, which under-counts dense payloads
+    by roughly 2x - enough to turn "does not fit the window" into "fits", so the estimate
+    is doubled before comparing. Over-counting refits a conversation that would have
+    fitted anyway; under-counting never breaks the replay-into-the-same-timeout loop
+    this function exists to stop.
     """
     if limit <= 0:
         return False
-    return estimate_request_tokens(body) > limit * _REFIT_WORTH_TRYING_ABOVE
+    estimate = estimate_request_tokens(body)
+    if not _has_tokeniser():
+        estimate *= 2
+    return estimate > limit * _REFIT_WORTH_TRYING_ABOVE
 
 
 def _degraded_upstream_message(tokens: int, limit: int) -> str:
