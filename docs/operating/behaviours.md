@@ -51,7 +51,10 @@ Two consequences worth knowing:
 `agentaus_search` and `agentaus_zoom` are the exception in the other direction: the bridge
 runs those itself, so they never reach a permission prompt. They are read-only and
 confined by `AGENTAUS_SEARCH_ROOTS` — to the request's working directory when it is
-unset, and to the named roots when it is set.
+unset, and to the named roots when it is set. The working directory is read whole from
+Claude Code's system prompt, spaces and native Windows paths included, and on Windows the
+comparison ignores case and slash direction. A symlink counts as where it leads: one inside
+the project pointing outside the roots is skipped, and symlinked folders are not walked.
 
 ## Truncated tool output is read back from disk
 

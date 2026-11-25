@@ -693,9 +693,12 @@ schema is untouched.
 
 **What it will not read.** `.env` files, `*.pem`, `*.key`, SSH keys and `.git/` are
 excluded no matter what matches. With `AGENTAUS_SEARCH_ROOTS` unset the bridge stays
-inside the session's working directory; set it to colon-separated roots to pin it to
-specific trees. Both matter, because these reads never pass through Claude Code's
-permission prompts.
+inside the session's working directory - the one Claude Code names in its system prompt,
+spaces and native Windows `C:\...` or `\\server\share` paths included; set it to
+colon-separated roots (semicolon-separated on Windows) to pin it to specific trees. A
+symlink is judged by where it leads: a link inside the project to a file outside the roots
+is not read, and symlinked folders are not walked. Both matter, because these reads never
+pass through Claude Code's permission prompts.
 
 **What it costs.** One expansion call plus one call per chunk, capped at
 `AGENTAUS_SEARCH_MAX_CHUNKS`. When the cap truncates a search, the result says so. A
@@ -1120,7 +1123,7 @@ tuning, search limits, retries and timeouts, and the ultracode agent graph, is i
 | `AGENTAUS_PDF_OCR` | `true` | OCR the pages that came back blank or garbled. macOS Vision first, then tesseract |
 | `AGENTAUS_SEARCH` | `true` | Offer `agentaus_search`, the bridge-executed semantic search |
 | `AGENTAUS_WEB_SEARCH` | `true` | Offer `agentaus_web_search`, which drives Agentaus' own web search |
-| `AGENTAUS_SEARCH_ROOTS` | *(empty)* | Colon-separated directories search may read. Empty confines reads to the session's working directory, not any absolute path |
+| `AGENTAUS_SEARCH_ROOTS` | *(empty)* | Colon-separated (`;` on Windows) directories search may read. Empty confines reads to the session's working directory, not any absolute path |
 | `AGENTAUS_SEARCH_MAX_FILES` | `5000` | Ceiling on files one search or inventory walk returns |
 | `AGENTAUS_TOOL_TIMEOUT` | `480` | Wall-clock ceiling on one bridge tool call. `0` disables |
 | `AGENTAUS_TOOL_ROUNDS` | `12` | Rounds of bridge-executed tool calls one turn may run before the answer has to stand |
