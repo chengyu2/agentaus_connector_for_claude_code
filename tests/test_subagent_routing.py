@@ -57,26 +57,26 @@ class SubagentsFollowTheirSession(unittest.TestCase):
         sessions.reset()
 
     def test_a_subagent_of_an_agentaus_session_runs_on_agentaus(self):
-        self.assertEqual(main_loop("agentaus"), (True, False))
-        self.assertEqual(subagent(), (True, True))
+        self.assertEqual(main_loop("agentaus"), (True, None))
+        self.assertEqual(subagent(), (True, server.ROUTE_FOLLOWS_SESSION))
 
     def test_the_billing_line_marks_a_subagent_too(self):
         main_loop("agentaus")
-        self.assertEqual(subagent(marker="system"), (True, True))
+        self.assertEqual(subagent(marker="system"), (True, server.ROUTE_FOLLOWS_SESSION))
 
     def test_switching_the_session_to_claude_sends_its_subagents_to_claude(self):
         main_loop("agentaus")
         main_loop("claude-opus-5")
-        self.assertEqual(subagent(), (False, False))
+        self.assertEqual(subagent(), (False, None))
 
     def test_switching_back_to_agentaus_takes_them_back(self):
         main_loop("claude-opus-5")
         main_loop("agentaus")
-        self.assertEqual(subagent(), (True, True))
+        self.assertEqual(subagent(), (True, server.ROUTE_FOLLOWS_SESSION))
 
     def test_other_sessions_are_not_affected(self):
         main_loop("agentaus", session="s1")
-        self.assertEqual(subagent(session="s2"), (False, False))
+        self.assertEqual(subagent(session="s2"), (False, None))
 
     def test_a_subagent_does_not_change_its_session(self):
         main_loop("claude-opus-5")
@@ -89,12 +89,12 @@ class SubagentsFollowTheirSession(unittest.TestCase):
         server._route(_Request({"x-claude-code-session-id": "s1"}),
                       {"model": "claude-haiku-4-5", "messages": []}, "claude-haiku-4-5",
                       main_loop=True)
-        self.assertEqual(subagent(), (True, True))
+        self.assertEqual(subagent(), (True, server.ROUTE_FOLLOWS_SESSION))
 
     def test_off_means_by_model_id_alone(self):
         settings.agentaus_subagents_follow_session = False
         main_loop("agentaus")
-        self.assertEqual(subagent(), (False, False))
+        self.assertEqual(subagent(), (False, None))
 
     def test_the_session_table_is_bounded(self):
         for i in range(sessions._MAX_SESSIONS + 10):
