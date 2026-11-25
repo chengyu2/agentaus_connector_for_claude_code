@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import stub_server  # noqa: E402
 from agentaus_bridge import server  # noqa: E402
 from agentaus_bridge.config import settings  # noqa: E402
+from agentaus_bridge import stall_check  # noqa: E402
 
 CALLS: list = []
 STALL = "Let me read the settings file next."
@@ -66,7 +67,7 @@ class StallCheckWithoutBuffering(unittest.TestCase):
 
     def setUp(self):
         CALLS.clear()
-        server._STALL_REASKS.clear()
+        stall_check._STALL_REASKS.clear()
         names = ("agentaus_base_url", "agentaus_api_key", "agentaus_self_review",
                  "agentaus_thinking", "agentaus_grounding_check")
         self._saved = {n: getattr(settings, n) for n in names}

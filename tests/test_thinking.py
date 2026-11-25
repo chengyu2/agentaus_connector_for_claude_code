@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agentaus_bridge import tools  # noqa: E402
 from agentaus_bridge.augment import plan_prompt, should_think, with_plan  # noqa: E402
-from agentaus_bridge.server import (  # noqa: E402
+from agentaus_bridge.tool_handling import (  # noqa: E402
     _openai_calls,
     _partition_tool_calls,
     _without_bridge_calls,
@@ -34,6 +34,7 @@ from agentaus_bridge.translate import (  # noqa: E402
     anthropic_request_to_agentaus,
     inject_bridge_tools,
 )
+from agentaus_bridge import agentaus_stream, tool_handling  # noqa: E402
 
 
 def events(raw: bytes) -> list:
@@ -227,14 +228,14 @@ class TestBridgeToolsNeverReachTheClient(unittest.TestCase):
         self.assertEqual([c["id"] for c in theirs], ["1"])
 
     def test_the_correction_names_the_real_tools(self):
-        from agentaus_bridge.server import _correction_for
+        from agentaus_bridge.tool_handling import _correction_for
         text = _correction_for({"name": "open_file"}, {"Read", "Grep"})
         self.assertIn("open_file", text)
         self.assertIn("Grep, Read", text)
         self.assertIn("invented", text)
 
     def test_known_names_come_from_the_payload_actually_sent(self):
-        from agentaus_bridge.server import _known_tool_names
+        from agentaus_bridge.tool_handling import _known_tool_names
         self.assertEqual(
             _known_tool_names({"tools": [
                 {"type": "function", "function": {"name": "Read"}},
@@ -343,7 +344,7 @@ class TestTheInnerToolLoop(unittest.IsolatedAsyncioTestCase):
         try:
             with mock.patch.object(tools, "execute", fake_search):
                 chunks = []
-                async for chunk in server._agentaus_event_stream(
+                async for chunk in agentaus_stream._agentaus_event_stream(
                     upstream,
                     {"messages": [{"role": "user", "content": "where is the cap"}],
                      "stream": False},
@@ -392,7 +393,7 @@ class TestTheInnerToolLoop(unittest.IsolatedAsyncioTestCase):
         settings.agentaus_self_review = False
         try:
             chunks = []
-            async for chunk in server._agentaus_event_stream(
+            async for chunk in agentaus_stream._agentaus_event_stream(
                 upstream,
                 {"messages": [{"role": "user", "content": "read a.py"}], "stream": False},
                 {"messages": [{"role": "user", "content": "read a.py"}]},
@@ -418,7 +419,7 @@ class TestNameResolution(unittest.TestCase):
     """
 
     def setUp(self):
-        from agentaus_bridge.server import _canonical
+        from agentaus_bridge.tool_handling import _canonical
         self.canonical = _canonical
         self.known = {"Read", "Grep", "agentaus_search"}
 
@@ -568,7 +569,7 @@ class TestReviewIsNotCalledEndToEnd(unittest.IsolatedAsyncioTestCase):
         settings.agentaus_self_review = True  # on, and still must not fire
         try:
             chunks = []
-            async for chunk in server._agentaus_event_stream(
+            async for chunk in agentaus_stream._agentaus_event_stream(
                 upstream,
                 {"messages": [{"role": "user", "content": "x"}], "stream": False},
                 {"messages": conversation},
@@ -700,7 +701,7 @@ class TestRepeatedBridgeCallsAreShortCircuited(unittest.IsolatedAsyncioTestCase)
         try:
             with mock.patch.object(tools, "execute", counting_execute):
                 chunks = []
-                async for chunk in server._agentaus_event_stream(
+                async for chunk in agentaus_stream._agentaus_event_stream(
                     upstream,
                     {"messages": [{"role": "user", "content": "q"}], "stream": False},
                     {"messages": [{"role": "user", "content": "q"}]},
@@ -723,14 +724,14 @@ class TestRepeatedBridgeCallsAreShortCircuited(unittest.IsolatedAsyncioTestCase)
             {"id": "1", "name": tools.SEARCH_TOOL, "arguments": '{"query": "a"}'},
             {"id": "2", "name": tools.SEARCH_TOOL, "arguments": '{"query": "b"}'},
         ]
-        self.assertNotEqual(server._call_signature(calls[0]),
-                            server._call_signature(calls[1]))
+        self.assertNotEqual(tool_handling._call_signature(calls[0]),
+                            tool_handling._call_signature(calls[1]))
 
     async def test_argument_order_does_not_defeat_the_check(self):
         from agentaus_bridge import server
         a = {"id": "1", "name": "t", "arguments": '{"x": 1, "y": 2}'}
         b = {"id": "2", "name": "t", "arguments": '{"y": 2, "x": 1}'}
-        self.assertEqual(server._call_signature(a), server._call_signature(b))
+        self.assertEqual(tool_handling._call_signature(a), tool_handling._call_signature(b))
 
 
 class TestRefusalClassification(unittest.TestCase):

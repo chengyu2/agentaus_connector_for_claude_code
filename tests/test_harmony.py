@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agentaus_bridge import harmony, server, throttle  # noqa: E402
 from agentaus_bridge.config import settings  # noqa: E402
+from agentaus_bridge import tool_handling, upstream_http  # noqa: E402
 
 logging.getLogger("agentaus-bridge").setLevel(logging.CRITICAL)
 
@@ -110,7 +111,7 @@ class OrdinaryTextIsUntouched(unittest.TestCase):
 class ServerIntegration(unittest.TestCase):
     def test_a_non_streaming_response_has_the_markup_replaced_by_calls(self):
         data = {"choices": [{"message": {"content": OBSERVED, "tool_calls": None}}]}
-        cleaned, calls = server._recover_harmony_calls(data)
+        cleaned, calls = tool_handling._recover_harmony_calls(data)
         self.assertEqual(len(calls), 1)
         content = cleaned["choices"][0]["message"]["content"]
         self.assertFalse(content, "markup must not survive into the client's answer")
@@ -125,7 +126,7 @@ class ServerIntegration(unittest.TestCase):
         """
         data = {"choices": [{"finish_reason": "stop",
                              "message": {"content": OBSERVED, "tool_calls": None}}]}
-        cleaned, calls = server._recover_harmony_calls(data)
+        cleaned, calls = tool_handling._recover_harmony_calls(data)
         self.assertEqual(len(calls), 1)
         message = cleaned["choices"][0]["message"]
         [call] = message["tool_calls"]
@@ -137,13 +138,13 @@ class ServerIntegration(unittest.TestCase):
 
     def test_an_ordinary_response_is_returned_unchanged(self):
         data = {"choices": [{"message": {"content": "Plain answer."}}]}
-        same, calls = server._recover_harmony_calls(data)
+        same, calls = tool_handling._recover_harmony_calls(data)
         self.assertEqual(calls, [])
         self.assertIs(same, data)
 
     def test_an_empty_response_does_not_raise(self):
-        self.assertEqual(server._recover_harmony_calls({})[1], [])
-        self.assertEqual(server._recover_harmony_calls({"choices": []})[1], [])
+        self.assertEqual(tool_handling._recover_harmony_calls({})[1], [])
+        self.assertEqual(tool_handling._recover_harmony_calls({"choices": []})[1], [])
 
 
 class EndToEndNonStreaming(unittest.TestCase):
@@ -199,7 +200,7 @@ class EndToEndNonStreaming(unittest.TestCase):
             seen.append(json_body)
             return httpx.Response(200, json=responses[min(len(seen) - 1, len(responses) - 1)])
 
-        with mock.patch.object(server, "_post_with_retry", upstream), \
+        with mock.patch.object(upstream_http, "_post_with_retry", upstream), \
                 TestClient(server.app) as client:
             r = client.post("/v1/messages", json=self.BODY)
         return r, seen

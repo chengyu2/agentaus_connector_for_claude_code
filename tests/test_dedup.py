@@ -12,7 +12,7 @@ grammar is dropped.
 
 import unittest
 
-from agentaus_bridge.server import _call_signature, _same_request, _singular
+from agentaus_bridge.tool_handling import _call_signature, _same_request, _singular
 
 
 def search(query: str, path: str = "/repo") -> dict:

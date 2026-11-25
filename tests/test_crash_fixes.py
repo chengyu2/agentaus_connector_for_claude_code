@@ -29,6 +29,7 @@ from agentaus_bridge import server, tools  # noqa: E402
 from agentaus_bridge.config import settings  # noqa: E402
 
 import stub_server  # noqa: E402
+from agentaus_bridge import agentaus_stream, upstream_http  # noqa: E402
 
 
 def run(coro):
@@ -78,11 +79,11 @@ class WholeDisk(unittest.TestCase):
 
 class Transient(unittest.TestCase):
     def test_what_counts(self):
-        self.assertTrue(server._is_transient(
+        self.assertTrue(upstream_http._is_transient(
             "peer closed connection without sending complete message body (incomplete chunked read)"))
-        self.assertTrue(server._is_transient("HTTP 524 origin timed out"))
-        self.assertFalse(server._is_transient("invalid tool schema"))
-        self.assertFalse(server._is_transient(
+        self.assertTrue(upstream_http._is_transient("HTTP 524 origin timed out"))
+        self.assertFalse(upstream_http._is_transient("invalid tool schema"))
+        self.assertFalse(upstream_http._is_transient(
             "The engine prompt length 224662 exceeds the max_model_len 131072"))
 
 
@@ -150,7 +151,7 @@ class InBandDropsAreRetried(unittest.TestCase):
             async with httpx.AsyncClient() as client:
                 body = {"model": "agentaus", "messages": [{"role": "user", "content": "q"}]}
                 out = b""
-                async for chunk in server._agentaus_event_stream(
+                async for chunk in agentaus_stream._agentaus_event_stream(
                         client, {"messages": [], "stream": True}, body, "agentaus", 0.0):
                     out += chunk
                 return out.decode()
@@ -162,7 +163,7 @@ class InBandDropsAreRetried(unittest.TestCase):
     def test_a_buffered_call_recovers_too(self):
         async def go():
             async with httpx.AsyncClient() as client:
-                r = await server._post_with_retry(client, settings.agentaus_url,
+                r = await upstream_http._post_with_retry(client, settings.agentaus_url,
                                                   json_body={"messages": []}, headers={})
                 return r.json()
         data = run(go())
@@ -171,7 +172,7 @@ class InBandDropsAreRetried(unittest.TestCase):
 
     def test_a_real_error_is_still_reported(self):
         STATE["calls"] = 1          # skip the drop; stub now answers normally
-        self.assertFalse(server._is_transient("tools[3].function.parameters is invalid"))
+        self.assertFalse(upstream_http._is_transient("tools[3].function.parameters is invalid"))
 
 
 if __name__ == "__main__":

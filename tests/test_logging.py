@@ -18,12 +18,24 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agentaus_bridge import server  # noqa: E402
+from agentaus_bridge import request_log  # noqa: E402
+
+_SPLIT = ("server", "request_log", "bridge_responses", "upstream_http", "passthrough",
+          "conversation_text", "helper_calls", "graph_turn", "tool_handling",
+          "stall_check", "context_window", "stream_delivery", "agentaus_stream",
+          "agentaus_turn")
+
+
+def _bridge_source() -> str:
+    """server.py and the modules split out of it: the request path spans all of them."""
+    folder = os.path.dirname(server.__file__)
+    return "".join(open(os.path.join(folder, f"{name}.py")).read() for name in _SPLIT)
 
 
 class TestRequestScopedLogging(unittest.TestCase):
     def test_every_request_path_log_call_carries_a_request_id(self):
         """A line without an id cannot be tied to the turn that produced it."""
-        source = open(server.__file__).read()
+        source = _bridge_source()
         bare = re.findall(r"^\s*log\.(?:info|warning|error)\(", source, re.M)
 
         # Only the two startup lines may be bare: they belong to no request.
@@ -32,16 +44,16 @@ class TestRequestScopedLogging(unittest.TestCase):
 
     def test_log_helper_prefixes_the_id(self):
         with self.assertLogs("agentaus-bridge", level="INFO") as captured:
-            token = server._request_id.set("abcd1234")
+            token = request_log._request_id.set("abcd1234")
             try:
-                server.rlog(logging.INFO, "something happened")
+                request_log.rlog(logging.INFO, "something happened")
             finally:
-                server._request_id.reset(token)
+                request_log._request_id.reset(token)
 
         self.assertIn("req abcd1234 something happened", captured.output[0])
 
     def test_ids_are_distinct_per_request(self):
-        self.assertNotEqual(server._new_request_id(), server._new_request_id())
+        self.assertNotEqual(request_log._new_request_id(), request_log._new_request_id())
 
 
 class TestPhaseLogging(unittest.TestCase):
@@ -49,7 +61,7 @@ class TestPhaseLogging(unittest.TestCase):
         """A start with no matching end is the signature of a hang - which is only
         visible if the start was logged at all."""
         with self.assertLogs("agentaus-bridge", level="INFO") as captured:
-            with server._Phase("compaction", "est 400,000 tok"):
+            with request_log._Phase("compaction", "est 400,000 tok"):
                 pass
 
         joined = "\n".join(captured.output)
@@ -61,7 +73,7 @@ class TestPhaseLogging(unittest.TestCase):
         """CancelledError carries no message; "ended after 0.0s:" says nothing."""
         with self.assertLogs("agentaus-bridge", level="WARNING") as captured:
             try:
-                with server._Phase("compaction"):
+                with request_log._Phase("compaction"):
                     raise __import__("asyncio").CancelledError()
             except BaseException:
                 pass
@@ -71,7 +83,7 @@ class TestPhaseLogging(unittest.TestCase):
     def test_a_failed_phase_still_reports_its_duration(self):
         with self.assertLogs("agentaus-bridge", level="WARNING") as captured:
             try:
-                with server._Phase("compaction"):
+                with request_log._Phase("compaction"):
                     raise RuntimeError("upstream refused")
             except RuntimeError:
                 pass
@@ -85,7 +97,7 @@ class TestDiagnosticCoverage(unittest.TestCase):
     """The specific things whose absence made the original stall unreadable."""
 
     def setUp(self) -> None:
-        self.source = open(server.__file__).read()
+        self.source = _bridge_source()
 
     def test_requests_are_logged_on_arrival_not_only_on_completion(self):
         """A hung request never completes, so a completion-only log never mentions it.

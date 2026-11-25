@@ -27,6 +27,7 @@ from agentaus_bridge import tools as bridge_tools  # noqa: E402
 from agentaus_bridge.config import settings  # noqa: E402
 
 from test_bridge_robust import Stub, _WithStub, events_of, tool, user  # noqa: E402
+from agentaus_bridge import agentaus_turn, helper_calls, stall_check, tool_handling  # noqa: E402
 
 
 class ToolStub(Stub):
@@ -74,7 +75,7 @@ def cut_off(payload: dict) -> bool:
 
 
 async def answered_search(client, payload, calls, default_path=None, seen=None):
-    return server._with_tool_results(payload, calls, ["nothing relevant"] * len(calls))
+    return tool_handling._with_tool_results(payload, calls, ["nothing relevant"] * len(calls))
 
 
 async def unreviewed(client, question, answer):
@@ -94,10 +95,10 @@ class _Loop(_WithStub):
         settings.agentaus_search = True
         settings.agentaus_tool_rounds = 1
         settings.agentaus_correction_rounds = 3
-        for target, value in (("_run_bridge_tools", answered_search),
-                              ("_worth_checking", lambda *a, **k: False),
-                              ("_self_review", unreviewed)):
-            patcher = mock.patch.object(server, target, value)
+        for module, target, value in ((tool_handling, "_run_bridge_tools", answered_search),
+                                      (stall_check, "_worth_checking", lambda *a, **k: False),
+                                      (helper_calls, "_self_review", unreviewed)):
+            patcher = mock.patch.object(module, target, value)
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -194,7 +195,7 @@ class RoundLimit(_Loop):
             return {"tool_calls": calls}
 
         settings.agentaus_skill_library = True
-        served = mock.patch.object(server, "with_library_skills",
+        served = mock.patch.object(agentaus_turn, "with_library_skills",
                                    lambda body: (body, frozenset({"cache-notes"})))
         served.start()
         self.addCleanup(served.stop)
@@ -235,7 +236,7 @@ class RoundLimit(_Loop):
             return {"tool_calls": [(bridge_tools.SEARCH_TOOL, {"query": "cache reload", "path": "/tmp"})]}
 
         settings.agentaus_skill_library = True
-        served = mock.patch.object(server, "with_library_skills",
+        served = mock.patch.object(agentaus_turn, "with_library_skills",
                                    lambda body: (body, frozenset({"cache-notes"})))
         served.start()
         self.addCleanup(served.stop)

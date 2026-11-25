@@ -35,6 +35,7 @@ from agentaus_bridge import (augment, flight, graph, import_guard, ledger, repai
                              server, throttle)
 from agentaus_bridge.config import settings  # noqa: E402
 from agentaus_bridge.translate import AnthropicStreamBuilder  # noqa: E402
+from agentaus_bridge import stream_delivery, tool_handling, upstream_http  # noqa: E402
 
 
 def run(coro):
@@ -250,7 +251,7 @@ class Heartbeat(_WithStub):
         async def go():
             out = [builder.start()]
             box: dict = {}
-            async for beat in server._waiting(asyncio.sleep(0.35, result="answer"), builder,
+            async for beat in stream_delivery._waiting(asyncio.sleep(0.35, result="answer"), builder,
                                               box, every=0.1):
                 out.append(beat)
             out.append(builder.text(box["value"]))
@@ -275,7 +276,7 @@ class Heartbeat(_WithStub):
         builder = AnthropicStreamBuilder("agentaus")
         builder.start()
         builder.text("half an answer")
-        self.assertEqual(server._heartbeat(builder, 60), b"")
+        self.assertEqual(stream_delivery._heartbeat(builder, 60), b"")
 
     def test_a_turn_waiting_on_the_upstream_streams_heartbeats(self):
         self.stub(lambda p: (200, 0.45, "hello after a long wait"))
@@ -405,7 +406,7 @@ class Flights(_WithStub):
         async def go():
             flight.reset()
             started = time.monotonic()
-            r = await server._answer_buffered(Gone(), "k2", slow, "agentaus")
+            r = await stream_delivery._answer_buffered(Gone(), "k2", slow, "agentaus")
             waited = time.monotonic() - started
             f = flight._flights.get("k2")
             await asyncio.sleep(1.0)
@@ -452,7 +453,7 @@ class AlwaysStreamed(_WithStub):
             transport = httpx.MockTransport(lambda r: httpx.Response(
                 200, text=sse, headers={"content-type": "text/event-stream"}))
             async with httpx.AsyncClient(transport=transport) as c:
-                return await server._post_with_retry(c, "http://x", json_body={}, headers={},
+                return await upstream_http._post_with_retry(c, "http://x", json_body={}, headers={},
                                                       stream_upstream=True)
         data = run(go()).json()
         message = data["choices"][0]["message"]
@@ -491,7 +492,7 @@ class HealthEndpoint(_WithStub):
             transport = throttle.LimitedTransport(
                 httpx.MockTransport(lambda r: httpx.Response(200, json={})), adaptive=lambda: gate)
             async with httpx.AsyncClient(transport=transport) as c:
-                call = asyncio.ensure_future(server._post_with_retry(
+                call = asyncio.ensure_future(upstream_http._post_with_retry(
                     c, "http://x", json_body={}, headers={}))
                 await asyncio.sleep(0.2)
                 await gate.release(True)
@@ -605,7 +606,7 @@ class EditRepair(unittest.TestCase):
             every = {"id": "3", "name": "Edit", "arguments": json.dumps({
                 "file_path": path, "old_string": "  order", "new_string": "  ordering",
                 "replace_all": True})}
-            broken = server._validate_tool_calls([first, second, every], {"Edit": schema}, cwd)
+            broken = tool_handling._validate_tool_calls([first, second, every], {"Edit": schema}, cwd)
             self.assertEqual(broken, [])
             self.assertEqual(json.loads(first["arguments"])["old_string"], "    if depth < 6:")
             self.assertEqual(json.loads(second["arguments"])["new_string"],
@@ -614,7 +615,7 @@ class EditRepair(unittest.TestCase):
             again = {"id": "4", "name": "Edit", "arguments": json.dumps({
                 "file_path": path, "old_string": "    if depth < 7:\n        return None",
                 "new_string": "    if depth < 6:\n        return None"})}
-            [(call, message)] = server._validate_tool_calls([again], {"Edit": schema}, cwd)
+            [(call, message)] = tool_handling._validate_tool_calls([again], {"Edit": schema}, cwd)
             self.assertIn("already in", message)
 
     def test_a_refused_edit_gets_the_closest_lines_with_their_indentation(self):
@@ -769,7 +770,7 @@ if __name__ == "__main__":
 class RetryForever(unittest.TestCase):
     def test_retries_are_unbounded_by_default_and_back_off_to_a_cap(self):
         from agentaus_bridge.config import Settings
-        from agentaus_bridge.server import _retry_delay
+        from agentaus_bridge.upstream_http import _retry_delay
         s = Settings()
         self.assertGreater(s.max_retries, 1000)
         self.assertGreaterEqual(s.retry_max_delay_seconds, 300)
