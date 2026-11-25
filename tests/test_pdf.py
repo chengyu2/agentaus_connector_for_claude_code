@@ -1,7 +1,9 @@
 """The PDF ladder: tier order, the readability gate, and where OCR is spent."""
 
+import glob
 import logging
 import os
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -12,6 +14,37 @@ from agentaus_bridge.config import settings
 
 READABLE = "The quick brown fox jumps over the lazy dog, repeatedly and at length. " * 3
 FEED = "\x0c"
+SCAN = "The quick brown fox jumps over the lazy dog."
+
+
+def _write_one_page_pdf(path, text):
+    """A minimal single-page PDF, xref offsets included.
+
+    Built rather than committed as a fixture: for the OCR tests the text only has to
+    be visible once pdftoppm rasterises the page. Sized to fit the MediaBox - text
+    wider than the page is clipped off the raster and unreadable.
+    """
+    stream = f"BT /F1 20 Tf 72 700 Td ({text}) Tj ET".encode()
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+        b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    out += b"".join(b"%010d 00000 n \n" % off for off in offsets)
+    out += (b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+            % (len(objs) + 1, xref))
+    with open(path, "wb") as handle:
+        handle.write(bytes(out))
 
 
 class Pages(unittest.TestCase):
@@ -124,6 +157,57 @@ class Ladder(unittest.TestCase):
     def test_a_pdf_nothing_can_read_yields_no_text_rather_than_an_exception(self):
         pdf.TEXT_TIERS = (("nothing", lambda p: None),)
         self.assertEqual(pdf.extract(self.path), "")
+
+
+class TesseractOCR(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ocr-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.pdf = os.path.join(self.dir, "scan.pdf")
+
+    def test_absent_tools_skip_the_tier(self):
+        with mock.patch.object(pdf, "_tool", return_value=None), \
+                mock.patch.object(pdf.subprocess, "run") as run:
+            self.assertEqual(pdf._tesseract_ocr(self.pdf, [0]), {})
+        run.assert_not_called()
+
+    def test_the_rasteriser_writes_into_a_temp_dir_never_stdout(self):
+        """pdftoppm's no-prefix output cannot be relied on: poppler 24.x wrote it to
+        stdout, 26.x drops a PNG in the CWD instead - leaving stdout empty for
+        tesseract, so every scanned page was skipped. Ask for a temp-dir file."""
+        with mock.patch.object(pdf, "_tool", side_effect=lambda n: "/x/" + n), \
+                mock.patch.object(pdf.subprocess, "run") as run:
+            pdf._tesseract_ocr(self.pdf, [0])
+        argv = run.call_args_list[0].args[0]
+        self.assertIn("-singlefile", argv)
+        self.assertTrue(argv[-1].startswith(tempfile.gettempdir()),
+                        "the PNG prefix must sit in a temp dir, not the CWD")
+
+
+@unittest.skipUnless(pdf._tool("tesseract") and pdf._tool("pdftoppm"),
+                     "tesseract and poppler not installed")
+class RealTesseractOCR(TesseractOCR):
+    """The installed tools themselves, not stubs: tested wherever they are installed."""
+
+    def setUp(self):
+        super().setUp()
+        _write_one_page_pdf(self.pdf, SCAN)
+
+    def test_a_rasterised_page_is_read(self):
+        recovered = pdf._tesseract_ocr(self.pdf, [0])
+        self.assertIn("quick brown fox", recovered.get(0, "").lower())
+
+    def test_ocr_leaves_no_png_in_the_working_directory(self):
+        scratch = tempfile.mkdtemp(prefix="ocr-cwd-")
+        self.addCleanup(shutil.rmtree, scratch, True)
+        previous = os.getcwd()
+        os.chdir(scratch)
+        try:
+            pdf._tesseract_ocr(self.pdf, [0])
+            self.assertEqual(glob.glob(os.path.join(scratch, "*.png")), [],
+                             "the rasterised page must be cleaned up, not left in the CWD")
+        finally:
+            os.chdir(previous)
 
 
 class Routing(unittest.TestCase):

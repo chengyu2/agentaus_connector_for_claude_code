@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import contextvars
 import hashlib
+import itertools
 import json
 import logging
 import random
@@ -471,6 +472,13 @@ class _Phase:
 _RETRYABLE_STATUS = {402, 408, 425, 429, 500, 502, 503, 504,
                      520, 521, 522, 523, 524, 525, 526, 527}
 
+# The passthrough talks to Anthropic, whose 402 is a billing error - a final answer
+# about the client's account, not an outage. Retrying it with backoff would stall the
+# turn for nothing, so 402 is explicitly excluded here while the Agentaus policy above
+# keeps it deliberately for its own quota outages (the throttle waits those out).
+# Everything else - gateway blips, capacity - stays retryable.
+_PASSTHROUGH_RETRYABLE_STATUS = _RETRYABLE_STATUS - {402}
+
 # Connection-level faults that never reached the application upstream. A DNS blip
 # ("nodename nor servname provided") arrives as ConnectError; a dropped keep-alive
 # socket arrives as RemoteProtocolError or ConnectError depending on timing.
@@ -502,21 +510,26 @@ def _retry_delay(attempt: int) -> float:
     calls alongside the main turn, and without it they would all retry in lockstep and
     re-hammer an upstream that is already struggling.
     """
-    base = settings.retry_backoff_seconds * (2 ** min(attempt, 30))
-    return min(base, settings.retry_max_delay_seconds) + random.uniform(
-        0, settings.retry_backoff_seconds
-    )
-
-
-# A failed gateway attempt usually took Agentaus's ~125 s timeout before it failed.
-_FAILED_ATTEMPT_S = 125.0
+    backoff = settings.retry_backoff_seconds
+    ceiling = settings.retry_max_delay_seconds
+    base = backoff * (2 ** min(attempt, 30))
+    # Bound the TOTAL at the ceiling while keeping jitter alive at saturation - a
+    # fleet of clients retrying a long outage must not fall back into lockstep, which
+    # is exactly what capping after the jitter would cause. So one jitter interval is
+    # reserved under the ceiling: below saturation the curve is unchanged, at
+    # saturation the pause still spreads over the final interval [ceiling - backoff, ceiling].
+    # A ceiling tighter than one backoff interval leaves no room to reserve, so there
+    # the pause just spreads over [0, ceiling].
+    if ceiling <= backoff:
+        return random.uniform(0, max(ceiling, 0.0))
+    return min(base, ceiling - backoff) + random.uniform(0, backoff)
 
 
 def _is_rate_limited(why: str) -> bool:
     return why.startswith("HTTP 429")
 
 
-async def _sleep_before_retry(attempt: int, why: str) -> None:
+async def _sleep_before_retry(attempt: int, why: str, attempt_s: float = 0.0) -> None:
     delay = _retry_delay(attempt)
     if _is_rate_limited(why):
         # A 429 (Agentaus or the Anthropic passthrough) waits at most
@@ -527,8 +540,10 @@ async def _sleep_before_retry(attempt: int, why: str) -> None:
         delay = min(delay, ceiling * random.uniform(0.5, 1.0))
     rlog(logging.WARNING, "upstream attempt %d failed (%s); retrying in %.2fs", attempt + 1, why, delay)
     # Neither the failed attempt nor this wait counts against the turn's timeout: retrying
-    # through a slump is waiting, not being wedged (see flight.Flight.served).
-    flight.note_wait(delay + (_FAILED_ATTEMPT_S if why.startswith(("HTTP 52", "HTTP 504", "ReadTimeout")) else 0.0))
+    # through a slump is waiting, not being wedged (see flight.Flight.served). The attempt
+    # is credited for how long it actually took - a gateway failure dies near the 125 s
+    # timeout, a refused connection in milliseconds - not for a flat guess.
+    flight.note_wait(delay + max(0.0, attempt_s))
     await asyncio.sleep(delay)
 
 
@@ -625,6 +640,7 @@ async def _post_with_retry(
     failed_before = False
     for attempt in range(settings.max_retries + 1):
         throttle.REQUEST_KIND.set(kind if not failed_before or kind != "normal" else "retry")
+        attempt_started = time.monotonic()
         try:
             async with _watching_for_stall(f"upstream POST (attempt {attempt + 1})"):
                 if stream_upstream:
@@ -637,7 +653,8 @@ async def _post_with_retry(
             if (not _is_retryable_exception(exc) or attempt == settings.max_retries
                     or (give_up is not None and give_up())):
                 raise
-            await _sleep_before_retry(attempt, _describe(exc))
+            await _sleep_before_retry(
+                attempt, _describe(exc), time.monotonic() - attempt_started)
             continue
         finally:
             throttle.REQUEST_KIND.set("normal")
@@ -657,7 +674,8 @@ async def _post_with_retry(
                      "it", response.status_code)
                 return response
             await response.aread()  # release the connection before sleeping
-            await _sleep_before_retry(attempt, f"HTTP {response.status_code}")
+            await _sleep_before_retry(
+                attempt, f"HTTP {response.status_code}", time.monotonic() - attempt_started)
             continue
         if response.status_code == 200 and attempt < settings.max_retries:
             # An HTTP 200 carrying an error object: retry it when it is the upstream's own
@@ -668,7 +686,8 @@ async def _post_with_retry(
                 in_band = None
             if isinstance(in_band, dict) and _is_transient(str(in_band.get("message") or "")):
                 await _sleep_before_retry(
-                    attempt, f"in-band: {str(in_band.get('message'))[:60]}")
+                    attempt, f"in-band: {str(in_band.get('message'))[:60]}",
+                    time.monotonic() - attempt_started)
                 continue
         return response
 
@@ -926,12 +945,43 @@ async def _stream_helper(
     return reply
 
 
+def _without_bridge_tools(payload: dict) -> dict:
+    """The payload with the bridge's own tools taken off, and a turn asking it to settle.
+
+    The first answer to a spent search budget. Taking every tool away ended the agent's
+    turn even when its next step was to run a test or make the edit, so only the tools
+    the budget counts are withdrawn: Claude Code's stay, and a call to one of them goes
+    to the client like any other. Only when the model still asks for a search is it
+    asked again with nothing at all - see _answer_without_tools.
+    """
+    kept = [t for t in payload.get("tools") or []
+            if ((t or {}).get("function") or {}).get("name") not in bridge_tools.BRIDGE_TOOLS]
+    out = {k: v for k, v in payload.items() if k not in ("tools", "tool_choice")}
+    if kept:
+        out["tools"] = kept
+        out["tool_choice"] = "auto"
+    out["messages"] = list(out.get("messages") or []) + [{
+        "role": "user",
+        "content": prompt_style.section(
+            "task",
+            "Your search budget for this turn is spent, and the search tools are gone. "
+            "Do not search again, with Bash or any other tool: what you found is above."
+            "\n\nIf it is enough, give the answer now, in the format originally asked "
+            "for. If the task needs a step that is not a search - running a test, "
+            "reading a file you already know, making an edit - take it with the tools "
+            "you still have.",
+        ),
+    }]
+    return out
+
+
 async def _answer_without_tools(client: httpx.AsyncClient, payload: dict) -> str:
     """Ask for an answer from what is already in the conversation, tools removed.
 
-    Used where the model has the material and will not settle: it has searched its budget
-    away, or it returned nothing at all. Taking the tools off the request removes the
-    option it keeps choosing, and everything it found is still in the messages.
+    The last resort, where the model has the material and will not settle: it still asked
+    for a search after _without_bridge_tools took the search tools away, or it returned
+    nothing twice. Taking the tools off the request removes the option it keeps choosing,
+    and everything it found is still in the messages.
 
     Returns "" on any failure, so the caller can fall back to saying what happened.
     """
@@ -1344,21 +1394,24 @@ def _with_forced_answer(data: dict, text: str) -> dict:
     return {**data, "choices": [choice] + choices[1:]}
 
 
-def _without_bridge_calls(data: dict) -> dict:
+def _without_bridge_calls(data: dict, drop: set | None = None) -> dict:
     """Strip bridge-owned tool calls from a response.
 
     Needed when the tool-round budget runs out with one still pending: Claude Code has
     never heard of `agentaus_search` and would fail the tool_use rather than run it, so
-    an unanswered bridge call must never be surfaced.
+    an unanswered bridge call must never be surfaced. `drop` names more calls by id: a
+    `Skill` call for a library skill is the bridge's too, but its name doesn't say so.
     """
     choices = list(data.get("choices") or [])
     if not choices:
         return data
     choice = dict(choices[0] or {})
     message = dict(choice.get("message") or {})
+    drop = drop or ()
     kept = [
         call for call in (message.get("tool_calls") or [])
         if ((call.get("function") or {}).get("name") or "") not in bridge_tools.BRIDGE_TOOLS
+        and call.get("id") not in drop
     ]
     message["tool_calls"] = kept or None
     if not kept and not (message.get("content") or "").strip():
@@ -2384,6 +2437,11 @@ def _is_over_length(text: str) -> bool:
 # it: it classified a 3,642-token payload as "possibly too big" and spent eight minutes
 # recompacting 3% of a context window while a six-token probe to the same endpoint was
 # also timing out.
+#
+# (Without a real tokeniser the estimate itself is only chars/4, so this threshold is
+# effectively half the window: _worth_refitting doubles the fallback estimate, because
+# an under-count there misclassifies an oversized request as a sick upstream and replays
+# it into the same timeout forever.)
 _REFIT_WORTH_TRYING_ABOVE = 1.0
 
 
@@ -2392,10 +2450,19 @@ def _worth_refitting(body: dict, limit: int) -> bool:
 
     Distinguishes "the conversation does not fit" from "the upstream is unwell". Both
     arrive as HTTP 524 and only the first is something the bridge can act on.
+
+    Without a real tokeniser the estimate is chars/4, which under-counts dense payloads
+    by roughly 2x - enough to turn "does not fit the window" into "fits", so the estimate
+    is doubled before comparing. Over-counting refits a conversation that would have
+    fitted anyway; under-counting never breaks the replay-into-the-same-timeout loop
+    this function exists to stop.
     """
     if limit <= 0:
         return False
-    return estimate_request_tokens(body) > limit * _REFIT_WORTH_TRYING_ABOVE
+    estimate = estimate_request_tokens(body)
+    if not _has_tokeniser():
+        estimate *= 2
+    return estimate > limit * _REFIT_WORTH_TRYING_ABOVE
 
 
 def _degraded_upstream_message(tokens: int, limit: int) -> str:
@@ -2967,7 +3034,16 @@ async def _handle_agentaus(
         # prose, or with a tool only Claude Code can run.
         corrections = 0
         ran: dict = {}
-        for tool_round in range(settings.agentaus_tool_rounds + 1):
+        # Each re-ask below happens once: the bridge's tools withdrawn at the round limit,
+        # and an empty reply sent again unchanged.
+        cut_off = False
+        empty_retried = False
+        # Charged only for rounds that run bridge tools, as on the streamed path: a
+        # correction or a re-ask is not work the budget is for.
+        tool_round = 0
+        # Unbounded on its face, bounded by what continues it: corrections, bridge rounds
+        # and the two re-asks above each have their own limit.
+        for _ in itertools.count():
             # Agentaus is the authority on whether a prompt fits. If it says no, it also
             # says what its real limit is, so the next attempt compacts against that
             # instead of against our estimate.
@@ -3081,6 +3157,15 @@ async def _handle_agentaus(
                      "rounds to correct them", len(broken))
             _guard_imports(_theirs, received, cwd)
             data = _with_coerced_calls(data, mine + _theirs)
+            # An empty reply is never a valid answer, but it is not a reason to take the
+            # tools away either: the first one is sent again as it was.
+            if (not calls and not empty_retried and not (
+                    ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+                    or "").strip()):
+                empty_retried = True
+                rlog(logging.WARNING, "upstream returned an empty answer; asking again "
+                     "with the same tools")
+                continue
             if not mine:
                 data = _with_reads_first(data, _theirs, received)
                 if invented:
@@ -3089,6 +3174,7 @@ async def _handle_agentaus(
                     data = _without_unknown_calls(data, known)
                 break
             if tool_round < settings.agentaus_tool_rounds:
+                tool_round += 1
                 rlog(logging.INFO, "running %d bridge tool call(s): %s",
                      len(mine), ", ".join(c["name"] for c in mine))
                 payload = await _run_bridge_tools(
@@ -3100,10 +3186,19 @@ async def _handle_agentaus(
             rlog(logging.WARNING,
                  "tool round limit (%d) reached; dropping %d unanswered bridge call(s)",
                  settings.agentaus_tool_rounds, len(mine))
+            if _theirs:
+                # Claude Code still has work to run, so the turn goes on without a re-ask.
+                data = _without_bridge_calls(data, drop={c["id"] for c in mine if c.get("id")})
+                break
+            if not cut_off:
+                cut_off = True
+                payload = _without_bridge_tools(payload)
+                continue
             # Everything those searches found is still in the payload, so ask again with
             # the tools removed rather than surfacing an apology for having searched.
             forced = await _answer_without_tools(client, payload)
-            data = _with_forced_answer(data, forced) if forced else _without_bridge_calls(data)
+            data = _with_forced_answer(data, forced) if forced else _without_bridge_calls(
+                data, drop={c["id"] for c in mine if c.get("id")})
             break
 
         choice0 = (data.get("choices") or [{}])[0]
@@ -3443,6 +3538,10 @@ async def _unguarded_event_stream(
     tool_round = 0
     corrections = 0
     ran: dict = {}
+    # Each re-ask below happens once: the bridge's tools withdrawn at the round limit,
+    # and an empty reply sent again unchanged.
+    cut_off = False
+    empty_retried = False
     # The tool_choice to put back after a stall re-ask that forced one. See below.
     forced_from = None
     # (answer, task): the answer's check, started beside the stall check. See below.
@@ -3472,6 +3571,7 @@ async def _unguarded_event_stream(
             usage = None
             accumulator = ToolCallAccumulator()
             retry_reason: str | None = None
+            attempt_started = time.monotonic()
             throttle.REQUEST_KIND.set(
                 "retry" if failed_once and request_kind == "normal" else request_kind)
 
@@ -3676,7 +3776,8 @@ async def _unguarded_event_stream(
             if retry_reason:
                 if live_started:
                     yield progress(f"retrying: {retry_reason}")
-                await _sleep_before_retry(attempt, retry_reason)
+                await _sleep_before_retry(
+                    attempt, retry_reason, time.monotonic() - attempt_started)
                 attempt += 1
                 continue
             break
@@ -3770,6 +3871,25 @@ async def _unguarded_event_stream(
                 rlog(logging.DEBUG, "discarded %d chars of interim narration",
                      len("".join(pending)))
             pending = []
+            continue
+        if mine and not theirs and not cut_off:
+            # Out of rounds with a search still wanted. Withdraw the search tools but not
+            # Claude Code's, so a next step that is not a search can still be taken.
+            cut_off = True
+            rlog(logging.WARNING,
+                 "tool round limit (%d) reached; dropping %d unanswered bridge call(s) "
+                 "and asking again without the bridge's tools",
+                 settings.agentaus_tool_rounds, len(mine))
+            yield progress("search budget spent; asking for the answer")
+            payload = _without_bridge_tools(payload)
+            pending = []
+            continue
+        # An empty reply is never a valid answer, but it is not a reason to take the tools
+        # away either: the first one is sent again as it was.
+        if not calls and not emitted and not "".join(pending).strip() and not empty_retried:
+            empty_retried = True
+            rlog(logging.WARNING, "upstream returned an empty answer; asking again with "
+                 "the same tools")
             continue
         # A turn that used no tools and claims it has none is not an answer. Whether it
         # IS that is a judgement about language, so Agentaus makes it - behind a
@@ -3916,6 +4036,12 @@ async def _unguarded_event_stream(
             rlog(logging.WARNING,
                  "tool round limit (%d) reached; dropping %d unanswered bridge call(s)",
                  settings.agentaus_tool_rounds, len(mine))
+            if buffering and pending and not theirs:
+                # Narration before a search that will not run promises work that never
+                # happens. The forced answer replaces it, as it does unbuffered.
+                rlog(logging.DEBUG, "discarded %d chars of interim narration",
+                     len("".join(pending)))
+                pending = []
             if not pending and not theirs:
                 # Every one of those searches is still in the payload. Asking again with
                 # the tools REMOVED forces the model to answer from what it gathered,
@@ -3931,6 +4057,13 @@ async def _unguarded_event_stream(
                     "I searched without reaching an answer. Narrow the question and I "
                     "will try again."
                 ]
+                if not buffering:
+                    # Only a buffered answer is emitted below; a live one is sent here.
+                    yield builder.text(pending[0])
+            if not theirs:
+                # The dropped search left "tool_calls" here, and the turn now has none -
+                # also when the model narrated before searching again after the cut-off.
+                finish_reason = "stop"
         break
 
     # Same repair as the buffered path: a non-breaking hyphen in a filename looks
@@ -4146,18 +4279,24 @@ async def _passthrough(request: Request, raw: bytes) -> Response:
             request.method, url, headers=headers, content=_upload_slices(raw)
         )
         try:
+            attempt_started = time.monotonic()
             upstream = await client.send(upstream_request, stream=True)
         except httpx.HTTPError as exc:
             if not _is_retryable_exception(exc) or attempt == settings.max_retries:
                 return _error_response(
                     502, "api_error", f"Upstream Anthropic request failed: {_describe(exc)}"
                 )
-            await _sleep_before_retry(attempt, _describe(exc))
+            await _sleep_before_retry(
+                attempt, _describe(exc), time.monotonic() - attempt_started)
             continue
 
-        if upstream.status_code in _RETRYABLE_STATUS and attempt < settings.max_retries:
+        # Anthropic's own retry policy, not the Agentaus one: 402 is a billing error
+        # here and goes straight back to the client with its body untouched.
+        if upstream.status_code in _PASSTHROUGH_RETRYABLE_STATUS and attempt < settings.max_retries:
             await upstream.aclose()
-            await _sleep_before_retry(attempt, f"HTTP {upstream.status_code}")
+            await _sleep_before_retry(
+                attempt, f"HTTP {upstream.status_code}",
+                time.monotonic() - attempt_started)
             continue
         break
 

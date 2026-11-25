@@ -329,18 +329,51 @@ class TestBackoffCurve(unittest.TestCase):
         from agentaus_bridge.server import _retry_delay
 
         # Jitter is bounded by retry_backoff_seconds, so compare worst-case to
-        # best-case: attempt N's floor must exceed attempt N-1's ceiling.
+        # best-case: attempt N's floor must exceed attempt N-1's ceiling. Attempt 3
+        # is saturated - its base fills the interval reserved under the ceiling -
+        # so its floor is ceiling - backoff; holding 2**3 there would require
+        # pinning every retry to exactly the ceiling, i.e. no jitter at all.
+        floors = (1.0, 2.0, 4.0, 8.0 - 1.0)
         for attempt in range(4):
             lo = min(_retry_delay(attempt) for _ in range(200))
             hi = max(_retry_delay(attempt) for _ in range(200))
-            self.assertGreaterEqual(lo, 2**attempt, f"attempt {attempt} floor too low")
+            self.assertGreaterEqual(lo, floors[attempt], f"attempt {attempt} floor too low")
             self.assertLessEqual(hi, min(2**attempt, 8.0) + 1.0, f"attempt {attempt} ceiling")
 
     def test_delay_is_capped(self):
         from agentaus_bridge.server import _retry_delay
 
         # Without a cap, attempt 20 would be 2**20 seconds - a 12-day wait.
-        self.assertLessEqual(_retry_delay(20), 8.0 + 1.0)
+        # The cap bounds the total, so jitter may not push the pause past it either.
+        for _ in range(200):
+            self.assertLessEqual(_retry_delay(20), 8.0)
+
+    def test_saturated_delay_keeps_jitter(self):
+        from agentaus_bridge.server import _retry_delay
+
+        # Capping after the jitter would flatten every saturated retry to exactly
+        # the ceiling - lockstep retries, the thing the jitter exists to prevent.
+        # Instead the pause spreads over the interval reserved under the ceiling.
+        draws = [_retry_delay(20) for _ in range(200)]
+        self.assertGreater(max(draws) - min(draws), 0.5, "jitter dies at the cap")
+        self.assertGreaterEqual(min(draws), 8.0 - 1.0)
+        self.assertLessEqual(max(draws), 8.0)
+
+    def test_ceiling_tighter_than_backoff_stays_bounded(self):
+        from agentaus_bridge.config import settings
+        from agentaus_bridge.server import _retry_delay
+
+        # A deadline tighter than one backoff interval leaves nothing to reserve;
+        # the pause must still land inside [0, ceiling].
+        saved = (settings.retry_backoff_seconds, settings.retry_max_delay_seconds)
+        try:
+            settings.retry_backoff_seconds, settings.retry_max_delay_seconds = 2.0, 1.0
+            for _ in range(200):
+                delay = _retry_delay(20)
+                self.assertGreaterEqual(delay, 0.0)
+                self.assertLessEqual(delay, 1.0)
+        finally:
+            settings.retry_backoff_seconds, settings.retry_max_delay_seconds = saved
 
 
 class TestTimeoutIsTreatedAsTooBig(unittest.TestCase):
@@ -500,6 +533,35 @@ class TestSmallRequestTimeoutsAreNotBlamedOnSize(unittest.TestCase):
         body = {"messages": [{"role": "user", "content": "x " * 200_000}]}
         self.assertTrue(_worth_refitting(body, 131072))
 
+    def test_no_tokeniser_still_refits_a_request_that_does_not_fit(self):
+        """The chars/4 fallback under-counts dense payloads by ~2x, which turns a
+        request that does not fit into one that apparently does - and the refit decision
+        then sends the identical oversized payload into the same timeout forever. The
+        decision must correct for the fallback's known error instead of trusting it."""
+        from unittest import mock
+
+        from agentaus_bridge import server, tokens
+
+        body = {"messages": [{"role": "user", "content": "x " * 200_000}]}
+        with mock.patch.object(tokens, "_ENCODING", None), \
+                mock.patch.object(server, "_has_tokeniser", lambda: False):
+            # chars/4 puts this at ~100k against a 131k window: exactly the reading
+            # that must not be trusted at this threshold.
+            self.assertLess(server.estimate_request_tokens(body), 131_072)
+            self.assertTrue(server._worth_refitting(body, 131072))
+
+    def test_no_tokeniser_does_not_refit_a_request_that_clearly_fits(self):
+        """The correction is for the fallback's error, not a new size ceiling: a
+        comfortably small request stays a sick-upstream 524 even without tiktoken."""
+        from unittest import mock
+
+        from agentaus_bridge import server, tokens
+
+        body = {"messages": [{"role": "user", "content": "x " * 40_000}]}
+        with mock.patch.object(tokens, "_ENCODING", None), \
+                mock.patch.object(server, "_has_tokeniser", lambda: False):
+            self.assertFalse(server._worth_refitting(body, 131072))
+
     def test_over_length_still_drives_recompaction_on_its_own_signal(self):
         """The explicit error is the primary path; the 524 heuristic is the backstop."""
         from agentaus_bridge.server import _is_over_length
@@ -573,3 +635,69 @@ class RateLimitBackoffIsShort(unittest.TestCase):
         wait = self._429_waits(0.0, lambda a, b: b)[0]
         self.assertGreater(wait, 0.0)
         self.assertLessEqual(wait, 1.0)
+
+
+class FailedAttemptsAreCreditedForRealElapsed(unittest.TestCase):
+    """A failed attempt is credited for how long it actually took, not a flat guess.
+
+    The old code credited a flat 125 s to any failure reported as HTTP 52x, 504 or
+    ReadTimeout, whatever it really took, and nothing to any other failure. Flight.served
+    subtracts `waited` from the turn clock, so the guess padded or shortened
+    BRIDGE_TURN_TIMEOUT by however far it was from the real attempt.
+    """
+
+    def test_a_failed_attempt_is_credited_what_it_actually_took(self):
+        import asyncio
+        from unittest import mock
+
+        import httpx
+
+        from agentaus_bridge import server
+        from agentaus_bridge.config import settings
+
+        class _Refused:
+            async def post(self, url, *, json=None, headers=None):  # noqa: A002
+                await asyncio.sleep(0.2)
+                raise httpx.ConnectError("connection refused")
+
+        noted = []
+        saved = (settings.retry_backoff_seconds, settings.max_retries,
+                 settings.stall_warning_seconds)
+        settings.retry_backoff_seconds = 0.001
+        settings.max_retries = 2
+        loop = asyncio.new_event_loop()
+        try:
+            with mock.patch.object(settings, "stall_warning_seconds", 0.0), \
+                 mock.patch.object(server.flight, "note_wait", noted.append):
+                with self.assertRaises(httpx.ConnectError):
+                    loop.run_until_complete(server._post_with_retry(
+                        _Refused(), "http://x", json_body={}, headers={}))
+        finally:
+            loop.close()
+            (settings.retry_backoff_seconds, settings.max_retries,
+             settings.stall_warning_seconds) = saved
+
+        self.assertTrue(noted, "a retried failure must credit some waiting")
+        for wait in noted:
+            self.assertGreaterEqual(wait, 0.2, "the attempt's real duration was not credited")
+            self.assertLess(wait, 1.0, "a fast-failing attempt was credited ~125 s of waiting")
+
+    def test_the_credit_matches_the_attempt_passed_in(self):
+        import asyncio
+        from unittest import mock
+
+        from agentaus_bridge import server
+        from agentaus_bridge.config import settings
+
+        noted = []
+
+        async def fake_sleep(s):
+            pass
+
+        with mock.patch.object(settings, "retry_backoff_seconds", 0.0), \
+             mock.patch.object(server.flight, "note_wait", noted.append), \
+             mock.patch.object(server.asyncio, "sleep", fake_sleep):
+            asyncio.run(server._sleep_before_retry(0, "HTTP 524", 37.0))
+            # A negative measurement is a bug in the caller; never credit it.
+            asyncio.run(server._sleep_before_retry(0, "ReadTimeout", -3.0))
+        self.assertEqual(noted, [37.0, 0.0])

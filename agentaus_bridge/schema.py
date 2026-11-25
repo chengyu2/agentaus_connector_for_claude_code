@@ -126,7 +126,13 @@ def check(value, schema: dict, path: str = "") -> list[str]:
     problems: list[str] = []
 
     types = [t for t in _types_of(schema) if t in _TYPES]
-    if types and value is not None:
+    if value is None:
+        # Present-but-null is valid only where the schema itself permits null, not
+        # merely because the field is optional - the client's validator rejects the
+        # null either way, so name it here in a sentence the model can act on.
+        if types and not _nullable(schema):
+            return [f"{_named(path)} must be {' or '.join(types)}, but you sent null."]
+    elif types:
         # bool is an int in Python and never what a numeric field wants.
         def fits(name: str) -> bool:
             return isinstance(value, _TYPES[name]) and not (
@@ -137,17 +143,21 @@ def check(value, schema: dict, path: str = "") -> list[str]:
 
     if isinstance(value, dict):
         properties = schema.get("properties") or {}
+        reported = set()
         for key in schema.get("required") or []:
             # Present-but-null is missing only where the field cannot be null. Strict
             # output schemas make every field required and the optional ones nullable,
             # so a valid null was being "corrected" until the rounds ran out.
             if key not in value or (value[key] is None
                                     and not _nullable(properties.get(key))):
+                reported.add(key)
                 problems.append(
                     f"{_named(path)} is missing the required field `{key}`."
                 )
         for key, item in value.items():
-            if key in properties:
+            # A null the required loop just called missing needs no second report
+            # of the same fault from the recursion below.
+            if key in properties and not (item is None and key in reported):
                 problems += check(item, properties[key], f"{path}.{key}" if path else key)
 
     elif isinstance(value, list):

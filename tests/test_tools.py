@@ -77,7 +77,8 @@ class TestSearchFindsWhatRegexCannot(unittest.TestCase):
             call = responder(terms="Semaphore\nasyncio", hit_on="gate.py",
                              answer="2: _limit = asyncio.Semaphore(6)")
             out = run(tools.run_search(
-                "where do we cap concurrent calls", tree.path, None, call))
+                "where do we cap concurrent calls", tree.path, None, call,
+                default_path=tree.path))
 
         self.assertIn("Semaphore(6)", out)
         self.assertIn("gate.py", out)
@@ -90,7 +91,7 @@ class TestSearchFindsWhatRegexCannot(unittest.TestCase):
         }) as tree:
             # Expansion returns a term present in no file, so nothing is shortlisted.
             call = responder(terms="zzzznotpresent", hit_on="b.py", answer="2: return 2")
-            out = run(tools.run_search("what does it return", tree.path, None, call))
+            out = run(tools.run_search("what does it return", tree.path, None, call, default_path=tree.path))
 
         self.assertIn("b.py", out)
         chunk_prompts = [p for p in call.seen if "<excerpt file=" in p]
@@ -112,7 +113,7 @@ class TestSearchFindsWhatRegexCannot(unittest.TestCase):
         with _Tree(files) as tree:
             call = responder(terms="MARKER_SCNFR11", hit_on="needle.py",
                              answer="1: MARKER_SCNFR11 = 'the answer'")
-            out = run(tools.run_search("what is the marker", tree.path, None, call))
+            out = run(tools.run_search("what is the marker", tree.path, None, call, default_path=tree.path))
 
         chunk_prompts = [p for p in call.seen if "<excerpt file=" in p]
         self.assertTrue(chunk_prompts, "no chunks were read at all")
@@ -127,14 +128,14 @@ class TestResultsAreReportedHonestly(unittest.TestCase):
     def test_none_answers_are_dropped(self):
         with _Tree({"a.py": "x = 1\n", "b.py": "y = 2\n"}) as tree:
             call = responder(terms="x\ny", hit_on="a.py", answer="1: x = 1")
-            out = run(tools.run_search("where is x", tree.path, None, call))
+            out = run(tools.run_search("where is x", tree.path, None, call, default_path=tree.path))
         self.assertIn("a.py", out)
         self.assertNotIn("b.py", out)
 
     def test_no_hits_says_so_rather_than_returning_nothing(self):
         with _Tree({"a.py": "x = 1\n"}) as tree:
             call = responder(terms="x", hit_on="nothing-matches-this")
-            out = run(tools.run_search("where is the parser", tree.path, None, call))
+            out = run(tools.run_search("where is the parser", tree.path, None, call, default_path=tree.path))
         self.assertIn("No excerpt", out)
         self.assertIn("Searched", out)
 
@@ -146,7 +147,7 @@ class TestResultsAreReportedHonestly(unittest.TestCase):
         try:
             with _Tree(files) as tree:
                 call = responder(terms="value", hit_on="f0.py", answer="1: value = 0")
-                out = run(tools.run_search("where is value", tree.path, None, call))
+                out = run(tools.run_search("where is value", tree.path, None, call, default_path=tree.path))
         finally:
             settings.agentaus_search_max_chunks = previous
 
@@ -164,7 +165,7 @@ class TestResultsAreReportedHonestly(unittest.TestCase):
                 if "<question>" in prompt and "<excerpt" not in prompt and "list the literal strings" in prompt.lower():
                     return "x"
                 return "1: see $$retry_budget_ms$$ in EU‑WEST‑2"
-            out = run(tools.run_search("where is x", tree.path, None, call))
+            out = run(tools.run_search("where is x", tree.path, None, call, default_path=tree.path))
 
         self.assertIn("`retry_budget_ms`", out)
         self.assertIn("EU-WEST-2", out)
@@ -201,10 +202,109 @@ class TestWhatItRefusesToRead(unittest.TestCase):
             previous = settings.agentaus_search_roots
             settings.agentaus_search_roots = "/nonexistent-root"
             try:
-                out = run(tools.run_search("where is x", tree.path, None, responder()))
+                out = run(tools.run_search("where is x", tree.path, None, responder(), default_path=tree.path))
             finally:
                 settings.agentaus_search_roots = previous
         self.assertIn("AGENTAUS_SEARCH_ROOTS", out)
+
+    def test_explicit_roots_still_allow_a_named_root(self):
+        previous = settings.agentaus_search_roots
+        with _Tree({"a.py": "x = 1\n"}) as tree:
+            settings.agentaus_search_roots = tree.path
+            try:
+                out = run(tools.run_search(
+                    "where is x", tree.path, None,
+                    responder(terms="x", hit_on="a.py", answer="1: x = 1"),
+                    default_path="/somewhere-else-entirely"))
+            finally:
+                settings.agentaus_search_roots = previous
+        self.assertIn("a.py", out)
+
+    def test_empty_roots_allow_the_request_working_directory(self):
+        """An empty AGENTAUS_SEARCH_ROOTS is not "read anything".
+
+        The reads never reach Claude Code's permission prompts, so without a default
+        the only thing between a search and, say, the home directory was the model's
+        good sense. Empty now means "the working directory the request named".
+        """
+        with _Tree({"a.py": "x = 1\n"}) as tree:
+            out = run(tools.run_search(
+                "where is x", tree.path, None,
+                responder(terms="x", hit_on="a.py", answer="1: x = 1"),
+                default_path=tree.path))
+        self.assertIn("a.py", out)
+
+    def test_the_default_working_directory_expands_a_home_shortcut(self):
+        with _Tree({"a.py": "x = 1\n"}) as tree:
+            previous = os.environ.get("HOME")
+            os.environ["HOME"] = tree.path
+            try:
+                out = run(tools.run_inventory(tree.path, None, default_path="~"))
+            finally:
+                if previous is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = previous
+        self.assertIn("a.py", out)
+
+    def test_empty_roots_refuse_a_sibling_of_the_working_directory(self):
+        with _Tree({"a.py": "x = 1\n"}) as tree, \
+                _Tree({"secret.py": "key = 'leak'\n"}) as sibling:
+            out = run(tools.run_search("where is the key", sibling.path, None,
+                                       responder(), default_path=tree.path))
+        self.assertIn("outside the session's working directory", out)
+
+    def test_empty_roots_confine_inventory_to_the_working_directory(self):
+        with _Tree({"a.py": "x = 1\n"}) as tree:
+            inside = run(tools.run_inventory(tree.path, None, default_path=tree.path))
+            with _Tree({"secret.py": "key = 'leak'\n"}) as sibling:
+                outside = run(tools.run_inventory(sibling.path, None,
+                                                  default_path=tree.path))
+        self.assertIn("a.py", inside)
+        self.assertIn("outside the session's working directory", outside)
+
+    def test_empty_roots_confine_zoom_to_the_working_directory(self):
+        with _Tree({"doc.md": "one\ntwo\n"}) as tree:
+            inside = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2,
+                                        default_path=tree.path))
+            with _Tree({"secret.py": "key = 'leak'\n"}) as sibling:
+                outside = run(tools.run_zoom(os.path.join(sibling.path, "secret.py"),
+                                             1, 1, default_path=tree.path))
+        self.assertIn("two", inside)
+        self.assertIn("outside the session's working directory", outside)
+
+    def test_empty_roots_refuse_investigate_outside_the_working_directory(self):
+        """One refusal up front, not three searches that each discover it."""
+        call = responder()
+        with _Tree({"a.py": "x = 1\n"}) as tree, \
+                _Tree({"b.py": "y = 2\n"}) as sibling:
+            out = run(tools.run_investigate("where is y", sibling.path, call,
+                                            default_path=tree.path))
+        self.assertIn("outside the session's working directory", out)
+        self.assertEqual([p for p in call.seen if "<excerpt file=" in p], [],
+                         "it searched the outside tree anyway")
+
+    def test_the_process_cwd_is_the_fallback_when_no_request_named_one(self):
+        tree_dir = tempfile.mkdtemp()
+        with open(os.path.join(tree_dir, "a.py"), "w") as fh:
+            fh.write("x = 1\n")
+        sibling = tempfile.mkdtemp()
+        with open(os.path.join(sibling, "secret.py"), "w") as fh:
+            fh.write("key = 'leak'\n")
+        previous = os.getcwd()
+        try:
+            os.chdir(tree_dir)
+            inside = run(tools.run_search(
+                "where is x", tree_dir, None,
+                responder(terms="x", hit_on="a.py", answer="1: x = 1")))
+            outside = run(tools.run_search("where is the key", sibling, None, responder()))
+        finally:
+            os.chdir(previous)
+            import shutil
+            shutil.rmtree(tree_dir, True)
+            shutil.rmtree(sibling, True)
+        self.assertIn("a.py", inside)
+        self.assertIn("outside the session's working directory", outside)
 
     def test_a_failing_tool_becomes_output_rather_than_an_exception(self):
         async def broken(_: str) -> str:
@@ -214,7 +314,8 @@ class TestWhatItRefusesToRead(unittest.TestCase):
             # Expansion failing must not end the turn; it falls back to the query's
             # own words and carries on.
             out = run(tools.execute(
-                tools.SEARCH_TOOL, {"query": "where is x", "path": tree.path}, broken))
+                tools.SEARCH_TOOL, {"query": "where is x", "path": tree.path}, broken,
+                default_path=tree.path))
         self.assertIsInstance(out, str)
         self.assertTrue(out)
 
@@ -239,7 +340,7 @@ class TestConcurrency(unittest.TestCase):
         gate.reset()
         try:
             with _Tree(files) as tree:
-                run(tools.run_search("where is value", tree.path, None, slow))
+                run(tools.run_search("where is value", tree.path, None, slow, default_path=tree.path))
         finally:
             settings.agentaus_max_concurrency, settings.max_concurrency_is_explicit = previous
             gate.reset()
@@ -412,7 +513,7 @@ class TestZoom(unittest.TestCase):
             path = os.path.join(tree.path, "doc.md")
             cited = self.DOC.splitlines().index(
                 "The core service holds ISO/IEC 27001 certification.") + 1
-            out = run(tools.run_zoom(path, cited, cited))
+            out = run(tools.run_zoom(path, cited, cited, default_path=tree.path))
 
         self.assertIn("## Security", out, "the heading that names the passage was lost")
         self.assertIn("Essential 8 Maturity Level 2", out, "neighbouring evidence was lost")
@@ -422,7 +523,7 @@ class TestZoom(unittest.TestCase):
         with _Tree({"doc.md": self.DOC}) as tree:
             path = os.path.join(tree.path, "doc.md")
             cited = self.DOC.splitlines().index("Hosted in Vault Cloud.") + 1
-            out = run(tools.run_zoom(path, cited, cited))
+            out = run(tools.run_zoom(path, cited, cited, default_path=tree.path))
         line = next(l for l in out.splitlines() if "Vault Cloud" in l)
         self.assertTrue(line.strip().startswith(str(cited)),
                         f"line number missing or wrong: {line!r}")
@@ -432,7 +533,7 @@ class TestZoom(unittest.TestCase):
         call = self.stub()
         with _Tree({"doc.md": self.DOC}) as tree:
             path = os.path.join(tree.path, "doc.md")
-            run(tools.run_zoom(path, 5, 5))
+            run(tools.run_zoom(path, 5, 5, default_path=tree.path))
         self.assertEqual(call.seen, [], "it called the model on a passage that already fit")
 
     # The window is trimmed to fit the budget now, so condensation only fires when the
@@ -442,7 +543,7 @@ class TestZoom(unittest.TestCase):
 
     def test_a_line_past_the_end_says_so(self):
         with _Tree({"doc.md": "one\ntwo\n"}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 999, None))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 999, None, default_path=tree.path))
         self.assertIn("past the end", out)
 
     def test_a_docx_is_refused_only_when_it_cannot_be_read(self):
@@ -451,7 +552,7 @@ class TestZoom(unittest.TestCase):
         settings.agentaus_office_extract = False
         try:
             with _Tree({"r.docx": "PK\x03\x04binary"}) as tree:
-                out = run(tools.run_zoom(os.path.join(tree.path, "r.docx"), 1, 1))
+                out = run(tools.run_zoom(os.path.join(tree.path, "r.docx"), 1, 1, default_path=tree.path))
         finally:
             settings.agentaus_office_extract = previous
         self.assertIn("no reader for it is", out)
@@ -467,7 +568,7 @@ class TestZoom(unittest.TestCase):
     def test_search_output_points_at_zoom(self):
         with _Tree({"a.py": "x = 1\n"}) as tree:
             call = responder(terms="x", hit_on="a.py", answer="1: x = 1")
-            out = run(tools.run_search("where is x", tree.path, None, call))
+            out = run(tools.run_search("where is x", tree.path, None, call, default_path=tree.path))
         self.assertIn(tools.ZOOM_TOOL, out,
                       "a citation is only useful if the model knows it can open it")
 
@@ -493,7 +594,7 @@ class TestZoomWindowFloor(unittest.TestCase):
     def test_a_tiny_section_is_widened_to_something_readable(self):
         """Bold lines are weak boundaries - a passage may grow through them."""
         with _Tree({"doc.md": self.BOLD_HEAVY}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 90, 90))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 90, 90, default_path=tree.path))
         body = [l for l in out.splitlines()
                 if l.strip() and l.split()[0].isdigit()]
         self.assertGreaterEqual(len(body), 20,
@@ -504,21 +605,21 @@ class TestZoomWindowFloor(unittest.TestCase):
         body = ("# First subject\n" + "content of the first\n" * 5
                 + "# Second subject\n" + "content of the second\n" * 5)
         with _Tree({"doc.md": body}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 3, 3))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 3, 3, default_path=tree.path))
         self.assertIn("first", out)
         self.assertNotIn("Second subject", out,
                          "the passage grew through a heading into another subject")
 
     def test_the_cited_line_stays_inside_the_window(self):
         with _Tree({"doc.md": self.BOLD_HEAVY}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 90, 90))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 90, 90, default_path=tree.path))
         nums = [int(l.split()[0]) for l in out.splitlines() if l.strip() and l.split()[0].isdigit()]
         self.assertLessEqual(min(nums), 90)
         self.assertGreaterEqual(max(nums), 90)
 
     def test_a_short_file_is_not_padded_past_its_end(self):
         with _Tree({"doc.md": "one\ntwo\nthree\n"}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2, default_path=tree.path))
         nums = [int(l.split()[0]) for l in out.splitlines() if l.strip() and l.split()[0].isdigit()]
         self.assertLessEqual(max(nums), 3)
 
@@ -597,7 +698,7 @@ class TestLearnedCapacity(unittest.TestCase):
         settings.agentaus_search_chunk_tokens = 40_000   # one chunk, so it must split
         try:
             with _Tree({"big.md": body}) as tree:
-                out = run(tools.run_search("where is the cap", tree.path, None, flaky))
+                out = run(tools.run_search("where is the cap", tree.path, None, flaky, default_path=tree.path))
         finally:
             settings.agentaus_search_chunk_tokens = previous
 
@@ -625,7 +726,7 @@ class TestZoomIsNormallyFree(unittest.TestCase):
             raise AssertionError("zoom spent a model call on a passage that fits")
 
         with _Tree({"doc.md": prose}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 200, 200))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 200, 200, default_path=tree.path))
         self.assertIn("Paragraph 200", out)
 
     def test_a_passage_stays_small_enough_to_send(self):
@@ -637,7 +738,7 @@ class TestZoomIsNormallyFree(unittest.TestCase):
             raise AssertionError("condensed a passage that should be returned verbatim")
 
         with _Tree({"doc.md": prose}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 300, 300))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 300, 300, default_path=tree.path))
 
         self.assertIn("Paragraph 300", out, "the cited line fell outside the window")
         self.assertLess(len(out), 40_000,
@@ -660,20 +761,20 @@ class TestZoomNeverCallsAModel(unittest.TestCase):
 
     def test_a_short_passage_is_verbatim(self):
         with _Tree({"doc.md": "# H\nalpha\nbeta\ngamma\n"}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2, default_path=tree.path))
         self.assertIn("alpha", out)
         self.assertIn("verbatim", out)
 
     def test_an_enormous_cited_line_is_truncated_not_condensed(self):
         with _Tree({"doc.md": "intro\n" + "x" * 400_000 + "\ntail\n"}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 2, 2, default_path=tree.path))
         self.assertIn("xxx", out, "the passage was lost")
         self.assertIn("verbatim", out, "the header must still promise verbatim text")
 
     def test_the_header_states_the_range_actually_returned(self):
         body = "\n".join(f"line {i} " + "y" * 400 for i in range(400))
         with _Tree({"doc.md": body}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 200, 200))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 200, 200, default_path=tree.path))
         header = out.splitlines()[0]
         shown = [int(l.split()[0]) for l in out.splitlines()[1:]
                  if l.strip() and l.split()[0].isdigit()]
@@ -686,7 +787,7 @@ class TestZoomNeverCallsAModel(unittest.TestCase):
         """A range of hundreds of lines is not a citation, and cannot be trimmed."""
         body = "\n".join(f"line {i}" for i in range(2000))
         with _Tree({"doc.md": body}) as tree:
-            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 10, 1900))
+            out = run(tools.run_zoom(os.path.join(tree.path, "doc.md"), 10, 1900, default_path=tree.path))
         self.assertLess(len(out), 60_000, "a 1890-line 'citation' was returned whole")
 
 
@@ -720,7 +821,7 @@ class TestZoomSizesInTokensOnly(unittest.TestCase):
         sizes = []
         for name, body in (("code.py", code), ("prose.md", prose)):
             with _Tree({name: body}) as tree:
-                out = run(tools.run_zoom(os.path.join(tree.path, name), 2000, 2000))
+                out = run(tools.run_zoom(os.path.join(tree.path, name), 2000, 2000, default_path=tree.path))
             sizes.append(len(out))
         ratio = max(sizes) / min(sizes)
         self.assertLess(ratio, 3.0,

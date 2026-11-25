@@ -1850,11 +1850,21 @@ def should_think(body: dict) -> bool:
 # prompt - so without lifting the path out explicitly the planner has no idea where the
 # code is. Observed live: it planned to "ask user for the codebase source (repo URL,
 # internal path, or name)" while the answer was sitting in the system prompt all along.
+#
+# The path is the rest of the line, not the first word: a directory may contain spaces
+# (`/Users/me/GitHub Repo/proj`), and this path is also the root the bridge confines its own
+# file reads to, so a path cut at the first space both refused the real project and admitted
+# a sibling of its prefix. A quoted path is taken up to its closing quote.
+_CWD_VALUE = r"""[ \t]*(?:"([^"\n]+)"|'([^'\n]+)'|`([^`\n]+)`|([^\n]+))"""
 _CWD_PATTERNS = (
-    re.compile(r"(?:primary\s+)?working\s+directory[^\n:]*:\s*(\S+)", re.I),
-    re.compile(r"\bcwd\b[^\n:]*:\s*(\S+)", re.I),
-    re.compile(r"current\s+(?:working\s+)?dir(?:ectory)?[^\n:]*:\s*(\S+)", re.I),
+    re.compile(r"(?:primary\s+)?working\s+directory[^\n:]*:" + _CWD_VALUE, re.I),
+    re.compile(r"\bcwd\b[^\n:]*:" + _CWD_VALUE, re.I),
+    re.compile(r"current\s+(?:working\s+)?dir(?:ectory)?[^\n:]*:" + _CWD_VALUE, re.I),
 )
+
+# An absolute path as Claude Code states it: POSIX (`/`, `~`) or native Windows - a drive
+# letter (`C:\Users\me`, `C:/Users/me`) or a UNC share (`\\server\share`).
+_ABSOLUTE_CWD = re.compile(r"^(?:[/~]|[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)")
 
 
 def working_directory_of(body: dict) -> str | None:
@@ -1882,10 +1892,10 @@ def working_directory(system) -> str | None:
     else:
         return None
     for pattern in _CWD_PATTERNS:
-        found = pattern.search(text)
-        if found:
-            path = found.group(1).strip().strip("`'\".,")
-            if path.startswith("/") or path.startswith("~"):
+        for found in pattern.finditer(text):
+            quoted = found.group(1) or found.group(2) or found.group(3)
+            path = quoted.strip() if quoted else found.group(4).strip().strip("`'\".,").rstrip()
+            if _ABSOLUTE_CWD.match(path):
                 return path
     return None
 

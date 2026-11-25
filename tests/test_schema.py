@@ -169,6 +169,36 @@ class Constraints(unittest.TestCase):
         self.assertTrue(any("questions[0].options[1]" in p for p in problems))
 
 
+class Nulls(unittest.TestCase):
+    """Present-but-null is valid only where the schema itself permits null.
+
+    Optional is not nullable: a model sending `"limit": null` for an optional field
+    was being forwarded to a validator that rejects the null either way.
+    """
+
+    def test_a_null_in_an_optional_non_nullable_field_is_reported(self):
+        _, problems = schema.validate({"file_path": "/a", "limit": None}, READ)
+        self.assertTrue(any("`limit`" in p and "null" in p for p in problems))
+
+    def test_a_null_is_fine_where_the_schema_permits_it(self):
+        nullable = {"type": "object", "properties": {
+            "note": {"type": ["string", "null"]},
+            "also": {"type": "string", "nullable": True},
+        }}
+        self.assertEqual(schema.validate({"note": None, "also": None}, nullable)[1], [])
+
+    def test_a_null_passes_where_the_schema_says_nothing_about_the_type(self):
+        bare = {"type": "object", "properties": {"note": {}}}
+        self.assertEqual(schema.validate({"note": None}, bare)[1], [])
+
+    def test_a_null_required_field_is_still_reported_once_as_missing(self):
+        strict = {"type": "object", "required": ["n"],
+                  "properties": {"n": {"type": "integer"}}}
+        _, problems = schema.validate({"n": None}, strict)
+        self.assertEqual(problems,
+                         ["the arguments is missing the required field `n`."])
+
+
 class NoSchema(unittest.TestCase):
     def test_a_tool_with_no_published_schema_is_left_alone(self):
         """Absence of a schema is not licence to reject the call."""

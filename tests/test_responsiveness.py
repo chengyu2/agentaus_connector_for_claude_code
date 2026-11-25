@@ -93,7 +93,7 @@ class ToolsDoNotBlockTheLoop(unittest.TestCase):
                     ticks += 1
 
             beat = asyncio.ensure_future(ticker())
-            await tools.execute("agentaus_inventory", {"path": root}, _no_model)
+            await tools.execute("agentaus_inventory", {"path": root}, _no_model, root)
             beat.cancel()
             return ticks
 
@@ -118,7 +118,7 @@ class ToolsDoNotBlockTheLoop(unittest.TestCase):
 
             beat = asyncio.ensure_future(ticker())
             result = await tools.execute(
-                "agentaus_zoom", {"file_path": path, "start_line": 1}, _no_model)
+                "agentaus_zoom", {"file_path": path, "start_line": 1}, _no_model, root)
             beat.cancel()
             return ticks, result
 
@@ -142,7 +142,7 @@ class ToolDeadline(unittest.TestCase):
         root = _tree(40)
         with _SlowDocuments(0.2):
             started = time.monotonic()
-            result = run(tools.execute("agentaus_inventory", {"path": root}, _no_model))
+            result = run(tools.execute("agentaus_inventory", {"path": root}, _no_model, root))
             elapsed = time.monotonic() - started
         self.assertIn("stopped after", result)
         self.assertIn("narrow `path`", result)
@@ -153,7 +153,7 @@ class ToolDeadline(unittest.TestCase):
         # check inside the reads, this one would go on converting all 40 files.
         root = _tree(40)
         with _SlowDocuments(0.05) as slow:
-            run(tools.execute("agentaus_inventory", {"path": root}, _no_model))
+            run(tools.execute("agentaus_inventory", {"path": root}, _no_model, root))
             time.sleep(0.4)
             settled = slow.reads
             time.sleep(0.3)
@@ -164,13 +164,13 @@ class ToolDeadline(unittest.TestCase):
         settings.agentaus_tool_timeout_seconds = 0
         root = _tree(3)
         with _SlowDocuments(0.01):
-            result = run(tools.execute("agentaus_inventory", {"path": root}, _no_model))
+            result = run(tools.execute("agentaus_inventory", {"path": root}, _no_model, root))
         self.assertNotIn("stopped after", result)
 
     def test_the_deadline_does_not_leak_past_the_call(self):
         root = _tree(2)
         with _SlowDocuments(0.0):
-            run(tools.execute("agentaus_inventory", {"path": root}, _no_model))
+            run(tools.execute("agentaus_inventory", {"path": root}, _no_model, root))
         self.assertIsNone(tools._deadline.get())
 
 
@@ -195,7 +195,7 @@ class WalkBounds(unittest.TestCase):
             files, truncated = tools.enumerate_files_bounded(root)
             self.assertEqual(len(files), 5)
             self.assertTrue(truncated)
-            listing = run(tools.execute("agentaus_inventory", {"path": root}, _no_model))
+            listing = run(tools.execute("agentaus_inventory", {"path": root}, _no_model, root))
             self.assertIn("Stopped listing at 5 files", listing)
         finally:
             settings.agentaus_search_max_files = saved

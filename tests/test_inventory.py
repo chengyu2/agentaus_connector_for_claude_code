@@ -110,7 +110,8 @@ class AsATool(unittest.TestCase):
             return ""
 
         with Tree({"a.md": "# A\n", "b.py": "def f():\n    pass\n"}) as tree:
-            out = run(tools.execute("agentaus_inventory", {"path": tree.path}, never))
+            out = run(tools.execute("agentaus_inventory", {"path": tree.path}, never,
+                                    tree.path))
         self.assertIn("<inventory", out)
         self.assertEqual(calls, [], "an inventory must not cost a model call")
 
@@ -128,7 +129,7 @@ class AsATool(unittest.TestCase):
     def test_a_glob_narrows_it(self):
         with Tree({"a.md": "# A\n", "b.py": "x = 1\n"}) as tree:
             out = run(tools.execute("agentaus_inventory",
-                                    {"path": tree.path, "glob": "*.md"}, lambda t: None))
+                                    {"path": tree.path, "glob": "*.md"}, lambda t: None, tree.path))
         self.assertIn("a.md", out)
         self.assertNotIn("b.py", out)
 
@@ -140,7 +141,7 @@ class AsATool(unittest.TestCase):
         with Tree({"a.md": "# A\n", ".env": "KEY=x\n",
                    "credentials.json": "{}\n"}) as tree:
             out = run(tools.execute("agentaus_inventory", {"path": tree.path},
-                                    lambda t: None))
+                                    lambda t: None, tree.path))
         self.assertIn("a.md", out)
         self.assertNotIn(".env", out)
         self.assertNotIn("credentials.json", out)
