@@ -21,6 +21,7 @@ import random
 import re
 import time
 import uuid
+from pathlib import Path
 from collections import OrderedDict
 from typing import AsyncIterator, Callable
 
@@ -524,6 +525,11 @@ def _quality_page() -> str:
 @app.get("/", response_class=HTMLResponse)
 async def ui_root() -> HTMLResponse:
     return HTMLResponse(_quality_page())
+
+
+@app.get("/chess", response_class=HTMLResponse)
+async def chess_ui() -> HTMLResponse:
+    return HTMLResponse((Path(__file__).parent / "chess.html").read_text(encoding="utf-8"))
 
 
 _CLEAR_CONTEXT_NEXT: bool = False
