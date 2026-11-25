@@ -573,3 +573,69 @@ class RateLimitBackoffIsShort(unittest.TestCase):
         wait = self._429_waits(0.0, lambda a, b: b)[0]
         self.assertGreater(wait, 0.0)
         self.assertLessEqual(wait, 1.0)
+
+
+class FailedAttemptsAreCreditedForRealElapsed(unittest.TestCase):
+    """A failed attempt is credited for how long it actually took, not a flat guess.
+
+    The old code credited a flat 125 s to any failure reported as HTTP 52x, 504 or
+    ReadTimeout, whatever it really took, and nothing to any other failure. Flight.served
+    subtracts `waited` from the turn clock, so the guess padded or shortened
+    BRIDGE_TURN_TIMEOUT by however far it was from the real attempt.
+    """
+
+    def test_a_failed_attempt_is_credited_what_it_actually_took(self):
+        import asyncio
+        from unittest import mock
+
+        import httpx
+
+        from agentaus_bridge import server
+        from agentaus_bridge.config import settings
+
+        class _Refused:
+            async def post(self, url, *, json=None, headers=None):  # noqa: A002
+                await asyncio.sleep(0.2)
+                raise httpx.ConnectError("connection refused")
+
+        noted = []
+        saved = (settings.retry_backoff_seconds, settings.max_retries,
+                 settings.stall_warning_seconds)
+        settings.retry_backoff_seconds = 0.001
+        settings.max_retries = 2
+        loop = asyncio.new_event_loop()
+        try:
+            with mock.patch.object(settings, "stall_warning_seconds", 0.0), \
+                 mock.patch.object(server.flight, "note_wait", noted.append):
+                with self.assertRaises(httpx.ConnectError):
+                    loop.run_until_complete(server._post_with_retry(
+                        _Refused(), "http://x", json_body={}, headers={}))
+        finally:
+            loop.close()
+            (settings.retry_backoff_seconds, settings.max_retries,
+             settings.stall_warning_seconds) = saved
+
+        self.assertTrue(noted, "a retried failure must credit some waiting")
+        for wait in noted:
+            self.assertGreaterEqual(wait, 0.2, "the attempt's real duration was not credited")
+            self.assertLess(wait, 1.0, "a fast-failing attempt was credited ~125 s of waiting")
+
+    def test_the_credit_matches_the_attempt_passed_in(self):
+        import asyncio
+        from unittest import mock
+
+        from agentaus_bridge import server
+        from agentaus_bridge.config import settings
+
+        noted = []
+
+        async def fake_sleep(s):
+            pass
+
+        with mock.patch.object(settings, "retry_backoff_seconds", 0.0), \
+             mock.patch.object(server.flight, "note_wait", noted.append), \
+             mock.patch.object(server.asyncio, "sleep", fake_sleep):
+            asyncio.run(server._sleep_before_retry(0, "HTTP 524", 37.0))
+            # A negative measurement is a bug in the caller; never credit it.
+            asyncio.run(server._sleep_before_retry(0, "ReadTimeout", -3.0))
+        self.assertEqual(noted, [37.0, 0.0])
