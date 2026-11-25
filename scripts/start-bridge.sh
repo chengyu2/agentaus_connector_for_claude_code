@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+    #!/usr/bin/env bash
 # Start the Agentaus bridge in the foreground. Ctrl-C to stop.
 set -euo pipefail
 cd "$(dirname "$0")/.."
