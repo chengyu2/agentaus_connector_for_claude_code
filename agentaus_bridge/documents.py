@@ -252,6 +252,9 @@ def extract(path: str) -> str:
 
     binary = soffice()
     with tempfile.TemporaryDirectory(prefix="agentaus-office-") as workdir:
+        # A failed conversion is returned but not cached: a one-off timeout, crash or
+        # profile fight would otherwise read as "no content" for the life of the
+        # process. The next call retries the conversion and caches only a success.
         try:
             subprocess.run(
                 [
@@ -270,17 +273,14 @@ def extract(path: str) -> str:
             )
         except subprocess.TimeoutExpired:
             log.warning("LibreOffice timed out converting %s", path)
-            _remember(key, "")
             return ""
         except (subprocess.CalledProcessError, OSError) as exc:
             log.warning("LibreOffice could not convert %s (%s)", path, exc)
-            _remember(key, "")
             return ""
 
         produced = sorted(Path(workdir).glob("*.htm*"), key=lambda p: -p.stat().st_size)
         if not produced:
             log.warning("LibreOffice produced no output for %s", path)
-            _remember(key, "")
             return ""
         text = html_to_text(produced[0].read_text(errors="replace"))
 
