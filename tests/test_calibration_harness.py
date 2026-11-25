@@ -214,6 +214,16 @@ class ToolErrorsReachTheModel(unittest.TestCase):
                              "arguments": json.dumps({"path": "pkg/mod.py", "content": "x"})}}
         self.assertIn("Permission denied", agent._execute(call, box, None))
 
+    def test_write_file_refuses_a_sibling_of_work(self):
+        from benchmarks.calibration import sandbox
+        with tempfile.TemporaryDirectory() as tmp:
+            box = sandbox.Sandbox.__new__(sandbox.Sandbox)
+            box.tmp = Path(tmp)
+            (box.tmp / "work").mkdir()
+            self.assertIn("refused", box.write_file("../workx/a", "x"))
+            self.assertFalse((box.tmp / "workx").exists())
+            self.assertIn("wrote", box.write_file("pkg/a.py", "x"))
+
     def test_reading_a_binary_file_returns_text(self):
         import subprocess
         from benchmarks.calibration import sandbox

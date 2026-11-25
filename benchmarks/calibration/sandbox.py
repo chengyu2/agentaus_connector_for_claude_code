@@ -55,7 +55,7 @@ class Sandbox:
 
     def write_file(self, path: str, content: str) -> str:
         target = self.tmp / "work" / Path(path.removeprefix("/work/")).as_posix().lstrip("/")
-        if not str(target.resolve()).startswith(str((self.tmp / "work").resolve())):
+        if not target.resolve().is_relative_to((self.tmp / "work").resolve()):
             return "[refused: path is outside /work]"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content)
