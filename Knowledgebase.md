@@ -876,9 +876,7 @@ summarisation byte-for-byte.
   it is; injecting a short line costs ~60 tokens versus the ~3,500-token rewrite the model
   would otherwise produce, and `tests/test_identity.py` enforces it.
 - **`status.py`** — **single source of truth for "what is wrong right now"** (its own
-  docstring role, for Agentaus and the Anthropic passthrough on this branch; the docstring's
-  Gemini clause belongs to a separate branch — there is no `gemini.py`/`test_gemini.py`
-  here). Every producer of a struggling upstream — retries and adaptive limits — reports
+  docstring role, for Agentaus and the Anthropic passthrough on this branch). Every producer of a struggling upstream — retries and adaptive limits — reports
   one line here; the `compacting`/`compaction_fallback` incident kinds are defined
   (status.py:44-45) but no producer currently records them on this branch; every consumer
   (the `/status` page, the Windows toast, recent history) reads the assembled picture. The
