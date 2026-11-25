@@ -38,8 +38,8 @@ class TestRequestScopedLogging(unittest.TestCase):
         source = _bridge_source()
         bare = re.findall(r"^\s*log\.(?:info|warning|error)\(", source, re.M)
 
-        # Only the two startup lines may be bare: they belong to no request.
-        self.assertLessEqual(len(bare), 2,
+        # Only the three startup lines may be bare: they belong to no request.
+        self.assertLessEqual(len(bare), 3,
                              f"{len(bare)} request-path log calls have no request id")
 
     def test_log_helper_prefixes_the_id(self):

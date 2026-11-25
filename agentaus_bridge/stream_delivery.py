@@ -133,6 +133,16 @@ async def _answer_buffered(request: Request, key: str, run, model: str) -> Respo
         "far). The bridge keeps it going: retry the request and it will get this turn's answer.")
 
 
+# How far ahead of a slow client the relay may queue. This is not backpressure on
+# the turn: a flight appends every upstream chunk to its own buffer whether or not
+# anyone reads it, and _keepalive's source for a turn is a reader of that buffer, so
+# the queue only holds extra references to chunks the flight already keeps. The
+# bound just stops the queue itself growing without limit. The consumer is always
+# draining (a get() is pending whenever the loop is waiting), so a bound cannot
+# stall a stream that is actually being read.
+_KEEPALIVE_QUEUE_BOUND = 256
+
+
 async def _keepalive(
     source: AsyncIterator[bytes],
     interval: float,
@@ -153,7 +163,9 @@ async def _keepalive(
 
     A turn from _handle_agentaus passes no deadline here: its flight holds it (flight.py).
     """
-    queue: asyncio.Queue = asyncio.Queue()
+    # Bounded (see _KEEPALIVE_QUEUE_BOUND). A bound means pump() can be parked in
+    # put() when the client leaves, which is why pump() closes its source itself.
+    queue: asyncio.Queue = asyncio.Queue(maxsize=_KEEPALIVE_QUEUE_BOUND)
     sentinel = object()
     started = time.monotonic()
     down_at_start = throttle.down_total()
@@ -162,13 +174,22 @@ async def _keepalive(
         return time.monotonic() - started - max(0.0, throttle.down_total() - down_at_start)
 
     async def pump() -> None:
+        # The end marker goes in only on a normal finish. When the client leaves, the
+        # finally below cancels this task, possibly while it waits in put() on a full
+        # queue; a put in a `finally` would then wait forever on a queue nobody reads.
+        # Closing the source on every exit runs its cleanup now rather than at some
+        # later garbage collection: for a turn, that detaches the client from its
+        # flight, so an abandoned turn still gets its grace period and cancellation.
         try:
             async for item in source:
                 await queue.put(item)
+            await queue.put(sentinel)
         except Exception as exc:  # surfaced to the consumer below
             await queue.put(exc)
         finally:
-            await queue.put(sentinel)
+            aclose = getattr(source, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     pump_task = asyncio.create_task(pump())
     getter: asyncio.Task | None = None

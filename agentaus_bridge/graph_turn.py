@@ -8,16 +8,25 @@ import logging
 
 from . import graph
 
-from .augment import awaiting_background, is_subagent_turn, workflow_opted_in, working_directory_of
+from .augment import (
+    _tools_used, awaiting_background, is_subagent_turn, workflow_offered, workflow_opted_in,
+    working_directory_of,
+)
 from .config import settings
 from .conversation_text import _last_user_text, _original_request, _user_texts, _without_reminders
 from .request_log import rlog
 
 
 def _graph_main_loop(body: dict) -> bool:
-    """A main loop whose `Workflow` call the bridge runs its graph in place of."""
+    """A main loop whose `Workflow` call the bridge runs its graph in place of. Opted in is not
+    enough: with `Workflow` still deferred there is no call to run the graph for, and treating
+    the session as one skipped the planning pass and held every write for a Workflow call
+    the model could not make. Nor once the main loop has delegated with `Agent` (as
+    `focus_tools` keeps `Agent` then): loading `Workflow` afterwards must not refuse the write
+    that merges the subagents' results, or relaunch the whole request as a graph."""
     return bool(settings.agentaus_workflow_graph and not is_subagent_turn(body)
-                and workflow_opted_in(body))
+                and workflow_opted_in(body) and workflow_offered(body)
+                and "Agent" not in _tools_used(body))
 
 
 def _writes_plain_text(body: dict) -> bool:

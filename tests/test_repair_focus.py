@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -83,6 +84,113 @@ class Arguments(unittest.TestCase):
     def test_what_cannot_be_repaired_is_still_reported(self):
         _, broken = self.fix("Write", {"content": "orphan"})
         self.assertEqual(len(broken), 1)
+
+
+class MultiEditFailures(unittest.TestCase):
+    """An edit in a MultiEdit that cannot be applied refuses the call as a whole - Claude
+    Code applies none of the group - so `pending` keeps the pre-call state and the
+    unexamined rest is reported rather than silent."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, "a.py")
+        with open(self.path, "w") as fh:
+            fh.write("x = 1\n")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def group(self, *edits):
+        return {"file_path": self.path, "edits": list(edits)}
+
+    def test_a_failed_middle_edit_leaves_pending_at_the_pre_call_state(self):
+        pending = {}
+        changed, _ = repair._repair_edits("MultiEdit", self.group(
+            {"old_string": "x = 1", "new_string": "x = 2"},
+            {"old_string": "not there", "new_string": "y"},
+            {"old_string": "x = 2", "new_string": "x = 3"}), pending)
+        self.assertEqual(pending, {}, "nothing lands, so the first edit's result must not "
+                         "stand as the file's expected state for the calls after it")
+        notice = "\n".join(changed)
+        self.assertIn("occurs 0 times", notice, "the blocker is named with its count")
+        self.assertIn("refused as a whole", notice, "the tail is not applied with the call")
+
+    def test_a_failed_group_does_not_clobber_what_an_earlier_call_left(self):
+        pending = {}
+        repair.repair({"name": "Edit", "arguments": {
+            "file_path": self.path, "old_string": "x = 1", "new_string": "x = 2"}},
+            "Edit", {}, None, pending)
+        self.assertEqual(pending[self.path], "x = 2\n")
+        repair._repair_edits("MultiEdit", self.group(
+            {"old_string": "not there", "new_string": "y"}), pending)
+        self.assertEqual(pending[self.path], "x = 2\n", "the earlier call's text stands")
+
+    def test_an_applying_group_still_leaves_its_result_in_pending(self):
+        pending = {}
+        changed, _ = repair._repair_edits("MultiEdit", self.group(
+            {"old_string": "x = 1", "new_string": "x = 2"},
+            {"old_string": "x = 2", "new_string": "x = 3"}), pending)
+        self.assertEqual((changed, pending[self.path]), ([], "x = 3\n"))
+
+    def test_a_failed_single_edit_leaves_pending_at_the_pre_call_state(self):
+        held = {self.path: "x = 1\n"}
+        changed, _ = repair._repair_edits("Edit", {
+            "file_path": self.path, "old_string": "not there", "new_string": "y"}, held)
+        self.assertIn("occurs 0 times", "\n".join(changed))
+        self.assertEqual(held[self.path], "x = 1\n")
+        absent = {}
+        repair._repair_edits("Edit", {"file_path": self.path, "old_string": "not there",
+                                      "new_string": "y"}, absent)
+        self.assertEqual(absent, {})
+
+    def test_a_malformed_edit_is_recorded_and_keeps_pending(self):
+        pending = {}
+        changed, _ = repair._repair_edits("MultiEdit", self.group(
+            {"old_string": "x = 1", "new_string": "x = 2"},
+            {"old_string": None, "new_string": "y"}), pending)
+        self.assertIn("not strings", "\n".join(changed))
+        self.assertEqual(pending, {})
+
+    def test_a_failed_replace_all_is_reported(self):
+        pending = {}
+        changed, correction = repair._repair_edits("Edit", {
+            "file_path": self.path, "old_string": "not there", "new_string": "y",
+            "replace_all": True}, pending)
+        self.assertIsNone(correction)
+        self.assertIn("not found", "\n".join(changed))
+        self.assertEqual(pending, {})
+
+    def test_each_failure_names_the_edit_that_failed(self):
+        changed, _ = repair._repair_edits("MultiEdit", self.group(
+            {"old_string": "x = 1", "new_string": "x = 2"},
+            {"old_string": "not there", "new_string": "y"}), {})
+        self.assertIn("edit 2: old_string occurs 0 times", "\n".join(changed))
+        changed, _ = repair._repair_edits("MultiEdit", self.group(
+            {"old_string": "x = 1", "new_string": "x = 2"},
+            {"old_string": "not there", "new_string": "y", "replace_all": True}), {})
+        self.assertIn("edit 2: old_string not found", "\n".join(changed))
+
+    def test_an_empty_old_string_gets_its_own_reason(self):
+        for extra in ({}, {"replace_all": True}):
+            pending = {}
+            changed, _ = repair._repair_edits("Edit", {
+                "file_path": self.path, "old_string": "", "new_string": "y", **extra}, pending)
+            notice = "\n".join(changed)
+            self.assertIn("edit 1: old_string is empty", notice)
+            self.assertNotIn("occurs", notice, "no len(text) + 1 count for an empty string")
+            self.assertEqual(pending, {})
+
+    def test_the_skipped_edits_show_in_the_repair_notice(self):
+        with self.assertLogs("agentaus-bridge", level="INFO") as logs:
+            repair.repair({"name": "MultiEdit", "arguments": self.group(
+                {"old_string": "x = 1", "new_string": "x = 2"},
+                {"old_string": "not there", "new_string": "y"},
+                {"old_string": "also not there", "new_string": "z"})},
+                "MultiEdit", {}, None, {})
+        notice = "\n".join(logs.output)
+        self.assertIn("occurs 0 times", notice)
+        self.assertIn("refused as a whole", notice)
+        self.assertIn("not applied", notice)
 
 
 def _tool(name):

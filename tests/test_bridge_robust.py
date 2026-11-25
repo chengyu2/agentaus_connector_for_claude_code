@@ -391,6 +391,49 @@ class Flights(_WithStub):
         self.assertTrue(f.done)
         self.assertIsNone(flight.find("k"))
 
+    def test_a_streamed_client_that_leaves_with_a_full_relay_queue_detaches(self):
+        # A re-send joining a long turn gets the whole buffer replayed at once, which fills
+        # _keepalive's bounded queue; the client then leaves (Esc, or another re-send).
+        # The relay must still detach it so the abandoned turn is cancelled after the grace,
+        # and must not leave its pump task behind.
+        settings.flight_grace_seconds = 0.2
+        backlog = stream_delivery._KEEPALIVE_QUEUE_BOUND * 4
+        ran = {"cancelled": False}
+
+        async def long_turn():
+            try:
+                for i in range(backlog):
+                    yield f"event: ping\ndata: {i}\n\n".encode()
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                ran["cancelled"] = True
+                raise
+
+        def relay_pumps():
+            return [t for t in asyncio.all_tasks() if not t.done()
+                    and t.get_coro().__qualname__ == "_keepalive.<locals>.pump"]
+
+        async def go():
+            flight.reset()
+            f = flight.start_stream("k3", long_turn())
+            while len(f.events) < backlog:
+                await asyncio.sleep(0.01)
+            relay = stream_delivery._keepalive(stream_delivery._relay(f), 30, lambda: b"ping")
+            await relay.__anext__()            # the client reads one chunk ...
+            await asyncio.sleep(0.05)          # ... the queue fills up behind it ...
+            await relay.aclose()               # ... and it hangs up
+            await asyncio.sleep(0.05)
+            detached = (f.subscribers, f.abandoned, len(relay_pumps()))
+            await asyncio.sleep(1.0)           # past the grace
+            return f, detached
+        f, (subscribers, abandoned, pumps) = run(go())
+        self.assertEqual(pumps, 0, "the relay's pump task is stuck")
+        self.assertEqual(subscribers, 0, "the client was never detached from the turn")
+        self.assertTrue(abandoned)
+        self.assertTrue(ran["cancelled"], "the abandoned turn was not cancelled after the grace")
+        self.assertTrue(f.done)
+        self.assertIsNone(flight.find("k3"))
+
     def test_a_buffered_client_that_disconnects_stops_waiting(self):
         settings.flight_grace_seconds = 0.2
 
