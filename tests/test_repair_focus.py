@@ -160,6 +160,26 @@ class MultiEditFailures(unittest.TestCase):
         self.assertIn("not found", "\n".join(changed))
         self.assertEqual(pending, {})
 
+    def test_each_failure_names_the_edit_that_failed(self):
+        changed, _ = repair._repair_edits("MultiEdit", self.group(
+            {"old_string": "x = 1", "new_string": "x = 2"},
+            {"old_string": "not there", "new_string": "y"}), {})
+        self.assertIn("edit 2: old_string occurs 0 times", "\n".join(changed))
+        changed, _ = repair._repair_edits("MultiEdit", self.group(
+            {"old_string": "x = 1", "new_string": "x = 2"},
+            {"old_string": "not there", "new_string": "y", "replace_all": True}), {})
+        self.assertIn("edit 2: old_string not found", "\n".join(changed))
+
+    def test_an_empty_old_string_gets_its_own_reason(self):
+        for extra in ({}, {"replace_all": True}):
+            pending = {}
+            changed, _ = repair._repair_edits("Edit", {
+                "file_path": self.path, "old_string": "", "new_string": "y", **extra}, pending)
+            notice = "\n".join(changed)
+            self.assertIn("edit 1: old_string is empty", notice)
+            self.assertNotIn("occurs", notice, "no len(text) + 1 count for an empty string")
+            self.assertEqual(pending, {})
+
     def test_the_skipped_edits_show_in_the_repair_notice(self):
         with self.assertLogs("agentaus-bridge", level="INFO") as logs:
             repair.repair({"name": "MultiEdit", "arguments": self.group(

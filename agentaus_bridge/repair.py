@@ -486,11 +486,16 @@ def _repair_edits(name: str, args: dict, pending: dict | None) -> tuple[list, st
             # keeps the pre-call state.
             changed.append(f"edit {n}: old_string/new_string not strings; not applied")
             break
+        if not old:
+            # Checked before any count: "" is in every text len(text) + 1 times, which made
+            # the notice below report a nonsense count.
+            changed.append(f"edit {n}: old_string is empty for {path}; not applied")
+            break
         if edit.get("replace_all"):
-            if old and old in text:
+            if old in text:
                 text = text.replace(old, new)
             else:
-                changed.append(f"old_string not found in {path}; replace_all not applied")
+                changed.append(f"edit {n}: old_string not found in {path}; replace_all not applied")
                 break
             continue
         fixed = repair_edit(text, old, new)
@@ -506,7 +511,9 @@ def _repair_edits(name: str, args: dict, pending: dict | None) -> tuple[list, st
         else:
             # The count is against the text the edits before this one leave - what Claude
             # Code itself matches when it refuses the group here and applies none of it.
-            changed.append(f"old_string occurs {text.count(old)} times in {path}; not applied")
+            why = (f"old_string occurs {text.count(old)} times in {path}" if old
+                   else f"old_string is empty for {path}")
+            changed.append(f"edit {n}: {why}; not applied")
             break
     else:
         if pending is not None:
