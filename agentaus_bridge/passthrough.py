@@ -115,6 +115,22 @@ def _warn_if_bridge_token_was_the_only_credential(request: Request, headers: dic
 # Anthropic passthrough
 # --------------------------------------------------------------------------------------
 
+_UPLOAD_SLICE = 64 * 1024
+
+
+async def _upload_slices(raw: bytes) -> AsyncIterator[bytes]:
+    """Yield a request body in slices so the write timeout applies to each slice.
+
+    httpcore writes one `bytes` body as a single chunk inside one write timeout, so a
+    multi-megabyte Claude request (screenshots make 3-20 MB common) had to finish
+    uploading within BRIDGE_CONNECT_TIMEOUT or fail with WriteTimeout and start over.
+    Per slice, a dead connection still times out but a slow uplink does not.
+    """
+    view = memoryview(raw)
+    for start in range(0, len(view), _UPLOAD_SLICE):
+        yield bytes(view[start:start + _UPLOAD_SLICE])
+
+
 async def _passthrough(request: Request, raw: bytes) -> Response:
     """Forward a request to api.anthropic.com unchanged.
 
@@ -145,10 +161,14 @@ async def _passthrough(request: Request, raw: bytes) -> Response:
     # Retry the connect only. Nothing has been written to the client yet, so replaying
     # the identical body is invisible; once we start streaming the response back a
     # retry would duplicate bytes, so failures past this point are surfaced as-is.
+    # Keep Content-Length: with it set, httpx sends the sliced body as a plain upload
+    # rather than switching to chunked transfer encoding.
+    headers["content-length"] = str(len(raw))
+
     upstream = None
     for attempt in range(settings.max_retries + 1):
         upstream_request = client.build_request(
-            request.method, url, headers=headers, content=raw
+            request.method, url, headers=headers, content=_upload_slices(raw)
         )
         try:
             attempt_started = time.monotonic()
@@ -156,7 +176,7 @@ async def _passthrough(request: Request, raw: bytes) -> Response:
         except httpx.HTTPError as exc:
             if not _is_retryable_exception(exc) or attempt == settings.max_retries:
                 return _error_response(
-                    502, "api_error", f"Upstream Anthropic request failed: {exc}"
+                    502, "api_error", f"Upstream Anthropic request failed: {_describe(exc)}"
                 )
             await _sleep_before_retry(
                 attempt, _describe(exc), time.monotonic() - attempt_started)

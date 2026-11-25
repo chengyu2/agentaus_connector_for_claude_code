@@ -37,12 +37,67 @@ $Saved = @{
     ANTHROPIC_CUSTOM_MODEL_OPTION      = $env:ANTHROPIC_CUSTOM_MODEL_OPTION
     ANTHROPIC_CUSTOM_MODEL_OPTION_NAME = $env:ANTHROPIC_CUSTOM_MODEL_OPTION_NAME
     ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION = $env:ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS     = $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS
 }
 
 $env:ANTHROPIC_BASE_URL = $BridgeUrl
 $env:ANTHROPIC_CUSTOM_MODEL_OPTION = "agentaus"
 $env:ANTHROPIC_CUSTOM_MODEL_OPTION_NAME = "Agentaus (Trellis Data)"
 $env:ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION = "Sovereign Australian model, served via the local Agentaus bridge"
+# Claude Code does not recognise the id `agentaus` and would assume a 1M-token window,
+# compacting long after Agentaus's 131,072-token limit. CLAUDE_CODE_MAX_CONTEXT_TOKENS
+# corrects that for unrecognised ids only - unless DISABLE_COMPACT is set, when Claude Code
+# applies it to every model and Opus or Sonnet would stop at 131,072 too. So it is set here,
+# for this one session, never in a settings file, and left out when DISABLE_COMPACT is set
+# in the shell or named in a settings file the session reads. A value you set yourself wins.
+#
+# Where Claude Code looks: .claude\settings.json in the folder it starts in, and
+# .claude\settings.local.json there or - on macOS and Linux, started below the top of a
+# git repository - at the repository's root (the main checkout, for a linked worktree).
+# The local file is checked in all three places on every OS, as scripts/claude-agentaus.sh
+# does; one too many only leaves the window to the bridge.
+function Get-ProjectRoots {
+    # The git repository's root and its main checkout; nothing outside a repository or without git.
+    $ErrorActionPreference = "Continue"  # Windows PowerShell turns git's stderr into errors under Stop
+    $Roots = @()
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return $Roots }
+    try {
+        $Top = @(git rev-parse --show-toplevel 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $Top.Count -gt 0 -and $Top[0]) { $Roots += [string]$Top[0] }
+        $Worktrees = @(git worktree list --porcelain 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $Worktrees.Count -gt 0 -and $Worktrees[0] -match '^worktree (.+)$') {
+            $Roots += $Matches[1]
+        }
+    } catch { }
+    return $Roots
+}
+function Test-CompactDisabled {
+    if ($env:DISABLE_COMPACT -and (@("1", "true", "yes", "on") -contains $env:DISABLE_COMPACT.Trim())) {
+        return $true
+    }
+    $ConfigDir = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME ".claude" }
+    $Files = @((Join-Path $ConfigDir "settings.json"),
+               (Join-Path ".claude" "settings.json"),
+               (Join-Path ".claude" "settings.local.json"))
+    foreach ($Root in @(Get-ProjectRoots)) {
+        $Files += Join-Path (Join-Path $Root ".claude") "settings.local.json"
+    }
+    foreach ($File in $Files) {
+        if ((Test-Path -LiteralPath $File) -and
+            (Select-String -LiteralPath $File -Pattern '"DISABLE_COMPACT"' -SimpleMatch -Quiet)) {
+            return $true
+        }
+    }
+    return $false
+}
+if (-not $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS) {
+    if (Test-CompactDisabled) {
+        Write-Host ("DISABLE_COMPACT is set, so Claude Code is not told Agentaus's 131,072-token window " +
+                    "(it would cap Claude models too); the bridge trims long Agentaus conversations instead.") -ForegroundColor Yellow
+    } else {
+        $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "131072"
+    }
+}
 
 # NOTE: do NOT set CLAUDE_CODE_ATTRIBUTION_HEADER=0 here. Behind a custom
 # ANTHROPIC_BASE_URL it also strips the block from auto-mode permission-classifier
