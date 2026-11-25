@@ -923,15 +923,21 @@ _APPLY_PATCH = re.compile(r"\s*(?:cd\s+[^;&|\n]+?\s*(?:&&|;)\s*)?apply_patch\b")
 # was decided with no candidate at all.
 _SCRATCH_REF = re.compile(r"(?:/private)?/tmp/agentaus-graph(?:/([^\s'\"`/;|&)\\]*))?")
 
+# On Windows one scratch root has many spellings: %TEMP% with either slash, in any case and as
+# JSON escapes it (C:/Users/me/AppData/Local/Temp/agentaus-graph); its 8.3 short form
+# (C:/Users/RUNNER~1/...), which is what %TEMP% often holds; Git Bash's /c/Users/me/..., which
+# is what `pwd`, `realpath` and `find` print; and /tmp/agentaus-graph, which Git Bash maps to
+# %TEMP% as well. Matching only the spellings the bridge itself uses let another run's scratch
+# through under the others, so on Windows any path with an `agentaus-graph` folder in it
+# counts - the folder name is the graph's own. The path before it is kept for the message.
+_WIN_SCRATCH_ROOT = r"(?:(?:[A-Za-z]:|/)[^\s'\"`;|&()<>]*?)?[\\/]+agentaus-graph"
+_WIN_SCRATCH_REF = re.compile(_WIN_SCRATCH_ROOT + r"(?:[\\/]+([^\s'\"`/;|&)\\]*))?", re.I)
+
 
 def _scratch_ref() -> re.Pattern:
-    """A path under scratch_root(), with the run's folder name as group 1. On Windows that is
-    the %TEMP% root with either slash, any case, as JSON escapes it - and /tmp/agentaus-graph
-    too, which Git Bash reads as the same folder."""
-    if not _on_windows():
-        return _SCRATCH_REF
-    root = re.escape(scratch_root()).replace("/", r"[\\/]+")
-    return re.compile(rf"(?:{root}|/tmp/agentaus-graph)(?:[\\/]+([^\s'\"`/;|&)\\]*))?", re.I)
+    """A path under scratch_root(), with the run's folder name as group 1 - on Windows in any
+    of its spellings (see _WIN_SCRATCH_ROOT)."""
+    return _WIN_SCRATCH_REF if _on_windows() else _SCRATCH_REF
 
 
 def own_scratch(cwd: str) -> str:
@@ -961,7 +967,7 @@ def guarded_writes(calls: list, body: dict, cwd: str | None) -> list:
     if not is_graph_task(body):
         return []
     role = role_of(body)
-    root = os.path.normpath(cwd) + os.sep if cwd else None
+    root = os.path.normpath(cwd) if cwd else None
     out = []
     for call in calls:
         name = call.get("name")
@@ -1005,7 +1011,7 @@ def guarded_writes(calls: list, body: dict, cwd: str | None) -> list:
         if not root:
             continue
         path = (args or {}).get("file_path") or (args or {}).get("notebook_path") or ""
-        inside = isinstance(path, str) and os.path.normpath(path).startswith(root)
+        inside = isinstance(path, str) and _inside(os.path.normpath(path), root, strict=True)
         if inside and role in READ_ONLY_ROLES:
             out.append((call, f"Your call to `{name}` was not run: the project folder is read-only "
                               f"for your role ({role}). Work in your own copy, as your task says."))
@@ -1093,6 +1099,14 @@ def _norm(path: str) -> str:
     return path[len("/private"):] if re.match(r"^/private/(tmp|var)(/|$)", path) else path
 
 
+def _inside(path: str, root: str, *, strict: bool = False) -> bool:
+    """Whether `path` is below `root` - or is `root`, unless `strict`. normcase makes it the
+    Windows comparison there (any case, either slash) and changes nothing on macOS and Linux;
+    without it no Windows path ever counted as inside the project."""
+    path, root = os.path.normcase(path), os.path.normcase(root).rstrip(os.sep)
+    return path.startswith(root + os.sep) or (not strict and path == root)
+
+
 def _resolve(target: str, here: str, env: dict) -> str | None:
     def var(m):
         name = m.group(1) or m.group(2)
@@ -1101,6 +1115,9 @@ def _resolve(target: str, here: str, env: dict) -> str | None:
     if "\0" in target or "$" in target or not target:
         return None   # a variable it set somewhere this cannot see: not counted
     target = os.path.expanduser(target)
+    if _on_windows():
+        # Git Bash names drive C: as /c: `/c/Users/me/proj/bank.py` is C:/Users/me/proj/bank.py.
+        target = re.sub(r"^/([A-Za-z])(?=/|$)", r"\1:/", target)
     return _norm(target if os.path.isabs(target) else os.path.join(here, target))
 
 
@@ -1339,7 +1356,7 @@ def bash_writes_into(command: str, cwd: str) -> list:
     except Exception as exc:  # noqa: BLE001 - an unreadable command is not blocked
         log.debug("could not read a shell command (%s)", exc)
         return []
-    return [t for t in targets if t == root or t.startswith(root.rstrip("/") + "/")]
+    return [t for t in targets if _inside(t, root)]
 
 
 def overwrites_source(command: str, cwd: str) -> bool:
@@ -1347,18 +1364,23 @@ def overwrites_source(command: str, cwd: str) -> bool:
     `cat > bank.py`, `rsync copy/ project/`. Copies from the graph's own pristine snapshot or
     pre-fix backup (restore, undo) are not counted; neither are `patch` and edit scripts."""
     root = _norm(cwd)
-    scratch, seen = _norm(scratch_of(cwd)), _norm_command(command)
     if _on_windows():
-        # normpath would turn the scratch root's "/" into "\"; commands may use either.
-        scratch, seen = scratch_of(cwd).lower(), command.replace("\\", "/").lower()
+        # The snapshot in any spelling of the scratch root (see _WIN_SCRATCH_ROOT), with
+        # either slash and in any case.
+        restore = re.compile(rf"{_WIN_SCRATCH_ROOT}[\\/]+{re.escape(own_scratch(cwd))}"
+                             r"[\\/]+pristine\b|[\\/]before-fix\b", re.I)
+        seen = command
+    else:
+        scratch, seen = _norm(scratch_of(cwd)), _norm_command(command)
+        restore = re.compile(rf"{re.escape(scratch)}/pristine\b|/before-fix\b")
     try:
-        if re.search(rf"{re.escape(scratch)}/pristine\b|/before-fix\b", seen):
+        if restore.search(seen):
             return False
         targets = _bash_targets(command, root, whole=True)
     except Exception as exc:  # noqa: BLE001 - an unreadable command is not blocked
         log.debug("could not read a shell command (%s)", exc)
         return False
-    inside = [t for t in targets if t.startswith(root.rstrip("/") + "/")]
+    inside = [t for t in targets if _inside(t, root, strict=True)]
     return any(_SOURCE.search(t) and os.path.isfile(t) for t in inside)
 
 
