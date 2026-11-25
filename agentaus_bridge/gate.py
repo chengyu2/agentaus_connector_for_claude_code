@@ -18,6 +18,7 @@ visible stall, which is the exact failure the streaming path was restructured to
 from __future__ import annotations
 
 import asyncio
+import heapq
 import logging
 import time
 
@@ -101,8 +102,12 @@ class _PriorityGate:
     def __init__(self, capacity: int) -> None:
         self._capacity = capacity
         self._free = capacity
-        # (priority, arrival, future) - priority first, then arrival, so equal-priority
-        # waiters still queue fairly rather than by chance.
+        # A heap of (priority, arrival, future) - priority first, then arrival, so
+        # equal-priority waiters still queue fairly rather than by chance. A list that
+        # is re-sorted on every acquire and shifted from the front on every release is
+        # O(n) per operation; the heap keeps both at O(log n). Cancelled waiters are
+        # left in place and skipped lazily when they surface (their future is `done`),
+        # and swept from the top before taking a free slot.
         self._waiters: list = []
         self._sequence = 0
 
@@ -111,30 +116,48 @@ class _PriorityGate:
         return self._capacity
 
     async def acquire(self, priority: int) -> None:
+        if self._free > 0:
+            # With lazy deletion a cancelled waiter can sit at the top of the heap; a
+            # new acquire must sweep it before taking a free slot, or the fast path
+            # would wait behind a waiter nobody is going to release for.
+            self._discard_dead()
         if self._free > 0 and not self._waiters:
             self._free -= 1
             return
         loop = asyncio.get_event_loop()
         future = loop.create_future()
         self._sequence += 1
-        self._waiters.append((priority, self._sequence, future))
-        self._waiters.sort(key=lambda row: (row[0], row[1]))
+        heapq.heappush(self._waiters, (priority, self._sequence, future))
         try:
             await future
         except asyncio.CancelledError:
             # Cancelled while queued: leave no ghost waiter behind, and if a slot was
             # handed to us in the same tick, pass it on rather than leaking capacity.
-            self._waiters = [w for w in self._waiters if w[2] is not future]
             if future.done() and not future.cancelled():
                 self._release_one()
+            else:
+                # Still queued and nothing will ever await it. Mark it dead rather
+                # than leaving a pending future in the heap: a release would otherwise
+                # "serve" it and consume a slot nobody ever holds.
+                future.cancel()
             raise
 
     def release(self) -> None:
         self._release_one()
 
+    def _discard_dead(self) -> None:
+        """Pop cancelled waiters off the top of the heap.
+
+        Lazy deletion: entries whose future is `done` are never served, so they are
+        removed here - and only here, and only when they would otherwise block a live
+        waiter or a free slot.
+        """
+        while self._waiters and self._waiters[0][2].done():
+            heapq.heappop(self._waiters)
+
     def _release_one(self) -> None:
         while self._waiters:
-            _priority, _seq, future = self._waiters.pop(0)
+            _priority, _seq, future = heapq.heappop(self._waiters)
             if not future.done():
                 future.set_result(None)
                 return

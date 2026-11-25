@@ -704,9 +704,13 @@ on Agentaus turns, to say it is for exact literal matches you can already spell.
 schema is untouched.
 
 **What it will not read.** `.env` files, `*.pem`, `*.key`, SSH keys and `.git/` are
-excluded no matter what matches. Set `AGENTAUS_SEARCH_ROOTS` to confine the bridge to
-specific trees. It is worth doing, because these reads never pass through Claude Code's
-permission prompts.
+excluded no matter what matches. With `AGENTAUS_SEARCH_ROOTS` unset the bridge stays
+inside the session's working directory - the one Claude Code names in its system prompt,
+spaces and native Windows `C:\...` or `\\server\share` paths included; set it to
+colon-separated roots (semicolon-separated on Windows) to pin it to specific trees. A
+symlink is judged by where it leads: a link inside the project to a file outside the roots
+is not read, and symlinked folders are not walked. Both matter, because these reads never
+pass through Claude Code's permission prompts.
 
 **What it costs.** One expansion call plus one call per chunk, capped at
 `AGENTAUS_SEARCH_MAX_CHUNKS`. When the cap truncates a search, the result says so. A
@@ -761,10 +765,19 @@ it back as context for the real call:
 your message
      │
      ├─ plan call ...... "what does this turn require? what must you find out?"
-     │                    → rendered as ✻ Thinking… in the UI
-     ├─ answer call .... same request, with the plan in the system prompt
-     └─ review call .... "what is wrong with this answer?" → revise if needed
+     │   (beside the       → rendered as ✻ Thinking… in the UI
+     │    first call)
+     ├─ answer calls ... the first goes out at once; later ones carry the plan
+     └─ check call ..... "is every figure here backed by a tool result?" → corrected in the same call
 ```
+
+The planner runs beside the turn's first call rather than before it
+(`AGENTAUS_PLAN_ASYNC`). It used to hold that call back 8-57 s, and its plan reached
+only that one call. Now the first request after a tool result waits at most
+`AGENTAUS_PLAN_WAIT_SECONDS` (30) for a plan still being written, and the plan is capped
+at twelve lines. Without that wait, a read-then-edit turn made its edit before the plan
+arrived, and repeated the slip the plan prevents: a renamed parameter still used under
+its old name.
 
 It runs when the turn carries tools, or when you have extended thinking switched on in
 Claude Code. The client's own toggle drives it. A plain prose question gets neither,
@@ -1049,6 +1062,55 @@ footer (`Generated with Claude Code`) is left alone, since the tool is still Cla
 
 ---
 
+## Speed: fewer and cheaper Agentaus calls
+
+An Agentaus step takes 6-20 s whatever its size: a 20,000-token prompt reaches its first
+token in about 2.4 s, and the rest is the model's hidden reasoning. So what a turn costs
+is mostly how many calls it makes. Measured on headless Claude Code sessions driving real tasks,
+the bridge made 2.4 Agentaus calls for every request Claude Code sent, and the defaults
+below are what cut that:
+
+| Change | Setting | What it saves |
+| --- | --- | --- |
+| Several tool calls in one reply | `AGENTAUS_BATCH_TOOLS` | Agentaus writes parallel tool calls, but its API returns only one and drops the rest. The bridge offers a `run_tools` tool whose argument is a list of calls and hands Claude Code the whole list at once. Reading seven files is one round trip instead of seven: 32% fewer Agentaus calls on the benchmark |
+| A shorter prompt | `AGENTAUS_PROMPT_DIET` | The first request drops from about 13,500 tokens to 8,700: a short operating block replaces the long notes, long descriptions of non-core tools are capped (Bash, Edit, Write, Read, Agent, Skill and the like keep their full manuals, safety rules included), and the skill library listing, skill routing and `agentaus_investigate` are left out. Turn any of them back on by name (`AGENTAUS_SKILL_LIBRARY=true` and so on) |
+| A lower temperature | `AGENTAUS_TEMPERATURE` | `0.2`: fewer calls per task, each a little faster. Empty sends none |
+| The planner beside the first call | `AGENTAUS_PLAN_ASYNC` | 23 s per turn that used to come first |
+| One-call grounding check, started beside the stall check | `AGENTAUS_GROUNDING_ONE_PASS`, `AGENTAUS_OVERLAP_CHECKS` | The check and its rewrite were two calls; the syntax fix no longer runs on printed command output, where it cost 11-38 s and could never succeed |
+| A short wait after HTTP 429 | `BRIDGE_RATE_LIMIT_MAX_DELAY` | Agentaus limits each tenant's request rate. The outage backoff grew to about 256 s per attempt under it, and every timeout in the benchmark baseline came from that wait. A 429 now waits at most 20 s (between 10 and 20 s, jittered) |
+
+Some changes keep a turn from ending early or wrong, each at no cost unless it fires:
+
+- **Finish gate** (`AGENTAUS_FINISH_GATE`): before a turn ends on prose, re-ask once when
+  a file the request named does not exist, code was edited and nothing ran since, or the
+  last test run still failed. An `import` of the edited module does not count as a run.
+- **Undefined names** (`AGENTAUS_NAME_CHECK`): after an edit to a `.py` file, the edit's
+  result says which names it left undefined in the functions it touched, until they are
+  defined. A parameter renamed in the signature and left under its old name in the body
+  shipped a `NameError` in all three runs without this note.
+- **Read before edit** (`AGENTAUS_READ_FIRST`): an `Edit` that Claude Code would refuse
+  because the file was not read gets a `Read` in front of it in the same reply.
+- **`python -I`** (`AGENTAUS_EDIT_REPAIR`): `-I` drops the working directory from the import
+  path, so `python -I -c "from solutions import f"` fails. When a command imports the
+  project's own modules it becomes `-E -s`, which keeps the rest of the isolation.
+- **Rewrites of a large file** (`AGENTAUS_REWRITE_NUDGE`): once a turn has written a large
+  file, the system prompt asks for `Edit`s to it. Each whole-file rewrite of a 30 KB file
+  took Agentaus 150-530 s.
+
+**Measured.** Sixteen graded coding and analysis tasks, two runs each, this bridge against
+`main` before it, run side by side so both met the same upstream load:
+
+| | mean score | timeouts | mean of per-task median wall time | per-task wall time vs `main` (geometric mean) |
+| --- | --- | --- | --- | --- |
+| `main` (n=28) | 0.944 | 5 | 423 s | 1.00 |
+| this bridge (n=32) | 0.968 | 2 | 320 s | **0.74** |
+
+It was faster on 13 of 16 tasks; `codebase_qa`, which `main` failed or timed out on, went
+from 0.41 to 0.95. The one score it lost is an `h_concurrency` run in which Agentaus
+accepted a request and sent nothing for fifteen minutes, twice, until the run timed out. Runs that met heavy HTTP 429 throttling are left out of both arms.
+
+---
+
 ## Configuration reference
 
 All settings are environment variables, readable from `.env`. Shell exports win over
@@ -1073,19 +1135,25 @@ tuning, search limits, retries and timeouts, and the ultracode agent graph, is i
 | `AGENTAUS_PDF_OCR` | `true` | OCR the pages that came back blank or garbled. macOS Vision first, then tesseract |
 | `AGENTAUS_SEARCH` | `true` | Offer `agentaus_search`, the bridge-executed semantic search |
 | `AGENTAUS_WEB_SEARCH` | `true` | Offer `agentaus_web_search`, which drives Agentaus' own web search |
-| `AGENTAUS_SEARCH_ROOTS` | *(empty)* | Colon-separated directories search may read. Empty allows any absolute path |
+| `AGENTAUS_SEARCH_ROOTS` | *(empty)* | Colon-separated (`;` on Windows) directories search may read. Empty confines reads to the session's working directory, not any absolute path |
 | `AGENTAUS_SEARCH_MAX_FILES` | `5000` | Ceiling on files one search or inventory walk returns |
 | `AGENTAUS_TOOL_TIMEOUT` | `480` | Wall-clock ceiling on one bridge tool call. `0` disables |
 | `AGENTAUS_TOOL_ROUNDS` | `12` | Rounds of bridge-executed tool calls one turn may run before the answer has to stand |
-| `AGENTAUS_INVESTIGATE` | `true` | Three independent searches; a fact must appear in two to be reported as established |
+| `AGENTAUS_INVESTIGATE` | `true`, `false` under the prompt diet | Three independent searches; a fact must appear in two to be reported as established |
 | `AGENTAUS_ZOOM` | `true` | Open a citation from a search result and read it in its section |
 | `AGENTAUS_DISTILL_RESULTS` | `false` | Condense oversized tool results before sending them. Off by default |
 | `AGENTAUS_TOOL_LEDGER` | `true` | Append a list of tools already run to the system prompt |
 | `AGENTAUS_GROUNDING_CHECK` | `true` | Check a tool-derived answer against the tools actually run |
 | `AGENTAUS_THINKING` | `true` | Plan the turn in a separate call before answering it |
 | `AGENTAUS_THINKING_VISIBLE` | `true` | Show that plan as a thinking block |
-| `AGENTAUS_SKILL_ROUTING` | `true` | Restore project skill descriptions and route skills/subagents by "if this, use that" |
-| `AGENTAUS_SKILL_LIBRARY` | `true` | Offer the bridge's own skill library to Agentaus in every project |
+| `AGENTAUS_PLAN_ASYNC` | `true` | Plan beside the turn's first call instead of before it |
+| `AGENTAUS_BATCH_TOOLS` | `true` | Offer `run_tools`, so one Agentaus reply can carry several tool calls |
+| `AGENTAUS_PROMPT_DIET` | `true` | A shorter prompt: see [Speed](#speed-fewer-and-cheaper-agentaus-calls). Turns `AGENTAUS_SKILL_LIBRARY`, `AGENTAUS_SKILL_ROUTING` and `AGENTAUS_INVESTIGATE` off unless they are set |
+| `AGENTAUS_TEMPERATURE` | `0.2` | Sampling temperature for main-loop calls. Empty sends none; `client` forwards Claude Code's |
+| `AGENTAUS_FINISH_GATE` | `true` | Re-ask a turn that ends with a requested file missing, an edit never run, or tests still failing |
+| `BRIDGE_RATE_LIMIT_MAX_DELAY` | `20` | Ceiling on the wait after an HTTP 429, which is a rate window rather than an outage. Each wait falls between half the ceiling and the ceiling; values under 1 count as 1 |
+| `AGENTAUS_SKILL_ROUTING` | `true`, `false` under the prompt diet | Restore project skill descriptions and route skills/subagents by "if this, use that" |
+| `AGENTAUS_SKILL_LIBRARY` | `true`, `false` under the prompt diet | Offer the bridge's own skill library to Agentaus in every project |
 | `AGENTAUS_SUBAGENTS_FOLLOW_SESSION` | `true` | A subagent runs on the model its session's main loop is on |
 | `AGENTAUS_COAUTHOR` | `Agentaus <theteam@trellisdata.com>` | The `Co-Authored-By:` line commits on Agentaus turns end with. See [Commit credit](#commit-credit) |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | `127.0.0.1` / `8787` | Listen address |

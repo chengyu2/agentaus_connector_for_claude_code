@@ -27,6 +27,7 @@ import os
 import re
 import shlex
 import shutil
+import tempfile
 import time
 import zipfile
 from collections import OrderedDict
@@ -83,6 +84,7 @@ def expand(call: dict, task: str, cwd: str | None, started_at: float | None = No
         "description": arguments.get("description") or "Agentaus agent graph",
         "script": script_for(),
         "args": {"task": task, "cwd": cwd or "", "width": settings.agentaus_graph_width,
+                 "scratch_root": scratch_root(),
                  # The graph waits a little longer than the bridge lets an agent run, so the
                  # result an agent is made to report at TIME_UP still counts. Measured: the
                  # cap was 720 s and the graph's deadline 600 s - every forced report arrived
@@ -110,10 +112,28 @@ def expand(call: dict, task: str, cwd: str | None, started_at: float | None = No
 # after others had already edited it; and planners guessed function names. A script does each
 # exactly, once, before any agent runs.
 
+def _on_windows() -> bool:
+    return os.name == "nt"
+
+
+def scratch_root() -> str:
+    """Where every graph run keeps its scratch; the graphs get it as args.scratch_root.
+
+    /tmp on macOS and Linux. Not on Windows: there the bridge (Python) reads /tmp as C:\\tmp and
+    the agents' shell (Git Bash) reads it as %TEMP%. Measured (24 Nov 2026, Windows 11): the
+    bridge wrote the snapshot to C:\\tmp, every solver's `cp` of it failed with "cannot stat",
+    and the solvers then worked without their copies. So on Windows it is %TEMP%, written with
+    forward slashes - the one form Python, Git Bash and Claude Code's file tools all read alike.
+    """
+    if _on_windows():
+        return tempfile.gettempdir().replace("\\", "/").rstrip("/") + "/agentaus-graph"
+    return "/tmp/agentaus-graph"
+
+
 def scratch_of(cwd: str | None) -> str:
     """The graph's scratch folder - the same expression as SCRATCH in graphs/dynamic.js."""
     name = re.sub(r"[^\w.-]+", "_", re.sub(r"^/+", "", cwd or "") or "task", flags=re.A)
-    return f"/tmp/agentaus-graph/{name}-dyn"
+    return f"{scratch_root()}/{name}-dyn"
 
 
 _SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".pytest_cache",
@@ -235,7 +255,7 @@ def _texts(cwd: str, files: list[str], inputs: str) -> list:
             continue
         if not text.strip():
             continue
-        dest = os.path.join(inputs, rel + ".txt")
+        dest = f"{inputs}/{rel.replace(os.sep, '/')}.txt"   # an agent reads this path
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         with open(dest, "w", encoding="utf-8") as fh:
             fh.write(text if text.endswith("\n") else text + "\n")
@@ -423,12 +443,14 @@ def prepare(cwd: str | None) -> dict:
     except Exception as exc:  # noqa: BLE001
         log.warning("graph prep: could not set up %s (%s)", scratch, exc)
         return extra
+    # Joined with "/", not os.path.join: these paths go to agents, and on Windows a "\" in the
+    # middle of a path ("...-dyn\pristine/notify.py") is one more thing for Git Bash to misread.
     steps = (
-        ("pristine", lambda: _snapshot(cwd, files, os.path.join(scratch, "pristine"))),
-        ("texts", lambda: _texts(cwd, files, os.path.join(scratch, "inputs"))),
+        ("pristine", lambda: _snapshot(cwd, files, f"{scratch}/pristine")),
+        ("texts", lambda: _texts(cwd, files, f"{scratch}/inputs")),
         ("questions", lambda: _questions(cwd, files, extra["texts"])),
         ("inventory", lambda: _inventory(cwd, files)),
-        ("examples", lambda: _write(os.path.join(scratch, "examples.py"), EXAMPLES_SCRIPT)),
+        ("examples", lambda: _write(f"{scratch}/examples.py", EXAMPLES_SCRIPT)),
     )
     for name, step in steps:
         try:
@@ -745,15 +767,21 @@ def run_state(entry: dict | None) -> str:
 
 
 def is_graph_task(body: dict) -> bool:
-    """Whether a subagent request was started by the graph - its prompt carries MARK."""
+    """Whether a subagent request was started by the graph - its prompt carries MARK.
+
+    Read from the first user message only: that is the graph's prompt for its own agents, and
+    the user's own request in a main loop. Measured (25 Nov 2026): an audit report later in a
+    main session quoted the Knowledgebase's line about the `[agentaus-graph]` mark, and from
+    then on the main loop was focused like a graph agent - Agent, Workflow, ToolSearch and
+    PowerShell held back - so for an hour it announced "launching the reviewers" and could not.
+    """
     for message in body.get("messages") or []:
         if message.get("role") != "user":
             continue
         content = message.get("content")
         texts = [content] if isinstance(content, str) else [
             b.get("text", "") for b in content or [] if isinstance(b, dict)]
-        if any(MARK in (t or "") for t in texts):
-            return True
+        return any(MARK in (t or "") for t in texts)
     return False
 
 
@@ -896,6 +924,22 @@ _APPLY_PATCH = re.compile(r"\s*(?:cd\s+[^;&|\n]+?\s*(?:&&|;)\s*)?apply_patch\b")
 # was decided with no candidate at all.
 _SCRATCH_REF = re.compile(r"(?:/private)?/tmp/agentaus-graph(?:/([^\s'\"`/;|&)\\]*))?")
 
+# On Windows one scratch root has many spellings: %TEMP% with either slash, in any case and as
+# JSON escapes it (C:/Users/me/AppData/Local/Temp/agentaus-graph); its 8.3 short form
+# (C:/Users/RUNNER~1/...), which is what %TEMP% often holds; Git Bash's /c/Users/me/..., which
+# is what `pwd`, `realpath` and `find` print; and /tmp/agentaus-graph, which Git Bash maps to
+# %TEMP% as well. Matching only the spellings the bridge itself uses let another run's scratch
+# through under the others, so on Windows any path with an `agentaus-graph` folder in it
+# counts - the folder name is the graph's own. The path before it is kept for the message.
+_WIN_SCRATCH_ROOT = r"(?:(?:[A-Za-z]:|/)[^\s'\"`;|&()<>]*?)?[\\/]+agentaus-graph"
+_WIN_SCRATCH_REF = re.compile(_WIN_SCRATCH_ROOT + r"(?:[\\/]+([^\s'\"`/;|&)\\]*))?", re.I)
+
+
+def _scratch_ref() -> re.Pattern:
+    """A path under scratch_root(), with the run's folder name as group 1 - on Windows in any
+    of its spellings (see _WIN_SCRATCH_ROOT)."""
+    return _WIN_SCRATCH_REF if _on_windows() else _SCRATCH_REF
+
 
 def own_scratch(cwd: str) -> str:
     """The scratch folder name the graph gives the run in `cwd` (dynamic.js SCRATCH)."""
@@ -903,10 +947,13 @@ def own_scratch(cwd: str) -> str:
 
 
 def foreign_scratch(text: str, cwd: str) -> str | None:
-    """The first /tmp/agentaus-graph path in `text` that is not this run's own scratch."""
+    """The first path under the scratch root in `text` that is not this run's own scratch."""
     own = own_scratch(cwd)
-    for m in _SCRATCH_REF.finditer(text or ""):
-        if m.group(1) != own:
+    for m in _scratch_ref().finditer(text or ""):
+        name = m.group(1)
+        if _on_windows():                     # Windows paths ignore case
+            name, own = (name or "").lower(), own.lower()
+        if name != own:
             return m.group(0)
     return None
 
@@ -921,7 +968,7 @@ def guarded_writes(calls: list, body: dict, cwd: str | None) -> list:
     if not is_graph_task(body):
         return []
     role = role_of(body)
-    root = os.path.normpath(cwd) + os.sep if cwd else None
+    root = os.path.normpath(cwd) if cwd else None
     out = []
     for call in calls:
         name = call.get("name")
@@ -934,10 +981,10 @@ def guarded_writes(calls: list, body: dict, cwd: str | None) -> list:
         elsewhere = foreign_scratch(json.dumps(args), cwd) if cwd else None
         if elsewhere:
             out.append((call, f"Your call to `{name}` was not run: `{elsewhere}` is not yours - "
-                              "other runs keep their work under /tmp/agentaus-graph, and none "
+                              f"other runs keep their work under {scratch_root()}, and none "
                               "of it is your task's. Use only the paths your task names: the "
                               "project folder and your own copy under "
-                              f"`/tmp/agentaus-graph/{own_scratch(cwd)}`."))
+                              f"`{scratch_of(cwd)}`."))
             continue
         if name not in ("Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"):
             continue
@@ -953,7 +1000,7 @@ def guarded_writes(calls: list, body: dict, cwd: str | None) -> list:
             if role in READ_ONLY_ROLES and isinstance(command, str) and bash_writes_into(command, cwd):
                 out.append((call, "Your command was not run: it would write into the project "
                                   f"folder, which is read-only for your role ({role}). Work in "
-                                  "your own copy under /tmp, as your task says."))
+                                  f"your own copy under {scratch_root()}, as your task says."))
             # Measured (he10, d9): an assembler blocked from `Write` seven times ran
             # `cp <solver copy>/solutions.py <project>/solutions.py` instead, and one solver's
             # file replaced nine good functions.
@@ -965,7 +1012,7 @@ def guarded_writes(calls: list, body: dict, cwd: str | None) -> list:
         if not root:
             continue
         path = (args or {}).get("file_path") or (args or {}).get("notebook_path") or ""
-        inside = isinstance(path, str) and os.path.normpath(path).startswith(root)
+        inside = isinstance(path, str) and _inside(os.path.normpath(path), root, strict=True)
         if inside and role in READ_ONLY_ROLES:
             out.append((call, f"Your call to `{name}` was not run: the project folder is read-only "
                               f"for your role ({role}). Work in your own copy, as your task says."))
@@ -1053,6 +1100,14 @@ def _norm(path: str) -> str:
     return path[len("/private"):] if re.match(r"^/private/(tmp|var)(/|$)", path) else path
 
 
+def _inside(path: str, root: str, *, strict: bool = False) -> bool:
+    """Whether `path` is below `root` - or is `root`, unless `strict`. normcase makes it the
+    Windows comparison there (any case, either slash) and changes nothing on macOS and Linux;
+    without it no Windows path ever counted as inside the project."""
+    path, root = os.path.normcase(path), os.path.normcase(root).rstrip(os.sep)
+    return path.startswith(root + os.sep) or (not strict and path == root)
+
+
 def _resolve(target: str, here: str, env: dict) -> str | None:
     def var(m):
         name = m.group(1) or m.group(2)
@@ -1061,6 +1116,9 @@ def _resolve(target: str, here: str, env: dict) -> str | None:
     if "\0" in target or "$" in target or not target:
         return None   # a variable it set somewhere this cannot see: not counted
     target = os.path.expanduser(target)
+    if _on_windows():
+        # Git Bash names drive C: as /c: `/c/Users/me/proj/bank.py` is C:/Users/me/proj/bank.py.
+        target = re.sub(r"^/([A-Za-z])(?=/|$)", r"\1:/", target)
     return _norm(target if os.path.isabs(target) else os.path.join(here, target))
 
 
@@ -1299,7 +1357,7 @@ def bash_writes_into(command: str, cwd: str) -> list:
     except Exception as exc:  # noqa: BLE001 - an unreadable command is not blocked
         log.debug("could not read a shell command (%s)", exc)
         return []
-    return [t for t in targets if t == root or t.startswith(root.rstrip("/") + "/")]
+    return [t for t in targets if _inside(t, root)]
 
 
 def overwrites_source(command: str, cwd: str) -> bool:
@@ -1307,15 +1365,23 @@ def overwrites_source(command: str, cwd: str) -> bool:
     `cat > bank.py`, `rsync copy/ project/`. Copies from the graph's own pristine snapshot or
     pre-fix backup (restore, undo) are not counted; neither are `patch` and edit scripts."""
     root = _norm(cwd)
-    scratch = _norm(scratch_of(cwd))
+    if _on_windows():
+        # The snapshot in any spelling of the scratch root (see _WIN_SCRATCH_ROOT), with
+        # either slash and in any case.
+        restore = re.compile(rf"{_WIN_SCRATCH_ROOT}[\\/]+{re.escape(own_scratch(cwd))}"
+                             r"[\\/]+pristine\b|[\\/]before-fix\b", re.I)
+        seen = command
+    else:
+        scratch, seen = _norm(scratch_of(cwd)), _norm_command(command)
+        restore = re.compile(rf"{re.escape(scratch)}/pristine\b|/before-fix\b")
     try:
-        if re.search(rf"{re.escape(scratch)}/pristine\b|/before-fix\b", _norm_command(command)):
+        if restore.search(seen):
             return False
         targets = _bash_targets(command, root, whole=True)
     except Exception as exc:  # noqa: BLE001 - an unreadable command is not blocked
         log.debug("could not read a shell command (%s)", exc)
         return False
-    inside = [t for t in targets if t.startswith(root.rstrip("/") + "/")]
+    inside = [t for t in targets if _inside(t, root, strict=True)]
     return any(_SOURCE.search(t) and os.path.isfile(t) for t in inside)
 
 

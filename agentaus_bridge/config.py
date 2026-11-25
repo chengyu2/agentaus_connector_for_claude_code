@@ -31,6 +31,16 @@ def _float(name: str, default: float) -> float:
         return default
 
 
+# AGENTAUS_PROMPT_DIET: a shorter, sharper prompt for Agentaus. Read once, here, because
+# it changes the defaults of the settings below that add prompt weight (each can still be
+# set explicitly). See diet.py.
+# On by default: measured head-to-head on ten Claude Code tasks, two runs each, with
+# temperature 0.2 it cut the first request from 13.5k to 7.4k tokens (8.7k since the core
+# tools keep their full descriptions), upstream calls per run from 27 to 18 and wall time
+# by 19%, at no cost in score.
+_DIET = _bool("AGENTAUS_PROMPT_DIET", True)
+
+
 def _csv(name: str, default: list[str]) -> list[str]:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -204,6 +214,15 @@ class Settings:
     )
     retry_max_delay_seconds: float = field(
         default_factory=lambda: _float("BRIDGE_RETRY_MAX_DELAY", 300.0)
+    )
+    # A 429 is a rate window, not an outage: Agentaus limits per tenant, and the window
+    # reopens within seconds. The outage backoff above grew to ~256 s per attempt under
+    # it, which turned a few seconds of throttling into turns that timed out. Measured
+    # (six concurrent Claude Code sessions on one key): every timeout in the baseline
+    # came from that backoff, not from the model. The adaptive concurrency limit in
+    # throttle.py still narrows the bridge's own width on 429, so this does not hammer.
+    rate_limit_max_delay_seconds: float = field(
+        default_factory=lambda: _float("BRIDGE_RATE_LIMIT_MAX_DELAY", 20.0)
     )
 
     # --- Agentaus context window ---------------------------------------------------
@@ -385,6 +404,8 @@ class Settings:
     # Expose Agentaus' own web search as a tool. Claude Code's WebSearch is an Anthropic
     # server-side stub with no input_schema, so it is dropped in translation and an
     # Agentaus turn otherwise has no way to search the web at all.
+    # Kept on under the prompt diet: without it an Agentaus turn cannot reach the web at
+    # all, and the tool costs one short schema.
     agentaus_web_search: bool = field(
         default_factory=lambda: _bool("AGENTAUS_WEB_SEARCH", True)
     )
@@ -392,12 +413,13 @@ class Settings:
     # agreed on is reported as established. Slower than one search, so it is offered as
     # a separate tool rather than made the default.
     agentaus_investigate: bool = field(
-        default_factory=lambda: _bool("AGENTAUS_INVESTIGATE", True)
+        default_factory=lambda: _bool("AGENTAUS_INVESTIGATE", not _DIET)
     )
     # Zoom: read a cited passage in context. A search quotes enough to prove a fact is
     # there, not enough to paraphrase it accurately - so a model working from search
     # output alone writes "(evidence: lines 3585-3586)" where a substantive clause was
-    # wanted. Observed on a real tender.
+    # wanted. Observed on a real tender. Kept on under the prompt diet: it is one short
+    # schema, and agentaus_search output points at it.
     agentaus_zoom: bool = field(default_factory=lambda: _bool("AGENTAUS_ZOOM", True))
     # How far either side of the cited lines to look for a section boundary.
     agentaus_zoom_radius_lines: int = field(
@@ -547,9 +569,10 @@ class Settings:
     agentaus_search_max_document_bytes: int = field(
         default_factory=lambda: _int("AGENTAUS_SEARCH_MAX_DOCUMENT_BYTES", 25 * 1024 * 1024)
     )
-    # Colon-separated directories the search may read. Empty means any absolute path the
-    # model names, which matches what Claude Code's own Read tool would allow. Set it to
-    # confine the bridge to specific trees.
+    # Colon-separated directories the search may read. Empty confines the bridge to the
+    # working directory the request named (falling back to the bridge process's own cwd
+    # when none was named) plus the bridge's skill library - NOT to any absolute path.
+    # Set it to specific roots to widen or pin that.
     agentaus_search_roots: str = field(
         default_factory=lambda: os.environ.get("AGENTAUS_SEARCH_ROOTS", "").strip()
     )
@@ -590,6 +613,49 @@ class Settings:
         default_factory=lambda: _int("AGENTAUS_CORRECTION_ROUNDS", 3)
     )
 
+    # --- Finishing the job (finish.py) -------------------------------------------------
+    # Before a main-loop turn ends on prose: re-ask when a requested file does not exist,
+    # code was changed and nothing ran since, the last test run still failed, or - once -
+    # to check the work against the request's own enumerated items and named spec.
+    # Structural checks, so no model call to decide; one call only when one fires.
+    agentaus_finish_gate: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_FINISH_GATE", True)
+    )
+    # The checklist re-ask is off by default: measured on three hard tasks already solved,
+    # it added 1.6-3.7 min each (2-5 more requests) and changed no score.
+    agentaus_finish_checklist: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_FINISH_CHECKLIST", False)
+    )
+    # After this many tool calls in a turn without writing a file the request asked for,
+    # the system prompt says to write it now. 0 turns it off - the default, because
+    # augment.write_now_note already says the same after WRITE_NOW_AFTER_CALLS calls, and
+    # two notes saying it would only add weight.
+    agentaus_deliverable_nudge_calls: int = field(
+        default_factory=lambda: _int("AGENTAUS_DELIVERABLE_NUDGE_CALLS", 0)
+    )
+    # Once the turn has written a large file, the system prompt asks for Edits to it
+    # rather than whole-file rewrites (each one minutes of generation on Agentaus).
+    agentaus_rewrite_nudge: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_REWRITE_NUDGE", True)
+    )
+
+    # Trim what the bridge and Claude Code send Agentaus: a short operating block in place
+    # of the long notes, no tool-selection or routing sections, capped tool descriptions,
+    # and the Claude Code sections that do not apply to this model. See diet.py.
+    agentaus_prompt_diet: bool = field(default_factory=lambda: _DIET)
+
+    # --- Decoding --------------------------------------------------------------------
+    # Sampling temperature sent with every main-loop request. Empty = send none, so
+    # Agentaus uses its own default. "client" forwards whatever temperature Claude Code
+    # asked for. Helper calls (planner, review, classifiers) are not affected.
+    agentaus_temperature: str = field(
+        default_factory=lambda: os.environ.get("AGENTAUS_TEMPERATURE", "0.2").strip()
+    )
+    # Nucleus sampling for main-loop requests. Empty = send none.
+    agentaus_top_p: str = field(
+        default_factory=lambda: os.environ.get("AGENTAUS_TOP_P", "").strip()
+    )
+
     # --- Synthesised thinking --------------------------------------------------------
     # Agentaus has no native thinking, so it acts before it plans. The bridge runs one
     # planning call first and feeds the result into the answer call.
@@ -598,6 +664,17 @@ class Settings:
     # unsigned one; the plan is then folded into the answer call without being shown.
     agentaus_thinking_visible: bool = field(
         default_factory=lambda: _bool("AGENTAUS_THINKING_VISIBLE", True)
+    )
+    # Write the plan beside the turn's first call instead of before it, and carry it in every
+    # later request of the turn. The first call no longer waits 8-57 s for the planner. See
+    # plans.py. False restores the old order: plan first, then one planned call.
+    agentaus_plan_async: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_PLAN_ASYNC", True)
+    )
+    # How long the turn's second request (the first after a tool result) may wait for a plan
+    # still being written; later requests never wait. 0: never wait.
+    agentaus_plan_wait_seconds: float = field(
+        default_factory=lambda: _float("AGENTAUS_PLAN_WAIT_SECONDS", 30.0)
     )
 
     # --- Agentaus compensation ------------------------------------------------------
@@ -617,7 +694,7 @@ class Settings:
     # planner name the skill it will load. Opus picks skills from bare names; Agentaus
     # did not load one in any baseline run.
     agentaus_skill_routing: bool = field(
-        default_factory=lambda: _bool("AGENTAUS_SKILL_ROUTING", True)
+        default_factory=lambda: _bool("AGENTAUS_SKILL_ROUTING", not _DIET)
     )
     # A subagent follows its session: started from an Agentaus session it runs on Agentaus,
     # from a Claude session on Claude. Off, a subagent goes by the model id Claude Code
@@ -626,7 +703,7 @@ class Settings:
     # Anthropic's Apache-2.0 plugins) to Agentaus in every project, and answer `Skill`
     # calls for it in the bridge. Claude sessions never see these.
     agentaus_skill_library: bool = field(
-        default_factory=lambda: _bool("AGENTAUS_SKILL_LIBRARY", True)
+        default_factory=lambda: _bool("AGENTAUS_SKILL_LIBRARY", not _DIET)
     )
     agentaus_subagents_follow_session: bool = field(
         default_factory=lambda: _bool("AGENTAUS_SUBAGENTS_FOLLOW_SESSION", True)
@@ -697,6 +774,16 @@ class Settings:
     agentaus_edit_repair: bool = field(
         default_factory=lambda: _bool("AGENTAUS_EDIT_REPAIR", True)
     )
+    # Put a Read ahead of an Edit/Write the client would refuse as unread or changed since
+    # read (see read_first.py).
+    # Say in an Edit's result when it left a name undefined in a Python function (see
+    # name_check.py).
+    agentaus_name_check: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_NAME_CHECK", True)
+    )
+    agentaus_read_first: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_READ_FIRST", True)
+    )
     # Who a commit written on an Agentaus turn credits, as `Name <email>`. Claude Code asks
     # an unknown model for `Co-Authored-By: Claude Code <noreply@anthropic.com>`; the bridge
     # swaps in this one. GitHub credits the account the email is verified on. Empty leaves
@@ -722,8 +809,24 @@ class Settings:
     agentaus_grounding_check: bool = field(
         default_factory=lambda: _bool("AGENTAUS_GROUNDING_CHECK", True)
     )
+    # Check and rewrite in one call: "GROUNDED", or "REVISED" and the reissued answer. False
+    # restores the two-call form (verdict, then a rewrite when it found gaps).
+    # Start the answer's grounding check (or review) beside the stall/refusal check instead
+    # of after it; cancelled when the verdict sends the turn back to the model.
+    agentaus_overlap_checks: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_OVERLAP_CHECKS", True)
+    )
+    agentaus_grounding_one_pass: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_GROUNDING_ONE_PASS", True)
+    )
     agentaus_self_review: bool = field(
         default_factory=lambda: _bool("AGENTAUS_SELF_REVIEW", True)
+    )
+    # Offer Agentaus a `run_tools` tool whose argument is a list of tool uses, beside the
+    # tools themselves, so one reply can carry several calls. Its API returns at most one
+    # tool call per response and drops the rest. See batching.py.
+    agentaus_batch_tools: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_BATCH_TOOLS", True)
     )
     # Review and grounding run on agent turns only - requests that offer tools. Claude
     # Code's own utility calls offer none: the end-of-turn classifier that decides

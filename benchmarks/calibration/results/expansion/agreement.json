@@ -1,0 +1,325 @@
+{
+ "note": "Hand-matched answer agreement, labelled from the answers alone before correctness was looked at. baseline_runs_agree: baseline runs 1 and 2 gave the same substantive answer (abstentions and missing answers never agree). other_runs_matching_run_1: how many of baseline run 2, limits, frequency and combined gave baseline run 1's answer.",
+ "items": {
+  "66e89ebe7361982cbfbc5952": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 4
+  },
+  "66ea7d2cc321286a5288ef06": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "66ebefa090db075818df99a9": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 4
+  },
+  "66edf49c46d28f04618d6498": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 1
+  },
+  "66f1db990130ee934e5b9810": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "66f28a89f1256af80477e15d": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 4
+  },
+  "66f57e3ddc7259d8b5bb0b46": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "66f5fa6547b598f037ec67fd": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 2
+  },
+  "66f6743f2db0dfd3e0b594e7": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "66fc5e8f98a7264ef58309b9": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 1
+  },
+  "66ffaae1068d942d32104650": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 2
+  },
+  "66ffcf486c0e5bf5dcf91072": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "6708c1dc2f33698babc6479d": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "670a6b32b3f67b11c0799489": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 1
+  },
+  "670c149e9d374d71ed99e5e5": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "670d86ec56f489221087dc67": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 2
+  },
+  "670e87009fd2a94b93cec307": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "670f8518ffa4ea9fb0cc5fea": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 1
+  },
+  "6712290fcecd80f50716f9aa": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 2
+  },
+  "67130fff5fcf1fbb43d4a687": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 4
+  },
+  "671728a6382088970288d4c0": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 2
+  },
+  "6717bd1d443232c907a31720": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 3
+  },
+  "6717cfeee8995e9e60504f33": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "6719e946a81614142be02bec": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 4
+  },
+  "671be6027aa97b5c9f77d90e": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "671e7fd05cd705ffbd3faab7": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "671f1f88e6600c2d52d9fbe6": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "671f3210e38f776acdad8aab": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "671fc9508c7c5056012df16a": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 3
+  },
+  "6720d5455cedc02ed70dbe42": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "6721590e300612460696da18": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "672255e153af61d9b29732b8": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 3
+  },
+  "6722613b4152cab57c187de5": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 4
+  },
+  "6722c3ce8e469fbdb3ba6a6e": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "6723a06c2ed591ecf750d591": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "6723ac21af0a31f10468be05": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 4
+  },
+  "6724e08542ec04c22a24aaa5": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 1
+  },
+  "67255d0e51c2cc162e5b53e4": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 3
+  },
+  "6725bb338255543498bdcbec": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "6725e470de551b21db6a0f0d": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 1
+  },
+  "672604100aae355a51195cdf": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 1
+  },
+  "672b2749f64de603265f9fc4": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 4
+  },
+  "672bf0d1e9ebfc8b093c1309": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "672c2ab86195c23913d66c90": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 2
+  },
+  "67323ba02db3b4507c5bf93f": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 1
+  },
+  "6734d8dc5339f30ba329709d": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "67358dcb88918873c7ae22ce": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 4
+  },
+  "6735a032f947388686c608f1": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "6737016cd6feab08ed98c77d": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 3
+  },
+  "67371b7640b2f9bcb6faa940": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 4
+  },
+  "67379aea6c946be458900f3f": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 3
+  },
+  "6738f514851b80b033aa8648": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 2
+  },
+  "6738f778851b80b033aa8654": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 1
+  },
+  "673aa3536b5c65098f208d6f": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "673b198c2e9d1d0e28ee75ca": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "677609438253c248a60436cb": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 1
+  },
+  "6794d3076631365107923092": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 1
+  },
+  "67956249c222b7268c796caf": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 4
+  },
+  "67956c8b1fc0728a139117b3": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 3
+  },
+  "6797fc716d6587faa72672b9": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "6798867ef44b5aad9f2a54c3": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "679cade8165d45e7a4d26886": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "679cbe704d510c035951e6d5": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "679e10f50080c2f1bf489f53": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 1
+  },
+  "67a4ff1f155a54bae14a9455": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 4
+  },
+  "67a55e5426c698ac1c11802e": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 1
+  },
+  "67aba44a1c713466eaffa805": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "67b1ac7a0724fd0788302708": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 3
+  },
+  "67bf803f18c44c1840cc3a29": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "67c1fca02f0a2a1da4ab944c": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 3
+  },
+  "67c5e471a7e99910049ad4bc": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 3
+  },
+  "67c74de58003ef0c99fce92f": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "67cf89214a13d74b072db886": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 4
+  },
+  "67d44ca3c423aa12b3e9d1af": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 0
+  },
+  "67d664d7f37a184fc6fea75b": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 3
+  },
+  "67d8ff96a8fde84b0a59fbe6": {
+   "baseline_runs_agree": false,
+   "other_runs_matching_run_1": 1
+  },
+  "699124784a7905cb2ccd51f0": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 4
+  },
+  "6a3c2043920e85d60db17493": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 4
+  },
+  "6a68efab6e77187149170dfc": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 1
+  },
+  "6a751e22605f6e04228e2279": {
+   "baseline_runs_agree": true,
+   "other_runs_matching_run_1": 4
+  }
+ }
+}

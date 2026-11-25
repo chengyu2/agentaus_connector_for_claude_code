@@ -128,6 +128,47 @@ class TestCaching(unittest.TestCase):
             self.assertNotEqual(first, documents._key(path),
                                 "a changed document would have served a stale extract")
 
+    def test_a_failed_conversion_is_not_cached_as_empty(self):
+        """A transient soffice failure must not silence the document for the process life.
+
+        Caching the "" sentinel turned a one-off timeout into permanent "no content";
+        a failure returns "" but leaves the cache alone, so the next read retries.
+        """
+        import subprocess
+        import tempfile
+        from unittest import mock
+
+        previous = settings.agentaus_office_extract
+        settings.agentaus_office_extract = True
+        try:
+            if not documents.available():
+                self.skipTest("LibreOffice is not installed here")
+        finally:
+            settings.agentaus_office_extract = previous
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.docx")
+            with open(path, "w") as fh:
+                fh.write("pretend document")
+            attempts = []
+
+            def flaky_run(cmd, **kwargs):
+                attempts.append(cmd)
+                if len(attempts) == 1:
+                    raise subprocess.TimeoutExpired(cmd, timeout=1)
+                outdir = cmd[cmd.index("--outdir") + 1]
+                with open(os.path.join(outdir, "a.htm"), "w") as fh:
+                    fh.write("<html><body><table><tr><td>salvaged</td></tr></table></body></html>")
+                return mock.Mock(returncode=0)
+
+            with mock.patch.object(documents.subprocess, "run", flaky_run):
+                self.assertEqual(documents.extract(path), "")
+                self.assertEqual(len(attempts), 1)
+                self.assertEqual(documents._cached(documents._key(path)), None,
+                                 "a failed conversion was cached as no content")
+                self.assertEqual(documents.extract(path).strip(), "salvaged")
+            self.assertEqual(len(attempts), 2, "the retry must have re-run the conversion")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

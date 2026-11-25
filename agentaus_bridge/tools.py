@@ -171,19 +171,19 @@ async def run_inventory(path: str, glob: str | None, default_path: str | None = 
         return (f"{path} is the whole disk, not a project. Pass the absolute path of the "
                 f"project or folder to search - the working directory, if you do not know "
                 f"which.")
-    if not _allowed_root(path):
-        return f"{path} is outside AGENTAUS_SEARCH_ROOTS, which this bridge is confined to."
+    if not _allowed_root(path, default_path):
+        return _outside_roots(path)
     if os.path.isfile(path):
         path = os.path.dirname(path)
 
     # A walk plus a headline read per file, and a headline read of a document is a
     # LibreOffice or PDF conversion. Off the event loop, or every other request the
     # bridge is serving - Claude passthrough included - waits for it.
-    return await asyncio.to_thread(_inventory_sync, path, glob)
+    return await asyncio.to_thread(_inventory_sync, path, glob, default_path)
 
 
-def _inventory_sync(path: str, glob: str | None) -> str:
-    files, truncated = enumerate_files_bounded(path, glob)
+def _inventory_sync(path: str, glob: str | None, default_path: str | None = None) -> str:
+    files, truncated = enumerate_files_bounded(path, glob, default_path)
     rendered = inventory.render(path, files, read=read_text)
     log.info("inventory %s: %d file(s) -> %d chars, no model calls",
              os.path.basename(path.rstrip("/")) or path, len(files), len(rendered))
@@ -438,23 +438,59 @@ def _is_secret(name: str, path: str | None = None) -> bool:
     return False
 
 
-def _allowed_root(path: str) -> bool:
+def _allowed_root(path: str, default_path: str | None = None) -> bool:
     """Whether `path` is inside a configured search root.
 
-    An empty AGENTAUS_SEARCH_ROOTS allows anything absolute, which matches what Claude
-    Code's own Read tool would let the model open. Setting it confines the bridge, which
-    matters because these reads never reach Claude Code's permission prompts.
+    An empty AGENTAUS_SEARCH_ROOTS does not mean "read anything": these reads never
+    reach Claude Code's permission prompts, so "anything" let a search follow a model's
+    guess to a sibling project or the home directory. It means "confine to the working
+    directory the request named" - the same default Claude Code itself operates under.
+    The bridge's own process cwd is the fallback only when no request named one, because
+    the process is not the session: it may be launched from anywhere.
+
+    Setting AGENTAUS_SEARCH_ROOTS confines further, to those roots instead.
     """
-    roots = [r for r in settings.agentaus_search_roots.split(":") if r.strip()]
+    return _within(path, _search_roots(default_path))
+
+
+def _search_roots(default_path: str | None = None) -> list[str]:
+    """The roots `_allowed_root` admits, resolved and case-folded, for `_within`.
+
+    AGENTAUS_SEARCH_ROOTS is split on the platform's path-list separator: `:` on macOS and
+    Linux, `;` on Windows, where a `:` is part of every root (`C:\\Users\\me\\proj`).
+    """
+    roots = [r.strip() for r in settings.agentaus_search_roots.split(os.path.pathsep)
+             if r.strip()]
     if not roots:
-        return True
+        base = os.path.expanduser(default_path or os.getcwd())
+        if not os.path.isabs(base):
+            base = os.path.abspath(base)
+        roots = [base]
     from .skills import LIBRARY
     roots.append(LIBRARY)       # the bridge's own skills are always readable
-    resolved = os.path.realpath(path)
+    return [os.path.normcase(os.path.realpath(r)) for r in roots]
+
+
+def _within(path: str, roots: list[str]) -> bool:
+    """Whether `path`, symlinks resolved, is one of `roots` or below one.
+
+    normcase makes the compare case-insensitive with either slash on Windows, where
+    Claude Code may name `c:\\users\\me\\proj` and a model `C:\\Users\\Me\\proj\\a.py`;
+    on macOS and Linux it changes nothing.
+    """
+    resolved = os.path.normcase(os.path.realpath(path))
     return any(
-        resolved == os.path.realpath(r) or resolved.startswith(os.path.realpath(r) + os.sep)
-        for r in roots
+        resolved == root or resolved.startswith(root.rstrip(os.path.sep) + os.path.sep)
+        for root in roots
     )
+
+
+def _outside_roots(path: str) -> str:
+    """The refusal for a path `_allowed_root` rejected, naming the limit that applied."""
+    if settings.agentaus_search_roots.strip():
+        return f"{path} is outside AGENTAUS_SEARCH_ROOTS, which this bridge is confined to."
+    return (f"{path} is outside the session's working directory, which this bridge is "
+            f"confined to. Set AGENTAUS_SEARCH_ROOTS to allow other trees.")
 
 
 class ToolDeadline(Exception):
@@ -518,17 +554,28 @@ def _truncation_note(count: int) -> str:
     )
 
 
-def enumerate_files(path: str, glob: str | None = None) -> list[str]:
+def enumerate_files(path: str, glob: str | None = None,
+                    default_path: str | None = None) -> list[str]:
     """Readable text files under `path`, in a stable order."""
-    return enumerate_files_bounded(path, glob)[0]
+    return enumerate_files_bounded(path, glob, default_path)[0]
 
 
 def whole_disk(path: str) -> bool:
     return os.path.realpath(path) in ("/", os.path.realpath(os.path.expanduser("~/..")))
 
 
-def enumerate_files_bounded(path: str, glob: str | None = None) -> tuple[list[str], bool]:
-    """Readable text files under `path`, and whether the file cap cut the walk short."""
+def enumerate_files_bounded(
+    path: str, glob: str | None = None, default_path: str | None = None
+) -> tuple[list[str], bool]:
+    """Readable text files under `path`, and whether the file cap cut the walk short.
+
+    A symlinked file is listed only when it resolves inside the walk's own tree or a root
+    `_allowed_root` admits for `default_path`. Checking `path` alone was not enough: a
+    `notes.txt -> ../other/secret.txt` link inside the project was walked, read and
+    quoted as if it were project material. Symlinked directories are never descended
+    (os.walk's default); a Windows junction, which os.walk does descend, is descended
+    only when it too resolves inside.
+    """
     if os.path.isfile(path):
         name = os.path.basename(path).lower()
         # Naming a binary explicitly does not make it readable as text, so the same
@@ -540,10 +587,26 @@ def enumerate_files_bounded(path: str, glob: str | None = None) -> tuple[list[st
     skipped = _skipped_suffixes()
     cap = settings.agentaus_search_max_files
     found: list[str] = []
+    roots: list[str] | None = None      # resolved only when a link turns up
+
+    def leads_out(full: str) -> bool:
+        nonlocal roots
+        if roots is None:
+            roots = _search_roots(default_path) + [os.path.normcase(os.path.realpath(path))]
+        if _within(full, roots):
+            return False
+        log.info("skipped %s: a link to %s, outside the allowed roots",
+                 full, os.path.realpath(full))
+        return True
+
+    isjunction = getattr(os.path, "isjunction", lambda _: False)   # Python 3.12+
     for directory, subdirs, names in os.walk(path):
         _check_deadline()
         # Pruned in place so os.walk does not descend into them at all.
-        subdirs[:] = sorted(d for d in subdirs if not _skip_dir(directory, d))
+        subdirs[:] = sorted(
+            d for d in subdirs if not _skip_dir(directory, d)
+            and not (isjunction(os.path.join(directory, d))
+                     and leads_out(os.path.join(directory, d))))
         for name in sorted(names):
             if cap > 0 and len(found) >= cap:
                 log.warning("walk of %s stopped at %d files (AGENTAUS_SEARCH_MAX_FILES)",
@@ -559,6 +622,8 @@ def enumerate_files_bounded(path: str, glob: str | None = None) -> tuple[list[st
             if glob and not fnmatch.fnmatch(name, glob):
                 continue
             full = os.path.join(directory, name)
+            if os.path.islink(full) and leads_out(full):
+                continue
             if not documents.is_office_document(full) and looks_binary(full):
                 continue
             # Documents are measured on a different scale: a .pptx is mostly embedded
@@ -959,16 +1024,15 @@ async def run_search(
         return (f"{path} is the whole disk, not a project. Pass the absolute path of the "
                 f"project or folder to search - the working directory, if you do not know "
                 f"which.")
-    if not _allowed_root(path):
-        return (
-            f"{path} is outside AGENTAUS_SEARCH_ROOTS, which this bridge is confined to."
-        )
+    if not _allowed_root(path, default_path):
+        return _outside_roots(path)
 
     # Every step that touches the disk runs in a worker thread. They read every file in
     # the tree, and reading a document is a LibreOffice or PDF conversion; done on the
     # event loop, one search over a large tree froze the whole bridge - pings, other
     # turns and Claude passthrough - for 90 minutes.
-    files, truncated = await asyncio.to_thread(enumerate_files_bounded, path, glob)
+    files, truncated = await asyncio.to_thread(enumerate_files_bounded, path, glob,
+                                               default_path)
     if not files:
         return f"No readable files under {path}" + (f" matching {glob}" if glob else "") + "."
 
@@ -1197,6 +1261,8 @@ async def run_investigate(
         path = default_path if not path else os.path.join(default_path, path)
     if not os.path.isabs(path):
         return f"agentaus_investigate needs an absolute path; got {path!r}."
+    if not _allowed_root(path, default_path):
+        return _outside_roots(path)
 
     started_at = time.monotonic()
     reports = await asyncio.gather(*[
@@ -1419,9 +1485,9 @@ def _zoom(
         file_path = default_path if not file_path else os.path.join(default_path, file_path)
     if not os.path.isabs(file_path):
         return f"agentaus_zoom needs an absolute path; got {file_path!r}."
-    if not _allowed_root(file_path):
-        return f"{file_path} is outside AGENTAUS_SEARCH_ROOTS."
-    if not enumerate_files(file_path):
+    if not _allowed_root(file_path, default_path):
+        return _outside_roots(file_path)
+    if not enumerate_files(file_path, default_path=default_path):
         if documents.is_office_document(file_path) and not documents.available(file_path):
             return (f"{file_path} is an office document and no reader for it is "
                     f"available.\n{documents.install_hint(file_path)}")

@@ -902,9 +902,18 @@ def guidance_for(body: dict, *, covered_by_skill: tuple = (), routing: bool = Tr
     data, for the same reason and on the same evidence: it is the turn that writes up a
     result, and on every other turn it is advice that cannot be followed.
     """
+    from .config import settings as _settings
+    diet = _settings.agentaus_prompt_diet
     if not body.get("tools"):
         return prompt_style.headings(CORE_GUIDANCE)
-    notes = CORE_GUIDANCE + TOOL_GUIDANCE + _where_files_go(body)
+    if diet:
+        from .diet import LEAN_GUIDANCE
+        notes = LEAN_GUIDANCE + _where_files_go(body)
+    else:
+        notes = CORE_GUIDANCE + TOOL_GUIDANCE + _where_files_go(body)
+    # The diet drops the tool-selection section: each tool's own description says
+    # what it is for, and the section restated it at ~800 tokens.
+    selection = "" if diet else tool_selection(body)
     if is_subagent_turn(body):
         # A subagent hands back a value, not a write-up: the reporting contract asked
         # for 2,000 characters of prose where the script reads one tool call, and the
@@ -912,7 +921,7 @@ def guidance_for(body: dict, *, covered_by_skill: tuple = (), routing: bool = Tr
         offered = {t.get("name") for t in body.get("tools") or [] if isinstance(t, dict)}
         how = _RETURN_BY_TOOL if "StructuredOutput" in offered else _RETURN_BY_TEXT
         notes += SUBAGENT_GUIDANCE.format(how=how)
-        return prompt_style.headings(notes) + tool_selection(body)
+        return prompt_style.headings(notes) + selection
     opted = workflow_opt_in if workflow_opt_in is not None else workflow_opted_in(body)
     if opted and not workflow_offered(body) and any(
             isinstance(t, dict) and t.get("name") == "Agent" for t in body.get("tools") or []):
@@ -937,7 +946,7 @@ def guidance_for(body: dict, *, covered_by_skill: tuple = (), routing: bool = Tr
         notes += ANALYSIS_GUIDANCE
     routed = routing_section(body) if routing else ""
     return (prompt_style.headings(notes) + write_now_note(body, working_directory_of(body))
-            + routed + tool_selection(body))
+            + routed + selection)
 
 
 def with_skill_descriptions(body: dict) -> tuple[dict, int]:
@@ -1637,6 +1646,69 @@ this correction.
 """)
 
 
+# The check and the rewrite in one call (AGENTAUS_GROUNDING_ONE_PASS). Two calls cost two
+# round trips whenever the check finds something - half of all agent turns in the benchmark
+# (15 of 30 runs), 10-27 s for the second call alone.
+GROUNDING_ONE_PASS_INSTRUCTION = Template("""\
+An agent answered a question after using tools. Below is what it actually did, what
+each call returned, and what it then said.
+
+<tools_it_actually_ran>
+{ledger}
+</tools_it_actually_ran>
+
+<its_answer>
+{answer}
+</its_answer>
+
+<task>
+Find statements in the answer that the agent could not possibly know from what it ran.
+
+Look for:
+- claims about the CONTENTS of a file it never read
+- comparisons against material it never opened
+- named policies, rules, conventions or standards that appear nowhere in what it ran
+- numbers or counts that contradict each other, or that nothing it ran could produce
+
+A statement is fine if it follows from a tool result, is general knowledge, or is clearly
+offered as a suggestion rather than a finding.
+
+A value a command computed and printed is SUPPORTED by that command having run. Do not
+ask for a figure to be re-derived, re-read or cited from somewhere else: the run is the
+evidence. Only flag a number that CONTRADICTS an output shown below, or that no call
+made could have produced. An output may be excerpted - a value consistent with what a
+command of that kind returns is supported, not unsupported.
+
+That the agent wrote or edited a file - a Write or Edit call, or a command that created
+it - is SUPPORTED by that call: do not flag "I wrote response.md" as unread. The facts
+written INTO the file still need support like any other claim. Results reported back by
+a background workflow are SUPPORTED in the same way as a tool result.
+</task>
+
+<output_format>
+If everything checks out, reply with exactly: GROUNDED
+
+Otherwise reply with REVISED on the first line, then the whole answer reissued with each
+unsupported statement removed, or rewritten as the open question it actually is - "the
+repo may contain X; I did not read it" rather than a claim about X. Change nothing else:
+keep every grounded statement, its wording, and the structure and formatting of the
+original. Do not add new material, do not apologise, and do not mention this check.
+</output_format>
+""")
+
+
+def grounding_revision(reply: str) -> str:
+    """The reissued answer from a one-pass grounding reply, or "" to keep the original.
+
+    As with `grounding_verdict`, anything that does not follow the format keeps the answer.
+    """
+    text = (reply or "").strip()
+    first, _, rest = text.partition("\n")
+    if first.strip().strip("*#: ").upper() != "REVISED":
+        return ""
+    return rest.strip()
+
+
 def grounding_verdict(reply: str) -> str:
     """The listed gaps, or "" when the answer was found grounded.
 
@@ -1742,7 +1814,7 @@ any question about how something works or where a behaviour lives - a regex only
 text you can already spell.
 - Never plan to ask the user for something you can look up yourself - especially not \
 where the code is. You already know.
-- Be terse: short lines, no prose, no preamble.
+- Be terse: short lines, no prose, no preamble. At most twelve lines in all.
 - Do not answer the request here, and do not write code here.
 </rules>
 
@@ -1805,11 +1877,21 @@ def should_think(body: dict) -> bool:
 # prompt - so without lifting the path out explicitly the planner has no idea where the
 # code is. Observed live: it planned to "ask user for the codebase source (repo URL,
 # internal path, or name)" while the answer was sitting in the system prompt all along.
+#
+# The path is the rest of the line, not the first word: a directory may contain spaces
+# (`/Users/me/GitHub Repo/proj`), and this path is also the root the bridge confines its own
+# file reads to, so a path cut at the first space both refused the real project and admitted
+# a sibling of its prefix. A quoted path is taken up to its closing quote.
+_CWD_VALUE = r"""[ \t]*(?:"([^"\n]+)"|'([^'\n]+)'|`([^`\n]+)`|([^\n]+))"""
 _CWD_PATTERNS = (
-    re.compile(r"(?:primary\s+)?working\s+directory[^\n:]*:\s*(\S+)", re.I),
-    re.compile(r"\bcwd\b[^\n:]*:\s*(\S+)", re.I),
-    re.compile(r"current\s+(?:working\s+)?dir(?:ectory)?[^\n:]*:\s*(\S+)", re.I),
+    re.compile(r"(?:primary\s+)?working\s+directory[^\n:]*:" + _CWD_VALUE, re.I),
+    re.compile(r"\bcwd\b[^\n:]*:" + _CWD_VALUE, re.I),
+    re.compile(r"current\s+(?:working\s+)?dir(?:ectory)?[^\n:]*:" + _CWD_VALUE, re.I),
 )
+
+# An absolute path as Claude Code states it: POSIX (`/`, `~`) or native Windows - a drive
+# letter (`C:\Users\me`, `C:/Users/me`) or a UNC share (`\\server\share`).
+_ABSOLUTE_CWD = re.compile(r"^(?:[/~]|[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)")
 
 
 def working_directory_of(body: dict) -> str | None:
@@ -1837,10 +1919,10 @@ def working_directory(system) -> str | None:
     else:
         return None
     for pattern in _CWD_PATTERNS:
-        found = pattern.search(text)
-        if found:
-            path = found.group(1).strip().strip("`'\".,")
-            if path.startswith("/") or path.startswith("~"):
+        for found in pattern.finditer(text):
+            quoted = found.group(1) or found.group(2) or found.group(3)
+            path = quoted.strip() if quoted else found.group(4).strip().strip("`'\".,").rstrip()
+            if _ABSOLUTE_CWD.match(path):
                 return path
             if _WINDOWS_PATH.match(path):
                 # A Windows path often holds spaces ("C:\Users\me\GitHub Repo\x"), so it runs to
@@ -1933,7 +2015,7 @@ _SKILL_STEP = ("Begin the plan with these two lines, before anything else:\n\n"
                "choose one whenever it fits.")
 
 
-def with_plan(system, plan: str) -> object:
+def with_plan(system, plan: str, *, mid_turn: bool = False) -> object:
     """Fold the plan into the system prompt for the answer call.
 
     In the system prompt rather than as an assistant message: injecting a synthetic turn
@@ -1944,6 +2026,10 @@ def with_plan(system, plan: str) -> object:
     if not plan or not plan.strip():
         return system
     notice = (
+        "\n\n[Your plan for this turn, written when it started. The conversation shows the "
+        "steps you have already taken: carry on from where you are, do not repeat them, and "
+        "revise the plan if what you found contradicts it.]\n" + plan.strip()
+    ) if mid_turn else (
         "\n\n[Your plan for this turn, which you wrote just now. Follow it, and revise "
         "it if what you find contradicts it.]\n" + plan.strip()
     )

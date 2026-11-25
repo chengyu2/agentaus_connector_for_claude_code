@@ -778,8 +778,10 @@ class RetryForever(unittest.TestCase):
         try:
             settings.retry_backoff_seconds, settings.retry_max_delay_seconds = 1.0, 300.0
             self.assertLess(_retry_delay(0), 3)
-            self.assertGreaterEqual(_retry_delay(50), 300)
-            self.assertLessEqual(_retry_delay(50), 301)
+            # Saturated retries spread over the interval reserved under the cap:
+            # still bounded by it, still jittered rather than pinned to it.
+            self.assertGreaterEqual(_retry_delay(50), 299)
+            self.assertLessEqual(_retry_delay(50), 300)
         finally:
             settings.retry_backoff_seconds, settings.retry_max_delay_seconds = saved
 

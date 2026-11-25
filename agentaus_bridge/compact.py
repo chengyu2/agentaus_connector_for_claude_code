@@ -439,13 +439,32 @@ class ConversationCompactor:
         "summarise what arrived since", which is the difference between minutes and
         seconds on a long session.
         """
-        best: tuple[int, str] | None = None
+        # Only the lengths actually cached are hashed, and incrementally: the
+        # serialisation is walked once, one fragment appended per message, and each
+        # wanted length snapshotted as it grows - O(total bytes) total. When the cache
+        # is empty this returns without hashing anything at all. (The first version of
+        # this rewrite hashed every prefix length up front on every miss, which is
+        # O(n^2): measured 5.1 s on a 1,500-message head that used to cost 0 ms cold.)
+        wanted = {length for length, _, _ in self._prefixes if length < len(head)}
+        if not wanted:
+            return None
+        running = hashlib.sha256(b"[")
+        hashes = {}
+        for index, message in enumerate(head[:max(wanted)], 1):
+            if index > 1:
+                running.update(b", ")
+            running.update(json.dumps(message, default=str, sort_keys=True).encode())
+            if index in wanted:
+                snapshot = running.copy()
+                snapshot.update(b"]")
+                hashes[index] = snapshot.hexdigest()
+        best_len, best_summary = -1, None
         for length, entry_hash, summary in self._prefixes:
-            if length >= len(head) or (best and length <= best[0]):
+            if length >= len(head) or length <= best_len:
                 continue
-            if self._key(head[:length]) == entry_hash:
-                best = (length, summary)
-        return best
+            if hashes.get(length) == entry_hash:
+                best_len, best_summary = length, summary
+        return (best_len, best_summary) if best_summary is not None else None
 
     def _remember_prefix(self, head: list, summary: str) -> None:
         self._prefixes.append((len(head), self._key(head), summary))
@@ -598,7 +617,24 @@ class ConversationCompactor:
         # keeps the turn alive, which is the whole point.
         kept = list(tail)
         dropped = len(head)
-        while total(kept) > limit:
+        # `total(kept)` re-serialises the whole surviving body on every iteration,
+        # which is O(n^2) on a long history. json.dumps emits the wrapper and list
+        # with fixed separators, so the exact same string is rebuilt from one
+        # per-message serialisation instead and each iteration costs a join.
+        sent = as_sent(messages) if has_unseen(messages) else messages
+        frags = [json.dumps(m, default=str) for m in sent]
+        body_head = '{"s": ' + json.dumps(body.get("system"), default=str) + ', "m": ['
+        body_tail = '], "t": ' + json.dumps(body.get("tools"), default=str) + '}'
+
+        def tail_total(start: int) -> int:
+            # Same arithmetic as `total(kept)` above: even the empty summary pays the
+            # calibrated overhead and safety margin, and dropping that constant would
+            # silently shift where the trim boundary lands.
+            return (estimate_tokens(body_head + ", ".join(frags[start:]) + body_tail)
+                    + estimate_tokens("") + reserve)
+
+        start = len(head)
+        while tail_total(start) > limit:
             # Drop a whole turn at a time. Popping message by message is what lets the
             # list end up opening on a `tool_result` whose `tool_use` has just been
             # dropped, so advance to the next clean turn or stop.
@@ -612,5 +648,6 @@ class ConversationCompactor:
                 break
             kept = kept[nxt:]
             dropped += nxt
+            start += nxt
         return {"messages": kept, "summary": None, "summarised": 0,
                 "method": "trimmed", "dropped": dropped}
