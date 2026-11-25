@@ -592,7 +592,7 @@ class EditRepair(unittest.TestCase):
     def test_through_validation_sequential_edits_and_replace_all(self):
         with tempfile.TemporaryDirectory() as cwd:
             path = os.path.join(cwd, "bank.py")
-            with open(path, "w") as fh:
+            with open(path, "w", encoding="utf-8") as fh:
                 fh.write(FILE)
             schema = {"type": "object", "properties": {k: {"type": "string"} for k in
                                                          ("file_path", "old_string", "new_string")}}
@@ -620,7 +620,7 @@ class EditRepair(unittest.TestCase):
     def test_a_refused_edit_gets_the_closest_lines_with_their_indentation(self):
         with tempfile.TemporaryDirectory() as cwd:
             path = os.path.join(cwd, "bank.py")
-            with open(path, "w") as fh:
+            with open(path, "w", encoding="utf-8") as fh:
                 fh.write(FILE)
             body = {"messages": [
                 user("fix it"),

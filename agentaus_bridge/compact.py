@@ -558,6 +558,8 @@ class ConversationCompactor:
         keep_fraction: float = 0.5,
         threshold: float = 1.0,
         chunk_tokens: int | None = None,
+        skip_summarisation: bool = False,
+        summarisation_timeout: float = 0.0,
     ) -> dict:
         """Return a plan describing how to fit `body` into `limit`.
 
@@ -591,12 +593,24 @@ class ConversationCompactor:
             return {"messages": tail, "summary": None, "summarised": 0, "method": "none"}
 
         summary = ""
-        try:
-            summary = await self.summarise_head(
-                head, chunk_budget=chunk_tokens or max(budget // 4, 1000)
-            )
-        except Exception as exc:  # fall back rather than fail the turn
-            log.warning("summarisation failed (%s); falling back to trimming", exc)
+        if skip_summarisation:
+            log.info("skipping summarisation (AGENTAUS_SKIP_SUMMARISATION); will trim instead")
+        else:
+            try:
+                _coro = self.summarise_head(
+                    head, chunk_budget=chunk_tokens or max(budget // 4, 1000)
+                )
+                if summarisation_timeout > 0:
+                    summary = await asyncio.wait_for(_coro, timeout=summarisation_timeout)
+                else:
+                    summary = await _coro
+            except asyncio.TimeoutError:
+                log.warning(
+                    "summarisation timed out after %.0fs; falling back to trimming",
+                    summarisation_timeout,
+                )
+            except Exception as exc:  # fall back rather than fail the turn
+                log.warning("summarisation failed (%s); falling back to trimming", exc)
 
         # The opening request and any background-task report, word for word, when they fit.
         # Measured (d12 c1913h): one compaction summarised the "ultracode:" request, the
@@ -615,6 +629,8 @@ class ConversationCompactor:
 
         # Summary absent or still too large: drop the head outright. Worse, but it
         # keeps the turn alive, which is the whole point.
+        # Trim back to the compaction trigger (not the hard limit) so the next 3-5
+        # exchanges do not immediately re-trigger the same slow cycle.
         kept = list(tail)
         dropped = len(head)
         # `total(kept)` re-serialises the whole surviving body on every iteration,
@@ -633,8 +649,9 @@ class ConversationCompactor:
             return (estimate_tokens(body_head + ", ".join(frags[start:]) + body_tail)
                     + estimate_tokens("") + reserve)
 
+        trim_target = min(trigger, limit)  # clamp: threshold > 1.0 must not exceed limit
         start = len(head)
-        while tail_total(start) > limit:
+        while tail_total(start) > trim_target:
             # Drop a whole turn at a time. Popping message by message is what lets the
             # list end up opening on a `tool_result` whose `tool_use` has just been
             # dropped, so advance to the next clean turn or stop.

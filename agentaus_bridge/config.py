@@ -275,6 +275,16 @@ class Settings:
     agentaus_verify_summary: bool = field(
         default_factory=lambda: _bool("AGENTAUS_VERIFY_SUMMARY", True)
     )
+    # Skip the expensive multi-call summarisation and go straight to dropping old
+    # messages. Much faster when rate-limited; the model is told what was dropped.
+    agentaus_skip_summarisation: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_SKIP_SUMMARISATION", False)
+    )
+    # Seconds before summarisation gives up and falls back to trimming. 0 = no timeout.
+    # Keeps the main request from waiting indefinitely when the API is rate-limited.
+    agentaus_summarisation_timeout: float = field(
+        default_factory=lambda: _float("AGENTAUS_SUMMARISATION_TIMEOUT", 0.0)
+    )
     # Deprecated in favour of AGENTAUS_MAX_CONCURRENCY below, which caps every
     # bridge-initiated call rather than only summarisation. Still read when set, so an
     # existing .env keeps working. See gate.max_concurrency().

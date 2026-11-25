@@ -25,8 +25,8 @@ from collections import OrderedDict
 from typing import AsyncIterator, Callable
 
 import httpx
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, Form, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 from . import attribution
 from . import diet
@@ -253,6 +253,32 @@ AGENTAUS_MODEL = {
     "description": "Sovereign Australian model via the local Agentaus bridge",
     "created_at": "2026-05-01T00:00:00Z",
 }
+# Quality-variant model IDs — prefixed with "claude-" so Claude Code's model discovery
+# filter (keeps only ids containing "claude" or "anthropic") shows them in /model.
+_AGENTAUS_QUALITY_MODELS = [
+    {
+        "id": "claude-agentaus-balanced",
+        "type": "model",
+        "display_name": "Agentaus · Balanced",
+        "description": "Agentaus with self-review — balanced speed and quality",
+        "created_at": "2026-05-01T00:00:00Z",
+    },
+    {
+        "id": "claude-agentaus-fast",
+        "type": "model",
+        "display_name": "Agentaus · Fast",
+        "description": "Agentaus with no extra passes — fastest response",
+        "created_at": "2026-05-01T00:00:00Z",
+    },
+]
+# Maps variant model ids to a quality mode. The base "agentaus" model is NOT listed
+# here so it respects whatever AGENTAUS_THINKING / AGENTAUS_SELF_REVIEW say in .env.
+_MODEL_TO_QUALITY: dict[str, str] = {
+    "claude-agentaus-balanced": "medium",
+    "claude-agentaus-fast": "low",
+}
+# IDs that should be normalised to plain "agentaus" before forwarding to Agentaus.
+_AGENTAUS_VARIANT_IDS: set[str] = {"claude-agentaus-balanced", "claude-agentaus-fast"}
 # Inside the picker's 3 s, with room for the bridge's own work.
 _MODELS_TIMEOUT_S = 2.5
 # The last list Anthropic returned, served when it cannot be reached in time.
@@ -305,6 +331,9 @@ async def list_models(request: Request) -> JSONResponse:
     models = list(live if live is not None else _MODELS_LAST["data"] or [])
     if not any(m.get("id") == AGENTAUS_MODEL["id"] for m in models):
         models.append(dict(AGENTAUS_MODEL))
+    for qm in _AGENTAUS_QUALITY_MODELS:
+        if not any(m.get("id") == qm["id"] for m in models):
+            models.append(dict(qm))
     rlog(logging.INFO, "model list: %d model(s) served (%s)", len(models),
              "live from Anthropic" if live is not None
              else "Anthropic's last list" if _MODELS_LAST["data"] else "Agentaus only")
@@ -357,6 +386,183 @@ def _route(request: Request, body: dict, model: str, *, main_loop: bool) -> tupl
     return by_model, False
 
 
+_QUALITY_PRESETS: dict[str, dict] = {
+    "high":   {"agentaus_thinking": True,  "agentaus_self_review": True},
+    "medium": {"agentaus_thinking": False, "agentaus_self_review": True},
+    "low":    {"agentaus_thinking": False, "agentaus_self_review": False},
+}
+
+# Derive initial quality label from .env settings so the UI reflects reality on startup.
+def _quality_from_settings() -> str:
+    for name, preset in _QUALITY_PRESETS.items():
+        if all(getattr(settings, attr, None) == val for attr, val in preset.items()):
+            return name
+    return "unknown"
+
+_QUALITY_MODE: str = _quality_from_settings()
+
+_QUALITY_DESCRIPTIONS: dict[str, str] = {
+    "high":   "Planning + self-review. Best results on complex tasks.",
+    "medium": "Self-review only. Faster, slightly less structured.",
+    "low":    "No extra passes. Fastest, least verified.",
+}
+
+
+def _apply_quality_mode(mode: str) -> None:
+    global _QUALITY_MODE
+    if mode not in _QUALITY_PRESETS:
+        return
+    _QUALITY_MODE = mode
+    for attr, value in _QUALITY_PRESETS[mode].items():
+        setattr(settings, attr, value)
+    rlog(logging.INFO, "quality mode set to %s (thinking=%s review=%s)",
+         mode, settings.agentaus_thinking, settings.agentaus_self_review)
+
+
+_UI_PAGE = """\
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Agentaus Bridge</title>
+  <style>
+    *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+    body{{font-family:system-ui,-apple-system,sans-serif;background:#0f0f0f;color:#e0e0e0;
+         min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}}
+    .card{{background:#161616;border:1px solid #2a2a2a;border-radius:16px;padding:32px;
+           max-width:520px;width:100%}}
+    .header{{margin-bottom:28px}}
+    h1{{font-size:1rem;font-weight:700;color:#fff;letter-spacing:-.01em}}
+    .sub{{font-size:.82rem;color:#666;margin-top:4px}}
+    .dot{{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px}}
+    .dot-ok{{background:#22c55e}} .dot-off{{background:#ef4444}}
+    .modes{{display:flex;flex-direction:column;gap:10px}}
+    .mode-btn{{width:100%;border:1px solid #2a2a2a;border-radius:10px;padding:14px 16px;
+               background:#1c1c1c;cursor:pointer;text-align:left;color:inherit;
+               transition:border-color .15s,background .15s;display:flex;align-items:center;gap:14px}}
+    .mode-btn:hover{{border-color:#444;background:#222}}
+    .mode-btn.active{{border-color:#3b82f6;background:#0d1f3c}}
+    .mode-icon{{font-size:1.3rem;line-height:1;flex-shrink:0}}
+    .mode-text h2{{font-size:.88rem;font-weight:600;color:#fff;margin-bottom:3px}}
+    .mode-btn.active .mode-text h2{{color:#93c5fd}}
+    .mode-text p{{font-size:.78rem;color:#666;line-height:1.5}}
+    .mode-btn.active .mode-text p{{color:#6b9fd4}}
+    .badge{{font-size:.65rem;background:#3b82f6;color:#fff;border-radius:4px;
+            padding:1px 6px;margin-left:6px;vertical-align:middle;font-weight:600}}
+    .model-id{{display:block;font-size:.72rem;font-family:ui-monospace,monospace;
+               color:#444;margin-top:5px;letter-spacing:-.01em}}
+    .mode-btn.active .model-id{{color:#4a7abf}}
+    .status{{margin-top:24px;font-size:.78rem;color:#555;border-top:1px solid #222;padding-top:16px}}
+  </style>
+</head>
+<body>
+<div class="card">
+  <div class="header">
+    <h1><span class="dot dot-ok"></span>Agentaus Bridge</h1>
+    <p class="sub">Quality mode &mdash; takes effect on the next turn</p>
+  </div>
+  <div class="modes">
+    {buttons}
+  </div>
+  <div class="status">
+    Thinking: <strong>{thinking}</strong> &nbsp;&bull;&nbsp;
+    Self-review: <strong>{review}</strong>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+_BTN_TEMPLATE = """\
+<form method="post" action="/quality">
+  <input type="hidden" name="mode" value="{mode}">
+  <button type="submit" class="mode-btn{active}">
+    <span class="mode-icon">{icon}</span>
+    <div class="mode-text">
+      <h2>{label}{default_badge}</h2>
+      <p>{description}</p>
+      <code class="model-id">{model_id}</code>
+    </div>
+  </button>
+</form>"""
+
+_MODE_ICONS = {"high": "🎯", "medium": "⚡", "low": "🚀"}
+_MODE_LABELS = {"high": "High", "medium": "Medium", "low": "Low"}
+_MODE_MODEL_IDS = {
+    "high":   "agentaus",
+    "medium": "claude-agentaus-balanced",
+    "low":    "claude-agentaus-fast",
+}
+
+
+def _quality_page() -> str:
+    buttons = []
+    for mode in ("high", "medium", "low"):
+        active = " active" if mode == _QUALITY_MODE else ""
+        default_badge = '<span class="badge">default</span>' if mode == "high" else ""
+        buttons.append(_BTN_TEMPLATE.format(
+            mode=mode, active=active, icon=_MODE_ICONS[mode],
+            label=_MODE_LABELS[mode], default_badge=default_badge,
+            description=_QUALITY_DESCRIPTIONS[mode],
+            model_id=_MODE_MODEL_IDS[mode],
+        ))
+    return _UI_PAGE.format(
+        buttons="\n    ".join(buttons),
+        thinking="on" if settings.agentaus_thinking else "off",
+        review="on" if settings.agentaus_self_review else "off",
+    )
+
+
+@app.get("/", response_class=HTMLResponse)
+async def ui_root() -> HTMLResponse:
+    return HTMLResponse(_quality_page())
+
+
+_CLEAR_CONTEXT_NEXT: bool = False
+
+
+@app.post("/clear-context")
+async def clear_context_post(request: Request) -> JSONResponse:
+    """Set a one-shot flag: the next request will have all but its last user message stripped."""
+    if not _client_authorised(request):
+        return _error_response(401, "authentication_error", "Invalid bridge token")
+    global _CLEAR_CONTEXT_NEXT
+    _CLEAR_CONTEXT_NEXT = True
+    return JSONResponse({"status": "ok", "message": "Context will be cleared on the next request."})
+
+
+@app.get("/quality")
+async def quality_get() -> JSONResponse:
+    return JSONResponse({"mode": _QUALITY_MODE,
+                         "thinking": settings.agentaus_thinking,
+                         "self_review": settings.agentaus_self_review})
+
+
+@app.post("/quality")
+async def quality_post(
+    request: Request,
+    mode: str = Form(default=""),
+) -> Response:
+    if not _client_authorised(request):
+        return _error_response(401, "authentication_error", "Invalid bridge token")
+    if not mode:
+        try:
+            body = await request.json()
+            mode = body.get("mode", "")
+        except Exception:
+            pass
+    if mode not in _QUALITY_PRESETS:
+        return JSONResponse({"error": f"unknown mode {mode!r}; use high, medium or low"}, status_code=400)
+    _apply_quality_mode(mode)
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept:
+        return RedirectResponse("/", status_code=303)
+    return JSONResponse({"mode": _QUALITY_MODE,
+                         "thinking": settings.agentaus_thinking,
+                         "self_review": settings.agentaus_self_review})
+
+
 @app.post("/v1/messages")
 async def messages(request: Request) -> Response:
     if not _client_authorised(request):
@@ -368,7 +574,28 @@ async def messages(request: Request) -> Response:
     except json.JSONDecodeError as exc:
         return _error_response(400, "invalid_request_error", f"Malformed JSON body: {exc}")
 
+    global _CLEAR_CONTEXT_NEXT
+    if _CLEAR_CONTEXT_NEXT:
+        _CLEAR_CONTEXT_NEXT = False
+        all_msgs = body.get("messages") or []
+        # Walk back to the last user-role message; keeping an assistant or tool_result
+        # as the first message would make the request malformed.
+        last_user = next(
+            (i for i in range(len(all_msgs) - 1, -1, -1)
+             if (all_msgs[i].get("role") == "user")),
+            None,
+        )
+        if last_user is not None and last_user > 0:
+            body = {**body, "messages": all_msgs[last_user:]}
+            rlog(logging.INFO, "context cleared: stripped %d message(s), keeping from last user turn",
+                 last_user)
+
     model = body.get("model") or ""
+    if model in _MODEL_TO_QUALITY:
+        _request_quality.set(_QUALITY_PRESETS[_MODEL_TO_QUALITY[model]])
+    if model in _AGENTAUS_VARIANT_IDS:
+        body = {**body, "model": "agentaus"}
+        model = "agentaus"
     wants_stream = bool(body.get("stream"))
     to_agentaus, inherited = _route(request, body, model, main_loop=True)
 
@@ -418,6 +645,15 @@ async def count_tokens(request: Request) -> Response:
 # what made a 90-second stall hard to read: sixty identical "200 OK" lines and no way
 # to tell which was the actual turn.
 _request_id: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+_request_quality: contextvars.ContextVar[dict | None] = contextvars.ContextVar("request_quality", default=None)
+
+
+def _eff(attr: str):
+    """Per-request quality override when a variant model was named, else the global setting."""
+    override = _request_quality.get()
+    if override is not None and attr in override:
+        return override[attr]
+    return getattr(settings, attr)
 
 
 def _new_request_id() -> str:
@@ -2239,9 +2475,19 @@ def _with_trim_notice(system, dropped: int):
     may invent continuity it has no basis for.
     """
     notice = (
-        f"\n\n[Note: the {dropped} oldest message(s) of this conversation were removed "
-        f"to fit the context window. If the user refers to something earlier that you "
-        f"cannot see, say so rather than guessing.]"
+        f"\n\n[IMPORTANT — CONTEXT TRIM: {dropped} message(s) were automatically "
+        f"removed from the start of this conversation to fit the 131k-token window. "
+        f"This means:\n"
+        f"- You have NO memory of anything said in those {dropped} messages.\n"
+        f"- Any replies YOU gave in those messages are also gone — do NOT say you "
+        f"already answered something if you cannot see that exchange.\n"
+        f"- Do NOT guess or invent what was discussed earlier.\n"
+        f"You MUST start your response with this exact notice:\n"
+        f"\"⚠️ **Context trimmed**: {dropped} older messages were dropped to fit the "
+        f"131k limit. I have no memory of what was in them — including any replies I "
+        f"gave. Starting a fresh Claude Code session restores full history. "
+        f"Want me to continue from here?\"\n"
+        f"Then answer the user's current question below that notice.]"
     )
     if system is None:
         return notice.strip()
@@ -2301,6 +2547,8 @@ async def _fit_to_window(
         keep_fraction=settings.agentaus_keep_fraction,
         threshold=threshold,
         chunk_tokens=settings.agentaus_summary_chunk_tokens,
+        skip_summarisation=settings.agentaus_skip_summarisation,
+        summarisation_timeout=settings.agentaus_summarisation_timeout,
     )
     if plan["method"] == "summarised":
         fitted = {**body, "messages": plan["messages"]}
@@ -2975,7 +3223,7 @@ async def _handle_agentaus(
 
         # Measured (d12 c1913): the planning pass took 254 s and failed with 524 before a
         # graph main loop's first turn reached the model - a turn whose job is to call Workflow.
-        thinking_on = settings.agentaus_thinking and not _graph_not_started(received)
+        thinking_on = _eff("agentaus_thinking") and not _graph_not_started(received)
         if thinking_on and settings.agentaus_plan_async and turn_key is not None:
             # Planned beside the first call rather than before it; every later request of
             # the turn carries the plan once it is written. See plans.py.
@@ -3226,7 +3474,7 @@ async def _handle_agentaus(
         # Review only a plain text answer. A turn that calls tools is mid-task, and
         # rewriting it would break the tool_use the client is waiting on.
         if (
-            settings.agentaus_self_review
+            _eff("agentaus_self_review")
             and _checks_apply(body)
             and not msg0.get("tool_calls")
             and not ran
@@ -3504,7 +3752,7 @@ async def _unguarded_event_stream(
     # Any of the passes that may rewrite it: tied to self-review alone, turning review off
     # silently turned off the grounding check and the syntax fix as well - the buffered path
     # never did that.
-    buffering = (settings.agentaus_self_review or settings.agentaus_grounding_check
+    buffering = (_eff("agentaus_self_review") or settings.agentaus_grounding_check
                  or settings.agentaus_syntax_check) and _checks_apply(original)
     pending: list[str] = []
 

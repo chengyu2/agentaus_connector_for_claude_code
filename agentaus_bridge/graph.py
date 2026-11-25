@@ -41,12 +41,12 @@ log = logging.getLogger("agentaus-bridge")
 
 MARK = "[agentaus-graph]"
 _GRAPHS = Path(__file__).parent / "graphs"
-SCRIPT = (_GRAPHS / "solve.js").read_text()
-DYNAMIC_SCRIPT = (_GRAPHS / "dynamic.js").read_text()
+SCRIPT = (_GRAPHS / "solve.js").read_text(encoding="utf-8")
+DYNAMIC_SCRIPT = (_GRAPHS / "dynamic.js").read_text(encoding="utf-8")
 # Every role in the dynamic graph works from a skill file: scout, plan, review-plan, solve,
 # merge, check, assemble, fix. Passed in with the script, so no agent spends a call reading
 # its own instructions off disk.
-SKILLS = {p.stem: p.read_text() for p in sorted((_GRAPHS / "skills").glob("*.md"))}
+SKILLS = {p.stem: p.read_text(encoding="utf-8") for p in sorted((_GRAPHS / "skills").glob("*.md"))}
 
 
 def script_for() -> str:
