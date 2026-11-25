@@ -167,6 +167,25 @@ class AStoppedWorkflowIsNotStillRunning(unittest.TestCase):
         body["messages"].pop(3)
         self.assertEqual(augment.pending_workflows(body), {"w5iah888s"})
 
+    def test_a_read_that_quotes_a_launch_is_not_one(self):
+        body = self.body("system")
+        body["messages"][1:4] = [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "r1", "name": "Read",
+                                               "input": {"file_path": "tests/test_delegation.py"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r1", "content":
+                'launch = ("Workflow launched in background. Task ID: w5iah888s\\n"'}]}]
+        self.assertEqual(augment.pending_workflows(body), set())
+
+    def test_a_quoted_launch_beside_a_real_one_adds_nothing(self):
+        body = self.body("system")
+        body["messages"].pop(3)
+        body["messages"][3:3] = [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "r1", "name": "Read",
+                                               "input": {"file_path": "tests/test_ultracode.py"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r1", "content":
+                "Workflow launched in background. Task ID: g1"}]}]
+        self.assertEqual(augment.pending_workflows(body), {"w5iah888s"})
+
 
 class TheGraphRecordCountsASystemEntryReport(unittest.TestCase):
     """`graph.note_run` keeps a launch "running" across compaction (the remembered set in
