@@ -43,6 +43,11 @@ from .prompt_style import Template
 
 log = logging.getLogger("agentaus-bridge")
 
+# The cached verdict for a condensation the growth gate rejected: keep the raw
+# result. An object, never a string the summariser could have produced, so a
+# rejection cannot be mistaken for a usable condensation.
+REJECTED = object()
+
 Summariser = Callable[[str], Awaitable[str]]
 
 
@@ -139,7 +144,7 @@ class ResultDistiller:
         self._summarise = summarise
         self._threshold = threshold_tokens
         self._chunk_tokens = chunk_tokens
-        self._cache: OrderedDict[str, str] = OrderedDict()
+        self._cache: OrderedDict[str, str | object] = OrderedDict()
         self._cache_size = cache_size
         self.hits = 0
         self.misses = 0
@@ -149,7 +154,7 @@ class ResultDistiller:
     def _key(tool_use_id: str, text: str) -> str:
         return hashlib.sha256(f"{tool_use_id}\x00{text}".encode()).hexdigest()
 
-    def _remember(self, key: str, value: str) -> None:
+    def _remember(self, key: str, value: str | object) -> None:
         self._cache[key] = value
         self._cache.move_to_end(key)
         while len(self._cache) > self._cache_size:
@@ -229,6 +234,12 @@ class ResultDistiller:
                 if condensed is not None:
                     self._cache.move_to_end(key)
                     self.hits += 1
+                    if condensed is REJECTED:
+                        # The gate rejected this condensation once; the verdict is
+                        # cached, so a later turn re-pays neither the model call
+                        # nor the gate.
+                        blocks.append(block)
+                        continue
                 else:
                     self.misses += 1
                     tool, tool_input = index.get(call_id, ("unknown tool", "{}"))
@@ -241,13 +252,16 @@ class ResultDistiller:
                                     "result", call_id, exc)
                         blocks.append(block)
                         continue
-                    self._remember(key, condensed)
 
                 after = estimate_tokens(condensed)
-                # A distillation that grew is not one worth having.
+                # A distillation that grew is not one worth having. Cache the verdict
+                # either way - the condensation if it passed, REJECTED if not - so the
+                # gate is paid at most once per unique output.
                 if after >= before:
+                    self._remember(key, REJECTED)
                     blocks.append(block)
                     continue
+                self._remember(key, condensed)
 
                 saved += before - after
                 changed = True
