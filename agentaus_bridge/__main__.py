@@ -12,6 +12,9 @@ import os
 import sys
 from pathlib import Path
 
+# The installer refuses anything older (scripts/install.sh); a hand-made virtualenv does not.
+MIN_PYTHON = (3, 11)
+
 
 def load_env_file(path: Path) -> int:
     """Minimal .env reader: KEY=VALUE lines, # comments, optional quotes.
@@ -81,6 +84,17 @@ def main(argv: list[str] | None = None) -> int:
     log = logging.getLogger("agentaus-bridge")
     if count:
         log.info("loaded %d settings from %s", count, env_path)
+    if sys.version_info < MIN_PYTHON:
+        # Warn rather than refuse: a background service that exits on start is restarted
+        # in a loop, which is worse than a bridge with one protection weakened.
+        log.warning(
+            "running on Python %d.%d; the bridge needs %d.%d or newer. Some protections are "
+            "off on older versions - for example, a script's local random.py or json.py "
+            "is not recognised as shadowing the standard library. Rebuild the virtualenv "
+            "with a newer Python: rm -rf .venv && python3.12 -m venv .venv && "
+            ".venv/bin/pip install -r requirements.txt",
+            *sys.version_info[:2], *MIN_PYTHON,
+        )
 
     if not settings.agentaus_api_key:
         log.error(
