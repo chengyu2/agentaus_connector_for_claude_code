@@ -223,6 +223,28 @@ class RoundLimit(_Loop):
                 stub = self.tool_stub(behave)
                 *blocks, stop = self.turn(stream)
                 self.assertFalse([b for b in blocks if b["type"] == "tool_use"])
+                self.assertIn("skips the cache key", "".join(b.get("text", "") for b in blocks))
+                self.assertEqual(stop, "end_turn")
+
+    def test_a_library_skill_call_after_the_cut_off_is_never_forwarded(self):
+        def behave(payload):
+            if not payload.get("tools"):
+                return {"content": ""}
+            if cut_off(payload):
+                return {"tool_calls": [("Skill", {"skill": "cache-notes"})]}
+            return {"tool_calls": [(bridge_tools.SEARCH_TOOL, {"query": "cache reload", "path": "/tmp"})]}
+
+        settings.agentaus_skill_library = True
+        served = mock.patch.object(server, "with_library_skills",
+                                   lambda body: (body, frozenset({"cache-notes"})))
+        served.start()
+        self.addCleanup(served.stop)
+        for stream, buffered in MODES:
+            with self.subTest(stream=stream, buffered=buffered):
+                settings.agentaus_self_review = buffered
+                self.tool_stub(behave)
+                *blocks, stop = self.turn(stream, tools=("Bash", "Read", "Skill"))
+                self.assertFalse([b for b in blocks if b["type"] == "tool_use"])
                 self.assertEqual(stop, "end_turn")
 
 
@@ -244,6 +266,23 @@ class EmptyReply(_Loop):
                 self.assertEqual([b.get("name") for b in blocks if b["type"] == "tool_use"],
                                  ["Bash"])
                 self.assertEqual(stop, "tool_use")
+
+    def test_an_empty_reply_does_not_spend_a_search_round(self):
+        def behave(payload):
+            if len(stub.calls) == 1:
+                return {"content": ""}
+            if any(m.get("role") == "tool" for m in payload.get("messages") or []):
+                return {"content": "The reload path skips the cache key."}
+            return {"tool_calls": [(bridge_tools.SEARCH_TOOL, {"query": "cache reload", "path": "/tmp"})]}
+
+        for stream, buffered in MODES:
+            with self.subTest(stream=stream, buffered=buffered):
+                settings.agentaus_self_review = buffered
+                stub = self.tool_stub(behave)
+                *blocks, stop = self.turn(stream)
+                self.assertFalse(any(cut_off(p) for p in stub.calls))
+                self.assertIn("skips the cache key", "".join(b.get("text", "") for b in blocks))
+                self.assertEqual(stop, "end_turn")
 
     def test_a_second_empty_reply_falls_back_to_no_tools(self):
         """Buffered only: a live stream has no answer to replace (unchanged here)."""

@@ -3015,9 +3015,12 @@ async def _handle_agentaus(
         # and an empty reply sent again unchanged.
         cut_off = False
         empty_retried = False
+        # Charged only for rounds that run bridge tools, as on the streamed path: a
+        # correction or a re-ask is not work the budget is for.
+        tool_round = 0
         # Unbounded on its face, bounded by what continues it: corrections, bridge rounds
         # and the two re-asks above each have their own limit.
-        for tool_round in itertools.count():
+        for _ in itertools.count():
             # Agentaus is the authority on whether a prompt fits. If it says no, it also
             # says what its real limit is, so the next attempt compacts against that
             # instead of against our estimate.
@@ -3148,6 +3151,7 @@ async def _handle_agentaus(
                     data = _without_unknown_calls(data, known)
                 break
             if tool_round < settings.agentaus_tool_rounds:
+                tool_round += 1
                 rlog(logging.INFO, "running %d bridge tool call(s): %s",
                      len(mine), ", ".join(c["name"] for c in mine))
                 payload = await _run_bridge_tools(
@@ -3170,7 +3174,8 @@ async def _handle_agentaus(
             # Everything those searches found is still in the payload, so ask again with
             # the tools removed rather than surfacing an apology for having searched.
             forced = await _answer_without_tools(client, payload)
-            data = _with_forced_answer(data, forced) if forced else _without_bridge_calls(data)
+            data = _with_forced_answer(data, forced) if forced else _without_bridge_calls(
+                data, drop={c["id"] for c in mine if c.get("id")})
             break
 
         choice0 = (data.get("choices") or [{}])[0]
@@ -4008,6 +4013,12 @@ async def _unguarded_event_stream(
             rlog(logging.WARNING,
                  "tool round limit (%d) reached; dropping %d unanswered bridge call(s)",
                  settings.agentaus_tool_rounds, len(mine))
+            if buffering and pending and not theirs:
+                # Narration before a search that will not run promises work that never
+                # happens. The forced answer replaces it, as it does unbuffered.
+                rlog(logging.DEBUG, "discarded %d chars of interim narration",
+                     len("".join(pending)))
+                pending = []
             if not pending and not theirs:
                 # Every one of those searches is still in the payload. Asking again with
                 # the tools REMOVED forces the model to answer from what it gathered,
