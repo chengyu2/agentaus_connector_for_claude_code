@@ -45,8 +45,32 @@ $env:ANTHROPIC_CUSTOM_MODEL_OPTION = "agentaus"
 $env:ANTHROPIC_CUSTOM_MODEL_OPTION_NAME = "Agentaus (Trellis Data)"
 $env:ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION = "Sovereign Australian model, served via the local Agentaus bridge"
 # Claude Code does not recognise the id `agentaus` and would assume a 1M-token window,
-# compacting long after Agentaus's real limit. This applies only to unrecognised ids.
-if (-not $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS) { $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "131072" }
+# compacting long after Agentaus's 131,072-token limit. CLAUDE_CODE_MAX_CONTEXT_TOKENS
+# corrects that for unrecognised ids only - unless DISABLE_COMPACT is set, when Claude Code
+# applies it to every model and Opus or Sonnet would stop at 131,072 too. So it is set here,
+# for this one session, never in a settings file, and left out when DISABLE_COMPACT is set
+# in the shell or named in a settings file the session reads. A value you set yourself wins.
+function Test-CompactDisabled {
+    if ($env:DISABLE_COMPACT -and (@("1", "true", "yes", "on") -contains $env:DISABLE_COMPACT.Trim())) {
+        return $true
+    }
+    $ConfigDir = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME ".claude" }
+    foreach ($File in @((Join-Path $ConfigDir "settings.json"), ".claude\settings.json", ".claude\settings.local.json")) {
+        if ((Test-Path -LiteralPath $File) -and
+            (Select-String -LiteralPath $File -Pattern '"DISABLE_COMPACT"' -SimpleMatch -Quiet)) {
+            return $true
+        }
+    }
+    return $false
+}
+if (-not $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS) {
+    if (Test-CompactDisabled) {
+        Write-Host ("DISABLE_COMPACT is set, so Claude Code is not told Agentaus's 131,072-token window " +
+                    "(it would cap Claude models too); the bridge trims long Agentaus conversations instead.") -ForegroundColor Yellow
+    } else {
+        $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "131072"
+    }
+}
 
 # NOTE: do NOT set CLAUDE_CODE_ATTRIBUTION_HEADER=0 here. Behind a custom
 # ANTHROPIC_BASE_URL it also strips the block from auto-mode permission-classifier

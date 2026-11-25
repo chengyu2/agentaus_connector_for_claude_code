@@ -16,6 +16,25 @@ from pathlib import Path
 MIN_PYTHON = (3, 11)
 
 
+def old_python_warning(version: tuple) -> str | None:
+    """What to tell someone whose bridge runs on a Python older than MIN_PYTHON, or None.
+
+    The fix names no interpreter or shell command: the same main() runs the Windows
+    service, and the installer picks a suitable Python and the user's own components.
+    The old virtualenv must go first, because install.ps1 reuses any it finds.
+    """
+    if tuple(version[:2]) >= MIN_PYTHON:
+        return None
+    return (
+        "running on Python %d.%d; the bridge needs %d.%d or newer. Some protections are off "
+        "on older versions - for example, a script's local random.py or json.py is not "
+        "recognised as shadowing the standard library. To rebuild on a newer Python, install "
+        "Python %d.%d or newer, delete the .venv folder in the bridge's directory, and run the "
+        "installer again (scripts/install.sh, or scripts\\install.ps1 on Windows)."
+        % (*version[:2], *MIN_PYTHON, *MIN_PYTHON)
+    )
+
+
 def load_env_file(path: Path) -> int:
     """Minimal .env reader: KEY=VALUE lines, # comments, optional quotes.
 
@@ -84,17 +103,11 @@ def main(argv: list[str] | None = None) -> int:
     log = logging.getLogger("agentaus-bridge")
     if count:
         log.info("loaded %d settings from %s", count, env_path)
-    if sys.version_info < MIN_PYTHON:
+    warning = old_python_warning(sys.version_info)
+    if warning:
         # Warn rather than refuse: a background service that exits on start is restarted
         # in a loop, which is worse than a bridge with one protection weakened.
-        log.warning(
-            "running on Python %d.%d; the bridge needs %d.%d or newer. Some protections are "
-            "off on older versions - for example, a script's local random.py or json.py "
-            "is not recognised as shadowing the standard library. Rebuild the virtualenv "
-            "with a newer Python: rm -rf .venv && python3.12 -m venv .venv && "
-            ".venv/bin/pip install -r requirements.txt",
-            *sys.version_info[:2], *MIN_PYTHON,
-        )
+        log.warning("%s", warning)
 
     if not settings.agentaus_api_key:
         log.error(

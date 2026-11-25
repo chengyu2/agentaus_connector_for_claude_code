@@ -296,8 +296,7 @@ probably holds your model and permission preferences:
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
     "ANTHROPIC_CUSTOM_MODEL_OPTION": "agentaus",
     "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Agentaus (Trellis Data)",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Sovereign Australian model via the local Agentaus bridge",
-    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "131072"
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Sovereign Australian model via the local Agentaus bridge"
   }
 }
 ```
@@ -340,7 +339,6 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
 export ANTHROPIC_CUSTOM_MODEL_OPTION="agentaus"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="Agentaus (Trellis Data)"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="Sovereign Australian model via the local bridge"
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS=131072
 claude
 ```
 
@@ -351,6 +349,29 @@ already sets `ANTHROPIC_BASE_URL` (Option 1), an exported value is ignored and t
 still talks to the bridge that file names. To point one run elsewhere, such as a second
 bridge on another port, pass it as flag settings, which outrank the settings files:
 `claude --settings '{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8788"}}'`.
+
+### Agentaus's context window, and why the settings file leaves it out
+
+Claude Code does not recognise the id `agentaus`, so it assumes a 1M-token window and
+plans its auto-compact for that, long after Agentaus's 131,072-token limit.
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS=131072` corrects it, and normally applies only to ids
+Claude Code does not recognise. But when `DISABLE_COMPACT` is set, Claude Code (checked in
+2.1.330) applies it to every model, so Opus and Sonnet would also stop at
+"Context limit reached" after 131,072 tokens. Claude Code has no setting that gives one
+model its own window, so the variable belongs only in a session meant for Agentaus:
+
+- The launchers (Option 3) set it for the session they start, and leave it out when
+  `DISABLE_COMPACT` is set in the shell or named in `~/.claude/settings.json`,
+  `.claude/settings.json` or `.claude/settings.local.json`. A value you export yourself wins.
+- The installer and the `env` blocks above (Options 1 and 2) leave it out on purpose,
+  because such a file outlives the choice: `DISABLE_COMPACT` set later, in any settings
+  file or shell, would cap every Claude model in every session that file covers.
+
+Without it, an Agentaus conversation that outgrows the window is still handled: the bridge
+compacts it itself (see [What happens when a conversation outgrows
+Agentaus](#what-happens-when-a-conversation-outgrows-agentaus)). If you never use
+`DISABLE_COMPACT`, you may add `"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "131072"` to an `env`
+block yourself, so Claude Code compacts Agentaus sessions earlier.
 
 ### Whichever you choose, restart afterwards
 
@@ -616,8 +637,7 @@ BRIDGE_PORT=9100
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:9100",
     "ANTHROPIC_CUSTOM_MODEL_OPTION": "agentaus",
     "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Agentaus (Trellis Data)",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Sovereign Australian model via the local Agentaus bridge",
-    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "131072"
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Sovereign Australian model via the local Agentaus bridge"
   }
 }
 ```

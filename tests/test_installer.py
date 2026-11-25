@@ -447,6 +447,32 @@ class ReviewFixes(_Fixture):
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX file modes and symlinks")
+class ContextWindowStaysOutOfSettings(_Fixture):
+    """With DISABLE_COMPACT set, Claude Code applies CLAUDE_CODE_MAX_CONTEXT_TOKENS to every
+    model, so a settings file holding it would cap Opus and Sonnet at Agentaus's window.
+    Only the launchers set it, for their own session (tests/test_context_window.py)."""
+
+    KEY = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+
+    def test_bridge_env_has_no_context_window(self):
+        self.assertNotIn(self.KEY, A.bridge_env(self.port))
+
+    def test_every_project_install_does_not_write_it(self):
+        code, _, _ = self.setup("--preset", "minimal", "--settings", "user")
+        self.assertEqual(code, 0)
+        env = json.loads((self.home / ".claude" / "settings.json").read_text())["env"]
+        self.assertEqual(env["ANTHROPIC_CUSTOM_MODEL_OPTION"], "agentaus")
+        self.assertNotIn(self.KEY, env)
+
+    def test_one_project_install_does_not_write_it(self):
+        project = self.home / "proj"
+        project.mkdir()
+        self.setup("--preset", "minimal", "--settings", str(project))
+        env = json.loads((project / ".claude" / "settings.local.json").read_text())["env"]
+        self.assertEqual(env["ANTHROPIC_CUSTOM_MODEL_OPTION"], "agentaus")
+        self.assertNotIn(self.KEY, env)
+
+
 class Writes(unittest.TestCase):
     def test_symlink_is_written_through_and_mode_kept(self):
         with tempfile.TemporaryDirectory() as d:
