@@ -33,6 +33,7 @@ from agentaus_bridge import documents, server, tools  # noqa: E402
 from agentaus_bridge.config import settings  # noqa: E402
 
 import stub_server  # noqa: E402
+from agentaus_bridge import stream_delivery  # noqa: E402
 
 
 def run(coroutine):
@@ -215,7 +216,7 @@ class TurnDeadline(unittest.TestCase):
 
         async def scenario():
             out = []
-            async for item in server._keepalive(wedged(), 0.05, lambda: b"ping",
+            async for item in stream_delivery._keepalive(wedged(), 0.05, lambda: b"ping",
                                                 deadline=0.3):
                 out.append(item)
             return out
@@ -234,7 +235,7 @@ class TurnDeadline(unittest.TestCase):
             yield b"answer"
 
         async def scenario():
-            return [item async for item in server._keepalive(
+            return [item async for item in stream_delivery._keepalive(
                 quick(), 0.5, lambda: b"ping", deadline=5)]
 
         self.assertEqual(run(scenario()), [b"answer"])

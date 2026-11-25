@@ -31,6 +31,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from agentaus_bridge import server as server_mod  # noqa: E402
 
 import stub_server  # noqa: E402
+from agentaus_bridge import upstream_http  # noqa: E402
 
 OVERSIZE_ERROR = {
     "error": {
@@ -90,7 +91,7 @@ class _Base(unittest.TestCase):
         settings.agentaus_api_key = "test-key"
         # The learned window is module state; without clearing it a limit picked up
         # by an earlier test silently overrides the one set here.
-        server_mod._reset_learned_limit()
+        upstream_http._reset_learned_limit()
         self._saved_explicit = settings.max_input_tokens_is_explicit
         settings.max_input_tokens_is_explicit = True
 
@@ -103,7 +104,7 @@ class _Base(unittest.TestCase):
             settings.agentaus_max_input_tokens,
         ) = self._saved
         settings.max_input_tokens_is_explicit = self._saved_explicit
-        server_mod._reset_learned_limit()
+        upstream_http._reset_learned_limit()
 
     def _post(self, text: str, stream: bool, max_tokens: int = 64):
         from agentaus_bridge import server
@@ -158,15 +159,15 @@ class TestAdaptiveFitting(_Base):
         from agentaus_bridge import server as srv
         from agentaus_bridge.config import settings
 
-        srv._reset_learned_limit()
+        upstream_http._reset_learned_limit()
         settings.max_input_tokens_is_explicit = False
         try:
             self._post("x" * 40_000, stream=False)
-            self.assertEqual(srv._context_limit(), 131072,
+            self.assertEqual(upstream_http._context_limit(), 131072,
                              "the limit stated by Agentaus was not adopted")
         finally:
             settings.max_input_tokens_is_explicit = True
-            srv._reset_learned_limit()
+            upstream_http._reset_learned_limit()
 
     def test_small_request_reaches_upstream_untouched(self):
         from agentaus_bridge.config import settings
@@ -305,7 +306,7 @@ class TestTrimReachesUpstream(unittest.TestCase):
         settings.agentaus_max_input_tokens = 2000
         settings.agentaus_auto_trim = True
         settings.max_input_tokens_is_explicit = True
-        server_mod._reset_learned_limit()
+        upstream_http._reset_learned_limit()
         try:
             messages = []
             for i in range(20):

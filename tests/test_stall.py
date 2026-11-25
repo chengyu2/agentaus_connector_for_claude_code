@@ -13,6 +13,7 @@ import unittest
 
 from agentaus_bridge import server
 from agentaus_bridge.config import settings
+from agentaus_bridge import upstream_http  # noqa: E402
 
 
 def run(coroutine):
@@ -33,7 +34,7 @@ class StallWatchdog(unittest.TestCase):
 
     def test_a_call_that_does_not_return_is_reported_while_it_is_happening(self):
         async def scenario():
-            async with server._watching_for_stall("upstream POST"):
+            async with upstream_http._watching_for_stall("upstream POST"):
                 await asyncio.sleep(0.2)
 
         with self.assertLogs("agentaus-bridge", level=logging.WARNING) as caught:
@@ -42,7 +43,7 @@ class StallWatchdog(unittest.TestCase):
 
     def test_the_warning_repeats_so_the_log_shows_how_long(self):
         async def scenario():
-            async with server._watching_for_stall("upstream POST"):
+            async with upstream_http._watching_for_stall("upstream POST"):
                 await asyncio.sleep(0.34)
 
         with self.assertLogs("agentaus-bridge", level=logging.WARNING) as caught:
@@ -52,7 +53,7 @@ class StallWatchdog(unittest.TestCase):
 
     def test_a_fast_call_is_not_announced(self):
         async def scenario():
-            async with server._watching_for_stall("upstream POST"):
+            async with upstream_http._watching_for_stall("upstream POST"):
                 await asyncio.sleep(0)
             logging.getLogger("agentaus-bridge").info("marker")
 
@@ -63,7 +64,7 @@ class StallWatchdog(unittest.TestCase):
     def test_the_watcher_stops_when_the_call_finishes(self):
         """A leaked watcher would warn about a call that already returned."""
         async def scenario():
-            async with server._watching_for_stall("upstream POST"):
+            async with upstream_http._watching_for_stall("upstream POST"):
                 await asyncio.sleep(0)
             await asyncio.sleep(0.2)
             logging.getLogger("agentaus-bridge").info("marker")
@@ -75,7 +76,7 @@ class StallWatchdog(unittest.TestCase):
     def test_an_exception_still_stops_the_watcher(self):
         async def scenario():
             try:
-                async with server._watching_for_stall("upstream POST"):
+                async with upstream_http._watching_for_stall("upstream POST"):
                     raise RuntimeError("upstream blew up")
             except RuntimeError:
                 pass

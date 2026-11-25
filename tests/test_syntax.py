@@ -72,53 +72,53 @@ class TestTheRepairPath(unittest.IsolatedAsyncioTestCase):
     async def test_a_fix_that_parses_is_accepted(self):
         from unittest import mock
 
-        from agentaus_bridge import server
+        from agentaus_bridge import helper_calls
 
         async def fixer(_client, _text):
             return "def f():\n    return [1, 2]\n"
 
-        with mock.patch.object(server, "_agentaus_summarise", fixer):
-            out = await server._fix_syntax(None, "def f():\n    return [1, 2}\n")
+        with mock.patch.object(helper_calls, "_agentaus_summarise", fixer):
+            out = await helper_calls._fix_syntax(None, "def f():\n    return [1, 2}\n")
         self.assertEqual(syntax.first_error(out), "")
 
     async def test_a_fix_that_still_breaks_is_rejected(self):
         """The original is no worse, and may be closer to right."""
         from unittest import mock
 
-        from agentaus_bridge import server
+        from agentaus_bridge import helper_calls
         original = "def f():\n    return [1, 2}\n"
 
         async def worse(_client, _text):
             return "def g(:\n"
 
-        with mock.patch.object(server, "_agentaus_summarise", worse):
-            out = await server._fix_syntax(None, original)
+        with mock.patch.object(helper_calls, "_agentaus_summarise", worse):
+            out = await helper_calls._fix_syntax(None, original)
         self.assertEqual(out, original)
 
     async def test_a_failed_call_keeps_the_answer(self):
         from unittest import mock
 
-        from agentaus_bridge import server
+        from agentaus_bridge import helper_calls
         original = "def f():\n    return [1, 2}\n"
 
         async def broken(_client, _text):
             raise RuntimeError("upstream down")
 
-        with mock.patch.object(server, "_agentaus_summarise", broken):
-            self.assertEqual(await server._fix_syntax(None, original), original)
+        with mock.patch.object(helper_calls, "_agentaus_summarise", broken):
+            self.assertEqual(await helper_calls._fix_syntax(None, original), original)
 
     async def test_valid_code_costs_no_call_at_all(self):
         from unittest import mock
 
-        from agentaus_bridge import server
+        from agentaus_bridge import helper_calls
         called = []
 
         async def counting(_client, _text):
             called.append(1)
             return "x"
 
-        with mock.patch.object(server, "_agentaus_summarise", counting):
-            await server._fix_syntax(None, "def f():\n    return 1\n")
+        with mock.patch.object(helper_calls, "_agentaus_summarise", counting):
+            await helper_calls._fix_syntax(None, "def f():\n    return 1\n")
         self.assertEqual(called, [], "a model was called on code that already parses")
 
 

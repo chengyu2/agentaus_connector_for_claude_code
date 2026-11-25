@@ -27,6 +27,7 @@ from agentaus_bridge.augment import (  # noqa: E402
     worth_reviewing_turn,
 )
 from agentaus_bridge.config import settings  # noqa: E402
+from agentaus_bridge import helper_calls  # noqa: E402
 
 
 def tool_turn(result="some output"):
@@ -201,15 +202,15 @@ class TestBridgeToolsCountAsEvidence(unittest.TestCase):
             prompts.append(prompt)
             return "VERDICT: GROUNDED"
 
-        saved = server._agentaus_summarise
-        server._agentaus_summarise = fake_summarise
+        saved = helper_calls._agentaus_summarise
+        helper_calls._agentaus_summarise = fake_summarise
         try:
             body = {"messages": [{"role": "user", "content": "Is the TTL really 300s?"}]}
-            answer = asyncio.new_event_loop().run_until_complete(server._check_grounding(
+            answer = asyncio.new_event_loop().run_until_complete(helper_calls._check_grounding(
                 None, body, "The TTL is 600 seconds (CACHE_TTL_SECONDS in src/config.py).",
                 bridge_ran))
         finally:
-            server._agentaus_summarise = saved
+            helper_calls._agentaus_summarise = saved
         return answer, prompts, json
 
     def test_what_a_bridge_tool_read_reaches_the_checker(self):
@@ -235,6 +236,6 @@ class TestABridgeToolTurnIsNotSelfReviewed(unittest.TestCase):
         from agentaus_bridge import server
         prose_turn = {"messages": [{"role": "user", "content": "where is the backoff?"}]}
         long_answer = "x" * (settings.agentaus_review_min_chars + 10)
-        self.assertTrue(server._grounding_applies(prose_turn, long_answer, {"k": "v"}))
-        self.assertFalse(server._grounding_applies(prose_turn, long_answer, {}))
-        self.assertFalse(server._grounding_applies(prose_turn, "short", {"k": "v"}))
+        self.assertTrue(helper_calls._grounding_applies(prose_turn, long_answer, {"k": "v"}))
+        self.assertFalse(helper_calls._grounding_applies(prose_turn, long_answer, {}))
+        self.assertFalse(helper_calls._grounding_applies(prose_turn, "short", {"k": "v"}))

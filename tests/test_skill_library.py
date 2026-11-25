@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agentaus_bridge import server, skills, tools  # noqa: E402
 from agentaus_bridge.augment import routes, with_library_skills  # noqa: E402
+from agentaus_bridge import tool_handling  # noqa: E402
 
 HEAD = "The following skills are available for use with the Skill tool:"
 REAL_LIBRARY = skills.LIBRARY
@@ -73,12 +74,12 @@ class TheLibraryIsListedAndAnswered(unittest.TestCase):
             {"id": "1", "name": "Skill", "arguments": json.dumps({"skill": "math-reasoning"})},
             {"id": "2", "name": "Skill", "arguments": json.dumps({"skill": "read-documents"})},
         ]
-        mine, theirs, _ = server._partition_tool_calls(
+        mine, theirs, _ = tool_handling._partition_tool_calls(
             calls, library=frozenset({"math-reasoning"}))
         self.assertEqual([c["id"] for c in mine], ["1"])
         self.assertEqual([c["id"] for c in theirs], ["2"])
         # Nothing offered, nothing taken: every Skill call stays Claude Code's.
-        self.assertEqual(server._partition_tool_calls(calls)[0], [])
+        self.assertEqual(tool_handling._partition_tool_calls(calls)[0], [])
 
     def test_the_bridge_serves_the_procedure_framed_to_be_followed(self):
         async def no_model(_):

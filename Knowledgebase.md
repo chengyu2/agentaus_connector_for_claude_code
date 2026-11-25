@@ -445,7 +445,9 @@ move, not once per turn.
 
 ---
 
-## 9. HTTP surface & turn pipeline — `server.py` (3958 lines)
+## 9. HTTP surface & turn pipeline — `server.py` and the modules split from it
+
+The turn pipeline lives in `agentaus_turn.py` and `agentaus_stream.py`.
 
 The FastAPI app. Key endpoints: `GET /healthz` (liveness), `GET /healthz/upstream` (ten
 minutes of upstream outcomes, adaptive limit, whether it is down and for how long, and the
@@ -478,7 +480,7 @@ that can make the request smaller want the failure now, not four timeouts later.
 indistinguishable from silence — a request was once observed received, never forwarded, and
 the only evidence was that the log had stopped). `give_up` lets a graph agent past its own
 budget say "don't replay". A **429 that names its own wait** is honoured: `_retry_after_of`
-(server.py:576-588) parses a numeric `Retry-After` header into seconds and `_sleep_before_retry`
+(upstream_http.py) parses a numeric `Retry-After` header into seconds and `_sleep_before_retry`
 waits at least that long (capped at one turn timeout), because the 429 is the upstream's own
 word on when the rate limit lifts. A 429 wait never counts against the turn's timeout — only a
 52x/504/ReadTimeout replay carries the `_FAILED_ATTEMPT_S` = 125 s penalty.
@@ -833,7 +835,7 @@ summarisation byte-for-byte.
   which keeps the bridge stateless" — there is no on-disk log). `with_ledger` appends a
   derived list of tools already run / tasks outstanding to the prompt so the model stops
   re-running what it just did; `render_evidence` / `render_notifications` (consumed at
-  server.py:1140-1141) digest the turn's tool calls and `<task-notification>` reports. Gated
+  agentaus_turn.py) digest the turn's tool calls and `<task-notification>` reports. Gated
   by `AGENTAUS_TOOL_LEDGER` (default on) and limited by `AGENTAUS_TOOL_LEDGER_LIMIT` (40).
   The append-only ledger keyed to the bridge's loaded-source hash belongs to
   `abbench/ultra/loop.py`'s run record, not this module.

@@ -26,6 +26,7 @@ from agentaus_bridge.config import settings  # noqa: E402
 from agentaus_bridge.translate import AnthropicStreamBuilder  # noqa: E402
 
 import stub_server  # noqa: E402
+from agentaus_bridge import agentaus_stream, agentaus_turn, helper_calls  # noqa: E402
 
 
 def run(coro):
@@ -125,7 +126,7 @@ class TokensArriveWhileAgentausIsStillWriting(unittest.TestCase):
                 body = {"model": "agentaus", "messages": [{"role": "user", "content": "q"}],
                         "tools": [{"name": "Read", "input_schema": {"type": "object"}}]}
                 payload = {"messages": [{"role": "user", "content": "q"}], "stream": True}
-                async for chunk in server._agentaus_event_stream(
+                async for chunk in agentaus_stream._agentaus_event_stream(
                         client, payload, body, "agentaus", started):
                     for e in events(chunk):
                         seen.append((time.monotonic() - started, e))
@@ -170,7 +171,7 @@ class HelperCallsCarryASystemMessage(unittest.TestCase):
         saved = settings.agentaus_stream_helpers
         settings.agentaus_stream_helpers = False
         try:
-            self.assertEqual(run(server._agentaus_summarise(_Client(), "summarise this")), "ok")
+            self.assertEqual(run(helper_calls._agentaus_summarise(_Client(), "summarise this")), "ok")
         finally:
             settings.agentaus_stream_helpers = saved
         roles = [m["role"] for m in sent["messages"]]
@@ -336,7 +337,7 @@ class ThePlanStreamsLive(unittest.TestCase):
                         "messages": [{"role": "user", "content": "fix the bug"}],
                         "tools": [{"name": "Read", "input_schema": {"type": "object"}}]}
                 started = time.monotonic()
-                response = await server._handle_agentaus(request, body, "agentaus", True)
+                response = await agentaus_turn._handle_agentaus(request, body, "agentaus", True)
                 seen = []
                 async for chunk in response.body_iterator:
                     for e in events(chunk if isinstance(chunk, bytes) else chunk.encode()):

@@ -12,7 +12,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agentaus_bridge import read_first  # noqa: E402
-from agentaus_bridge.server import _reads_first, _with_reads_first  # noqa: E402
+from agentaus_bridge.tool_handling import _reads_first, _with_reads_first  # noqa: E402
 
 TOOLS = [{"name": n, "input_schema": {"type": "object"}} for n in ("Read", "Edit", "Write", "Bash")]
 

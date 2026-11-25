@@ -17,7 +17,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agentaus_bridge import augment, repair  # noqa: E402
-from agentaus_bridge.server import _partition_tool_calls, _validate_tool_calls  # noqa: E402
+from agentaus_bridge.tool_handling import _partition_tool_calls, _validate_tool_calls  # noqa: E402
 from agentaus_bridge.translate import anthropic_request_to_agentaus  # noqa: E402
 
 KNOWN = {"Read", "Write", "Edit", "Bash", "agentaus_search"}
@@ -264,7 +264,7 @@ class StalledTurns(unittest.TestCase):
         self.assertIn("STALLED", prompt)
 
     def test_the_request_is_what_the_user_typed(self):
-        from agentaus_bridge.server import _last_user_text, _original_request
+        from agentaus_bridge.conversation_text import _last_user_text, _original_request
         body = {"messages": [
             {"role": "user", "content": [
                 {"type": "text", "text": "<system-reminder>\nuserEmail: x@y\n</system-reminder>"},
@@ -279,14 +279,14 @@ class StalledTurns(unittest.TestCase):
         self.assertEqual(_last_user_text(body), "Answer the questions in questions.json")
 
     def test_a_conversation_gets_two_stalled_reasks_at_most(self):
-        from agentaus_bridge import server
-        server._STALL_REASKS.clear()
+        from agentaus_bridge import stall_check
+        stall_check._STALL_REASKS.clear()
         body = {"messages": [{"role": "user", "content": "do the task"}]}
-        self.assertEqual([server._may_reask_stalled(body) for _ in range(4)],
+        self.assertEqual([stall_check._may_reask_stalled(body) for _ in range(4)],
                          [True, True, False, False])
         other = {"messages": [{"role": "user", "content": "a different task"}]}
-        self.assertTrue(server._may_reask_stalled(other))
-        server._STALL_REASKS.clear()
+        self.assertTrue(stall_check._may_reask_stalled(other))
+        stall_check._STALL_REASKS.clear()
 
 
 if __name__ == "__main__":

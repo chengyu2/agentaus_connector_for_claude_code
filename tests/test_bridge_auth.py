@@ -94,11 +94,11 @@ class BridgeAuth(unittest.TestCase):
         stub_server.stop(cls.server)
 
     def setUp(self) -> None:
-        from agentaus_bridge import server
+        from agentaus_bridge import passthrough, server
         from agentaus_bridge.config import settings
         STATE.update({"status": 200, "delay": 0.0, "seen": []})
         server._MODELS_LAST.clear()
-        server._WARNED_BRIDGE_TOKEN_ONLY_CREDENTIAL = False
+        passthrough._WARNED_BRIDGE_TOKEN_ONLY_CREDENTIAL = False
         self._saved = (settings.bridge_token, settings.anthropic_base_url)
         settings.bridge_token = BRIDGE_TOKEN
         settings.anthropic_base_url = stub_server.url(self.server)
@@ -125,8 +125,8 @@ class BridgeAuth(unittest.TestCase):
 
     @staticmethod
     def bridge_header() -> dict:
-        from agentaus_bridge import server
-        return {server.BRIDGE_TOKEN_HEADER: BRIDGE_TOKEN}
+        from agentaus_bridge import passthrough
+        return {passthrough.BRIDGE_TOKEN_HEADER: BRIDGE_TOKEN}
 
     def ids(self, response):
         self.assertEqual(response.status_code, 200, response.text)
@@ -203,8 +203,8 @@ class BridgeAuth(unittest.TestCase):
         self.assertEqual(upstream["headers"].get("x-api-key"), ANTHROPIC_KEY)
         self.assertNotIn(BRIDGE_TOKEN, json.dumps(upstream["headers"]),
                          "the bridge token leaked to Anthropic")
-        from agentaus_bridge import server
-        self.assertNotIn(server.BRIDGE_TOKEN_HEADER, upstream["headers"])
+        from agentaus_bridge import passthrough
+        self.assertNotIn(passthrough.BRIDGE_TOKEN_HEADER, upstream["headers"])
 
     def test_legacy_bridge_x_api_key_is_dropped_and_a_separate_bearer_survives(self):
         headers = {"x-api-key": BRIDGE_TOKEN, "authorization": f"Bearer {ANTHROPIC_OAUTH}"}
@@ -222,8 +222,8 @@ class BridgeAuth(unittest.TestCase):
         # Authenticated with the dedicated header; the legacy Bearer header carries the
         # bridge token too, and must not carry it to Anthropic. (The pure legacy pairing,
         # without the dedicated header, is covered further down.)
-        from agentaus_bridge import server
-        headers = {server.BRIDGE_TOKEN_HEADER: BRIDGE_TOKEN,
+        from agentaus_bridge import passthrough
+        headers = {passthrough.BRIDGE_TOKEN_HEADER: BRIDGE_TOKEN,
                    "authorization": f"Bearer {BRIDGE_TOKEN}", "x-api-key": ANTHROPIC_KEY}
         with self.client() as client:
             response = client.post("/v1/messages", json=self.messages_body(), headers=headers)
@@ -283,11 +283,11 @@ class BridgeAuth(unittest.TestCase):
         self.assertNotIn(BRIDGE_TOKEN, "\n".join(logs.output), "the token was logged")
 
     def test_a_real_credential_alongside_the_token_does_not_warn(self):
-        from agentaus_bridge import server
+        from agentaus_bridge import passthrough
         headers = {"authorization": f"Bearer {BRIDGE_TOKEN}", "x-api-key": ANTHROPIC_KEY}
         with self.client() as client:
             client.post("/v1/messages", json=self.messages_body(), headers=headers)
-        self.assertFalse(server._WARNED_BRIDGE_TOKEN_ONLY_CREDENTIAL)
+        self.assertFalse(passthrough._WARNED_BRIDGE_TOKEN_ONLY_CREDENTIAL)
 
     def test_startup_warns_when_the_bridge_token_looks_like_an_anthropic_key(self):
         from agentaus_bridge.config import settings
@@ -323,7 +323,7 @@ class BridgeAuth(unittest.TestCase):
     # -- model discovery is sanitised and credential-isolated --------------------------
 
     def test_model_discovery_forwards_the_real_credential_and_no_bridge_header(self):
-        from agentaus_bridge import server
+        from agentaus_bridge import passthrough
         headers = {**self.bridge_header(), "x-api-key": ANTHROPIC_KEY,
                    "anthropic-beta": "oauth-2025-04-20"}
         with self.client() as client:
@@ -334,7 +334,7 @@ class BridgeAuth(unittest.TestCase):
         self.assertEqual(upstream["headers"].get("x-api-key"), ANTHROPIC_KEY)
         self.assertEqual(upstream["headers"].get("anthropic-beta"), "oauth-2025-04-20")
         self.assertEqual(upstream["headers"].get("anthropic-version"), "2023-06-01")
-        self.assertNotIn(server.BRIDGE_TOKEN_HEADER, upstream["headers"])
+        self.assertNotIn(passthrough.BRIDGE_TOKEN_HEADER, upstream["headers"])
 
     def test_model_discovery_drops_a_bridge_valued_legacy_credential(self):
         with self.client() as client:

@@ -18,7 +18,7 @@ against the answers it receives is not a measurement of anything.
 
 Two questions currently score zero and at least one of them is arguably defensible - "what
 happens when one piece of a lookup takes too long" is handled in `tools.py` by splitting
-the chunk AND in `server.py` by refusing to replay a gateway timeout. It stays as it is.
+the chunk AND in `upstream_http.py` by refusing to replay a gateway timeout. It stays as it is.
 Read the reported F1 as a floor, and read that limitation as inherent to ground truth
 written by whoever wrote the code.
 
@@ -41,13 +41,13 @@ QUESTIONS = [
         "symbols": {"_PriorityGate", "max_concurrency", "hold"},
     },
     {
-        # Two places genuinely learn a limit from the upstream: server.py learns the
+        # Two places genuinely learn a limit from the upstream: upstream_http.py learns the
         # context window from the error that announces it, and tools.py learns the
         # largest prompt the upstream will answer under load. The first version of this
         # question expected only server.py and scored a correct answer as wrong - a flaw
         # in the ground truth, not in the model, and worth recording as one.
         "q": "How does the code find out the real size limit the upstream service will accept?",
-        "files": {"agentaus_bridge/server.py", "agentaus_bridge/tools.py"},
+        "files": {"agentaus_bridge/upstream_http.py", "agentaus_bridge/tools.py"},
         "symbols": {"_learn_limit_from", "_MAX_MODEL_LEN", "_context_limit",
                     "note_capacity_failure", "effective_chunk_tokens"},
     },
@@ -73,13 +73,13 @@ QUESTIONS = [
     },
     {
         "q": "How does the project avoid asking the same expensive question twice?",
-        "files": {"agentaus_bridge/compact.py", "agentaus_bridge/server.py",
+        "files": {"agentaus_bridge/compact.py", "agentaus_bridge/tool_handling.py",
                   "agentaus_bridge/documents.py"},
         "symbols": {"_find_prefix", "_call_signature", "_cache"},
     },
     {
         "q": "What stops a reply that claims something it has no basis for?",
-        "files": {"agentaus_bridge/augment.py", "agentaus_bridge/server.py"},
+        "files": {"agentaus_bridge/augment.py", "agentaus_bridge/helper_calls.py"},
         "symbols": {"GROUNDING_INSTRUCTION", "_check_grounding", "grounding_verdict"},
     },
 ]

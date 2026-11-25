@@ -25,6 +25,7 @@ import stub_server  # noqa: E402
 from agentaus_bridge import finish, plans, server, syntax  # noqa: E402
 from agentaus_bridge.augment import grounding_revision, with_plan  # noqa: E402
 from agentaus_bridge.config import settings  # noqa: E402
+from agentaus_bridge import agentaus_stream, agentaus_turn, gate, helper_calls  # noqa: E402
 
 PLAN_SECONDS = 0.8
 CHECK_SECONDS = 0.6
@@ -146,7 +147,7 @@ class TheFirstCallDoesNotWaitForThePlan(unittest.TestCase):
                         await asyncio.sleep(pause)
                     request = Request({"type": "http", "app": server.app, "headers": [
                         (b"x-claude-code-session-id", session)] if session else []})
-                    response = await server._handle_agentaus(request, body, "agentaus", True)
+                    response = await agentaus_turn._handle_agentaus(request, body, "agentaus", True)
                     async for _ in response.body_iterator:
                         pass
             finally:
@@ -209,13 +210,13 @@ class TheFirstCallDoesNotWaitForThePlan(unittest.TestCase):
 
     def _priorities(self):
         seen = []
-        real = server.hold
+        real = gate.hold
 
         def spy(label="helper call", priority="normal"):
             seen.append((label, priority))
             return real(label, priority)
 
-        return seen, mock.patch.object(server, "hold", spy)
+        return seen, mock.patch.object(gate, "hold", spy)
 
     def test_only_a_blocking_plan_is_urgent(self):
         seen, spy = self._priorities()
@@ -271,7 +272,7 @@ class TheGroundingCheckStartsBesideTheStallCheck(TheFirstCallDoesNotWaitForThePl
             return answer
 
         gate = mock.Mock(side_effect=[("unverified", "Run it.", False), ("", "", False)])
-        with mock.patch.object(server, "_answer_check", lambda c, o, a, r: probe(a)), \
+        with mock.patch.object(helper_calls, "_answer_check", lambda c, o, a, r: probe(a)), \
                 mock.patch.object(finish, "finish_gate", gate):
             self._turns([after_tool()])
         mains = [c["at"] for c in CALLS if c["kind"] == "main"]
@@ -340,8 +341,8 @@ class AClosedStreamCancelsItsCheck(unittest.TestCase):
                 yield b"one"
                 yield b"two"
 
-            with mock.patch.object(server, "_unguarded_event_stream", inner):
-                stream = server._agentaus_event_stream()
+            with mock.patch.object(agentaus_stream, "_unguarded_event_stream", inner):
+                stream = agentaus_stream._agentaus_event_stream()
                 self.assertEqual(await stream.__anext__(), b"one")
                 await stream.aclose()
             await asyncio.sleep(0)
@@ -390,11 +391,11 @@ class AGroundingRevisionThatLosesTheAnswer(unittest.TestCase):
         async def summarise(client, text, **kwargs):
             return queue.pop(0)
 
-        with mock.patch.object(server, "_agentaus_summarise", summarise):
-            return run(server._check_grounding(None, self.BODY, self.ANSWER))
+        with mock.patch.object(helper_calls, "_agentaus_summarise", summarise):
+            return run(helper_calls._check_grounding(None, self.BODY, self.ANSWER))
 
     def _cut(self, text):
-        reply = server._HelperText(text)
+        reply = helper_calls._HelperText(text)
         reply.finish_reason = "length"
         return reply
 
@@ -419,8 +420,8 @@ class AGroundingRevisionThatLosesTheAnswer(unittest.TestCase):
 
         async def go():
             async with httpx.AsyncClient() as client:
-                return (await server._agentaus_summarise(client, "TRUNCATE-ME"),
-                        await server._agentaus_summarise(client, "fine"))
+                return (await helper_calls._agentaus_summarise(client, "TRUNCATE-ME"),
+                        await helper_calls._agentaus_summarise(client, "fine"))
 
         try:
             cut, whole = run(go())

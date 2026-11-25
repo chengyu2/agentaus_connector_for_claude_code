@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agentaus_bridge import augment, graph, server, sessions  # noqa: E402
+from agentaus_bridge import augment, graph, graph_turn, server, sessions  # noqa: E402
 from agentaus_bridge.config import settings  # noqa: E402
 
 
@@ -77,10 +77,10 @@ class WorkflowStillDeferred(unittest.TestCase):
 
     def test_it_is_a_graph_main_loop_only_once_workflow_is_offered(self):
         self.assertTrue(augment.workflow_opted_in(opted("Agent")))
-        self.assertFalse(server._graph_main_loop(opted("Agent", "Read")))
-        self.assertTrue(server._graph_main_loop(opted("Agent", "Workflow")))
+        self.assertFalse(graph_turn._graph_main_loop(opted("Agent", "Read")))
+        self.assertTrue(graph_turn._graph_main_loop(opted("Agent", "Workflow")))
         # So the planning pass runs, and writes are not held for a Workflow call it cannot make.
-        self.assertFalse(server._graph_not_started(opted("Agent", "Read")))
+        self.assertFalse(graph_turn._graph_not_started(opted("Agent", "Read")))
 
     def test_the_guidance_says_to_delegate_with_agent_or_load_workflow(self):
         for listing in (LISTING, OLD_LISTING):
@@ -132,9 +132,9 @@ class WorkflowStillDeferred(unittest.TestCase):
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a1", "content": "notes"},
                                          {"type": "tool_result", "tool_use_id": "a2", "content": "notes"}]},
             call("ToolSearch", "t1", query="select:Workflow"), result("t1")]
-        self.assertFalse(server._graph_main_loop(body))
+        self.assertFalse(graph_turn._graph_main_loop(body))
         # So the merge write is not refused, and no graph is launched over the subagents' work.
-        self.assertFalse(server._graph_not_started(body))
+        self.assertFalse(graph_turn._graph_not_started(body))
         self.assertIn("Agent", self.offered(body))
 
 

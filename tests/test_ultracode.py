@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agentaus_bridge import augment, documents, graph, ledger, repair, schema, server, sessions, workflow_script  # noqa: E402
 from unittest import mock  # noqa: E402
+from agentaus_bridge import agentaus_stream, context_window, conversation_text, graph_turn, helper_calls, stall_check, tool_handling, upstream_http  # noqa: E402
 
 
 def tool(name):
@@ -171,7 +172,7 @@ class SubagentTurns(unittest.TestCase):
     def test_a_subagent_answer_is_not_rewritten(self):
         body = self.body("Bash", "StructuredOutput")
         self.assertFalse(augment.worth_reviewing_turn(body))
-        self.assertFalse(server._grounding_applies(body, "x" * 5000, {"agentaus_zoom": 1}))
+        self.assertFalse(helper_calls._grounding_applies(body, "x" * 5000, {"agentaus_zoom": 1}))
 
     def test_a_subagent_is_told_to_return_through_structured_output(self):
         notes = augment.guidance_for(self.body("Bash", "StructuredOutput"))
@@ -321,7 +322,7 @@ class WorkflowSchemas(unittest.TestCase):
 
     def test_an_unreadable_schema_forwards_the_call(self):
         calls = [{"name": "StructuredOutput", "arguments": '{"a": 1}'}]
-        broken = server._validate_tool_calls(calls, {"StructuredOutput": {"type": "object",
+        broken = tool_handling._validate_tool_calls(calls, {"StructuredOutput": {"type": "object",
                                                      "properties": "not a dict"}})
         self.assertEqual(broken, [])
 
@@ -411,41 +412,41 @@ class TheStallBudgetRefillsWithProgress(unittest.TestCase):
         return {"messages": messages}
 
     def setUp(self):
-        server._STALL_REASKS.clear()
+        stall_check._STALL_REASKS.clear()
 
     tearDown = setUp
 
     def test_two_reasks_without_progress_then_none(self):
-        self.assertEqual([server._may_reask_stalled(self.body(1)) for _ in range(3)],
+        self.assertEqual([stall_check._may_reask_stalled(self.body(1)) for _ in range(3)],
                          [True, True, False])
 
     def test_a_tool_call_since_the_last_reask_earns_a_fresh_budget(self):
         # Measured (influenca): each re-ask got one call, and the third announcement -
         # "Let me look at what's inside the uv tools dir." - was forwarded as the answer.
-        server._may_reask_stalled(self.body(1))
-        server._may_reask_stalled(self.body(1))
-        self.assertFalse(server._may_reask_stalled(self.body(1)))
-        self.assertTrue(server._may_reask_stalled(self.body(2)))
+        stall_check._may_reask_stalled(self.body(1))
+        stall_check._may_reask_stalled(self.body(1))
+        self.assertFalse(stall_check._may_reask_stalled(self.body(1)))
+        self.assertTrue(stall_check._may_reask_stalled(self.body(2)))
 
     def test_progress_still_runs_out_within_one_message(self):
-        got = [server._may_reask_stalled(self.body(n)) for n in range(1, 12)]
-        self.assertEqual(got.count(True), server._STALL_REASKS_PER_MESSAGE)
+        got = [stall_check._may_reask_stalled(self.body(n)) for n in range(1, 12)]
+        self.assertEqual(got.count(True), stall_check._STALL_REASKS_PER_MESSAGE)
         self.assertFalse(got[-1])
 
     def test_a_plainly_announced_step_gets_the_larger_budget(self):
-        got = [server._may_reask_stalled(self.body(n), announced=True) for n in range(1, 50)]
-        self.assertEqual(got.count(True), server._STALL_ANNOUNCED_PER_MESSAGE)
+        got = [stall_check._may_reask_stalled(self.body(n), announced=True) for n in range(1, 50)]
+        self.assertEqual(got.count(True), stall_check._STALL_ANNOUNCED_PER_MESSAGE)
 
     def test_an_announcement_without_progress_still_runs_out_after_two(self):
-        self.assertEqual([server._may_reask_stalled(self.body(1), announced=True) for _ in range(3)],
+        self.assertEqual([stall_check._may_reask_stalled(self.body(1), announced=True) for _ in range(3)],
                          [True, True, False])
 
     def test_a_new_message_from_the_user_starts_a_fresh_budget(self):
-        server._may_reask_stalled(self.body(1))
-        server._may_reask_stalled(self.body(1))
+        stall_check._may_reask_stalled(self.body(1))
+        stall_check._may_reask_stalled(self.body(1))
         later = self.body(1)
         later["messages"].append(user("yep look at it and continue"))
-        self.assertTrue(server._may_reask_stalled(later))
+        self.assertTrue(stall_check._may_reask_stalled(later))
 
 
 class AnAnnouncedStepIsAStall(unittest.TestCase):
@@ -501,12 +502,12 @@ class OneGateForBothStallChecks(unittest.TestCase):
         image = {"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "x"}},
             {"type": "text", "text": "what is this?"}]}
-        self.assertFalse(server._worth_checking(
+        self.assertFalse(stall_check._worth_checking(
             self.body(image), "I can't view images. Could you describe it?",
             tools_offered=True, called_a_tool=False))
 
     def test_a_short_toolless_reply_otherwise_is(self):
-        self.assertTrue(server._worth_checking(
+        self.assertTrue(stall_check._worth_checking(
             self.body(user("look in the folder")), "Let me look at the folder.",
             tools_offered=True, called_a_tool=False))
 
@@ -515,27 +516,27 @@ class TheStructuralStallCheck(unittest.TestCase):
     MISSING = [("report.md", "/w/report.md")]
 
     def test_a_question_back_is_not_sent_back_for_files(self):
-        self.assertEqual(server._structural_stall("Which folder should it go in?", self.MISSING),
+        self.assertEqual(stall_check._structural_stall("Which folder should it go in?", self.MISSING),
                          (False, [], False))
 
     def test_a_question_that_announces_a_step_goes_to_the_judge(self):
         # Neither structural signal fires; the shared gate still lets the judge decide.
-        self.assertEqual(server._structural_stall("Shall I look at the folder next?", []),
+        self.assertEqual(stall_check._structural_stall("Shall I look at the folder next?", []),
                          (False, [], False))
 
     def test_missing_files_alone_are_a_stall_on_the_smaller_budget(self):
-        stalled, missing, announced = server._structural_stall("Here is the summary.", self.MISSING)
+        stalled, missing, announced = stall_check._structural_stall("Here is the summary.", self.MISSING)
         self.assertTrue(stalled)
         self.assertEqual(missing, self.MISSING)
         # `announced` is what earns the 40-per-message cap; missing files get the judge's 8.
         self.assertFalse(announced)
 
     def test_an_announcement_is_asked_for_its_step_not_the_files(self):
-        self.assertEqual(server._structural_stall("Let me look at the folder.", self.MISSING),
+        self.assertEqual(stall_check._structural_stall("Let me look at the folder.", self.MISSING),
                          (True, [], True))
 
     def test_a_finished_answer_is_no_stall(self):
-        self.assertEqual(server._structural_stall("Done. The file is written.", []),
+        self.assertEqual(stall_check._structural_stall("Done. The file is written.", []),
                          (False, [], False))
 
 
@@ -640,7 +641,7 @@ class AfterManyCallsWriteTheFiles(unittest.TestCase):
 
 class NothingToGroundAfterALaunch(unittest.TestCase):
     def test_the_launch_report_is_not_grounding_checked(self):
-        self.assertFalse(server._grounding_applies(launched(), "It is running. " * 60, None))
+        self.assertFalse(helper_calls._grounding_applies(launched(), "It is running. " * 60, None))
 
 
 class TheInputsAreNamed(unittest.TestCase):
@@ -742,7 +743,7 @@ class TheBridgeRunsItsOwnGraph(unittest.TestCase):
     def test_the_models_script_is_replaced_by_the_graph(self):
         import json
         calls = [self.call(script="export const meta = {} broken(", description="mine")]
-        server._run_graph_instead(calls, self.body())
+        graph_turn._run_graph_instead(calls, self.body())
         args = json.loads(calls[0]["arguments"])
         self.assertEqual(args["script"], graph.SCRIPT)
         self.assertEqual(args["args"]["cwd"], "/work/proj")
@@ -761,7 +762,7 @@ class TheBridgeRunsItsOwnGraph(unittest.TestCase):
         body = {"system": "Primary working directory: /work/proj", "tools": [tool("Workflow")],
                 "messages": [user("ultracode: implement the functions in solutions.py")]}
         calls = [self.call(script="export const meta = { name: 'own' }")]
-        server._run_graph_instead(calls, body)
+        graph_turn._run_graph_instead(calls, body)
         self.assertIn("own", calls[0]["arguments"])
         self.assertIn("export const meta", augment.guidance_for(body))
 
@@ -774,7 +775,7 @@ class TheBridgeRunsItsOwnGraph(unittest.TestCase):
         body = self.body()
         body["messages"].append(user("ultracode: run exactly this:\n" + script))
         calls = [self.call(script=script)]
-        server._run_graph_instead(calls, body)
+        graph_turn._run_graph_instead(calls, body)
         self.assertIn("the user's own orchestration", calls[0]["arguments"])
 
     def test_a_follow_up_carries_the_opening_request(self):
@@ -782,7 +783,7 @@ class TheBridgeRunsItsOwnGraph(unittest.TestCase):
         body = self.body()
         body["messages"].append(user("now also do the 2021 file"))
         calls = [self.call(script="agentaus-solve")]
-        server._run_graph_instead(calls, body)
+        graph_turn._run_graph_instead(calls, body)
         task = json.loads(calls[0]["arguments"])["args"]["task"]
         self.assertIn("total the claims", task)
         self.assertIn("now also do the 2021 file", task)
@@ -791,7 +792,7 @@ class TheBridgeRunsItsOwnGraph(unittest.TestCase):
         for kept in (self.call(name="review"), self.call(scriptPath="/x.js"),
                      self.call(script="s", resumeFromRunId="wf_1")):
             before = kept["arguments"]
-            server._run_graph_instead([kept], self.body())
+            graph_turn._run_graph_instead([kept], self.body())
             self.assertEqual(kept["arguments"], before)
 
     def test_not_without_an_opt_in_or_on_a_subagent(self):
@@ -799,7 +800,7 @@ class TheBridgeRunsItsOwnGraph(unittest.TestCase):
         sub = {**self.body(), "system": SUBAGENT_SYSTEM}
         for body in (plain, sub):
             calls = [self.call(script="mine")]
-            server._run_graph_instead(calls, body)
+            graph_turn._run_graph_instead(calls, body)
             self.assertIn("mine", calls[0]["arguments"])
 
     def test_a_graph_subagent_gets_only_the_tools_its_job_needs(self):
@@ -1205,10 +1206,10 @@ class TheGraphRoundD9Fixes(unittest.TestCase):
             opted = {"tools": [tool("Workflow")], "messages": [user("ultracode: answer the RFQ")]}
             plain = {"tools": [tool("Write")], "messages": [user("tidy up notes.md")]}
             other = {"system": SUBAGENT_SYSTEM, "messages": [user("explore the repo")]}
-            self.assertTrue(server._writes_plain_text(agent))
-            self.assertTrue(server._writes_plain_text(opted))
-            self.assertFalse(server._writes_plain_text(plain))
-            self.assertFalse(server._writes_plain_text(other))
+            self.assertTrue(graph_turn._writes_plain_text(agent))
+            self.assertTrue(graph_turn._writes_plain_text(opted))
+            self.assertFalse(graph_turn._writes_plain_text(plain))
+            self.assertFalse(graph_turn._writes_plain_text(other))
         finally:
             settings.agentaus_workflow_graph = saved
 
@@ -1309,8 +1310,8 @@ class TheGraphRoundD9Fixes(unittest.TestCase):
         from fastapi.testclient import TestClient
         def upstream(*a, **k):
             raise AssertionError("an exact-command agent must not reach the model")
-        with mock.patch.object(server, "_post_with_retry", upstream), \
-                mock.patch.object(server, "_agentaus_event_stream", upstream), \
+        with mock.patch.object(upstream_http, "_post_with_retry", upstream), \
+                mock.patch.object(agentaus_stream, "_agentaus_event_stream", upstream), \
                 TestClient(server.app) as client:
             return client.post("/v1/messages", json={**body, "stream": stream})
 
@@ -1441,7 +1442,7 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
 
     def test_a_graph_launch_is_remembered_past_compaction(self):
         full = self.body(*self.launch(), self.notification(), *self.read())
-        self.assertEqual(graph.run_state(server._graph_session(full)), "reported")
+        self.assertEqual(graph.run_state(graph_turn._graph_session(full)), "reported")
         # The compacted body has no Workflow call, and the session record still knows it ran.
         self.assertEqual(augment.writes_before_workflow([self.edit()], self.compacted(full), self.CWD), [])
         # Before any graph ran the write is still refused, as before.
@@ -1449,7 +1450,7 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
 
     def test_a_running_graph_blocks_deliverable_writes_even_when_compacted(self):
         running = self.body(*self.launch(), *self.read())
-        server._graph_session(running)
+        graph_turn._graph_session(running)
         out = augment.early_deliverable_writes([self.edit()], self.compacted(running), self.CWD)
         self.assertEqual(len(out), 1)
         self.assertIn("w2ejzhiq6", out[0][1])
@@ -1463,9 +1464,9 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
     def test_a_second_workflow_after_the_report_is_refused(self):
         full = self.body(*self.launch(), self.notification(), *self.read())
         call = self.workflow()
-        [(refused, why)] = server._graph_reruns([call, self.edit()], full)
+        [(refused, why)] = graph_turn._graph_reruns([call, self.edit()], full)
         self.assertIs(refused, call)
-        self.assertEqual(why, server.GRAPH_ALREADY_RAN)
+        self.assertEqual(why, graph_turn.GRAPH_ALREADY_RAN)
         self.assertEqual(why, "Your `Workflow` call was not run: the agent graph already ran in this session "
                               "and reported. Make the fix its result names yourself: `Read` the lines, copy "
                               "`old_string` from that Read exactly (indentation included), and `Edit`.")
@@ -1476,21 +1477,21 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
                  {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "sk",
                                                "content": "Launching skill: workflow-authoring"}]})
         gone = {**full, "messages": [*skill, *self.read()]}
-        self.assertEqual(server._graph_reruns([call], gone), [(call, server.GRAPH_ALREADY_RAN)])
+        self.assertEqual(graph_turn._graph_reruns([call], gone), [(call, graph_turn.GRAPH_ALREADY_RAN)])
         # Claude Code's own compaction summary is not a new request either.
         summary = {**full, "messages": [user("This session is being continued from a previous conversation "
                                              "that ran out of context. ultracode: ..."), *self.read()]}
-        self.assertEqual(len(server._graph_reruns([call], summary)), 1)
+        self.assertEqual(len(graph_turn._graph_reruns([call], summary)), 1)
 
     def test_a_second_workflow_while_the_first_runs_is_refused(self):
         running = self.body(*self.launch(), *self.read())
-        [(_, why)] = server._graph_reruns([self.workflow()], running)
+        [(_, why)] = graph_turn._graph_reruns([self.workflow()], running)
         self.assertIn("already running in this session (w2ejzhiq6)", why)
         self.assertIn("Do not start another", why)
 
     def test_a_new_request_after_the_report_may_start_a_new_graph(self):
         full = self.body(*self.launch(), self.notification(), user("ultracode: now do part two"))
-        self.assertEqual(server._graph_reruns([self.workflow()], full), [])
+        self.assertEqual(graph_turn._graph_reruns([self.workflow()], full), [])
 
     def test_the_graph_never_runs_on_an_empty_task(self):
         import json
@@ -1504,19 +1505,19 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
                 {"role": "user", "content": [
                     {"type": "tool_result", "tool_use_id": "sk", "content": "Launching skill: workflow-authoring"},
                     {"type": "text", "text": "# Workflow authoring reference"}]}]}
-            self.assertTrue(server._graph_main_loop(empty))
-            self.assertEqual(server._original_request(empty), "")
+            self.assertTrue(graph_turn._graph_main_loop(empty))
+            self.assertEqual(conversation_text._original_request(empty), "")
             call = self.workflow()
-            server._run_graph_instead([call], empty)
+            graph_turn._run_graph_instead([call], empty)
             self.assertNotIn(graph.DYNAMIC_SCRIPT[:200], call["arguments"])
             # Substituted once with the request, then asked again with the request compacted
             # away (not yet launched): the remembered task is used, not "".
             first = self.workflow()
-            server._run_graph_instead([first], self.body())
+            graph_turn._run_graph_instead([first], self.body())
             task = json.loads(first["arguments"])["args"]["task"]
             self.assertIn("implement the functions", task)
             again = self.workflow()
-            server._run_graph_instead([again], empty)
+            graph_turn._run_graph_instead([again], empty)
             self.assertEqual(json.loads(again["arguments"])["args"]["task"], task)
         self.assertEqual(settings.agentaus_graph_kind, "dynamic")
 
@@ -1550,9 +1551,9 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
         from agentaus_bridge.config import settings
         for stream in (False, True):
             posts.clear()
-            with mock.patch.object(server, "_post_with_retry", upstream), \
-                    mock.patch.object(server, "_fit_to_window", compact), \
-                    mock.patch.object(server, "_plan_turn", no_plan), \
+            with mock.patch.object(upstream_http, "_post_with_retry", upstream), \
+                    mock.patch.object(context_window, "_fit_to_window", compact), \
+                    mock.patch.object(helper_calls, "_plan_turn", no_plan), \
                     mock.patch.object(settings, "upstream_stream", False), \
                     TestClient(server.app) as client:
                 r = client.post("/v1/messages", json={**full, "stream": stream})
@@ -1575,16 +1576,16 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
                 {"type": "text", "text": skill}]},
             user(skill),
             user("<system-reminder>\nTodo list is empty\n</system-reminder>"))
-        self.assertEqual(server._user_texts(body), ["ultracode: implement the functions in solutions.py"])
+        self.assertEqual(conversation_text._user_texts(body), ["ultracode: implement the functions in solutions.py"])
         call = self.workflow()
         with mock.patch.object(graph, "prepare", return_value={}):
-            server._run_graph_instead([call], body)
+            graph_turn._run_graph_instead([call], body)
         task = json.loads(call["arguments"])["args"]["task"]
         self.assertEqual(task, "ultracode: implement the functions in solutions.py")
         # A real follow-up after the skill still counts.
         later = {**body, "messages": body["messages"] + [
             {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}, user("also fix tests")]}
-        self.assertEqual(server._last_user_text(later), "also fix tests")
+        self.assertEqual(conversation_text._last_user_text(later), "also fix tests")
 
     # --- 3. Keep the main loop alive while the graph runs -----------------------------------
 
@@ -1592,8 +1593,8 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
         from fastapi.testclient import TestClient
         def upstream(*a, **k):
             raise AssertionError("the launched turn must not reach the model")
-        with mock.patch.object(server, "_post_with_retry", upstream), \
-                mock.patch.object(server, "_agentaus_event_stream", upstream), \
+        with mock.patch.object(upstream_http, "_post_with_retry", upstream), \
+                mock.patch.object(agentaus_stream, "_agentaus_event_stream", upstream), \
                 TestClient(server.app) as client:
             return client.post("/v1/messages", json={**body, "stream": stream})
 
@@ -1601,7 +1602,7 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
         # Measured (d16 tender a5): the model answered in chat and never called Workflow.
         body = self.body()
         with mock.patch.object(graph, "prepare", return_value={}):
-            launch = server._graph_launch(body)
+            launch = graph_turn._graph_launch(body)
             self.assertEqual(launch["script"], graph.DYNAMIC_SCRIPT)
             self.assertEqual(launch["args"]["task"], "ultracode: implement the functions in solutions.py")
             r = self.post(body, stream=False)
@@ -1611,23 +1612,23 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
 
     def test_no_launch_once_a_workflow_ran_or_on_a_tool_result(self):
         with mock.patch.object(graph, "prepare", return_value={}):
-            self.assertIsNone(server._graph_launch(self.body(*self.launch())))
-            self.assertIsNone(server._graph_launch(self.body(*self.read())))
-            self.assertIsNone(server._graph_launch(self.body(request="explain this repo")))
+            self.assertIsNone(graph_turn._graph_launch(self.body(*self.launch())))
+            self.assertIsNone(graph_turn._graph_launch(self.body(*self.read())))
+            self.assertIsNone(graph_turn._graph_launch(self.body(request="explain this repo")))
 
     def test_the_launched_turn_is_answered_without_the_model(self):
         body = self.body(*self.launch())
-        self.assertEqual(server._graph_waiting_reply(body), server.GRAPH_WAITING)
-        self.assertEqual(server.GRAPH_WAITING,
+        self.assertEqual(graph_turn._graph_waiting_reply(body), graph_turn.GRAPH_WAITING)
+        self.assertEqual(graph_turn.GRAPH_WAITING,
                          "The workflow is running in the background; I will check its result when it finishes.")
         r = self.post(body, stream=False)
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["stop_reason"], "end_turn")
-        self.assertEqual(r.json()["content"], [{"type": "text", "text": server.GRAPH_WAITING}])
+        self.assertEqual(r.json()["content"], [{"type": "text", "text": graph_turn.GRAPH_WAITING}])
         r = self.post(body, stream=True)
         events = TheGraphRoundD9Fixes.events(None, r)
         self.assertEqual("".join(e["delta"]["text"] for e in events if e["type"] == "content_block_delta"),
-                         server.GRAPH_WAITING)
+                         graph_turn.GRAPH_WAITING)
         self.assertEqual(events[-2]["delta"]["stop_reason"], "end_turn")
         # The launch was noted on the way: the session now knows its graph is running.
         self.assertEqual(graph.run_state(graph.note_run(self.compacted(body))), "running")
@@ -1637,13 +1638,13 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
         typed = {**result, "content": result["content"] + [{"type": "text", "text": "and check README"}]}
         reminded = {**result, "content": result["content"] + [
             {"type": "text", "text": "<system-reminder>todo</system-reminder>"}]}
-        self.assertIsNone(server._graph_waiting_reply(self.body(use, typed)))
-        self.assertEqual(server._graph_waiting_reply(self.body(use, reminded)), server.GRAPH_WAITING)
-        self.assertIsNone(server._graph_waiting_reply(self.body(use, result, *self.read())))
+        self.assertIsNone(graph_turn._graph_waiting_reply(self.body(use, typed)))
+        self.assertEqual(graph_turn._graph_waiting_reply(self.body(use, reminded)), graph_turn.GRAPH_WAITING)
+        self.assertIsNone(graph_turn._graph_waiting_reply(self.body(use, result, *self.read())))
         rejected = {**result, "content": [{**result["content"][0], "is_error": True}]}
-        self.assertIsNone(server._graph_waiting_reply(self.body(use, rejected)))
+        self.assertIsNone(graph_turn._graph_waiting_reply(self.body(use, rejected)))
         plain = {**self.body(use, result), "messages": [user("total the claims"), use, result]}
-        self.assertIsNone(server._graph_waiting_reply(plain))
+        self.assertIsNone(graph_turn._graph_waiting_reply(plain))
 
     def test_restored_output_is_capped_to_a_share_of_the_window(self):
         from agentaus_bridge import persisted
@@ -1675,7 +1676,7 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "b", "content": huge},
                                          {"type": "tool_result", "tool_use_id": "c", "content": "small"}]}]}
         self.assertGreater(estimate_request_tokens(body), 100000)
-        clipped, n = server._clip_largest_tool_results(body, 20000)
+        clipped, n = context_window._clip_largest_tool_results(body, 20000)
         self.assertEqual(n, 1)
         self.assertLessEqual(estimate_request_tokens(clipped), 20000)
         self.assertGreater(estimate_request_tokens(clipped), 10000)
@@ -1684,18 +1685,18 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
         self.assertTrue(text.endswith("29999.jsonl"))
         self.assertIn("cut to fit the context window", text)
         self.assertEqual(clipped["messages"][2]["content"][1]["content"], "small")
-        self.assertIs(server._clip_largest_tool_results(body, 10**7)[0], body)
+        self.assertIs(context_window._clip_largest_tool_results(body, 10**7)[0], body)
 
     def test_the_maximum_context_length_error_is_recognised_and_its_window_learned(self):
         message = ('{"error":{"code":400,"message":"This model\'s maximum context length is 131072 tokens. '
                    'However, you requested 0 output tokens and your prompt contains 248801 input tokens, for '
                    'a total of 248801 tokens. Please reduce the length of the input prompt."}}')
-        self.assertTrue(server._is_over_length(message))
-        self.assertFalse(server._is_transient(message))
-        server._reset_learned_limit()
-        self.addCleanup(server._reset_learned_limit)
-        server._learn_limit_from(message)
-        self.assertEqual(server._learned_limit, 131072)
+        self.assertTrue(upstream_http._is_over_length(message))
+        self.assertFalse(upstream_http._is_transient(message))
+        upstream_http._reset_learned_limit()
+        self.addCleanup(upstream_http._reset_learned_limit)
+        upstream_http._learn_limit_from(message)
+        self.assertEqual(upstream_http._learned_limit, 131072)
 
     def test_an_over_window_request_is_clipped_when_it_is_fitted(self):
         import asyncio
@@ -1709,8 +1710,8 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
             async def compact(self, body, **k):
                 return {"messages": body["messages"], "summary": None, "summarised": 0, "method": "none"}
 
-        with mock.patch.object(server, "_get_compactor", lambda request: Compactor()):
-            fitted = asyncio.run(server._fit_to_window(None, body, limit=50000, reserve=1000, scale=1.0))
+        with mock.patch.object(context_window, "_get_compactor", lambda request: Compactor()):
+            fitted = asyncio.run(context_window._fit_to_window(None, body, limit=50000, reserve=1000, scale=1.0))
         self.assertLessEqual(estimate_request_tokens(fitted), 50000 - 1000)
         self.assertGreater(estimate_request_tokens(fitted), 25000, "only what is over is cut")
 
@@ -1737,7 +1738,7 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
         own = {"role": "assistant", "content": [{"type": "tool_use", "id": "o", "name": "Workflow",
                                                  "input": {"script": "export const meta = {}", "description": "mine"}}]}
         body = self.body(use, result, own)
-        out, swapped = server._without_graph_script(body)
+        out, swapped = graph_turn._without_graph_script(body)
         self.assertEqual(swapped, 1)
         self.assertEqual(out["messages"][1]["content"][0]["input"],
                          {"description": "Implement", "script": "agentaus-solve"})
@@ -1745,7 +1746,7 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
         self.assertEqual(body["messages"][1]["content"][0]["input"]["script"], graph.DYNAMIC_SCRIPT,
                          "the client's body is left as it was")
         plain = self.body()
-        self.assertIs(server._without_graph_script(plain)[0], plain)
+        self.assertIs(graph_turn._without_graph_script(plain)[0], plain)
 
     def test_compaction_keeps_the_request_and_the_report_whole(self):
         from agentaus_bridge import compact
@@ -1813,11 +1814,11 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
     # --- 7. No planning pass for a graph main loop's first turn -----------------------------
 
     def test_a_graph_main_loop_is_not_planned_before_its_workflow(self):
-        self.assertTrue(server._graph_not_started(self.body()))
-        self.assertFalse(server._graph_not_started(self.body(*self.launch())))
-        self.assertFalse(server._graph_not_started({**self.body(), "messages": [user("total the claims")]}))
-        server._graph_session(self.body(*self.launch()))
-        self.assertFalse(server._graph_not_started(self.compacted(self.body(*self.read()))))
+        self.assertTrue(graph_turn._graph_not_started(self.body()))
+        self.assertFalse(graph_turn._graph_not_started(self.body(*self.launch())))
+        self.assertFalse(graph_turn._graph_not_started({**self.body(), "messages": [user("total the claims")]}))
+        graph_turn._graph_session(self.body(*self.launch()))
+        self.assertFalse(graph_turn._graph_not_started(self.compacted(self.body(*self.read()))))
 
         planned = []
 
@@ -1840,9 +1841,9 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
             return "answer"
 
         from fastapi.testclient import TestClient
-        with mock.patch.object(server, "_post_with_retry", upstream), \
-                mock.patch.object(server, "_plan_turn", plan), \
-                mock.patch.object(server, "_agentaus_summarise", judge), \
+        with mock.patch.object(upstream_http, "_post_with_retry", upstream), \
+                mock.patch.object(helper_calls, "_plan_turn", plan), \
+                mock.patch.object(helper_calls, "_agentaus_summarise", judge), \
                 TestClient(server.app) as client:
             r = client.post("/v1/messages", json={**self.body(session="first"), "stream": False})
             self.assertEqual(r.status_code, 200, r.text)
@@ -1854,9 +1855,9 @@ class TheGraphRoundD12Fixes(unittest.TestCase):
 
 class RewritesSeeTheWholeAnswer(unittest.TestCase):
     def test_an_answer_longer_than_a_rewrite_sees_is_kept(self):
-        long_answer = "x" * (server._REWRITE_CHARS + 1)
-        self.assertTrue(server._too_long_to_rewrite(long_answer, "self-review"))
-        self.assertFalse(server._too_long_to_rewrite("short", "self-review"))
+        long_answer = "x" * (helper_calls._REWRITE_CHARS + 1)
+        self.assertTrue(helper_calls._too_long_to_rewrite(long_answer, "self-review"))
+        self.assertFalse(helper_calls._too_long_to_rewrite("short", "self-review"))
 
 
 if __name__ == "__main__":

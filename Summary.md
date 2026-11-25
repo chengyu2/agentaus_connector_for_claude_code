@@ -71,12 +71,13 @@ compensation where there's no gap only adds latency and noise.
 
 | Part | What it does |
 | --- | --- |
-| `agentaus_bridge/` | The whole server — 38 Python modules. |
+| `agentaus_bridge/` | The whole server — 55 Python modules. |
 | `translate.py` + `tokens.py` | Convert Anthropic ↔ OpenAI messages; count tokens and calibrate against how many Agentaus actually charges (it's a fixed ~2,400-token overhead, not a ratio). |
 | `augment.py` | The "brain" — all the guidance, planning, review, grounding, refusal-catching, skill injection, tool-budget trimming. |
 | `compact.py` | Conversation summariser so long sessions fit the window; cached so it costs once per boundary move, not every turn. A cold compaction is capped by `AGENTAUS_COMPACT_TIMEOUT` (default 180 s): a long summarise falls back to trim/clip at 180 s instead of hanging to `BRIDGE_TURN_TIMEOUT` (900 s). |
 | `tools.py` | The bridge's own tools (`agentaus_search`, `agentaus_zoom`, `agentaus_investigate`, `agentaus_web_search`, `agentaus_inventory`). |
-| `server.py` | The HTTP surface and the turn pipeline — routing, retries, compaction, review, deadlines. |
+| `server.py` | The HTTP surface: startup, health, the model list, and routing each request to Agentaus or to Anthropic. |
+| `agentaus_turn.py` + `agentaus_stream.py` | One Agentaus turn, buffered or streamed. Their helpers: `upstream_http.py` (retries), `context_window.py` (fitting the window), `helper_calls.py` (planning, review, grounding), `tool_handling.py`, `graph_turn.py`, `stall_check.py`, `stream_delivery.py`, `passthrough.py`, `request_log.py`, `bridge_responses.py`, `conversation_text.py`. |
 | `status.py` + `notify.py` | health dashboard. `status.py` is the "single source of truth for what is wrong right now": Incident records for rate-limits (429), quota (402), rejected keys (401/403), connection loss and slow upstream (504/520/522/524); `notify.py` turns hard incidents into Windows desktop toasts immediately and soft ones once they have lasted `AGENTAUS_NOTIFY_AFTER_S`. The in-chat "Still waiting for Agentaus (Ns)" heartbeat and the `/status` page are always on; toasts are Windows-only. |
 | `graph.py` + `graphs/` | The reliable multi-agent workflow script the bridge substitutes for Agentaus's own. |
 | `gate.py` + `throttle.py` | Keep the bridge from hammering the upstream: one shared, priority-aware cap on helper calls, and one adaptive cap on everything. |

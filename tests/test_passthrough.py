@@ -227,7 +227,7 @@ class TestPassthroughRetryPolicy(unittest.TestCase):
         self.assertEqual(response.json()["id"], "msg_stub")
 
     def test_the_402_exclusion_leaves_the_rest_of_the_policy_alone(self):
-        from agentaus_bridge.server import _PASSTHROUGH_RETRYABLE_STATUS, _RETRYABLE_STATUS
+        from agentaus_bridge.upstream_http import _PASSTHROUGH_RETRYABLE_STATUS, _RETRYABLE_STATUS
 
         self.assertIn(402, _RETRYABLE_STATUS,
                       "the Agentaus policy must keep waiting out its quota 402s")

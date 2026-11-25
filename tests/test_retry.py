@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fastapi.testclient import TestClient  # noqa: E402
 
 import stub_server  # noqa: E402
+from agentaus_bridge import upstream_http  # noqa: E402
 
 
 # Mutated per-test to drive the stub's behaviour.
@@ -128,7 +129,7 @@ class _RetryTestBase(unittest.TestCase):
         settings.agentaus_api_key = "test-key"
         settings.retry_backoff_seconds = 0.01  # keep the suite fast
         from agentaus_bridge import server as _srv
-        _srv._reset_learned_limit()
+        upstream_http._reset_learned_limit()
         settings.max_retries = 2
 
     def tearDown(self) -> None:
@@ -326,7 +327,7 @@ class TestBackoffCurve(unittest.TestCase):
         settings.retry_backoff_seconds, settings.retry_max_delay_seconds = self._saved
 
     def test_delay_increases_with_each_attempt(self):
-        from agentaus_bridge.server import _retry_delay
+        from agentaus_bridge.upstream_http import _retry_delay
 
         # Jitter is bounded by retry_backoff_seconds, so compare worst-case to
         # best-case: attempt N's floor must exceed attempt N-1's ceiling. Attempt 3
@@ -341,7 +342,7 @@ class TestBackoffCurve(unittest.TestCase):
             self.assertLessEqual(hi, min(2**attempt, 8.0) + 1.0, f"attempt {attempt} ceiling")
 
     def test_delay_is_capped(self):
-        from agentaus_bridge.server import _retry_delay
+        from agentaus_bridge.upstream_http import _retry_delay
 
         # Without a cap, attempt 20 would be 2**20 seconds - a 12-day wait.
         # The cap bounds the total, so jitter may not push the pause past it either.
@@ -349,7 +350,7 @@ class TestBackoffCurve(unittest.TestCase):
             self.assertLessEqual(_retry_delay(20), 8.0)
 
     def test_saturated_delay_keeps_jitter(self):
-        from agentaus_bridge.server import _retry_delay
+        from agentaus_bridge.upstream_http import _retry_delay
 
         # Capping after the jitter would flatten every saturated retry to exactly
         # the ceiling - lockstep retries, the thing the jitter exists to prevent.
@@ -361,7 +362,7 @@ class TestBackoffCurve(unittest.TestCase):
 
     def test_ceiling_tighter_than_backoff_stays_bounded(self):
         from agentaus_bridge.config import settings
-        from agentaus_bridge.server import _retry_delay
+        from agentaus_bridge.upstream_http import _retry_delay
 
         # A deadline tighter than one backoff interval leaves nothing to reserve;
         # the pause must still land inside [0, ceiling].
@@ -386,20 +387,20 @@ class TestTimeoutIsTreatedAsTooBig(unittest.TestCase):
     """
 
     def test_gateway_timeouts_are_recognised(self):
-        from agentaus_bridge.server import _is_too_slow
+        from agentaus_bridge.upstream_http import _is_too_slow
         for text in ("Agentaus returned HTTP 524: <!DOCTYPE html>",
                      "522 connection timed out", "504 Gateway Timeout",
                      "<title>Gateway time-out</title>"):
             self.assertTrue(_is_too_slow(text), text)
 
     def test_other_failures_are_not(self):
-        from agentaus_bridge.server import _is_too_slow
+        from agentaus_bridge.upstream_http import _is_too_slow
         for text in ("HTTP 401 unauthorized", "HTTP 400 invalid request",
                      "the engine prompt length 224662 exceeds the max_model_len 131072"):
             self.assertFalse(_is_too_slow(text), text)
 
     def test_an_over_length_error_is_still_recognised_separately(self):
-        from agentaus_bridge.server import _is_over_length, _is_too_slow
+        from agentaus_bridge.upstream_http import _is_over_length, _is_too_slow
         text = "The engine prompt length 224662 exceeds the max_model_len 131072"
         self.assertTrue(_is_over_length(text))
         self.assertFalse(_is_too_slow(text), "the two signals must stay distinguishable")
@@ -418,7 +419,7 @@ class TestCapacityFailuresAreNotReplayed(unittest.TestCase):
     """
 
     def test_capacity_statuses_are_named_separately_from_retryable_ones(self):
-        from agentaus_bridge.server import _CAPACITY_STATUS, _RETRYABLE_STATUS
+        from agentaus_bridge.upstream_http import _CAPACITY_STATUS, _RETRYABLE_STATUS
         self.assertTrue(_CAPACITY_STATUS <= _RETRYABLE_STATUS,
                         "a capacity status must still be retryable for small requests")
         self.assertIn(524, _CAPACITY_STATUS)
@@ -450,7 +451,7 @@ class TestCapacityFailuresAreNotReplayed(unittest.TestCase):
         client = _Always524()
         loop = asyncio.new_event_loop()
         try:
-            response = loop.run_until_complete(server._post_with_retry(
+            response = loop.run_until_complete(upstream_http._post_with_retry(
                 client, "http://x", json_body={}, headers={}, retry_capacity=False))
         finally:
             loop.close()
@@ -487,7 +488,7 @@ class TestCapacityFailuresAreNotReplayed(unittest.TestCase):
         settings.retry_backoff_seconds = 0.001
         loop = asyncio.new_event_loop()
         try:
-            response = loop.run_until_complete(server._post_with_retry(
+            response = loop.run_until_complete(upstream_http._post_with_retry(
                 client, "http://x", json_body={}, headers={}))
         finally:
             loop.close()
@@ -518,18 +519,18 @@ class TestSmallRequestTimeoutsAreNotBlamedOnSize(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_a_tiny_request_is_not_worth_refitting(self):
-        from agentaus_bridge.server import _worth_refitting
+        from agentaus_bridge.upstream_http import _worth_refitting
         body = {"messages": [{"role": "user", "content": "short question"}]}
         self.assertFalse(_worth_refitting(body, 131072))
 
     def test_a_request_that_merely_fills_the_window_is_not_blamed_on_size(self):
         """It fits, so Agentaus can process it - a timeout means slow, not too big."""
-        from agentaus_bridge.server import _worth_refitting
+        from agentaus_bridge.upstream_http import _worth_refitting
         body = {"messages": [{"role": "user", "content": "x " * 40_000}]}
         self.assertFalse(_worth_refitting(body, 131072))
 
     def test_a_request_that_does_not_fit_is_worth_refitting(self):
-        from agentaus_bridge.server import _worth_refitting
+        from agentaus_bridge.upstream_http import _worth_refitting
         body = {"messages": [{"role": "user", "content": "x " * 200_000}]}
         self.assertTrue(_worth_refitting(body, 131072))
 
@@ -544,11 +545,11 @@ class TestSmallRequestTimeoutsAreNotBlamedOnSize(unittest.TestCase):
 
         body = {"messages": [{"role": "user", "content": "x " * 200_000}]}
         with mock.patch.object(tokens, "_ENCODING", None), \
-                mock.patch.object(server, "_has_tokeniser", lambda: False):
+                mock.patch.object(upstream_http, "_has_tokeniser", lambda: False):
             # chars/4 puts this at ~100k against a 131k window: exactly the reading
             # that must not be trusted at this threshold.
             self.assertLess(server.estimate_request_tokens(body), 131_072)
-            self.assertTrue(server._worth_refitting(body, 131072))
+            self.assertTrue(upstream_http._worth_refitting(body, 131072))
 
     def test_no_tokeniser_does_not_refit_a_request_that_clearly_fits(self):
         """The correction is for the fallback's error, not a new size ceiling: a
@@ -559,21 +560,21 @@ class TestSmallRequestTimeoutsAreNotBlamedOnSize(unittest.TestCase):
 
         body = {"messages": [{"role": "user", "content": "x " * 40_000}]}
         with mock.patch.object(tokens, "_ENCODING", None), \
-                mock.patch.object(server, "_has_tokeniser", lambda: False):
-            self.assertFalse(server._worth_refitting(body, 131072))
+                mock.patch.object(upstream_http, "_has_tokeniser", lambda: False):
+            self.assertFalse(upstream_http._worth_refitting(body, 131072))
 
     def test_over_length_still_drives_recompaction_on_its_own_signal(self):
         """The explicit error is the primary path; the 524 heuristic is the backstop."""
-        from agentaus_bridge.server import _is_over_length
+        from agentaus_bridge.upstream_http import _is_over_length
         self.assertTrue(_is_over_length(
             "The engine prompt length 224662 exceeds the max_model_len 131072"))
 
     def test_no_limit_means_nothing_to_refit_against(self):
-        from agentaus_bridge.server import _worth_refitting
+        from agentaus_bridge.upstream_http import _worth_refitting
         self.assertFalse(_worth_refitting({"messages": []}, 0))
 
     def test_the_message_tells_the_user_not_to_go_compacting(self):
-        from agentaus_bridge.server import _degraded_upstream_message
+        from agentaus_bridge.upstream_http import _degraded_upstream_message
         text = _degraded_upstream_message(3642, 131072)
         self.assertIn("3,642", text)
         self.assertIn("131,072", text)
@@ -600,9 +601,9 @@ class RateLimitBackoffIsShort(unittest.TestCase):
         with mock.patch.object(settings, "retry_backoff_seconds", 1.0), \
              mock.patch.object(settings, "retry_max_delay_seconds", 300.0), \
              mock.patch.object(settings, "rate_limit_max_delay_seconds", 20.0), \
-             mock.patch.object(server.asyncio, "sleep", fake_sleep):
-            asyncio.run(server._sleep_before_retry(8, "HTTP 429"))
-            asyncio.run(server._sleep_before_retry(8, "HTTP 503"))
+             mock.patch.object(upstream_http.asyncio, "sleep", fake_sleep):
+            asyncio.run(upstream_http._sleep_before_retry(8, "HTTP 429"))
+            asyncio.run(upstream_http._sleep_before_retry(8, "HTTP 503"))
         self.assertLessEqual(waits[0], 30.0)
         self.assertGreaterEqual(waits[1], 256.0)
 
@@ -621,9 +622,9 @@ class RateLimitBackoffIsShort(unittest.TestCase):
         with mock.patch.object(settings, "retry_backoff_seconds", 1.0), \
              mock.patch.object(settings, "retry_max_delay_seconds", 300.0), \
              mock.patch.object(settings, "rate_limit_max_delay_seconds", cap), \
-             mock.patch.object(server.random, "uniform", uniform), \
-             mock.patch.object(server.asyncio, "sleep", fake_sleep):
-            asyncio.run(server._sleep_before_retry(8, "HTTP 429"))
+             mock.patch.object(upstream_http.random, "uniform", uniform), \
+             mock.patch.object(upstream_http.asyncio, "sleep", fake_sleep):
+            asyncio.run(upstream_http._sleep_before_retry(8, "HTTP 429"))
         return waits
 
     def test_429_ceiling_is_never_exceeded(self):
@@ -670,7 +671,7 @@ class FailedAttemptsAreCreditedForRealElapsed(unittest.TestCase):
             with mock.patch.object(settings, "stall_warning_seconds", 0.0), \
                  mock.patch.object(server.flight, "note_wait", noted.append):
                 with self.assertRaises(httpx.ConnectError):
-                    loop.run_until_complete(server._post_with_retry(
+                    loop.run_until_complete(upstream_http._post_with_retry(
                         _Refused(), "http://x", json_body={}, headers={}))
         finally:
             loop.close()
@@ -696,8 +697,8 @@ class FailedAttemptsAreCreditedForRealElapsed(unittest.TestCase):
 
         with mock.patch.object(settings, "retry_backoff_seconds", 0.0), \
              mock.patch.object(server.flight, "note_wait", noted.append), \
-             mock.patch.object(server.asyncio, "sleep", fake_sleep):
-            asyncio.run(server._sleep_before_retry(0, "HTTP 524", 37.0))
+             mock.patch.object(upstream_http.asyncio, "sleep", fake_sleep):
+            asyncio.run(upstream_http._sleep_before_retry(0, "HTTP 524", 37.0))
             # A negative measurement is a bug in the caller; never credit it.
-            asyncio.run(server._sleep_before_retry(0, "ReadTimeout", -3.0))
+            asyncio.run(upstream_http._sleep_before_retry(0, "ReadTimeout", -3.0))
         self.assertEqual(noted, [37.0, 0.0])
