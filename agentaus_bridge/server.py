@@ -21,13 +21,11 @@ import random
 import re
 import time
 import uuid
-from pathlib import Path
 from collections import OrderedDict
 from typing import AsyncIterator, Callable
 
 import httpx
 from fastapi import FastAPI, Form, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 from . import attribution
@@ -114,12 +112,6 @@ from .translate import (
 log = logging.getLogger("agentaus-bridge")
 
 app = FastAPI(title="Agentaus bridge for Claude Code", docs_url=None, redoc_url=None)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*", "null"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # Headers we must not copy verbatim when proxying (hop-by-hop or recomputed).
 _STRIP_REQUEST_HEADERS = {
@@ -525,11 +517,6 @@ def _quality_page() -> str:
 @app.get("/", response_class=HTMLResponse)
 async def ui_root() -> HTMLResponse:
     return HTMLResponse(_quality_page())
-
-
-@app.get("/chess", response_class=HTMLResponse)
-async def chess_ui() -> HTMLResponse:
-    return HTMLResponse((Path(__file__).parent / "chess.html").read_text(encoding="utf-8"))
 
 
 _CLEAR_CONTEXT_NEXT: bool = False
