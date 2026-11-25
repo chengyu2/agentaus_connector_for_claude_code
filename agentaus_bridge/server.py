@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import contextvars
 import hashlib
+import itertools
 import json
 import logging
 import random
@@ -935,12 +936,43 @@ async def _stream_helper(
     return reply
 
 
+def _without_bridge_tools(payload: dict) -> dict:
+    """The payload with the bridge's own tools taken off, and a turn asking it to settle.
+
+    The first answer to a spent search budget. Taking every tool away ended the agent's
+    turn even when its next step was to run a test or make the edit, so only the tools
+    the budget counts are withdrawn: Claude Code's stay, and a call to one of them goes
+    to the client like any other. Only when the model still asks for a search is it
+    asked again with nothing at all - see _answer_without_tools.
+    """
+    kept = [t for t in payload.get("tools") or []
+            if ((t or {}).get("function") or {}).get("name") not in bridge_tools.BRIDGE_TOOLS]
+    out = {k: v for k, v in payload.items() if k not in ("tools", "tool_choice")}
+    if kept:
+        out["tools"] = kept
+        out["tool_choice"] = "auto"
+    out["messages"] = list(out.get("messages") or []) + [{
+        "role": "user",
+        "content": prompt_style.section(
+            "task",
+            "Your search budget for this turn is spent, and the search tools are gone. "
+            "Do not search again, with Bash or any other tool: what you found is above."
+            "\n\nIf it is enough, give the answer now, in the format originally asked "
+            "for. If the task needs a step that is not a search - running a test, "
+            "reading a file you already know, making an edit - take it with the tools "
+            "you still have.",
+        ),
+    }]
+    return out
+
+
 async def _answer_without_tools(client: httpx.AsyncClient, payload: dict) -> str:
     """Ask for an answer from what is already in the conversation, tools removed.
 
-    Used where the model has the material and will not settle: it has searched its budget
-    away, or it returned nothing at all. Taking the tools off the request removes the
-    option it keeps choosing, and everything it found is still in the messages.
+    The last resort, where the model has the material and will not settle: it still asked
+    for a search after _without_bridge_tools took the search tools away, or it returned
+    nothing twice. Taking the tools off the request removes the option it keeps choosing,
+    and everything it found is still in the messages.
 
     Returns "" on any failure, so the caller can fall back to saying what happened.
     """
@@ -2976,7 +3008,13 @@ async def _handle_agentaus(
         # prose, or with a tool only Claude Code can run.
         corrections = 0
         ran: dict = {}
-        for tool_round in range(settings.agentaus_tool_rounds + 1):
+        # Each re-ask below happens once: the bridge's tools withdrawn at the round limit,
+        # and an empty reply sent again unchanged.
+        cut_off = False
+        empty_retried = False
+        # Unbounded on its face, bounded by what continues it: corrections, bridge rounds
+        # and the two re-asks above each have their own limit.
+        for tool_round in itertools.count():
             # Agentaus is the authority on whether a prompt fits. If it says no, it also
             # says what its real limit is, so the next attempt compacts against that
             # instead of against our estimate.
@@ -3090,6 +3128,15 @@ async def _handle_agentaus(
                      "rounds to correct them", len(broken))
             _guard_imports(_theirs, received, cwd)
             data = _with_coerced_calls(data, mine + _theirs)
+            # An empty reply is never a valid answer, but it is not a reason to take the
+            # tools away either: the first one is sent again as it was.
+            if (not calls and not empty_retried and not (
+                    ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+                    or "").strip()):
+                empty_retried = True
+                rlog(logging.WARNING, "upstream returned an empty answer; asking again "
+                     "with the same tools")
+                continue
             if not mine:
                 data = _with_reads_first(data, _theirs, received)
                 if invented:
@@ -3109,6 +3156,14 @@ async def _handle_agentaus(
             rlog(logging.WARNING,
                  "tool round limit (%d) reached; dropping %d unanswered bridge call(s)",
                  settings.agentaus_tool_rounds, len(mine))
+            if _theirs:
+                # Claude Code still has work to run, so the turn goes on without a re-ask.
+                data = _without_bridge_calls(data)
+                break
+            if not cut_off:
+                cut_off = True
+                payload = _without_bridge_tools(payload)
+                continue
             # Everything those searches found is still in the payload, so ask again with
             # the tools removed rather than surfacing an apology for having searched.
             forced = await _answer_without_tools(client, payload)
@@ -3452,6 +3507,10 @@ async def _unguarded_event_stream(
     tool_round = 0
     corrections = 0
     ran: dict = {}
+    # Each re-ask below happens once: the bridge's tools withdrawn at the round limit,
+    # and an empty reply sent again unchanged.
+    cut_off = False
+    empty_retried = False
     # The tool_choice to put back after a stall re-ask that forced one. See below.
     forced_from = None
     # (answer, task): the answer's check, started beside the stall check. See below.
@@ -3782,6 +3841,25 @@ async def _unguarded_event_stream(
                      len("".join(pending)))
             pending = []
             continue
+        if mine and not theirs and not cut_off:
+            # Out of rounds with a search still wanted. Withdraw the search tools but not
+            # Claude Code's, so a next step that is not a search can still be taken.
+            cut_off = True
+            rlog(logging.WARNING,
+                 "tool round limit (%d) reached; dropping %d unanswered bridge call(s) "
+                 "and asking again without the bridge's tools",
+                 settings.agentaus_tool_rounds, len(mine))
+            yield progress("search budget spent; asking for the answer")
+            payload = _without_bridge_tools(payload)
+            pending = []
+            continue
+        # An empty reply is never a valid answer, but it is not a reason to take the tools
+        # away either: the first one is sent again as it was.
+        if not calls and not emitted and not "".join(pending).strip() and not empty_retried:
+            empty_retried = True
+            rlog(logging.WARNING, "upstream returned an empty answer; asking again with "
+                 "the same tools")
+            continue
         # A turn that used no tools and claims it has none is not an answer. Whether it
         # IS that is a judgement about language, so Agentaus makes it - behind a
         # structural gate, so the call only happens when there is something to judge.
@@ -3942,6 +4020,11 @@ async def _unguarded_event_stream(
                     "I searched without reaching an answer. Narrow the question and I "
                     "will try again."
                 ]
+                # The dropped search left "tool_calls" here, and the turn now has none.
+                finish_reason = "stop"
+                if not buffering:
+                    # Only a buffered answer is emitted below; a live one is sent here.
+                    yield builder.text(pending[0])
         break
 
     # Same repair as the buffered path: a non-breaking hyphen in a filename looks
