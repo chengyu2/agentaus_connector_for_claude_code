@@ -1398,11 +1398,11 @@ def _without_bridge_calls(data: dict, drop: set | None = None) -> dict:
         return data
     choice = dict(choices[0] or {})
     message = dict(choice.get("message") or {})
-    drop = drop or set()
+    drop = drop or ()
     kept = [
         call for call in (message.get("tool_calls") or [])
         if ((call.get("function") or {}).get("name") or "") not in bridge_tools.BRIDGE_TOOLS
-        and not (call.get("id") and call.get("id") in drop)
+        and call.get("id") not in drop
     ]
     message["tool_calls"] = kept or None
     if not kept and not (message.get("content") or "").strip():

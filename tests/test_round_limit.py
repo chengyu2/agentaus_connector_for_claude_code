@@ -189,6 +189,7 @@ class RoundLimit(_Loop):
             calls = [(bridge_tools.SEARCH_TOOL, {"query": "cache reload", "path": "/tmp"})]
             if len(stub.calls) > 1:
                 calls = [("Skill", {"skill": "cache-notes"}),
+                         ("Skill", {"skill": "review"}),
                          ("Read", {"file_path": "/tmp/cache.py"})]
             return {"tool_calls": calls}
 
@@ -202,8 +203,9 @@ class RoundLimit(_Loop):
                 settings.agentaus_self_review = buffered
                 stub = self.tool_stub(behave)
                 *blocks, stop = self.turn(stream, tools=("Bash", "Read", "Skill"))
+                # The library skill is dropped; Claude Code's own skill is not.
                 self.assertEqual([b.get("name") for b in blocks if b["type"] == "tool_use"],
-                                 ["Read"])
+                                 ["Skill", "Read"])
                 self.assertEqual(stop, "tool_use")
 
     def test_narration_before_a_search_after_the_cut_off_ends_the_turn(self):
