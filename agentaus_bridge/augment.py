@@ -432,9 +432,12 @@ WORKFLOW_NOT_LOADED = """\
 
 **The user opted into multi-agent orchestration, but the `Workflow` tool is not loaded.**
 
+{delegate}- To orchestrate with `Workflow`{instead}, load it first: `ToolSearch` with `select:Workflow`.
+"""
+_DELEGATE_WITH_AGENT = """\
+- **Trivial or conversational turn** → work alone, no `Agent`.
 - **Delegate with `Agent`**: one call per independent part, **all in the same turn** - a survey of one area, the tests for one module, a review of one file, a change to files no other part touches.
 - **Keep for yourself** only the edits to files several parts share.
-- To orchestrate with `Workflow` instead, load it first: `ToolSearch` with `select:Workflow`.
 """
 
 
@@ -443,6 +446,33 @@ def workflow_offered(body: dict) -> bool:
     opted-in session can hold the opt-in without the tool."""
     return any(isinstance(t, dict) and t.get("name") == "Workflow"
                for t in body.get("tools") or [])
+
+
+# Claude Code's list of deferred tools: `<available-deferred-tools>` in older versions, "The
+# following deferred tools are now available via ToolSearch" in newer ones, one name a line.
+_DEFERRED_LISTING = re.compile(r"<available-deferred-tools>|\bdeferred tools\b", re.I)
+_WORKFLOW_LINE = re.compile(r"^\s*Workflow\s*$", re.M)
+
+
+def workflow_deferred(body: dict) -> bool:
+    """Whether `Workflow` is deferred: not on the wire, but loadable with `ToolSearch`, which
+    the client offers and whose deferred-tools listing names it. Without tool search every
+    tool is on the wire, so a missing `Workflow` means this client has none to load."""
+    names = {t.get("name") for t in body.get("tools") or [] if isinstance(t, dict)}
+    if "Workflow" in names or "ToolSearch" not in names:
+        return False
+    from .translate import system_notes
+    system = body.get("system")
+    if isinstance(system, list):
+        system = "\n".join(b.get("text", "") for b in system if isinstance(b, dict))
+    texts = [system if isinstance(system, str) else "", *system_notes(body), *_user_text_blocks(body)]
+    for text in texts:
+        for found in _DEFERRED_LISTING.finditer(text):
+            listing = text[found.end():]
+            end = listing.find("</")
+            if _WORKFLOW_LINE.search(listing if end == -1 else listing[:end]):
+                return True
+    return False
 
 
 WORKFLOW_GUIDANCE = """\
@@ -923,9 +953,10 @@ def guidance_for(body: dict, *, covered_by_skill: tuple = (), routing: bool = Tr
         notes += SUBAGENT_GUIDANCE.format(how=how)
         return prompt_style.headings(notes) + selection
     opted = workflow_opt_in if workflow_opt_in is not None else workflow_opted_in(body)
-    if opted and not workflow_offered(body) and any(
-            isinstance(t, dict) and t.get("name") == "Agent" for t in body.get("tools") or []):
-        notes += WORKFLOW_NOT_LOADED
+    if opted and workflow_deferred(body):
+        agent = any(isinstance(t, dict) and t.get("name") == "Agent" for t in body.get("tools") or [])
+        notes += WORKFLOW_NOT_LOADED.format(delegate=_DELEGATE_WITH_AGENT if agent else "",
+                                            instead=" instead" if agent else "")
     if opted and workflow_offered(body):
         from .config import settings
         from . import graph
@@ -1924,17 +1955,7 @@ def working_directory(system) -> str | None:
             path = quoted.strip() if quoted else found.group(4).strip().strip("`'\".,").rstrip()
             if _ABSOLUTE_CWD.match(path):
                 return path
-            if _WINDOWS_PATH.match(path):
-                # A Windows path often holds spaces ("C:\Users\me\GitHub Repo\x"), so it runs to
-                # the end of its line, not to the first space as the patterns read it.
-                end = text.find("\n", found.start(1))
-                whole = text[found.start(1): end if end != -1 else len(text)]
-                return whole.strip().strip("`'\".,")
     return None
-
-
-# A drive-letter path (C:\ or C:/) or a UNC share (\\server\share).
-_WINDOWS_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\])")
 
 
 _TOOL_BLURB_CHARS = 240

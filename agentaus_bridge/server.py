@@ -82,6 +82,7 @@ from .augment import (
     with_plan,
     with_parent_request,
     workflow_offered,
+    _tools_used,
     workflow_opted_in,
     worth_reviewing,
     worth_reviewing_turn,
@@ -335,8 +336,15 @@ def _client_authorised(request: Request) -> bool:
 # Main entrypoint
 # --------------------------------------------------------------------------------------
 
-def _route(request: Request, body: dict, model: str, *, main_loop: bool) -> tuple[bool, bool]:
-    """(send to Agentaus, because it is a subagent following its session).
+# Why `_route` sent a request to Agentaus when its model id alone would not have; logged on
+# the recv line, so a reader blames the right mechanism.
+ROUTE_FOLLOWS_SESSION = "subagent of an Agentaus session"
+ROUTE_SUBAGENTS_ONLY = "AGENTAUS_SUBAGENTS_ONLY"
+
+
+def _route(request: Request, body: dict, model: str, *, main_loop: bool) -> tuple[bool, str | None]:
+    """(send to Agentaus, why when not by model id: ROUTE_FOLLOWS_SESSION, ROUTE_SUBAGENTS_ONLY
+    or None).
 
     By model id, as always - plus a subagent goes wherever its session's main loop last
     went. See `agentaus_bridge.sessions` for why the model id alone sent Agentaus
@@ -348,19 +356,19 @@ def _route(request: Request, body: dict, model: str, *, main_loop: bool) -> tupl
             and sessions.is_subagent(request.headers, body)):
         # Every subagent on Agentaus, whatever its session or model - including after a bridge
         # restart, when the in-memory session record is gone.
-        return True, True
+        return True, ROUTE_SUBAGENTS_ONLY
     if not settings.agentaus_subagents_follow_session:
-        return by_model, False
+        return by_model, None
     session = sessions.session_of(request.headers)
     if sessions.is_subagent(request.headers, body):
         if not by_model and sessions.main_loop_on_agentaus(session):
-            return True, True
-        return by_model, False
+            return True, ROUTE_FOLLOWS_SESSION
+        return by_model, None
     if main_loop and body.get("tools"):
         sessions.note_main_loop(session, by_model)
         if by_model:
             sessions.note_request(session, _last_user_text(body))
-    return by_model, False
+    return by_model, None
 
 
 @app.post("/v1/messages")
@@ -376,7 +384,7 @@ async def messages(request: Request) -> Response:
 
     model = body.get("model") or ""
     wants_stream = bool(body.get("stream"))
-    to_agentaus, inherited = _route(request, body, model, main_loop=True)
+    to_agentaus, why = _route(request, body, model, main_loop=True)
 
     _request_id.set(_new_request_id())
     messages_in = len(body.get("messages") or [])
@@ -384,8 +392,7 @@ async def messages(request: Request) -> Response:
         logging.INFO,
         "recv model=%s route=%s stream=%s msgs=%d est=%d bytes=%d",
         model or "(none)",
-        ("agentaus (subagent of an Agentaus session)" if inherited
-         else "agentaus" if to_agentaus else "anthropic"),
+        (f"agentaus ({why})" if why else "agentaus" if to_agentaus else "anthropic"),
         wants_stream,
         messages_in,
         estimate_request_tokens(body),
@@ -1540,9 +1547,12 @@ def _graph_main_loop(body: dict) -> bool:
     """A main loop whose `Workflow` call the bridge runs its graph in place of. Opted in is not
     enough: with `Workflow` still deferred there is no call to run the graph for, and treating
     the session as one skipped the planning pass and held every write for a Workflow call
-    the model could not make."""
+    the model could not make. Nor once the main loop has delegated with `Agent` (as
+    `focus_tools` keeps `Agent` then): loading `Workflow` afterwards must not refuse the write
+    that merges the subagents' results, or relaunch the whole request as a graph."""
     return bool(settings.agentaus_workflow_graph and not is_subagent_turn(body)
-                and workflow_opted_in(body) and workflow_offered(body))
+                and workflow_opted_in(body) and workflow_offered(body)
+                and "Agent" not in _tools_used(body))
 
 
 def _writes_plain_text(body: dict) -> bool:

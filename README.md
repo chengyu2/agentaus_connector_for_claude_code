@@ -493,14 +493,17 @@ it applies. Turn it off with `AGENTAUS_SUBAGENTS_FOLLOW_SESSION=false`.
 `AGENTAUS_SUBAGENTS_ONLY=true` goes further: every subagent runs on Agentaus, whatever
 session started it or model it names. That includes a Claude session's subagents, and the
 first subagents after a bridge restart, before the bridge has seen their session's main
-loop. Use it when subagents should never spend Claude usage.
+loop. Use it when subagents should never spend Claude usage. The log says
+`route=agentaus (AGENTAUS_SUBAGENTS_ONLY)` for a subagent it moved.
 
 An "ultracode" session (or one at max effort, which opts in) is orchestrated through the
 `Workflow` tool, but Claude Code keeps `Workflow` deferred until something loads it. Until it
 is on the wire the bridge treats the session as an ordinary one: `Agent` stays available,
-the planning pass runs, and Agentaus is told to delegate with `Agent` or load `Workflow`
-first. Measured before this: with the opt-in on and `Workflow` deferred, Agentaus worked
-alone for 32 turns.
+the planning pass runs, and, when `ToolSearch` is offered and Claude Code's deferred-tools
+list names `Workflow`, Agentaus is told to delegate with `Agent` (or work alone on a trivial
+turn) or load `Workflow` first. Once the main loop has delegated with `Agent`, loading
+`Workflow` later does not turn the session into a graph main loop. Measured before this: with
+the opt-in on and `Workflow` deferred, Agentaus worked alone for 32 turns.
 
 ---
 
