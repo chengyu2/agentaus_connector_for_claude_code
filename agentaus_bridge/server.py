@@ -26,6 +26,7 @@ from typing import AsyncIterator, Callable
 
 import httpx
 from fastapi import FastAPI, Form, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 from . import attribution
@@ -112,6 +113,12 @@ from .translate import (
 log = logging.getLogger("agentaus-bridge")
 
 app = FastAPI(title="Agentaus bridge for Claude Code", docs_url=None, redoc_url=None)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*", "null"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Headers we must not copy verbatim when proxying (hop-by-hop or recomputed).
 _STRIP_REQUEST_HEADERS = {

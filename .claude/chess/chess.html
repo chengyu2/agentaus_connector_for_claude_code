@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chess vs Agentaus</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+<style>
+  :root {
+    --light: #f0d9b5;
+    --dark: #b58863;
+    --highlight: rgba(20, 85, 30, 0.5);
+    --legal: rgba(20, 85, 30, 0.25);
+    --last-move: rgba(155, 199, 0, 0.4);
+    --check: rgba(220, 50, 50, 0.6);
+    --bg: #1a1a2e;
+    --panel: #16213e;
+    --text: #e0e0e0;
+    --accent: #0f3460;
+    --btn: #e94560;
+    --btn-hover: #c73652;
+    --dot-size: 28%;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    padding: 20px;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+
+  #board-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+
+  #board {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    width: min(80vw, 520px);
+    height: min(80vw, 520px);
+    border: 3px solid #0f3460;
+    border-radius: 4px;
+    overflow: hidden;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  }
+
+  .square {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    position: relative;
+    font-size: clamp(28px, 5vw, 48px);
+    user-select: none;
+    transition: filter 0.1s;
+  }
+
+  .square.light { background: var(--light); }
+  .square.dark  { background: var(--dark); }
+  .square.selected { background: var(--highlight) !important; }
+  .square.last-move { background: var(--last-move) !important; }
+  .square.in-check  { background: var(--check) !important; }
+
+  .square .dot {
+    position: absolute;
+    border-radius: 50%;
+    background: rgba(0,0,0,0.18);
+    width: var(--dot-size);
+    height: var(--dot-size);
+    pointer-events: none;
+  }
+
+  .square .ring {
+    position: absolute;
+    border-radius: 50%;
+    border: 5px solid rgba(0,0,0,0.18);
+    width: 90%;
+    height: 90%;
+    pointer-events: none;
+  }
+
+  .coord-row, .coord-col {
+    display: flex;
+    font-size: 11px;
+    color: #888;
+    width: min(80vw, 520px);
+  }
+  .coord-row { justify-content: space-around; }
+  .coord-col {
+    flex-direction: column;
+    height: min(80vw, 520px);
+    position: absolute;
+    left: -18px;
+    justify-content: space-around;
+  }
+
+  #panel {
+    background: var(--panel);
+    border-radius: 12px;
+    padding: 20px;
+    width: 240px;
+    min-height: 400px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  }
+
+  h1 { font-size: 1.1rem; color: #e94560; letter-spacing: 1px; text-transform: uppercase; }
+
+  #status {
+    background: var(--accent);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 0.85rem;
+    min-height: 44px;
+    line-height: 1.4;
+  }
+
+  #status.thinking { color: #ffd700; }
+  #status.error    { color: #ff6b6b; }
+  #status.win      { color: #69db7c; font-weight: bold; }
+
+  #moves {
+    flex: 1;
+    overflow-y: auto;
+    font-family: monospace;
+    font-size: 0.8rem;
+    line-height: 1.8;
+    color: #aaa;
+  }
+
+  #moves span.white { color: #eee; margin-right: 6px; }
+  #moves span.black { color: #aaa; margin-right: 12px; }
+
+  button {
+    background: var(--btn);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 10px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 600;
+    transition: background 0.2s;
+  }
+
+  button:hover { background: var(--btn-hover); }
+  button:disabled { background: #444; cursor: not-allowed; }
+
+  #thinking-bar {
+    height: 3px;
+    background: linear-gradient(90deg, #e94560, #ffd700, #e94560);
+    background-size: 200%;
+    border-radius: 2px;
+    display: none;
+    animation: shimmer 1.2s infinite;
+  }
+  #thinking-bar.active { display: block; }
+  @keyframes shimmer {
+    0%   { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+
+  #difficulty {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  #difficulty button {
+    flex: 1;
+    padding: 6px 4px;
+    font-size: 0.75rem;
+    background: var(--accent);
+  }
+  #difficulty button.active { background: var(--btn); }
+</style>
+</head>
+<body>
+
+<div id="board-wrap">
+  <div id="board"></div>
+  <div class="coord-row" id="file-labels"></div>
+</div>
+
+<div id="panel">
+  <h1>♟ Chess vs Agentaus</h1>
+
+  <div id="difficulty">
+    <button onclick="setDifficulty('fast')" class="active" id="btn-fast">Fast</button>
+    <button onclick="setDifficulty('balanced')" id="btn-balanced">Balanced</button>
+    <button onclick="setDifficulty('high')" id="btn-high">Strong</button>
+  </div>
+
+  <div id="thinking-bar"></div>
+  <div id="status">Your turn — you are White.</div>
+
+  <div id="moves"></div>
+
+  <button onclick="newGame()">New Game</button>
+</div>
+
+<script>
+const BRIDGE = 'http://127.0.0.1:8787';
+const MODELS = {
+  fast:     'claude-agentaus-fast',
+  balanced: 'claude-agentaus-balanced',
+  high:     'agentaus',
+};
+
+let game, selectedSq, lastFrom, lastTo, difficulty = 'fast', busy = false;
+
+const PIECES = {
+  wK:'♔', wQ:'♕', wR:'♖', wB:'♗', wN:'♘', wP:'♙',
+  bK:'♚', bQ:'♛', bR:'♜', bB:'♝', bN:'♞', bP:'♟',
+};
+
+function newGame() {
+  game = new Chess();
+  selectedSq = null;
+  lastFrom = lastTo = null;
+  busy = false;
+  setStatus('Your turn — you are White.');
+  renderBoard();
+  document.getElementById('moves').innerHTML = '';
+}
+
+function setDifficulty(d) {
+  difficulty = d;
+  ['fast','balanced','high'].forEach(k => {
+    document.getElementById('btn-'+k).className = k === d ? 'active' : '';
+  });
+}
+
+function setStatus(msg, cls = '') {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = cls;
+}
+
+function thinking(on) {
+  busy = on;
+  document.getElementById('thinking-bar').className = on ? 'active' : '';
+  if (on) setStatus('Agentaus is thinking…', 'thinking');
+}
+
+function renderBoard() {
+  const board = document.getElementById('board');
+  board.innerHTML = '';
+  for (let r = 7; r >= 0; r--) {
+    for (let c = 0; c < 8; c++) {
+      const sq = String.fromCharCode(97 + c) + (r + 1);
+      const isLight = (r + c) % 2 === 1;
+      const div = document.createElement('div');
+      div.className = 'square ' + (isLight ? 'light' : 'dark');
+      div.dataset.sq = sq;
+
+      if (sq === lastFrom || sq === lastTo) div.classList.add('last-move');
+      if (sq === selectedSq) div.classList.add('selected');
+
+      const piece = game.get(sq);
+      if (piece) {
+        div.textContent = PIECES[piece.color + piece.type.toUpperCase()];
+      }
+
+      if (selectedSq && !piece) {
+        const moves = game.moves({ square: selectedSq, verbose: true });
+        if (moves.some(m => m.to === sq)) {
+          const dot = document.createElement('div');
+          dot.className = 'dot';
+          div.appendChild(dot);
+        }
+      }
+      if (selectedSq && piece && piece.color !== game.turn()) {
+        const moves = game.moves({ square: selectedSq, verbose: true });
+        if (moves.some(m => m.to === sq)) {
+          const ring = document.createElement('div');
+          ring.className = 'ring';
+          div.appendChild(ring);
+        }
+      }
+
+      if (game.in_check()) {
+        const king = findKing(game.turn());
+        if (sq === king) div.classList.add('in-check');
+      }
+
+      div.addEventListener('click', () => onSquareClick(sq));
+      board.appendChild(div);
+    }
+  }
+
+  const labels = document.getElementById('file-labels');
+  labels.innerHTML = '';
+  'abcdefgh'.split('').forEach(f => {
+    const s = document.createElement('span');
+    s.textContent = f;
+    labels.appendChild(s);
+  });
+}
+
+function findKing(color) {
+  for (let r = 1; r <= 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const sq = String.fromCharCode(97 + c) + r;
+      const p = game.get(sq);
+      if (p && p.type === 'k' && p.color === color) return sq;
+    }
+  }
+}
+
+function onSquareClick(sq) {
+  if (busy || game.game_over() || game.turn() !== 'w') return;
+
+  const piece = game.get(sq);
+
+  if (selectedSq) {
+    const moves = game.moves({ square: selectedSq, verbose: true });
+    const target = moves.find(m => m.to === sq);
+    if (target) {
+      let moveStr = selectedSq + sq;
+      if (target.flags.includes('p')) moveStr += 'q'; // auto-promote to queen
+      const result = game.move({ from: selectedSq, to: sq, promotion: 'q' });
+      if (result) {
+        lastFrom = selectedSq;
+        lastTo = sq;
+        selectedSq = null;
+        renderBoard();
+        addMoveToHistory(result);
+        checkGameOver() || agentausMove();
+        return;
+      }
+    }
+    if (piece && piece.color === 'w') {
+      selectedSq = sq;
+      renderBoard();
+      return;
+    }
+    selectedSq = null;
+    renderBoard();
+    return;
+  }
+
+  if (piece && piece.color === 'w') {
+    selectedSq = sq;
+    renderBoard();
+  }
+}
+
+function addMoveToHistory(move) {
+  const movesEl = document.getElementById('moves');
+  const moveNum = Math.ceil(game.history().length / 2);
+  if (move.color === 'w') {
+    const span = document.createElement('span');
+    span.id = 'move-' + moveNum;
+    span.innerHTML = `<span style="color:#666">${moveNum}.</span> <span class="white">${move.san}</span>`;
+    movesEl.appendChild(span);
+    movesEl.appendChild(document.createTextNode(' '));
+  } else {
+    const existing = document.getElementById('move-' + moveNum);
+    if (existing) {
+      existing.innerHTML += ` <span class="black">${move.san}</span>`;
+    }
+  }
+  movesEl.scrollTop = movesEl.scrollHeight;
+}
+
+function checkGameOver() {
+  if (game.in_checkmate()) {
+    const winner = game.turn() === 'w' ? 'Agentaus wins!' : 'You win! 🎉';
+    setStatus('Checkmate — ' + winner, 'win');
+    return true;
+  }
+  if (game.in_stalemate()) { setStatus('Stalemate — draw.', 'win'); return true; }
+  if (game.in_draw())      { setStatus('Draw.', 'win'); return true; }
+  return false;
+}
+
+async function agentausMove() {
+  thinking(true);
+
+  const history = game.history().join(' ');
+  const fen = game.fen();
+  const prompt =
+    `You are playing chess as Black. Current position (FEN): ${fen}\n` +
+    `Move history: ${history || '(none)'}\n\n` +
+    `Reply with ONLY your move in standard algebraic notation (e.g. e5, Nf6, Bxc4, O-O). ` +
+    `No explanation, just the move.`;
+
+  let moveStr = null;
+  try {
+    const res = await fetch(`${BRIDGE}/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': 'chess', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: MODELS[difficulty],
+        max_tokens: 20,
+        system: 'You are a chess engine. Reply with exactly one move in standard algebraic notation. No commentary.',
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+
+    if (!res.ok) throw new Error(`Bridge returned ${res.status}`);
+    const data = await res.json();
+    const raw = (data.content?.[0]?.text || '').trim();
+    moveStr = raw.replace(/[^a-zA-Z0-9\-=+#]/g, '').trim();
+  } catch (e) {
+    thinking(false);
+    setStatus('Bridge error: ' + e.message + '\n\nIs the bridge running?', 'error');
+    return;
+  }
+
+  thinking(false);
+
+  const move = game.move(moveStr, { sloppy: true });
+  if (move) {
+    lastFrom = move.from;
+    lastTo = move.to;
+    renderBoard();
+    addMoveToHistory(move);
+    if (!checkGameOver()) setStatus('Your turn — you are White.');
+  } else {
+    // Try a random legal move as fallback if Claude gave a bad response
+    const legal = game.moves({ verbose: true });
+    if (legal.length) {
+      const fallback = legal[Math.floor(Math.random() * legal.length)];
+      const result = game.move(fallback);
+      lastFrom = result.from;
+      lastTo = result.to;
+      renderBoard();
+      addMoveToHistory(result);
+      if (!checkGameOver()) setStatus('Your turn — you are White.');
+    }
+  }
+}
+
+newGame();
+</script>
+</body>
+</html>
