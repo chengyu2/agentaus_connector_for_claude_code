@@ -423,6 +423,58 @@ def skills_for(body: dict) -> list[str]:
     return wanted
 
 
+# Ultracode with `Workflow` still deferred: Claude Code's reminder says "use the Workflow
+# tool", and it is not on the wire. Measured (24 Nov 2026): told that and offered nothing
+# else, an opted-in Agentaus main loop worked alone for 32 turns, one tool call at a time.
+WORKFLOW_NOT_LOADED = """\
+
+--- Multi-agent work ---
+
+**The user opted into multi-agent orchestration, but the `Workflow` tool is not loaded.**
+
+{delegate}- To orchestrate with `Workflow`{instead}, load it first: `ToolSearch` with `select:Workflow`.
+"""
+_DELEGATE_WITH_AGENT = """\
+- **Trivial or conversational turn** → work alone, no `Agent`.
+- **Delegate with `Agent`**: one call per independent part, **all in the same turn** - a survey of one area, the tests for one module, a review of one file, a change to files no other part touches.
+- **Keep for yourself** only the edits to files several parts share.
+"""
+
+
+def workflow_offered(body: dict) -> bool:
+    """Whether `Workflow` is on the wire. Claude Code defers it until it is loaded, so an
+    opted-in session can hold the opt-in without the tool."""
+    return any(isinstance(t, dict) and t.get("name") == "Workflow"
+               for t in body.get("tools") or [])
+
+
+# Claude Code's list of deferred tools: `<available-deferred-tools>` in older versions, "The
+# following deferred tools are now available via ToolSearch" in newer ones, one name a line.
+_DEFERRED_LISTING = re.compile(r"<available-deferred-tools>|\bdeferred tools\b", re.I)
+_WORKFLOW_LINE = re.compile(r"^\s*Workflow\s*$", re.M)
+
+
+def workflow_deferred(body: dict) -> bool:
+    """Whether `Workflow` is deferred: not on the wire, but loadable with `ToolSearch`, which
+    the client offers and whose deferred-tools listing names it. Without tool search every
+    tool is on the wire, so a missing `Workflow` means this client has none to load."""
+    names = {t.get("name") for t in body.get("tools") or [] if isinstance(t, dict)}
+    if "Workflow" in names or "ToolSearch" not in names:
+        return False
+    from .translate import system_notes
+    system = body.get("system")
+    if isinstance(system, list):
+        system = "\n".join(b.get("text", "") for b in system if isinstance(b, dict))
+    texts = [system if isinstance(system, str) else "", *system_notes(body), *_user_text_blocks(body)]
+    for text in texts:
+        for found in _DEFERRED_LISTING.finditer(text):
+            listing = text[found.end():]
+            end = listing.find("</")
+            if _WORKFLOW_LINE.search(listing if end == -1 else listing[:end]):
+                return True
+    return False
+
+
 WORKFLOW_GUIDANCE = """\
 
 --- Multi-agent workflows ---
@@ -741,7 +793,10 @@ def pending_workflows(body: dict) -> set:
     launched, reported = set(), set()
     for message in body.get("messages") or []:
         content = message.get("content")
-        if message.get("role") != "user":
+        # A report can arrive as a `system` entry too. Measured (Claude Code 2.1.331): a stopped
+        # workflow's `<status>killed</status>` notification came that way, the launch was never
+        # seen to report back, and every Edit after it was refused as "still running".
+        if message.get("role") not in ("user", "system"):
             continue
         blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content or []
         for block in blocks:
@@ -898,8 +953,11 @@ def guidance_for(body: dict, *, covered_by_skill: tuple = (), routing: bool = Tr
         notes += SUBAGENT_GUIDANCE.format(how=how)
         return prompt_style.headings(notes) + selection
     opted = workflow_opt_in if workflow_opt_in is not None else workflow_opted_in(body)
-    if opted and any(isinstance(t, dict) and t.get("name") == "Workflow"
-                     for t in body.get("tools") or []):
+    if opted and workflow_deferred(body):
+        agent = any(isinstance(t, dict) and t.get("name") == "Agent" for t in body.get("tools") or [])
+        notes += WORKFLOW_NOT_LOADED.format(delegate=_DELEGATE_WITH_AGENT if agent else "",
+                                            instead=" instead" if agent else "")
+    if opted and workflow_offered(body):
         from .config import settings
         from . import graph
         texts = [t for t in _user_text_blocks(body) if "<task-notification>" not in t]
@@ -2160,9 +2218,11 @@ def focus_tools(body: dict, *, workflow_opt_in: bool | None = None) -> tuple[dic
         used = used | {"Workflow"}
     # With the bridge's graph on, an opted-in main loop orchestrates through Workflow. Offered
     # `Agent` as well, Agentaus handed ten functions to one subagent instead, twice running.
+    # Only while Workflow is on the wire, though: hidden with Workflow still deferred, the
+    # main loop is left with no way to delegate at all.
     from .config import settings
     hide_agent = (opted and settings.agentaus_workflow_graph and not is_subagent_turn(body)
-                  and "Agent" not in _tools_used(body))
+                  and workflow_offered(body) and "Agent" not in _tools_used(body))
     kept, dropped = [], []
     for tool in tools:
         name = (tool or {}).get("name") or ""

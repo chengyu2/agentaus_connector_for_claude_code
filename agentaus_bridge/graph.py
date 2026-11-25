@@ -725,7 +725,8 @@ def note_run(body: dict) -> dict | None:
                         and is_graph_script((block.get("input") or {}).get("script"))):
                     uses[block.get("id")] = (index, ((block.get("input") or {}).get("args") or {}).get("task") or "")
             continue
-        if message.get("role") != "user":
+        # Reports also arrive as `system` entries (Claude Code 2.1.331: a killed workflow's).
+        if message.get("role") not in ("user", "system"):
             continue
         for block in content if isinstance(content, list) else []:
             if (isinstance(block, dict) and block.get("type") == "tool_result"

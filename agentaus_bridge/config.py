@@ -708,6 +708,13 @@ class Settings:
     agentaus_subagents_follow_session: bool = field(
         default_factory=lambda: _bool("AGENTAUS_SUBAGENTS_FOLLOW_SESSION", True)
     )
+    # Send every subagent to Agentaus, whatever session started it or model it names. Off by
+    # default: following the session already keeps an Agentaus session's subagents there, and
+    # a Claude session's subagents should stay on Claude. On for anyone who wants subagents
+    # never to spend Claude usage, including after a bridge restart forgets the sessions.
+    agentaus_subagents_only: bool = field(
+        default_factory=lambda: _bool("AGENTAUS_SUBAGENTS_ONLY", False)
+    )
     # Run one of the bridge's agent graphs in place of the script Agentaus writes for a
     # `Workflow` call. See agentaus_bridge/graph.py. On by default for the dynamic graph,
     # on evidence: across five tasks it averaged 0.64 against 0.57 for Agentaus's own

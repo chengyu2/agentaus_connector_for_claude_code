@@ -402,7 +402,9 @@ with no change to the bridge. The details:
   of those, the bridge has nothing to ask Anthropic with and serves only Agentaus, so the
   picker shows its usual alias rows and nothing breaks.
 - Claude Code waits 3 s; the bridge gives Anthropic 2.5 s and otherwise serves the last list
-  it fetched, and Claude Code falls back to its own cache or built-in list on any failure.
+  *that credential* fetched, and Claude Code falls back to its own cache or built-in list on
+  any failure. One credential's list is never served to another, nor to a caller that sent
+  none.
 
 ### Why the launcher does not set `ANTHROPIC_AUTH_TOKEN`
 
@@ -415,7 +417,10 @@ The bridge forwards the `anthropic-beta` header verbatim, which is what carries 
 OAuth capability a subscription login needs, so passthrough works unchanged.
 
 If you normally authenticate with an `ANTHROPIC_API_KEY`, that keeps working too. The
-bridge passes `Authorization` and `x-api-key` straight through.
+bridge passes `Authorization` and `x-api-key` through to Anthropic — except when a
+header's value *is* your `BRIDGE_TOKEN`, which is stripped rather than handed to
+Anthropic. See [Client authentication](#client-authentication) for how to hold both a
+bridge secret and a real Anthropic credential at once.
 
 ---
 
@@ -518,6 +523,21 @@ Switching mid-session moves the subagents with you, so the toggle is untouched. 
 main-loop turn (tools offered, no agent id) records the session's model, so a title or
 summary call cannot flip it. The log says `route=agentaus (subagent of an Agentaus session)` when
 it applies. Turn it off with `AGENTAUS_SUBAGENTS_FOLLOW_SESSION=false`.
+
+`AGENTAUS_SUBAGENTS_ONLY=true` goes further: every subagent runs on Agentaus, whatever
+session started it or model it names. That includes a Claude session's subagents, and the
+first subagents after a bridge restart, before the bridge has seen their session's main
+loop. Use it when subagents should never spend Claude usage. The log says
+`route=agentaus (AGENTAUS_SUBAGENTS_ONLY)` for a subagent it moved.
+
+An "ultracode" session (or one at max effort, which opts in) is orchestrated through the
+`Workflow` tool, but Claude Code keeps `Workflow` deferred until something loads it. Until it
+is on the wire the bridge treats the session as an ordinary one: `Agent` stays available,
+the planning pass runs, and, when `ToolSearch` is offered and Claude Code's deferred-tools
+list names `Workflow`, Agentaus is told to delegate with `Agent` (or work alone on a trivial
+turn) or load `Workflow` first. Once the main loop has delegated with `Agent`, loading
+`Workflow` later does not turn the session into a graph main loop. Measured before this: with
+the opt-in on and `Workflow` deferred, Agentaus worked alone for 32 turns.
 
 ---
 
@@ -1179,7 +1199,7 @@ tuning, search limits, retries and timeouts, and the ultracode agent graph, is i
 | `BRIDGE_PING_INTERVAL` | `10` | Seconds between keep-alive pings while Agentaus is silent |
 | `BRIDGE_CHUNK_CHARS` | `60` | Re-chunk buffered replies into smaller deltas; `0` disables |
 | `BRIDGE_TURN_TIMEOUT` | `900` | Wall-clock ceiling on one streamed Agentaus turn. `0` disables |
-| `BRIDGE_TOKEN` | *(empty)* | Require this token from clients; empty means no client auth |
+| `BRIDGE_TOKEN` | *(empty)* | Require this token from clients; empty means no client auth. Clients send it as `x-agentaus-bridge-token` (preferred) or, legacy, as `x-api-key`/`Authorization: Bearer` |
 | `BRIDGE_LOG_LEVEL` | `info` | `debug` for per-request detail |
 | `BRIDGE_LOG_BODIES` | `false` | Log full request bodies, which include your source code |
 | `AGENTAUS_PROMPT_STYLE` | `markdown` | How the bridge lays out what it writes for Agentaus: `markdown` or `xml` |
@@ -1423,6 +1443,48 @@ More symptoms, including DNS failures on macOS, stream errors and a generic-assi
 ---
 
 ## Security notes
+
+### Client authentication
+
+`BRIDGE_TOKEN` (empty by default) turns on a shared secret. When it is set, every
+bridge endpoint except the health probes (`/healthz`, `/healthz/upstream`, `/api/hello`)
+refuses a caller that does not present it: `/v1/messages`, `/v1/messages/count_tokens`
+and `/v1/models` all check.
+
+- **Preferred:** send it in the `x-agentaus-bridge-token` header. The bridge never
+  forwards that header, so it can sit beside a real Anthropic credential. In Claude Code,
+  add `"ANTHROPIC_CUSTOM_HEADERS": "x-agentaus-bridge-token: <BRIDGE_TOKEN>"` to the
+  same `env` block as `ANTHROPIC_BASE_URL`.
+- **Legacy (still accepted):** `x-api-key: <BRIDGE_TOKEN>` or
+  `Authorization: Bearer <BRIDGE_TOKEN>`, as Agentaus-only clients sent it before the
+  dedicated header existed.
+
+The bridge forwards your Anthropic credentials to Anthropic. If a legacy auth header
+holds the bridge token, the bridge removes it before the request goes upstream, so the
+secret never reaches Anthropic. A different value in the other auth header (your real
+`x-api-key` or OAuth Bearer token) is kept:
+
+| You send | Anthropic receives |
+| --- | --- |
+| `x-agentaus-bridge-token: <bridge>` + `x-api-key: sk-ant-...` | `x-api-key: sk-ant-...` |
+| `x-agentaus-bridge-token: <bridge>` + `Authorization: Bearer <oauth>` | `Authorization: Bearer <oauth>` |
+| `Authorization: Bearer <bridge>` + `x-api-key: sk-ant-...` (legacy) | `x-api-key: sk-ant-...` |
+| `x-api-key: <bridge>` + `Authorization: Bearer <oauth>` (legacy) | `Authorization: Bearer <oauth>` |
+| `x-api-key: <bridge>` (legacy, Agentaus-only client) | no credential, so Anthropic answers 401 |
+
+**Upgrading: if your `BRIDGE_TOKEN` is your Anthropic key.** Older versions forwarded the
+header that held the bridge token to Anthropic unchanged, so the only way to combine
+`BRIDGE_TOKEN` with Claude passthrough was to set it to the same `sk-ant-...` key Claude
+Code sends. That key now counts as the bridge token and is removed before the request
+goes upstream, so every Claude request reaches Anthropic with no credential and fails
+with 401. The bridge logs a warning at startup when `BRIDGE_TOKEN` starts with `sk-ant-`,
+and again the first time a request is forwarded without a credential. To fix it, set
+`BRIDGE_TOKEN` to a separate secret, send that secret in the `x-agentaus-bridge-token`
+header (see above), and keep your Anthropic key in `x-api-key` as before.
+
+Tokens are compared in constant time.
+
+### Deployment
 
 - The bridge binds `127.0.0.1` by default. It has **no client authentication** in that
   mode, which is fine on loopback. If you change `BRIDGE_HOST`, set `BRIDGE_TOKEN` as
