@@ -1385,21 +1385,24 @@ def _with_forced_answer(data: dict, text: str) -> dict:
     return {**data, "choices": [choice] + choices[1:]}
 
 
-def _without_bridge_calls(data: dict) -> dict:
+def _without_bridge_calls(data: dict, drop: set | None = None) -> dict:
     """Strip bridge-owned tool calls from a response.
 
     Needed when the tool-round budget runs out with one still pending: Claude Code has
     never heard of `agentaus_search` and would fail the tool_use rather than run it, so
-    an unanswered bridge call must never be surfaced.
+    an unanswered bridge call must never be surfaced. `drop` names more calls by id: a
+    `Skill` call for a library skill is the bridge's too, but its name doesn't say so.
     """
     choices = list(data.get("choices") or [])
     if not choices:
         return data
     choice = dict(choices[0] or {})
     message = dict(choice.get("message") or {})
+    drop = drop or set()
     kept = [
         call for call in (message.get("tool_calls") or [])
         if ((call.get("function") or {}).get("name") or "") not in bridge_tools.BRIDGE_TOOLS
+        and not (call.get("id") and call.get("id") in drop)
     ]
     message["tool_calls"] = kept or None
     if not kept and not (message.get("content") or "").strip():
@@ -3158,7 +3161,7 @@ async def _handle_agentaus(
                  settings.agentaus_tool_rounds, len(mine))
             if _theirs:
                 # Claude Code still has work to run, so the turn goes on without a re-ask.
-                data = _without_bridge_calls(data)
+                data = _without_bridge_calls(data, drop={c["id"] for c in mine if c.get("id")})
                 break
             if not cut_off:
                 cut_off = True
@@ -4020,11 +4023,13 @@ async def _unguarded_event_stream(
                     "I searched without reaching an answer. Narrow the question and I "
                     "will try again."
                 ]
-                # The dropped search left "tool_calls" here, and the turn now has none.
-                finish_reason = "stop"
                 if not buffering:
                     # Only a buffered answer is emitted below; a live one is sent here.
                     yield builder.text(pending[0])
+            if not theirs:
+                # The dropped search left "tool_calls" here, and the turn now has none -
+                # also when the model narrated before searching again after the cut-off.
+                finish_reason = "stop"
         break
 
     # Same repair as the buffered path: a non-breaking hyphen in a filename looks

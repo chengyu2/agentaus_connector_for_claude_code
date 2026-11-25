@@ -88,7 +88,8 @@ MODES = ((True, False), (True, True), (False, False))
 class _Loop(_WithStub):
     def setUp(self):
         super().setUp()
-        for k in ("agentaus_search", "agentaus_tool_rounds", "agentaus_correction_rounds"):
+        for k in ("agentaus_search", "agentaus_tool_rounds", "agentaus_correction_rounds",
+                  "agentaus_skill_library"):
             self.saved[k] = getattr(settings, k)
         settings.agentaus_search = True
         settings.agentaus_tool_rounds = 1
@@ -106,10 +107,10 @@ class _Loop(_WithStub):
         settings.agentaus_base_url = stub.url
         return stub
 
-    def turn(self, stream: bool) -> list:
+    def turn(self, stream: bool, tools=("Bash", "Read")) -> list:
         """The content blocks of one turn, and its stop reason last."""
         body = {"model": "agentaus", "max_tokens": 200, "stream": stream,
-                "tools": [tool("Bash"), tool("Read")],
+                "tools": [tool(name) for name in tools],
                 "messages": [user("why does the cache miss on reload? fix it")]}
         with TestClient(server.app) as client:
             r = client.post("/v1/messages", json=body)
@@ -181,6 +182,46 @@ class RoundLimit(_Loop):
                 self.assertEqual([b.get("name") for b in blocks if b["type"] == "tool_use"],
                                  ["Read"])
                 self.assertEqual(stop, "tool_use")
+
+
+    def test_a_spent_library_skill_call_is_not_forwarded(self):
+        def behave(payload):
+            calls = [(bridge_tools.SEARCH_TOOL, {"query": "cache reload", "path": "/tmp"})]
+            if len(stub.calls) > 1:
+                calls = [("Skill", {"skill": "cache-notes"}),
+                         ("Read", {"file_path": "/tmp/cache.py"})]
+            return {"tool_calls": calls}
+
+        settings.agentaus_skill_library = True
+        served = mock.patch.object(server, "with_library_skills",
+                                   lambda body: (body, frozenset({"cache-notes"})))
+        served.start()
+        self.addCleanup(served.stop)
+        for stream, buffered in MODES:
+            with self.subTest(stream=stream, buffered=buffered):
+                settings.agentaus_self_review = buffered
+                stub = self.tool_stub(behave)
+                *blocks, stop = self.turn(stream, tools=("Bash", "Read", "Skill"))
+                self.assertEqual([b.get("name") for b in blocks if b["type"] == "tool_use"],
+                                 ["Read"])
+                self.assertEqual(stop, "tool_use")
+
+    def test_narration_before_a_search_after_the_cut_off_ends_the_turn(self):
+        def behave(payload):
+            if not payload.get("tools"):
+                return {"content": "The reload path skips the cache key."}
+            search = [(bridge_tools.SEARCH_TOOL, {"query": "cache reload", "path": "/tmp"})]
+            if cut_off(payload):
+                return {"content": "Let me look once more.", "tool_calls": search}
+            return {"tool_calls": search}
+
+        for stream, buffered in MODES:
+            with self.subTest(stream=stream, buffered=buffered):
+                settings.agentaus_self_review = buffered
+                stub = self.tool_stub(behave)
+                *blocks, stop = self.turn(stream)
+                self.assertFalse([b for b in blocks if b["type"] == "tool_use"])
+                self.assertEqual(stop, "end_turn")
 
 
 class EmptyReply(_Loop):
