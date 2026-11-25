@@ -500,6 +500,35 @@ class TestSmallRequestTimeoutsAreNotBlamedOnSize(unittest.TestCase):
         body = {"messages": [{"role": "user", "content": "x " * 200_000}]}
         self.assertTrue(_worth_refitting(body, 131072))
 
+    def test_no_tokeniser_still_refits_a_request_that_does_not_fit(self):
+        """The chars/4 fallback under-counts dense payloads by ~2x, which turns a
+        request that does not fit into one that apparently does - and the refit decision
+        then sends the identical oversized payload into the same timeout forever. The
+        decision must correct for the fallback's known error instead of trusting it."""
+        from unittest import mock
+
+        from agentaus_bridge import server, tokens
+
+        body = {"messages": [{"role": "user", "content": "x " * 200_000}]}
+        with mock.patch.object(tokens, "_ENCODING", None), \
+                mock.patch.object(server, "_has_tokeniser", lambda: False):
+            # chars/4 puts this at ~100k against a 131k window: exactly the reading
+            # that must not be trusted at this threshold.
+            self.assertLess(server.estimate_request_tokens(body), 131_072)
+            self.assertTrue(server._worth_refitting(body, 131072))
+
+    def test_no_tokeniser_does_not_refit_a_request_that_clearly_fits(self):
+        """The correction is for the fallback's error, not a new size ceiling: a
+        comfortably small request stays a sick-upstream 524 even without tiktoken."""
+        from unittest import mock
+
+        from agentaus_bridge import server, tokens
+
+        body = {"messages": [{"role": "user", "content": "x " * 40_000}]}
+        with mock.patch.object(tokens, "_ENCODING", None), \
+                mock.patch.object(server, "_has_tokeniser", lambda: False):
+            self.assertFalse(server._worth_refitting(body, 131072))
+
     def test_over_length_still_drives_recompaction_on_its_own_signal(self):
         """The explicit error is the primary path; the 524 heuristic is the backstop."""
         from agentaus_bridge.server import _is_over_length
