@@ -362,7 +362,11 @@ model its own window, so the variable belongs only in a session meant for Agenta
 
 - The launchers (Option 3) set it for the session they start, and leave it out when
   `DISABLE_COMPACT` is set in the shell or named in `~/.claude/settings.json`,
-  `.claude/settings.json` or `.claude/settings.local.json`. A value you export yourself wins.
+  `.claude/settings.json` or `.claude/settings.local.json`. They look for the local file
+  where Claude Code does: in the folder you start in and, started from a subfolder of a git
+  repository, at the repository's root (the main checkout, for a linked worktree). They do
+  not read managed settings or a `--settings` file you pass through, so if `DISABLE_COMPACT`
+  is only there, export it in the shell too. A value you export yourself wins.
 - The installer and the `env` blocks above (Options 1 and 2) leave it out on purpose,
   because such a file outlives the choice: `DISABLE_COMPACT` set later, in any settings
   file or shell, would cap every Claude model in every session that file covers.

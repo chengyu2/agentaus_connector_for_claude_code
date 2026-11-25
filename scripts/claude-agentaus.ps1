@@ -50,12 +50,39 @@ $env:ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION = "Sovereign Australian model, se
 # applies it to every model and Opus or Sonnet would stop at 131,072 too. So it is set here,
 # for this one session, never in a settings file, and left out when DISABLE_COMPACT is set
 # in the shell or named in a settings file the session reads. A value you set yourself wins.
+#
+# Where Claude Code looks: .claude\settings.json in the folder it starts in, and
+# .claude\settings.local.json there or - on macOS and Linux, started below the top of a
+# git repository - at the repository's root (the main checkout, for a linked worktree).
+# The local file is checked in all three places on every OS, as scripts/claude-agentaus.sh
+# does; one too many only leaves the window to the bridge.
+function Get-ProjectRoots {
+    # The git repository's root and its main checkout; nothing outside a repository or without git.
+    $ErrorActionPreference = "Continue"  # Windows PowerShell turns git's stderr into errors under Stop
+    $Roots = @()
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return $Roots }
+    try {
+        $Top = @(git rev-parse --show-toplevel 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $Top.Count -gt 0 -and $Top[0]) { $Roots += [string]$Top[0] }
+        $Worktrees = @(git worktree list --porcelain 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $Worktrees.Count -gt 0 -and $Worktrees[0] -match '^worktree (.+)$') {
+            $Roots += $Matches[1]
+        }
+    } catch { }
+    return $Roots
+}
 function Test-CompactDisabled {
     if ($env:DISABLE_COMPACT -and (@("1", "true", "yes", "on") -contains $env:DISABLE_COMPACT.Trim())) {
         return $true
     }
     $ConfigDir = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME ".claude" }
-    foreach ($File in @((Join-Path $ConfigDir "settings.json"), ".claude\settings.json", ".claude\settings.local.json")) {
+    $Files = @((Join-Path $ConfigDir "settings.json"),
+               (Join-Path ".claude" "settings.json"),
+               (Join-Path ".claude" "settings.local.json"))
+    foreach ($Root in @(Get-ProjectRoots)) {
+        $Files += Join-Path (Join-Path $Root ".claude") "settings.local.json"
+    }
+    foreach ($File in $Files) {
         if ((Test-Path -LiteralPath $File) -and
             (Select-String -LiteralPath $File -Pattern '"DISABLE_COMPACT"' -SimpleMatch -Quiet)) {
             return $true

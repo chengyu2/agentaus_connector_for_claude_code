@@ -26,9 +26,8 @@ def old_python_warning(version: tuple) -> str | None:
     if tuple(version[:2]) >= MIN_PYTHON:
         return None
     return (
-        "running on Python %d.%d; the bridge needs %d.%d or newer. Some protections are off "
-        "on older versions - for example, a script's local random.py or json.py is not "
-        "recognised as shadowing the standard library. To rebuild on a newer Python, install "
+        "running on Python %d.%d; the bridge needs %d.%d or newer, the oldest version its "
+        "installers support. To rebuild on a newer Python, install "
         "Python %d.%d or newer, delete the .venv folder in the bridge's directory, and run the "
         "installer again (scripts/install.sh, or scripts\\install.ps1 on Windows)."
         % (*version[:2], *MIN_PYTHON, *MIN_PYTHON)

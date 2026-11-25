@@ -30,12 +30,27 @@ export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="Sovereign Australian model, se
 # applies it to every model and Opus or Sonnet would stop at 131,072 too. So it is set here,
 # for this one session, never in a settings file, and left out when DISABLE_COMPACT is set
 # in the shell or named in a settings file the session reads. A value you set yourself wins.
+#
+# Where Claude Code looks: .claude/settings.json in the folder it starts in, and
+# .claude/settings.local.json there or - on macOS and Linux, started below the top of a
+# git repository - at the repository's root (the main checkout, for a linked worktree).
+# So the local file is checked in all three places; one too many only leaves the window
+# to the bridge. scripts/claude-agentaus.ps1 checks the same files.
+project_roots() {
+  git rev-parse --show-toplevel 2>/dev/null || true
+  git worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p' || true
+}
 compact_disabled() {
   case "$(printf '%s' "${DISABLE_COMPACT:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
     1|true|yes|on) return 0 ;;
   esac
-  grep -qs '"DISABLE_COMPACT"' "${CLAUDE_CONFIG_DIR:-${HOME}/.claude}/settings.json" \
-    .claude/settings.json .claude/settings.local.json
+  local files=("${CLAUDE_CONFIG_DIR:-${HOME}/.claude}/settings.json"
+               .claude/settings.json .claude/settings.local.json)
+  local root
+  while IFS= read -r root; do
+    [ -n "$root" ] && files+=("$root/.claude/settings.local.json")
+  done < <(project_roots)
+  grep -qs '"DISABLE_COMPACT"' "${files[@]}"
 }
 if [ -z "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}" ]; then
   if compact_disabled; then
