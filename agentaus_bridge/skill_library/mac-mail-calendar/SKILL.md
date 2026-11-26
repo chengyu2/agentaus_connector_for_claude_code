@@ -1,6 +1,6 @@
 ---
 name: mac-mail-calendar
-description: On macOS, use AppleScript to find and read emails in Apple Mail (body, attachments, zip files of resumes or forms), save draft emails from a chosen account, clean up duplicate drafts, send saved drafts once the user confirms the list, and create Calendar events with invitations. Use when asked to search, read or reply to emails in Apple Mail, draft emails to a list of people, clean up or send those drafts, or schedule a meeting or interview and invite people. Covers the traps that make these look done when they are not - Calendar's AppleScript adds no attendees, and a slow or failed search is not a missing feature.
+description: On macOS, use AppleScript to find and read emails in Apple Mail (body, attachments, zip files of resumes or forms), save draft emails from a chosen account, clean up duplicate drafts, send email with the user's own signature once the user confirms the list, and create Calendar events with invitations. Use when asked to search, read or reply to emails in Apple Mail, draft emails to a list of people, clean up or send them, or schedule a meeting or interview and invite people. Covers the traps that make these look done when they are not - Calendar's AppleScript adds no attendees, and a slow or failed search is not a missing feature.
 license: Apache-2.0
 metadata:
   adapted-for: agentaus
@@ -33,6 +33,19 @@ real values first (section 1); never guess them.
   addresses.
 - Write longer scripts to a `.applescript` file and run `osascript file.applescript args`.
   Quoting a long script inside `osascript -e '...'` breaks on the first apostrophe.
+- **Let Mail add the signature.** End the body with a short sign-off and the user's first
+  name (`Thanks,` then `<first name>`), then set `message signature` to the user's Mail
+  signature (`tell application "Mail" to name of every signature`). Never type a name, title
+  or company block into the body: it duplicates the real signature and has no logo.
+- **No empty first line.** Mail puts an empty line above every body a script sets. Remove
+  it before saving or sending (section 4a), and check the first line is the greeting.
+- **Warn the user before Mail comes to the front.** Removing that line needs the message
+  window in front, and anything the user types meanwhile lands in the message. Say how long
+  to keep hands off the keyboard, and say when it is done.
+- **Test on the user's own address, then clean up.** Throwaway test drafts and windows are
+  discarded: answer a Save / Don't Save sheet on them with **Don't Save**, never Save.
+- **Read data files with Python, not `while IFS=$'\t' read`.** Bash collapses empty
+  tab-separated fields, so the next column (a file name) lands in the Cc field.
 
 ## 1. Find the accounts and calendars
 
@@ -117,14 +130,15 @@ pdftotext "<document>.pdf" - | grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[a-z]
 
 ```applescript
 on run argv
-	-- argv: account, recipient, subject, body, sender, then optionally the attachment's path
+	-- argv: account, recipient, subject, body, sender, signature, then optionally the attachment's path
 	set acct to item 1 of argv
 	set toAddr to item 2 of argv
 	set subj to item 3 of argv
 	set body to item 4 of argv
 	set fromId to item 5 of argv -- exactly "<Name> <address>" of that account
+	set sigName to item 6 of argv -- one of: tell application "Mail" to name of every signature
 	set wanted to 0
-	if (count of argv) > 5 then set wanted to 1
+	if (count of argv) > 6 then set wanted to 1
 	with timeout of 300 seconds
 		tell application "Mail"
 			set mb to item 1 of (mailboxes of account acct whose name is "Drafts")
@@ -134,11 +148,13 @@ on run argv
 				end repeat
 			end repeat
 			if (count (windows whose name is subj)) > 0 then return "WINDOW OPEN titled " & subj & " - nothing made"
-			set m to make new outgoing message with properties {subject:subj, content:body & return & return, visible:true, sender:fromId}
+			-- the body ends with "Thanks," and the first name; Mail adds the signature and its logo
+			set m to make new outgoing message with properties {subject:subj, content:body, visible:true, sender:fromId}
+			set message signature of m to signature sigName
 			tell m
 				make new to recipient at end of to recipients with properties {address:toAddr}
 				if wanted > 0 then
-					tell content to make new attachment with properties {file name:(POSIX file (item 6 of argv))} at after last paragraph
+					tell content to make new attachment with properties {file name:(POSIX file (item 7 of argv))} at after last paragraph
 				end if
 			end tell
 			delay 3 -- let the attachment load, then make sure it did
@@ -152,6 +168,7 @@ on run argv
 				close (first window whose name is subj) saving no
 				return "ATTACHMENT MISSING for " & toAddr & " - nothing saved"
 			end if
+			-- section 4a: remove the empty first line here, then read back, before saving
 			save m
 			delay 2
 			close (first window whose name is subj) saving no
@@ -161,7 +178,7 @@ on run argv
 end run
 ```
 
-Run: `osascript draft.applescript "<account>" "<to>" "<subject>" "<body>" "<Name> <address>" /path/invite.ics`.
+Run: `osascript draft.applescript "<account>" "<to>" "<subject>" "<body>" "<Name> <address>" "<signature>" /path/invite.ics`.
 It prints `DRAFT <address>` when one complete draft was saved. Any other line means nothing
 was saved for that person:
 
@@ -193,6 +210,35 @@ Why the recipe is built this way:
 - The draft lands in the `Drafts` mailbox of the account that `sender` belongs to. A
   `sender` that matches no account puts it in the default account.
 
+### 4a. Remove the empty first line Mail adds
+
+Whatever order you set the body and the signature in, Mail starts the HTML with
+`<div class="Apple-Mail-URLShareUserContentTopClass"><br></div>`: the reader sees an empty
+line above "Hi <name>,". AppleScript cannot reach that HTML. Measured:
+
+- Setting the body before or after the signature, or after the window opened: the line stays.
+- `visible:false` (no window): the line stays, the signature's logo is dropped, and every line
+  of the plain-text part starts with `>`. Do not use it for real email.
+- Rebuilding a saved draft as a new message (`scripts/send-draft.applescript`) copies the
+  line and drops the logo.
+- What works: with the message window in front, Cmd-Up then Forward Delete, once.
+
+That needs Mail in front for a few seconds per message, and keys typed by the user in that
+time go into the message. On 26 Nov 2026 a test message had its recipient replaced by the
+user's typing and went to someone else, and a stray "s" reached another email. So:
+
+1. **Before the batch, tell the user** how long Mail will come forward and to keep hands
+   off the keyboard until you say it is done. If they cannot, offer drafts they finish
+   themselves.
+2. Find the body by walking the window's tree: window > group > group > scroll area >
+   `AXWebArea`. `entire contents` of a Mail compose window returns nothing.
+3. Press the keys only while `name of (first process whose frontmost is true)` is "Mail".
+4. Read back before saving or sending: paragraph 1 of `content` starts with the greeting,
+   To, Cc and Bcc are exactly what you set, and the subject is unchanged. Otherwise discard.
+
+`scripts/send-message.applescript` (section 5) does all four; copy its `findWebArea` and
+the block under "remove the empty first line" for drafts.
+
 ### Check: exactly one complete draft per person
 
 Count the drafts with that subject: it should equal the number of people. If it is more, or
@@ -216,59 +262,71 @@ the mailbox again. Each line of its report is `KEEP`, `NONE` (no draft for that 
    with `delete` only after they agree.
 3. Run it with `list` once more: it should show one `KEEP` per person and no `DELETE`.
 
-## 5. Send drafts - only after the user confirms the list
+## 5. Send - only after the user confirms the list
 
-AppleScript cannot send a saved draft: `open` shows it in a reading window, with nothing to
-send. The script below rebuilds it as a new message - same sender, To, Cc and Bcc, subject, text
-and attachments - sends that, waits until it shows in the Sent mailbox, and only then
-deletes the draft. The rebuilt message is plain text: the draft's formatting and the
-signature's logo are not carried over.
+Build each message fresh and send it with `scripts/send-message.applescript`, next to this
+file. It sets the user's Mail signature (with its logo), removes the empty first line
+(section 4a), reads back the first line, To, Cc, Bcc and subject, sends, and treats a Mail
+warning sheet ("does not appear to be a valid email address") as not sent. A message it
+refuses is discarded, not saved.
 
-The script is `scripts/send-draft.applescript`, next to this file. With `preview` it changes
-nothing and prints what would go out. With `send` it rebuilds and sends the message, copies
-the draft's Cc and Bcc, and deletes the draft only once the Sent mailbox shows it.
+Do not send by rebuilding a saved draft. AppleScript cannot send a draft, and
+`scripts/send-draft.applescript`, which rebuilds one, sends plain text with the empty first
+line and without the signature's logo. Use it only if the user asks for drafts they edited
+themselves to go out as they are, and has been told how they will look.
 
-Run: `osascript <skill-dir>/scripts/send-draft.applescript "<account>" "<exact subject>" "<recipient>" 1 "<Sent mailbox>" /path/to/scratch/<recipient> preview`
-(`send` in place of `preview` to send). The Sent mailbox's name is the one section 2 found,
-such as `Sent Items` or `Sent Mail`.
+1. Write one body file per person: the greeting first, ending with `Thanks,` and the user's
+   first name, with no signature block. Drive the batch from Python, not a bash `read` loop.
+2. Show the user the whole list: each recipient with their Cc, the sending account, the
+   subject, the attachment names and the start of the text.
+3. Send only after the user confirms **that list**. A "send them" given before they saw it,
+   or before a re-draft, is not a confirmation: show the list and ask.
+4. **Test first:** send one to the user's own address and read its source (`source of m`):
+   the HTML body must not start with an empty `<div>`, and it must contain an `<img`. Then
+   delete the test from the Inbox and the Sent mailbox.
+5. **Warn the user** (section 4a): Mail comes to the front for about 10 seconds per message.
+   Ask them to keep hands off the keyboard until you say the batch is done.
+6. Send one person at a time, and read each result before the next:
 
-1. Run the clean-up check first (section 4), so each person has exactly one draft.
-2. Run it with `preview` for every recipient. It changes nothing and applies the
-   same checks as `send`.
-3. Show the user the whole list: each recipient with their Cc and Bcc, the sender, the
-   subject, the attachment names and the start of the text, and say that the sent mail is
-   rebuilt as plain text, without the draft's formatting or the signature's logo.
-4. Send only after the user confirms **that list**. A "send them" given before they saw it,
-   or before a clean-up or a re-draft, is not a confirmation: show the list and ask.
-5. Send one person at a time with `send`, and read each result before the next:
+   ```bash
+   osascript <skill-dir>/scripts/send-message.applescript "<account>" "<subject>" "<to>" "<cc or empty>" \
+       /path/body.txt /path/invite.ics "<signature name>" "<Sent mailbox>" nowait
+   ```
+
+   The Sent mailbox's name is the one section 2 found, such as `Sent Items` or `Sent Mail`.
+   Pass `""` for no Cc or no attachment. Without `nowait`, the script also waits up to 60
+   seconds for the message to show in the Sent mailbox, holding Mail in front meanwhile.
 
    | Result | What it means | Do |
    | --- | --- | --- |
-   | `SENT <address>` | It is in the Sent mailbox; the draft is deleted. | Check for a prompt (below), then the next person. |
-   | `NOT SENT <address> - ...` | The script stopped before sending. Nothing went out. | Fix the cause it names, then run it again for that person. |
-   | `UNCONFIRMED`, an error, "AppleEvent timed out", or anything else | Unknown: Mail may still be sending it. | Stop. Look in the Sent mailbox and the Outbox for that subject and recipient. Never send to that person again until both show nothing for them. If it was sent, delete the draft. |
+   | `SENT <address>` | Mail sent it. Without `nowait`, it is also in the Sent mailbox. | Next person. |
+   | `NOT SENT <address> - ...` | Discarded before sending. Nothing went out. | Stop the batch. Fix the cause it names, then run it again for that person. |
+   | `UNCONFIRMED`, an error, "AppleEvent timed out", or anything else | Unknown: Mail may still be sending it. | Stop. Look in the Sent mailbox and the Outbox for that subject and recipient. Never send to that person again until both show nothing for them. |
 
-6. **After each send, look for a prompt** before the next one: list Mail's windows and their
-   sheets (`tell application "System Events" to tell process "Mail" to get count sheets of
-   every window`). A "Save / Don't Save / Cancel" sheet means a message window was closed
-   unsaved - stop and tell the user rather than clicking it.
-   This call needs Accessibility access for the app running `osascript`. If it errors
-   (-1719, -25211) or a permission dialog appears, an error is **not** "no prompt": stop
-   sending, tell the user to allow it in System Settings > Privacy & Security >
-   Accessibility (for the terminal or the bridge), and ask them to look at Mail's windows.
-7. Check at the end by listing again, not from memory: the Sent mailbox has one message with
-   that subject for each person sent, and `Drafts` has none left for them.
-8. Delete the scratch folders: they hold copies of the attachments.
+7. **Look for a prompt the script did not answer:** list Mail's windows and their sheets
+   (`tell application "System Events" to tell process "Mail" to get count sheets of every
+   window`). On a window the user opened, stop and ask rather than clicking it.
+   This call needs Accessibility access for the app running `osascript`, and so does the
+   script. If it errors (-1719, -25211) or a permission dialog appears, an error is **not**
+   "no prompt": stop sending, tell the user to allow it in System Settings > Privacy &
+   Security > Accessibility (for the terminal or the bridge), and ask them to look at Mail's
+   windows.
+8. Check at the end by listing again, not from memory: the Sent mailbox has one message with
+   that subject for each person sent, with the right To and Cc, the attachment, the logo
+   (`content` contains `￼`), and the greeting as the first non-empty paragraph. Sent mail
+   can take over a minute to file. Then tell the user the batch is done.
+9. If you saved drafts for these people earlier, delete only those (section 4's clean-up
+   lists them), and only once each person's message is in the Sent mailbox.
 
 Notes:
 
 - `files` is a reserved word inside `tell application "Mail"`: name a list of paths
   `fileList`, or the script stops with "Can't set every file".
-- The draft's text already ends with the signature, so the rebuilt message adds none
-  (`message signature ... missing value`).
-- Mail's dictionary declares that `send` returns `false` when it fails, with no error; and an error after
-  `send` (a timeout, a failed `delete`) can come while the message is going out. That is
-  why only the Sent mailbox decides that a message was sent.
+- Mail's dictionary declares that `send` returns `false` when it fails, with no error; and an
+  error after `send` can come while the message is going out. That is why only the Sent
+  mailbox decides that a message was sent.
+- `close ... saving no` on a compose window can still raise a "Save / Don't Save / Cancel"
+  sheet. On your own failed or test message, click **Don't Save**.
 
 ## 6. Create the event, and invite people
 
