@@ -791,8 +791,16 @@ def pending_workflows(body: dict) -> set:
     if graph.run_state(entry) == "running":
         remembered = {t for t in entry["launched"] - entry["reported"] if t != "?"} or {"the agent graph"}
     launched, reported = set(), set()
+    # Only `Workflow`'s own results are launches. Measured (25 Nov 2026): a `Read` of
+    # tests/test_delegation.py returned its quoted "Workflow launched in background. Task ID:
+    # w5iah888s", and every Edit for the rest of the session was refused as "still running".
+    uses = set()
     for message in body.get("messages") or []:
         content = message.get("content")
+        if message.get("role") == "assistant" and isinstance(content, list):
+            uses.update(b.get("id") for b in content if isinstance(b, dict)
+                        and b.get("type") == "tool_use" and b.get("name") == "Workflow")
+            continue
         # A report can arrive as a `system` entry too. Measured (Claude Code 2.1.331): a stopped
         # workflow's `<status>killed</status>` notification came that way, the launch was never
         # seen to report back, and every Edit after it was refused as "still running".
@@ -803,6 +811,8 @@ def pending_workflows(body: dict) -> set:
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "tool_result" and not block.get("is_error"):
+                if block.get("tool_use_id") not in uses:
+                    continue
                 text = block.get("content")
                 text = text if isinstance(text, str) else json.dumps(text)
                 if re.search(r"Workflow launched in (the )?background", text, re.I):
